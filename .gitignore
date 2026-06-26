@@ -7,3 +7,8 @@ __pycache__/
 
 # Scraper debug screenshots
 *.png
+
+# Unrelated files — not part of the bot
+idx-research-agent.jsx
+modern_ta_checklist.tsx
+phase1_tf.md
