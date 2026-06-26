@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "neobdm-scraper (scheduler)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["neobdm_scraper.py"]
+    },
+    {
+      "name": "neobdm-scraper (run now)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["neobdm_scraper.py", "--now"]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+name: NeoBDM Daily Scrape
+
+on:
+  schedule:
+    # 23:00 UTC == 07:00 Asia/Kuala_Lumpur (UTC+8, no DST).
+    # Note: GitHub may delay scheduled runs by a few minutes under load.
+    - cron: "0 23 * * *"
+  workflow_dispatch:  # lets you trigger a run manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
+      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium (+ system deps)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run scraper (one-shot)
+        run: python neobdm_scraper.py --now
