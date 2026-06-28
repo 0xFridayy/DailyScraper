@@ -93,6 +93,17 @@ SMART_MONEY = {
 ALGO_BIG_PLAYERS_T1 = ["AK", "BK", "ZP", "RX"]
 ALGO_BIG_PLAYERS_T2 = ["YP", "YU", "AI", "CC"]
 
+# "Big player" absorber bloc for the broker-stalker signal: smart money + algo
+# T1 + T2. Retail codes (XL/XC/YP/PD) are EXCLUDED so the absorber and the retail
+# seller stay distinct parties (no double-counting in the buy-vs-sell magnitude).
+# The owning bandar is largely covered here (CC/AK/ZP/PD… already included).
+BIG_PLAYER_ABSORBERS = [
+    c for c in dict.fromkeys(
+        list(SMART_MONEY) + ALGO_BIG_PLAYERS_T1 + ALGO_BIG_PLAYERS_T2
+    )
+    if c not in RETAIL_BROKERS
+]
+
 # Bandar group -> broker codes mapping (used to cross-reference big-fund buy side)
 BANDAR_GROUPS = {
     "Prajogo":       ["DX", "NI"],
@@ -294,10 +305,11 @@ def scrape_market_summary(page):
     #     P2 dn-3   (net flow 3 days ago)
     #     P3 likuid ('v' ranks above 'x')
     #   pinky is ignored entirely.
-    #   Always return 5: stocks with dn-0 >= 10 are the strong picks; if fewer
-    #   than 5 clear that bar, fill the rest with the next-best unusual=v
-    #   stocks and flag them with a caution note (_caution).
+    #   Always return TOP_N: stocks with dn-0 >= 10 are the strong picks; if
+    #   fewer than TOP_N clear that bar, fill the rest with the next-best
+    #   unusual=v stocks and flag them with a caution note (_caution).
     DN0_MIN = 10
+    TOP_N = 2
     def is_v(val):
         return str(val).strip().lower() == "v"
 
@@ -316,10 +328,10 @@ def scrape_market_summary(page):
         ),
         reverse=True,
     )
-    top5 = candidates[:5]
-    for r in top5:
+    top = candidates[:TOP_N]
+    for r in top:
         r["_caution"] = parse_num(r.get("dn-0", "")) < DN0_MIN
-    return top5
+    return top
 
 
 # ── 3. BROKER STALKER ─────────────────────────
@@ -360,9 +372,17 @@ def set_duration(page, label="Today"):
         log.warning(f"Could not click duration '{label}': {e}")
 
 
-def parse_stalker_table(page):
-    page.wait_for_selector("#stalker-dist-table", timeout=15000)
-    trs = page.query_selector_all("#stalker-dist-table tr")
+# The broker_stalker page splits results into two tables:
+#   #broker-akum-stalker  -> net BUYS  (positive netval) = accumulation
+#   #broker-dist-stalker  -> net SELLS (negative netval) = distribution
+# Accumulation checks MUST read the akum side; retail-sell / SS read the dist side.
+SIDE_CONTAINER = {"akum": "#broker-akum-stalker", "dist": "#broker-dist-stalker"}
+
+
+def parse_stalker_table(page, side="dist"):
+    container = SIDE_CONTAINER[side]
+    page.wait_for_selector(f"{container} table", timeout=15000)
+    trs = page.query_selector_all(f"{container} table tr")
     data = []
     for tr in trs:
         symbol_el = tr.query_selector('td[data-dash-column="symbol"]')
@@ -384,7 +404,7 @@ def parse_stalker_table(page):
     return data
 
 
-def get_netflow(page, codes, duration="Today"):
+def get_netflow(page, codes, duration="Today", side="dist"):
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
@@ -394,99 +414,113 @@ def get_netflow(page, codes, duration="Today"):
     except Exception as e:
         log.warning(f"Could not click #submit-button: {e}")
     page.wait_for_timeout(4000)
-    page.screenshot(path=f"broker_stalker_{'_'.join(codes)}.png")
     try:
-        rows = parse_stalker_table(page)
+        rows = parse_stalker_table(page, side)
     except Exception as e:
-        log.error(f"Broker stalker table parse failed for {codes}: {e}")
+        log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
         rows = []
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
 
 def scrape_broker_stalker(page):
-    log.info(f"Scraping broker stalker (retail {'+'.join(RETAIL_BROKERS)} net sell, Today)...")
-    retail = get_netflow(page, RETAIL_BROKERS, "Today")
+    """Absorption signal: stocks where retail is net SELLING and the big-player
+    bloc is net BUYING MORE than retail sells (strong hands soaking up supply)."""
 
-    sells = []
-    for v in retail.values():
-        v = dict(v)
-        v["netval_num"] = parse_num(v["netval"])
-        if v["netval_num"] < 0:
-            sells.append(v)
-    sells.sort(key=lambda r: r["netval_num"])
-    top5 = sells[:5]
-    log.info(f"Top retail net sell candidates: {[r['symbol'] for r in top5]}")
-
-    log.info("Cross-referencing bandar groups...")
-    bandar_data = {}
-    for name, codes in BANDAR_GROUPS.items():
+    def safe_netflow(codes, side):
         try:
-            bandar_data[name] = get_netflow(page, codes, "Today")
+            return get_netflow(page, codes, "Today", side=side)
         except Exception as e:
-            log.error(f"Bandar group {name} failed: {e}")
-            bandar_data[name] = {}
-
-    # Special broker-behavior scans (smart money, whaler, smooth, algo, owner proxy).
-    log.info("Scanning special brokers (smart money / MG / SS / algo)...")
-    def safe_netflow(codes):
-        try:
-            return get_netflow(page, codes, "Today")
-        except Exception as e:
-            log.error(f"Special broker scan {codes} failed: {e}")
+            log.error(f"Scan {codes} ({side}) failed: {e}")
             return {}
 
-    # smart money scanned per-broker so we can name which one is accumulating
-    smart_data   = {code: safe_netflow([code]) for code in SMART_MONEY}
-    mg_data      = safe_netflow([WHALER_BROKER])
-    ss_data      = safe_netflow([SMOOTH_ACCUM_BROKER])
-    algo_t1_data = safe_netflow(ALGO_BIG_PLAYERS_T1)
-    algo_t2_data = safe_netflow(ALGO_BIG_PLAYERS_T2)
+    # 1) retail net SELL (dist side, negative netval)
+    log.info(f"Retail net sell scan ({'+'.join(RETAIL_BROKERS)})...")
+    retail_sell = safe_netflow(RETAIL_BROKERS, "dist")
 
-    results = []
-    for r in top5:
+    # 2) big-player net BUY (akum side, positive netval) — the absorber bloc
+    log.info(f"Big-player absorber scan ({'+'.join(BIG_PLAYER_ABSORBERS)})...")
+    big_buy = safe_netflow(BIG_PLAYER_ABSORBERS, "akum")
+
+    # 3) qualify: retail selling AND big player buying MORE than retail sells
+    candidates = []
+    for symbol, rrow in retail_sell.items():
+        sell_val = abs(parse_num(rrow.get("netval", "")))
+        if sell_val <= 0:
+            continue
+        brow = big_buy.get(symbol)
+        if not brow:
+            continue
+        buy_val = parse_num(brow.get("netval", ""))
+        if buy_val > sell_val:  # strict: absorption exceeds distribution
+            candidates.append({
+                "symbol":   symbol,
+                "netval":   rrow.get("netval", ""),     # retail sell
+                "savg":     rrow.get("savg", ""),
+                "big_buy":  buy_val,
+                "sell_val": sell_val,
+                "ratio":    buy_val / sell_val,
+            })
+    candidates.sort(key=lambda r: r["ratio"], reverse=True)
+    top = candidates[:5]
+    log.info(f"Absorption candidates: {[(c['symbol'], round(c['ratio'],1)) for c in top]}")
+
+    if not top:
+        return []
+
+    # 4) attribution — scan each big-player code INDIVIDUALLY (akum) so we can
+    # name the exact broker codes accumulating each stock.
+    log.info("Attribution scans (per big-player code / MG / SS)...")
+    code_data = {code: safe_netflow([code], "akum") for code in BIG_PLAYER_ABSORBERS}
+    mg_data   = safe_netflow([WHALER_BROKER], "akum")        # whaler buying = caution
+    ss_data   = safe_netflow([SMOOTH_ACCUM_BROKER], "dist")  # smooth distributing
+
+    # owner-proxy: only scan owners of candidates that HAVE a known owner, then
+    # tag only if that owning bandar is actually net-buying (real buyback).
+    owners_needed = {STOCK_OWNER[r["symbol"]] for r in top if r["symbol"] in STOCK_OWNER}
+    owner_data = {name: safe_netflow(BANDAR_GROUPS[name], "akum") for name in owners_needed}
+
+    for r in top:
         symbol = r["symbol"]
 
-        # bandar accumulation (net buy)
-        buyers = [
-            name for name, data in bandar_data.items()
-            if data.get(symbol) and parse_num(data[symbol].get("netval", "")) > 0
-        ]
+        # exact broker codes accumulating this stock, by buy value (desc)
+        accum = []
+        for code in BIG_PLAYER_ABSORBERS:
+            row = code_data.get(code, {}).get(symbol)
+            val = parse_num(row.get("netval", "")) if row else 0
+            if val > 0:
+                accum.append((code, val))
+        accum.sort(key=lambda x: x[1], reverse=True)
+        r["accum_codes"] = accum
 
-        # behavior tags
         tags = []
-        # smart money accumulating from retail — the core TOD bullish signal (top)
+        # which smart money is accumulating (core TOD attribution)
         for code, note in SMART_MONEY.items():
-            srow = smart_data.get(code, {}).get(symbol)
-            if srow and parse_num(srow.get("netval", "")) > 0:
+            if any(c == code for c, _ in accum):
                 tags.append(note)
-        # owner-proxy ("PPR"): is the stock's OWN bandar accumulating? (buyback)
+        if any(c in ALGO_BIG_PLAYERS_T1 for c, _ in accum):
+            tags.append("🤖 Algo big player T1 akumulasi (strong)")
+        if any(c in ALGO_BIG_PLAYERS_T2 for c, _ in accum):
+            tags.append("🤖 Algo big player T2 akumulasi")
         owner = STOCK_OWNER.get(symbol)
-        if owner and owner in bandar_data:
-            orow = bandar_data[owner].get(symbol)
+        if owner:
+            orow = owner_data.get(owner, {}).get(symbol)
             if orow and parse_num(orow.get("netval", "")) > 0:
                 codes = "+".join(BANDAR_GROUPS[owner])
-                tags.append(f"🟢 PPR — {owner} ({codes}) netbuy, buyback owner, bullish")
-        if parse_num((algo_t1_data.get(symbol) or {}).get("netval", "")) > 0:
-            tags.append("🤖 Algo big player T1 akumulasi (strong)")
-        if parse_num((algo_t2_data.get(symbol) or {}).get("netval", "")) > 0:
-            tags.append("🤖 Algo big player T2 akumulasi")
+                tags.append(f"🟢 Owner {owner} ({codes}) ikut serap — buyback!")
+            else:
+                tags.append(f"🏷️ Owner group: {owner} (tdk ikut serap hari ini)")
         if parse_num((mg_data.get(symbol) or {}).get("netval", "")) > 0:
-            tags.append("🐋 MG (whaler) top buy — hati2, besok biasa dijual")
+            tags.append("🐋 MG (whaler) ikut beli — hati2, besok biasa dijual")
         if parse_num((ss_data.get(symbol) or {}).get("netval", "")) < 0:
             tags.append("🟡 SS distribusi halus — masih ada waktu exit")
 
-        # base line
-        if buyers:
-            analisa = f"Retail jual, {buyers[0]} akumulasi — potensi buy back"
-        else:
-            analisa = "Retail jual, belum ada akumulasi bandar terdeteksi"
-
-        r["buyers"] = buyers
-        r["analisa"] = analisa
+        r["analisa"] = (
+            f"Retail jual {r['sell_val']:.1f}, big player serap {r['big_buy']:.1f} "
+            f"({r['ratio']:.1f}x) — strong hand akumulasi"
+        )
         r["tags"] = tags
-        results.append(r)
 
-    return results
+    return top
 
 
 # ── 4. FORMAT MESSAGES ────────────────────────
@@ -504,14 +538,18 @@ def format_market_summary_message(data):
             f"No data scraped today. Check screenshots."
         )
 
+    return "\n".join(_market_summary_lines(data))
+
+
+def _market_summary_lines(data):
     lines = [
-        "📊 NeoBDM — Top 5 Akum Bandar (Daily)",
+        "📊 Top 2 Akum Bandar (Daily)",
         "Filter: unusual=v | Strong: dn-0≥10 | Rank: dn-0 > dn-3 > liquid",
-        f"🕗 {now}",
-        "─────────────────────",
     ]
-    # display label "liquid" maps to the site's "likuid" column
-    label_map = {"likuid": "liquid"}
+    if not data:
+        lines.append("No data scraped today.")
+        return lines
+    label_map = {"likuid": "liquid"}  # display "liquid" for site's "likuid"
     for i, row in enumerate(data, 1):
         symbol = row.get("symbol", f"#{i}")
         details = "  ".join(
@@ -522,34 +560,45 @@ def format_market_summary_message(data):
         lines.append(f"{i}. {symbol}{flag} | {details}")
         if row.get("_caution"):
             lines.append("   ⚠️ caution: dn-0 < 10, akumulasi lemah hari ini")
-
-    lines.append("─────────────────────")
-    lines.append("neobdm.tech/market_summary/")
-    return "\n".join(lines)
+    return lines
 
 
 def format_broker_stalker_message(data):
-    now = now_str()
-    if not data:
-        return (
-            f"⚠️ NeoBDM Broker Stalker\n{now}\n\n"
-            f"No data scraped today. Check screenshots."
-        )
+    return "\n".join(_broker_stalker_lines(data))
 
+
+def _broker_stalker_lines(data):
     lines = [
-        f"🕵️ NeoBDM — Broker Stalker (Retail {'+'.join(RETAIL_BROKERS)} Net Sell, Today)",
-        f"🕗 {now}",
-        "─────────────────────",
+        "🕵️ Broker Stalker — Big Player Absorbing Retail (Today)",
+        "Signal: retail net sell + big player net buy > retail sell",
     ]
+    if not data:
+        lines.append("Tidak ada sinyal hari ini — belum ada big player yang "
+                     "serap ritel lebih besar dari jualan ritel.")
+        return lines
     for i, row in enumerate(data, 1):
-        lines.append(
-            f"{i}. {row['symbol']} | netval: {row['netval']}  savg: {row['savg']}\n   {row['analisa']}"
-        )
+        lines.append(f"{i}. {row['symbol']} | savg: {row['savg']}\n   {row['analisa']}")
+        accum = row.get("accum_codes", [])
+        if accum:
+            codes_str = ", ".join(f"{c} ({v:.1f})" for c, v in accum)
+            lines.append(f"   🔑 Akum by: {codes_str}")
         for tag in row.get("tags", []):
             lines.append(f"   {tag}")
+    return lines
 
+
+def format_combined_message(ms_data, bs_data):
+    """Both reports in ONE Telegram message with a single timestamp."""
+    lines = [
+        "📈 NeoBDM Daily Signal",
+        f"🕗 {now_str()}",
+        "═════════════════════",
+    ]
+    lines += _market_summary_lines(ms_data)
     lines.append("─────────────────────")
-    lines.append("neobdm.tech/broker_stalker/")
+    lines += _broker_stalker_lines(bs_data)
+    lines.append("═════════════════════")
+    lines.append("neobdm.tech")
     return "\n".join(lines)
 
 
@@ -593,8 +642,7 @@ def run_all_jobs():
 
             browser.close()
 
-        send_telegram(format_market_summary_message(ms_data))
-        send_telegram(format_broker_stalker_message(bs_data))
+        send_telegram(format_combined_message(ms_data, bs_data))
     except Exception as e:
         log.error(f"Job failed: {e}")
         try:
