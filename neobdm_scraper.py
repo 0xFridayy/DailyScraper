@@ -473,70 +473,54 @@ def get_netflow(page, codes, duration="Today", side="dist"):
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
 
-# ── BROKER SUMMARY (per-ticker buyer breakdown) ──
+# ── INVENTORY (per-ticker top "bag holders") ──
 
-def _fmt_date(d):
-    # non-padded "26 Jun 2026" — the format the broksum datepicker accepts
-    return f"{d.day} {d.strftime('%b')} {d.year}"
+NEOBDM_INVENTORY_URL = "https://neobdm.tech/inventory/"
 
 
-def trading_week_start(d0, sessions=5):
-    """Start date of a window of `sessions` trading days (Mon-Fri) ending at d0."""
-    days, cur = [], d0
-    while len(days) < sessions:
-        if cur.weekday() < 5:
-            days.append(cur)
-        cur -= timedelta(days=1)
-    return days[-1]
-
-
-def get_broker_summary_buyers(page, ticker, start, end, n=STALKER_BUYERS):
-    """Top-n net BUYERS of a ticker over [start, end] from the broker_summary
-    page. Table is sorted by buyer nval desc, so we take the first n rows."""
-    page.goto(NEOBDM_DASHBOARD_URL.replace("dashboard/screener", "broker_summary"),
-              wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(5000)
-    page.click("#input-broksum-ticker-selectized")
+def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
+    """Top-n 'bag holders' of a ticker = brokers with the highest cumulative net
+    inventory (Net Akum) over the page's default ~3-month window, from the
+    Plotly inventory chart. Each broker has a 'markers+text' end-point trace
+    whose last y = cumulative net (lot); we sort those descending."""
+    page.goto(NEOBDM_INVENTORY_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(7000)
+    # ticker = react-select dropdown #tick (same widget family as #broker)
+    page.click("#tick .Select-control")
+    page.wait_for_timeout(400)
     page.keyboard.type(ticker)
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(1500)
     page.keyboard.press("Enter")
     page.wait_for_timeout(800)
-    page.evaluate(
-        """(d) => {
-            document.getElementById('broksum-start-date').value = d.s;
-            document.getElementById('broksum-end-date').value = d.e;
-            for (const id of ['broksum-start-date','broksum-end-date'])
-                document.getElementById(id).dispatchEvent(new Event('change',{bubbles:true}));
-        }""",
-        {"s": start, "e": end},
+    page.click("#submit-button")     # Fetch (default date range; no calendar touched)
+    page.wait_for_timeout(11000)     # Plotly render
+    holders = page.evaluate(
+        """() => {
+            const el = document.querySelector('.js-plotly-plot');
+            if (!el || !el.data) return [];
+            return el.data
+                .filter(t => (t.mode||'').includes('markers') && t.name &&
+                             Array.isArray(t.y) && t.y.length)
+                .map(t => ({ code: t.name, cum: t.y[t.y.length-1] }))
+                .filter(t => typeof t.cum === 'number')
+                .sort((a, b) => b.cum - a.cum);
+        }"""
     )
-    page.wait_for_timeout(700)
-    page.click("#broksum-button-load")
-    page.wait_for_timeout(4000)
-    return page.evaluate(
-        """(n) => {
-            const out = [];
-            for (const tr of document.querySelectorAll('#broker-summary-table tbody tr')) {
-                const td = tr.querySelectorAll('td');
-                if (td.length >= 4) {
-                    const code = td[0].textContent.trim();
-                    if (code) out.push({
-                        code, name: td[0].querySelector('span')?.title || '',
-                        nlot: td[1].textContent.trim(), nval: td[2].textContent.trim(),
-                        bavg: td[3].textContent.trim()
-                    });
-                }
-                if (out.length >= n) break;
-            }
-            return out;
-        }""",
-        n,
-    )
+    return holders[:n]
+
+
+def _fmt_lot(v):
+    av = abs(v)
+    if av >= 1e6:
+        return f"{v/1e6:.2f}M lot"
+    if av >= 1e3:
+        return f"{v/1e3:.0f}k lot"
+    return f"{v:.0f} lot"
 
 
 def scrape_broker_stalker(page):
-    """Retail (XL+XC) top net-sell tickers, then who's accumulating each on the
-    broker_summary page — top buyers for d-0 and the 1-week window."""
+    """Retail (XL+XC) top net-sell tickers, then the top-2 'bag holders' of each
+    (highest cumulative net inventory) from the inventory chart."""
     # 1) retail net SELL (XL+XC, Foreign Only unchecked) -> top tickers
     log.info(f"Retail net sell scan ({'+'.join(STALKER_RETAIL)})...")
     try:
@@ -545,51 +529,27 @@ def scrape_broker_stalker(page):
         log.error(f"Retail net sell scan failed: {e}")
         return []
 
-    # d-0 (latest trading day) from the broker_stalker header — page is still here
-    d0_str = page.evaluate(
-        """() => {
-            const el = [...document.querySelectorAll('*')].find(
-                e => /Stalking Net Sell from/i.test(e.textContent) && e.children.length === 0);
-            return el ? el.textContent.trim() : '';
-        }"""
-    )
-    m = re.search(r"to (\d{1,2} \w{3} \d{4})", d0_str)
-    try:
-        d0 = datetime.strptime(m.group(1), "%d %b %Y")
-    except Exception:
-        d0 = datetime.now(pytz.timezone(TIMEZONE))
-        log.warning("Could not parse d-0 date from header; using today.")
-    d0_fmt = _fmt_date(d0)
-    wk_fmt = _fmt_date(trading_week_start(d0, 5))
-    log.info(f"d-0 = {d0_fmt}, 1-week start = {wk_fmt}")
-
     top = sorted(retail_sell.values(), key=lambda r: parse_num(r.get("netval", "")))
     top = [r for r in top if parse_num(r.get("netval", "")) < 0][:STALKER_TOP_N]
     log.info(f"Top retail net sell: {[(r['symbol'], r['netval']) for r in top]}")
     if not top:
         return []
 
-    # 2) per ticker -> broker_summary top buyers for d-0 and 1-week
+    # 2) per ticker -> top bag holders from the inventory chart
     results = []
     for r in top:
         symbol = r["symbol"]
         try:
-            d0_buyers = get_broker_summary_buyers(page, symbol, d0_fmt, d0_fmt)
+            holders = get_inventory_bagholders(page, symbol)
         except Exception as e:
-            log.error(f"broker_summary d-0 {symbol} failed: {e}")
-            d0_buyers = []
-        try:
-            wk_buyers = get_broker_summary_buyers(page, symbol, wk_fmt, d0_fmt)
-        except Exception as e:
-            log.error(f"broker_summary 1wk {symbol} failed: {e}")
-            wk_buyers = []
-        log.info(f"{symbol}: d0={[x['code'] for x in d0_buyers]} wk={[x['code'] for x in wk_buyers]}")
+            log.error(f"inventory bagholders {symbol} failed: {e}")
+            holders = []
+        log.info(f"{symbol} bag holders: {[(h['code'], round(h['cum'])) for h in holders]}")
         results.append({
-            "symbol":    symbol,
-            "netval":    r.get("netval", ""),
-            "savg":      r.get("savg", ""),
-            "d0_buyers": d0_buyers,
-            "wk_buyers": wk_buyers,
+            "symbol":  symbol,
+            "netval":  r.get("netval", ""),
+            "savg":    r.get("savg", ""),
+            "holders": holders,
         })
     return results
 
@@ -638,22 +598,19 @@ def format_broker_stalker_message(data):
     return "\n".join(_broker_stalker_lines(data))
 
 
-def _fmt_buyers(buyers):
-    # "ZP 331k @6106, AK 308k @6129"
-    return ", ".join(f"{x['code']} {x['nval']} @{x['bavg']}" for x in buyers) or "-"
-
-
 def _broker_stalker_lines(data):
     lines = [
-        "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → siapa yang akumulasi",
+        "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
+        "(bag holder = akumulasi inventory terbesar, ~3 bln)",
     ]
     if not data:
         lines.append("Tidak ada retail net sell hari ini.")
         return lines
     for i, row in enumerate(data, 1):
+        holders = row.get("holders", [])
+        bag = ", ".join(f"{h['code']} {_fmt_lot(h['cum'])}" for h in holders) or "-"
         lines.append(f"{i}. {row['symbol']} | retail jual {row['netval']}  savg: {row['savg']}")
-        lines.append(f"   d-0 top buyer: {_fmt_buyers(row.get('d0_buyers', []))}")
-        lines.append(f"   1wk top buyer: {_fmt_buyers(row.get('wk_buyers', []))}")
+        lines.append(f"   🎒 Bag holder: {bag}")
     return lines
 
 
