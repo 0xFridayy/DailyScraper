@@ -53,6 +53,16 @@ NEOBDM_PASSWORD    = _require_env("NEOBDM_PASSWORD")
 NEOBDM_LOGIN_URL   = "https://neobdm.tech/accounts/login/"
 NEOBDM_DATA_URL    = "https://neobdm.tech/market_summary/"
 NEOBDM_BROKER_URL  = "https://neobdm.tech/broker_stalker/"
+NEOBDM_DASHBOARD_URL = "https://neobdm.tech/dashboard/screener/"
+
+# Dashboard "Top Akum" presets to pull (label, dropdown value, emoji). The
+# dashboard table is a Tabulator grid (#table-custom); rows keyed by
+# tabulator-field: tick, price, chg, history (5d flow), tx (=%M, rank metric).
+DASHBOARD_PRESETS = [
+    ("Bandarmologi", "neobdm-m-d",  "🏦"),
+    ("NonRetail",    "neobdm-nr-d", "🏢"),
+    ("Foreign",      "neobdm-f-d",  "🌏"),
+]
 
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = _require_env("TELEGRAM_CHAT_ID")
@@ -334,6 +344,39 @@ def scrape_market_summary(page):
     return top
 
 
+# ── 2b. DASHBOARD "TOP AKUM" PRESETS ──────────
+
+def scrape_dashboard_presets(page):
+    """Pull the Dashboard Transaksi 'Top Akum' lists (Bandarmologi / NonRetail /
+    Foreign) from the Tabulator grid. Returns [(label, emoji, [rows]), ...]."""
+    log.info("Loading dashboard screener...")
+    page.goto(NEOBDM_DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(7000)
+
+    results = []
+    for label, value, emoji in DASHBOARD_PRESETS:
+        rows = []
+        try:
+            page.select_option("#preset-dropdown-custom", value)
+            page.wait_for_timeout(3500)
+            rows = page.evaluate("""() => {
+                const out = [];
+                document.querySelectorAll('#table-custom .tabulator-row').forEach(r => {
+                    const c = {};
+                    r.querySelectorAll('.tabulator-cell').forEach(cell => {
+                        c[cell.getAttribute('tabulator-field')] = cell.textContent.trim();
+                    });
+                    if (c.tick) out.push(c);
+                });
+                return out;
+            }""")
+        except Exception as e:
+            log.error(f"Dashboard preset {label} failed: {e}")
+        log.info(f"Dashboard {label}: {[r.get('tick') for r in rows]}")
+        results.append((label, emoji, rows))
+    return results
+
+
 # ── 3. BROKER STALKER ─────────────────────────
 
 def clear_broker_chips(page):
@@ -587,14 +630,30 @@ def _broker_stalker_lines(data):
     return lines
 
 
-def format_combined_message(ms_data, bs_data):
-    """Both reports in ONE Telegram message with a single timestamp."""
+def _dashboard_lines(data):
+    lines = ["📋 Dashboard Top Akum (EOD) — ticker (%M)"]
+    if not data:
+        lines.append("No dashboard data.")
+        return lines
+    for label, emoji, rows in data:
+        if rows:
+            tickers = " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
+        else:
+            tickers = "-"
+        lines.append(f"{emoji} {label}: {tickers}")
+    return lines
+
+
+def format_combined_message(ms_data, dash_data, bs_data):
+    """All sections in ONE Telegram message with a single timestamp."""
     lines = [
         "📈 NeoBDM Daily Signal",
         f"🕗 {now_str()}",
         "═════════════════════",
     ]
     lines += _market_summary_lines(ms_data)
+    lines.append("─────────────────────")
+    lines += _dashboard_lines(dash_data)
     lines.append("─────────────────────")
     lines += _broker_stalker_lines(bs_data)
     lines.append("═════════════════════")
@@ -638,11 +697,12 @@ def run_all_jobs():
 
             login(page)
             ms_data = scrape_market_summary(page)
+            dash_data = scrape_dashboard_presets(page)
             bs_data = scrape_broker_stalker(page)
 
             browser.close()
 
-        send_telegram(format_combined_message(ms_data, bs_data))
+        send_telegram(format_combined_message(ms_data, dash_data, bs_data))
     except Exception as e:
         log.error(f"Job failed: {e}")
         try:
