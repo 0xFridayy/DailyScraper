@@ -10,7 +10,8 @@ import requests
 import schedule
 import time
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 import os
 import pytz
 
@@ -75,6 +76,13 @@ SEND_TIME = "07:00"
 # contested codes are intentionally kept on both sides (per user choice), so a
 # stock can show retail selling and bandar buying through the same code.
 RETAIL_BROKERS = ["XL", "XC", "YP", "PD"]
+
+# Broker-stalker retail set: ONLY XL + XC (the purest retail). Their net sell on
+# the broker_stalker page (Foreign Only unchecked) gives the top retail-dumped
+# tickers; we then read who's accumulating them on the broker_summary page.
+STALKER_RETAIL = ["XL", "XC"]
+STALKER_TOP_N  = 3   # how many top retail-sold tickers to report
+STALKER_BUYERS = 2   # top buyers to show per timeframe
 
 # Special broker-behavior tags used to annotate the broker-stalker analisa.
 # (See memory: idx-broker-behavior-taxonomy)
@@ -465,105 +473,125 @@ def get_netflow(page, codes, duration="Today", side="dist"):
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
 
+# ── BROKER SUMMARY (per-ticker buyer breakdown) ──
+
+def _fmt_date(d):
+    # non-padded "26 Jun 2026" — the format the broksum datepicker accepts
+    return f"{d.day} {d.strftime('%b')} {d.year}"
+
+
+def trading_week_start(d0, sessions=5):
+    """Start date of a window of `sessions` trading days (Mon-Fri) ending at d0."""
+    days, cur = [], d0
+    while len(days) < sessions:
+        if cur.weekday() < 5:
+            days.append(cur)
+        cur -= timedelta(days=1)
+    return days[-1]
+
+
+def get_broker_summary_buyers(page, ticker, start, end, n=STALKER_BUYERS):
+    """Top-n net BUYERS of a ticker over [start, end] from the broker_summary
+    page. Table is sorted by buyer nval desc, so we take the first n rows."""
+    page.goto(NEOBDM_DASHBOARD_URL.replace("dashboard/screener", "broker_summary"),
+              wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(5000)
+    page.click("#input-broksum-ticker-selectized")
+    page.keyboard.type(ticker)
+    page.wait_for_timeout(1200)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(800)
+    page.evaluate(
+        """(d) => {
+            document.getElementById('broksum-start-date').value = d.s;
+            document.getElementById('broksum-end-date').value = d.e;
+            for (const id of ['broksum-start-date','broksum-end-date'])
+                document.getElementById(id).dispatchEvent(new Event('change',{bubbles:true}));
+        }""",
+        {"s": start, "e": end},
+    )
+    page.wait_for_timeout(700)
+    page.click("#broksum-button-load")
+    page.wait_for_timeout(4000)
+    return page.evaluate(
+        """(n) => {
+            const out = [];
+            for (const tr of document.querySelectorAll('#broker-summary-table tbody tr')) {
+                const td = tr.querySelectorAll('td');
+                if (td.length >= 4) {
+                    const code = td[0].textContent.trim();
+                    if (code) out.push({
+                        code, name: td[0].querySelector('span')?.title || '',
+                        nlot: td[1].textContent.trim(), nval: td[2].textContent.trim(),
+                        bavg: td[3].textContent.trim()
+                    });
+                }
+                if (out.length >= n) break;
+            }
+            return out;
+        }""",
+        n,
+    )
+
+
 def scrape_broker_stalker(page):
-    """Absorption signal: stocks where retail is net SELLING and the big-player
-    bloc is net BUYING MORE than retail sells (strong hands soaking up supply)."""
+    """Retail (XL+XC) top net-sell tickers, then who's accumulating each on the
+    broker_summary page — top buyers for d-0 and the 1-week window."""
+    # 1) retail net SELL (XL+XC, Foreign Only unchecked) -> top tickers
+    log.info(f"Retail net sell scan ({'+'.join(STALKER_RETAIL)})...")
+    try:
+        retail_sell = get_netflow(page, STALKER_RETAIL, "Today", side="dist")
+    except Exception as e:
+        log.error(f"Retail net sell scan failed: {e}")
+        return []
 
-    def safe_netflow(codes, side):
-        try:
-            return get_netflow(page, codes, "Today", side=side)
-        except Exception as e:
-            log.error(f"Scan {codes} ({side}) failed: {e}")
-            return {}
+    # d-0 (latest trading day) from the broker_stalker header — page is still here
+    d0_str = page.evaluate(
+        """() => {
+            const el = [...document.querySelectorAll('*')].find(
+                e => /Stalking Net Sell from/i.test(e.textContent) && e.children.length === 0);
+            return el ? el.textContent.trim() : '';
+        }"""
+    )
+    m = re.search(r"to (\d{1,2} \w{3} \d{4})", d0_str)
+    try:
+        d0 = datetime.strptime(m.group(1), "%d %b %Y")
+    except Exception:
+        d0 = datetime.now(pytz.timezone(TIMEZONE))
+        log.warning("Could not parse d-0 date from header; using today.")
+    d0_fmt = _fmt_date(d0)
+    wk_fmt = _fmt_date(trading_week_start(d0, 5))
+    log.info(f"d-0 = {d0_fmt}, 1-week start = {wk_fmt}")
 
-    # 1) retail net SELL (dist side, negative netval)
-    log.info(f"Retail net sell scan ({'+'.join(RETAIL_BROKERS)})...")
-    retail_sell = safe_netflow(RETAIL_BROKERS, "dist")
-
-    # 2) big-player net BUY (akum side, positive netval) — the absorber bloc
-    log.info(f"Big-player absorber scan ({'+'.join(BIG_PLAYER_ABSORBERS)})...")
-    big_buy = safe_netflow(BIG_PLAYER_ABSORBERS, "akum")
-
-    # 3) qualify: retail selling AND big player buying MORE than retail sells
-    candidates = []
-    for symbol, rrow in retail_sell.items():
-        sell_val = abs(parse_num(rrow.get("netval", "")))
-        if sell_val <= 0:
-            continue
-        brow = big_buy.get(symbol)
-        if not brow:
-            continue
-        buy_val = parse_num(brow.get("netval", ""))
-        if buy_val > sell_val:  # strict: absorption exceeds distribution
-            candidates.append({
-                "symbol":   symbol,
-                "netval":   rrow.get("netval", ""),     # retail sell
-                "savg":     rrow.get("savg", ""),
-                "big_buy":  buy_val,
-                "sell_val": sell_val,
-                "ratio":    buy_val / sell_val,
-            })
-    candidates.sort(key=lambda r: r["ratio"], reverse=True)
-    top = candidates[:5]
-    log.info(f"Absorption candidates: {[(c['symbol'], round(c['ratio'],1)) for c in top]}")
-
+    top = sorted(retail_sell.values(), key=lambda r: parse_num(r.get("netval", "")))
+    top = [r for r in top if parse_num(r.get("netval", "")) < 0][:STALKER_TOP_N]
+    log.info(f"Top retail net sell: {[(r['symbol'], r['netval']) for r in top]}")
     if not top:
         return []
 
-    # 4) attribution — scan each big-player code INDIVIDUALLY (akum) so we can
-    # name the exact broker codes accumulating each stock.
-    log.info("Attribution scans (per big-player code / MG / SS)...")
-    code_data = {code: safe_netflow([code], "akum") for code in BIG_PLAYER_ABSORBERS}
-    mg_data   = safe_netflow([WHALER_BROKER], "akum")        # whaler buying = caution
-    ss_data   = safe_netflow([SMOOTH_ACCUM_BROKER], "dist")  # smooth distributing
-
-    # owner-proxy: only scan owners of candidates that HAVE a known owner, then
-    # tag only if that owning bandar is actually net-buying (real buyback).
-    owners_needed = {STOCK_OWNER[r["symbol"]] for r in top if r["symbol"] in STOCK_OWNER}
-    owner_data = {name: safe_netflow(BANDAR_GROUPS[name], "akum") for name in owners_needed}
-
+    # 2) per ticker -> broker_summary top buyers for d-0 and 1-week
+    results = []
     for r in top:
         symbol = r["symbol"]
-
-        # exact broker codes accumulating this stock, by buy value (desc)
-        accum = []
-        for code in BIG_PLAYER_ABSORBERS:
-            row = code_data.get(code, {}).get(symbol)
-            val = parse_num(row.get("netval", "")) if row else 0
-            if val > 0:
-                accum.append((code, val))
-        accum.sort(key=lambda x: x[1], reverse=True)
-        r["accum_codes"] = accum
-
-        tags = []
-        # which smart money is accumulating (core TOD attribution)
-        for code, note in SMART_MONEY.items():
-            if any(c == code for c, _ in accum):
-                tags.append(note)
-        if any(c in ALGO_BIG_PLAYERS_T1 for c, _ in accum):
-            tags.append("🤖 Algo big player T1 akumulasi (strong)")
-        if any(c in ALGO_BIG_PLAYERS_T2 for c, _ in accum):
-            tags.append("🤖 Algo big player T2 akumulasi")
-        owner = STOCK_OWNER.get(symbol)
-        if owner:
-            orow = owner_data.get(owner, {}).get(symbol)
-            if orow and parse_num(orow.get("netval", "")) > 0:
-                codes = "+".join(BANDAR_GROUPS[owner])
-                tags.append(f"🟢 Owner {owner} ({codes}) ikut serap — buyback!")
-            else:
-                tags.append(f"🏷️ Owner group: {owner} (tdk ikut serap hari ini)")
-        if parse_num((mg_data.get(symbol) or {}).get("netval", "")) > 0:
-            tags.append("🐋 MG (whaler) ikut beli — hati2, besok biasa dijual")
-        if parse_num((ss_data.get(symbol) or {}).get("netval", "")) < 0:
-            tags.append("🟡 SS distribusi halus — masih ada waktu exit")
-
-        r["analisa"] = (
-            f"Retail jual {r['sell_val']:.1f}, big player serap {r['big_buy']:.1f} "
-            f"({r['ratio']:.1f}x) — strong hand akumulasi"
-        )
-        r["tags"] = tags
-
-    return top
+        try:
+            d0_buyers = get_broker_summary_buyers(page, symbol, d0_fmt, d0_fmt)
+        except Exception as e:
+            log.error(f"broker_summary d-0 {symbol} failed: {e}")
+            d0_buyers = []
+        try:
+            wk_buyers = get_broker_summary_buyers(page, symbol, wk_fmt, d0_fmt)
+        except Exception as e:
+            log.error(f"broker_summary 1wk {symbol} failed: {e}")
+            wk_buyers = []
+        log.info(f"{symbol}: d0={[x['code'] for x in d0_buyers]} wk={[x['code'] for x in wk_buyers]}")
+        results.append({
+            "symbol":    symbol,
+            "netval":    r.get("netval", ""),
+            "savg":      r.get("savg", ""),
+            "d0_buyers": d0_buyers,
+            "wk_buyers": wk_buyers,
+        })
+    return results
 
 
 # ── 4. FORMAT MESSAGES ────────────────────────
@@ -610,23 +638,22 @@ def format_broker_stalker_message(data):
     return "\n".join(_broker_stalker_lines(data))
 
 
+def _fmt_buyers(buyers):
+    # "ZP 331k @6106, AK 308k @6129"
+    return ", ".join(f"{x['code']} {x['nval']} @{x['bavg']}" for x in buyers) or "-"
+
+
 def _broker_stalker_lines(data):
     lines = [
-        "🕵️ Broker Stalker — Big Player Absorbing Retail (Today)",
-        "Signal: retail net sell + big player net buy > retail sell",
+        "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → siapa yang akumulasi",
     ]
     if not data:
-        lines.append("Tidak ada sinyal hari ini — belum ada big player yang "
-                     "serap ritel lebih besar dari jualan ritel.")
+        lines.append("Tidak ada retail net sell hari ini.")
         return lines
     for i, row in enumerate(data, 1):
-        lines.append(f"{i}. {row['symbol']} | savg: {row['savg']}\n   {row['analisa']}")
-        accum = row.get("accum_codes", [])
-        if accum:
-            codes_str = ", ".join(f"{c} ({v:.1f})" for c, v in accum)
-            lines.append(f"   🔑 Akum by: {codes_str}")
-        for tag in row.get("tags", []):
-            lines.append(f"   {tag}")
+        lines.append(f"{i}. {row['symbol']} | retail jual {row['netval']}  savg: {row['savg']}")
+        lines.append(f"   d-0 top buyer: {_fmt_buyers(row.get('d0_buyers', []))}")
+        lines.append(f"   1wk top buyer: {_fmt_buyers(row.get('wk_buyers', []))}")
     return lines
 
 
