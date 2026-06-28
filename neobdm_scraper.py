@@ -478,11 +478,28 @@ def get_netflow(page, codes, duration="Today", side="dist"):
 NEOBDM_INVENTORY_URL = "https://neobdm.tech/inventory/"
 
 
+def _parse_rp(s):
+    """'Rp 1.66Trl' -> 1.66e12, 'Rp -31.86Mlr' -> -31.86e9, 'Rp 0.24Trl', etc."""
+    if not s:
+        return 0.0
+    s = s.replace("Rp", "").replace(" ", "").strip()
+    mult = 1.0
+    for suf, m in (("Trl", 1e12), ("Mlr", 1e9), ("jt", 1e6), ("rb", 1e3)):
+        if s.endswith(suf):
+            s, mult = s[:-len(suf)], m
+            break
+    try:
+        return float(s) * mult
+    except ValueError:
+        return 0.0
+
+
 def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
     """Top-n 'bag holders' of a ticker = brokers with the highest cumulative net
     inventory (Net Akum) over the page's default ~3-month window, from the
     Plotly inventory chart. Each broker has a 'markers+text' end-point trace
-    whose last y = cumulative net (lot); we sort those descending."""
+    whose last y = cumulative net (lot) and customdata = [cum lot str, cum Rp str];
+    avg buy price (cost basis) = cum Rp / (cum lot * 100 shares)."""
     page.goto(NEOBDM_INVENTORY_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(7000)
     # ticker = react-select dropdown #tick (same widget family as #broker)
@@ -501,11 +518,19 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
             return el.data
                 .filter(t => (t.mode||'').includes('markers') && t.name &&
                              Array.isArray(t.y) && t.y.length)
-                .map(t => ({ code: t.name, cum: t.y[t.y.length-1] }))
+                .map(t => ({
+                    code: t.name,
+                    cum: t.y[t.y.length-1],
+                    netval: (t.customdata && t.customdata.length)
+                            ? t.customdata[t.customdata.length-1][1] : ''
+                }))
                 .filter(t => typeof t.cum === 'number')
                 .sort((a, b) => b.cum - a.cum);
         }"""
     )
+    for h in holders:
+        shares = h["cum"] * 100  # 1 lot = 100 shares
+        h["avg"] = (_parse_rp(h.get("netval", "")) / shares) if shares else 0
     return holders[:n]
 
 
@@ -608,7 +633,9 @@ def _broker_stalker_lines(data):
         return lines
     for i, row in enumerate(data, 1):
         holders = row.get("holders", [])
-        bag = ", ".join(f"{h['code']} {_fmt_lot(h['cum'])}" for h in holders) or "-"
+        bag = ", ".join(
+            f"{h['code']} {_fmt_lot(h['cum'])} @{h.get('avg', 0):.0f}" for h in holders
+        ) or "-"
         lines.append(f"{i}. {row['symbol']} | retail jual {row['netval']}  savg: {row['savg']}")
         lines.append(f"   🎒 Bag holder: {bag}")
     return lines
