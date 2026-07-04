@@ -11,6 +11,7 @@ import schedule
 import time
 import logging
 import re
+import sqlite3
 from datetime import datetime, timedelta
 import os
 import pytz
@@ -55,6 +56,12 @@ NEOBDM_LOGIN_URL   = "https://neobdm.tech/accounts/login/"
 NEOBDM_DATA_URL    = "https://neobdm.tech/market_summary/"
 NEOBDM_BROKER_URL  = "https://neobdm.tech/broker_stalker/"
 NEOBDM_DASHBOARD_URL = "https://neobdm.tech/dashboard/screener/"
+
+# Raw broker-flow history for the ML backtest pipeline (Roadmap #2). Committed
+# back to the repo by the GH Actions workflow after each run — see
+# .github/workflows/daily-scrape.yml.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
+BACKFILL_TARGET_DAYS = 30
 
 # Dashboard "Top Akum" presets to pull (label, dropdown value, emoji). The
 # dashboard table is a Tabulator grid (#table-custom); rows keyed by
@@ -167,6 +174,23 @@ STOCK_OWNER = {
     "PDPP": "Aguan", "JIHD": "Aguan", "ERAL": "Aguan", "INPC": "Aguan",
     "ERAA": "Aguan", "CBDK": "Aguan", "PANI": "Aguan",
 }
+
+# Tickers to persist daily broker_flow rows for (walk-forward backtest input).
+# PLACEHOLDER: defaults to every STOCK_OWNER ticker since that's the only
+# explicit ticker universe already in this file — confirm/replace with your
+# actual watchlist.
+TRACKED_TICKERS = sorted(set(STOCK_OWNER.keys()))
+
+# Broker codes to persist per-ticker flow for. Each code costs 2 get_netflow
+# calls (akum side + dist side), each a full page reload (~10-15s) — this
+# list size drives the nightly job's runtime. Trim it if the GH Actions
+# timeout gets tight.
+BROKER_FLOW_CODES = sorted(set(
+    RETAIL_BROKERS + STALKER_RETAIL + list(SMART_MONEY) +
+    ALGO_BIG_PLAYERS_T1 + ALGO_BIG_PLAYERS_T2 +
+    [WHALER_BROKER, SMOOTH_ACCUM_BROKER] +
+    [c for codes in BANDAR_GROUPS.values() for c in codes]
+))
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -579,6 +603,102 @@ def scrape_broker_stalker(page):
     return results
 
 
+# ── 3b. PERSISTENCE (SQLite) ───────────────────
+# Raw per-broker/per-ticker flow, stored as scraped — no feature engineering
+# here. Feature computation (broker_concentration, retail_presence_pct, etc.)
+# happens downstream once there's enough history to build/validate them.
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS broker_flow (
+            date TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            broker_code TEXT NOT NULL,
+            bval REAL,
+            sval REAL,
+            netval REAL,
+            bavg REAL,
+            savg REAL,
+            PRIMARY KEY (date, ticker, broker_code)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def scrape_broker_flow_for_db(page, tickers):
+    """For each code in BROKER_FLOW_CODES, pull today's net flow on both sides
+    (akum=net-buy, dist=net-sell) across all symbols, keeping only rows for
+    `tickers`. Reuses the already-authenticated `page` — no separate login."""
+    tickers = set(tickers)
+    rows = []
+    for code in BROKER_FLOW_CODES:
+        for side in ("akum", "dist"):
+            try:
+                flow = get_netflow(page, [code], "Today", side=side)
+            except Exception as e:
+                log.error(f"broker_flow scan failed for {code}/{side}: {e}")
+                continue
+            for symbol, r in flow.items():
+                if symbol not in tickers:
+                    continue
+                rows.append({
+                    "ticker": symbol,
+                    "broker_code": code,
+                    "bval": parse_num(r.get("bval")),
+                    "sval": parse_num(r.get("sval")),
+                    "netval": parse_num(r.get("netval")),
+                    "bavg": parse_num(r.get("bavg")),
+                    "savg": parse_num(r.get("savg")),
+                })
+    return rows
+
+
+def save_broker_flow(conn, date_str, rows):
+    conn.executemany(
+        """INSERT OR REPLACE INTO broker_flow
+           (date, ticker, broker_code, bval, sval, netval, bavg, savg)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (date_str, r["ticker"], r["broker_code"], r["bval"], r["sval"],
+             r["netval"], r["bavg"], r["savg"])
+            for r in rows
+        ],
+    )
+    conn.commit()
+
+
+def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
+    tickers = sorted(set(tickers))
+    if not tickers:
+        return
+    placeholders = ",".join("?" * len(tickers))
+    cur = conn.execute(
+        f"SELECT ticker, COUNT(DISTINCT date) FROM broker_flow "
+        f"WHERE ticker IN ({placeholders}) GROUP BY ticker",
+        tickers,
+    )
+    counts = dict(cur.fetchall())
+    log.info(f"=== Backfill progress (days of history / {target_days} target) ===")
+    for t in tickers:
+        days = counts.get(t, 0)
+        status = "done" if days >= target_days else f"{target_days - days} to go"
+        log.info(f"  {t}: {days}/{target_days} days ({status})")
+
+
+def save_daily_broker_flow(page):
+    date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+    conn = init_db()
+    try:
+        rows = scrape_broker_flow_for_db(page, TRACKED_TICKERS)
+        save_broker_flow(conn, date_str, rows)
+        log.info(f"broker_flow: saved {len(rows)} rows for {date_str}")
+        log_backfill_progress(conn, TRACKED_TICKERS)
+    finally:
+        conn.close()
+
+
 # ── 4. FORMAT MESSAGES ────────────────────────
 
 def now_str():
@@ -710,6 +830,11 @@ def run_all_jobs():
             ms_data = scrape_market_summary(page)
             dash_data = scrape_dashboard_presets(page)
             bs_data = scrape_broker_stalker(page)
+
+            try:
+                save_daily_broker_flow(page)
+            except Exception as e:
+                log.error(f"broker_flow persistence failed: {e}")
 
             browser.close()
 
