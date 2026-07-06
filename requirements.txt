@@ -2,3 +2,6 @@ playwright
 requests
 schedule
 pytz
+pandas
+numpy
+xgboost
