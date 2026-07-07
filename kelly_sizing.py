@@ -1,16 +1,26 @@
 """
 Roadmap #4 — Kelly criterion position sizing.
 
-DORMANT: not wired into anything yet. Kelly sizing only makes sense once
-Layer 1 (walk_forward_backtest.py) shows a positive-expectancy edge — feed it
-a negative or zero edge and it correctly tells you to bet nothing (or the
-math goes negative, which just means "don't take this trade"). As of
-2026-07-07 it hasn't: pooled walk-forward Sharpe was -3.91 (full feature
-set), -3.35 (price-only), -5.99 (broker-only) across 4 cycles / 57 days /
-45 tickers, and every variant tested was beaten by simply predicting zero
-return. See walk_forward_backtest.py's docstring and SYSTEM.md's Backtest
-Results Log for the full diagnostic (SHAP importance, horizon sweep,
-turnover-normalized features — none of it found a usable signal yet).
+DORMANT: not wired into anything yet. Feed kelly_fraction a negative or zero
+edge (equal-ish avg_win/avg_loss with hit_rate <= 50%) and it correctly
+returns 0 — but a positive number out of the formula is NOT the same thing
+as "Layer 1 found the broker-flow edge SYSTEM.md is looking for." As of
+2026-07-07, on the full ~218-day backfill (2025-08-01 to 2026-07-04, 45
+tickers), pooled walk-forward Sharpe is +0.94 (full feature set) / +0.76
+(price-only) / +0.68 (broker-only) across 31 cycles — better than the
+clearly-negative Sharpe seen on the earlier 19/57 day backfills (mostly
+small-sample noise, in hindsight), and plugging its actual win_rate/avg_win/
+avg_loss into kelly_fraction below does output a small positive fraction.
+But that Sharpe improvement traces to price momentum (momentum_1d dominates
+SHAP importance by ~3x), not broker flow: price-only features alone score a
+BETTER pooled Sharpe than the full set, and broker_concentration ranks 7th
+of 8 by SHAP. hit_rate is 42.9%, under a coin flip (the positive Sharpe comes
+entirely from winners being bigger than losers), every variant's test MAE is
+still worse than a naive "predict zero" baseline, and it's well below
+SYSTEM.md's Sharpe > 1.5 validation bar. See walk_forward_backtest.py's
+docstring and SYSTEM.md's Backtest Results Log for the full diagnostic —
+this module is still inert; see the __main__ block below for why a positive
+number out of the formula doesn't change that.
 
 This module exists so the formula is ready and tested for whenever a real
 edge shows up (Layer 1 Sharpe > 1.5 sustained, per SYSTEM.md), not because
@@ -63,7 +73,19 @@ if __name__ == "__main__":
     assert abs(f - 0.2) < 1e-9, f
     print("kelly_fraction sanity check passed (60%/1:1 -> 0.20 Kelly).")
 
-    # This project's actual current numbers (pooled, full feature set) -> should be 0,
-    # since hit_rate < 50% and Sharpe is negative (no edge to size).
-    f = kelly_fraction(win_rate=0.3553, avg_win=0.045, avg_loss=0.045, fraction_cap=0.5)
-    print(f"Current Layer 1 numbers -> Kelly fraction = {f:.3f} (expect 0.0: no edge yet)")
+    # This project's ACTUAL current numbers (pooled, full feature set, 218-day
+    # backfill, 2026-07-07): win_rate=0.4288, avg_win=0.0525, avg_loss=0.0330 —
+    # wins are bigger than losses even though hit_rate is under 50%, so the raw
+    # math is NOT zero here (unlike the negative-Sharpe runs on less data).
+    f = kelly_fraction(win_rate=0.4288, avg_win=0.0525, avg_loss=0.0330, fraction_cap=0.5)
+    print(f"Current Layer 1 numbers -> Kelly fraction = {f:.3f} (half-Kelly)")
+    print(
+        "DO NOT read this as 'ready to size trades.' A positive Kelly output "
+        "just means the formula is doing its job on whatever numbers you feed "
+        "it - it has no way to know this Sharpe (+0.94) is unvalidated: mostly "
+        "momentum-driven rather than the broker-flow edge SYSTEM.md is testing "
+        "for (see walk_forward_backtest.py's docstring), built on 31 walk-"
+        "forward cycles with overlapping/autocorrelated market history (not 31 "
+        "independent trials), and still below the Sharpe > 1.5 validation bar. "
+        "Garbage-in-garbage-out applies to Kelly like anything else."
+    )

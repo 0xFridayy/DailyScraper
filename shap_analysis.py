@@ -10,9 +10,12 @@ is a red flag for the model fitting noise, not a real relationship.
 
 SYSTEM.md's Layer 1 success metric includes "broker_concentration in Top 3
 feature importance." Rerun this whenever the panel changes (e.g. as more
-live-scraped days accumulate from 2026-07-05 onward) to check where it
-stands — see walk_forward_backtest.py's docstring for the 2026-07-07 result
-(rank 5 of 8, missed the bar).
+live-scraped days accumulate from 2026-07-05 onward, since the 2025-08-01
+inventory-chart backfill ceiling has now been reached — see
+backfill_inventory.py) to check where it stands — see
+walk_forward_backtest.py's docstring for the 2026-07-07 result on the full
+218-day panel (rank 7 of 8, worse than an earlier smaller-sample run's 5 of
+8 — momentum_1d dominates instead).
 """
 
 import sqlite3

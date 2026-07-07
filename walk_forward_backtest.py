@@ -3,29 +3,45 @@ Roadmap #2 — XGBoost walk-forward backtest.
 
 Data status (2026-07-07): neobdm_scraper.py started writing live broker_flow
 rows (full bval/sval/bavg/savg) on 2026-07-05 (see save_daily_broker_flow).
-2026-04-07 through 2026-07-04 was backfilled separately from the /inventory/
-page's per-broker cumulative Plotly chart — that's the full history the
-chart has (it only keeps ~3 months); the broker_stalker page itself can't be
-queried for an arbitrary past date, only rolling windows anchored to today
-(Today/2d/3d/.../60d).
+2025-08-01 through 2026-07-04 was backfilled separately from the
+/inventory/ page's per-broker cumulative Plotly chart. IMPORTANT: that
+chart's default view only shows ~3 months, but it has a DateRangePicker
+(Start Date / End Date fields) that goes back much further — 2025-08-01 is
+the actual earliest available date (verified by walking the calendar back
+month by month; July 2025 and earlier are greyed out "Not available"). The
+first backfill pass only used the default ~3-month view and missed this;
+don't repeat that mistake. The broker_stalker page itself still can't be
+queried for an arbitrary past date (only rolling windows anchored to today),
+but /inventory/ is not similarly limited once you drive the date picker.
 
-RESULT (2026-07-07 run, read before doing more feature engineering): across
-every variant tested — full feature set, broker-only, price-only, 1d/3d/5d
-forward-return horizons, and a turnover-normalized net_flow — the model's
-walk-forward test MAE was WORSE than a naive "always predict zero return"
-baseline, and pooled Sharpe was negative in all of them (see the Backtest
-Results Log in SYSTEM.md for the numbers). SHAP importance also put
-broker_concentration at rank 5 of 8, missing SYSTEM.md's "Top 3" success bar,
-with the two price-derived features (volume_ratio, momentum_1d) dominating
-instead. Conclusion: no usable edge in this feature set / dataset yet. This
-is NOT proof the broker-flow thesis is wrong — most of the window is
-netval-only reconstructed data (see caveats below), which is a real
-information handicap vs the live bval/sval fields. The honest next step is
-more live-scraped (non-reconstructed) history, not more hyperparameter
-tuning on what's here. Do not proceed to Roadmap #5/#6 (live trading, DDQN)
-on this result — SYSTEM.md gates those on a validated edge, which this run
-does not show. kelly_sizing.py (Roadmap #4) is written but intentionally
-inert for the same reason.
+RESULT, revised 2026-07-07 after extending the backfill from ~57 to ~220
+days (read this instead of chasing the same experiments on more data — this
+run already exists): pooled walk-forward Sharpe went from clearly negative
+at 19-57 days to +0.94 at 218 days (31 cycles, train_min=30/test_window=6) —
+the earlier negative results were mostly small-sample noise/overfitting, as
+suspected at the time. But this is NOT a validated edge:
+  - Still below SYSTEM.md's Sharpe > 1.5 bar, and hit_rate is 42.9% (under a
+    coin flip) — whatever positive Sharpe exists comes from winning trades
+    being larger than losing ones, not from being right more often.
+  - Every feature-set variant's test MAE is still WORSE than a naive
+    "predict zero" baseline (full/price-only/broker-only all ~0.044 vs
+    naive ~0.042) — the model doesn't actually forecast magnitude well, even
+    where the crude long/no-trade rule nets a positive Sharpe.
+  - SHAP now puts broker_concentration at rank 7 of 8 (worse than the 5/8
+    seen at 57 days), with momentum_1d dominating by ~3x over every other
+    feature. price-only features alone score BETTER pooled Sharpe (0.76)
+    than the full set (0.54) or broker-only (0.68) — see feature_ablation.py.
+  - The one specific lead flagged at 57 days (CUAN's net_flow_total vs
+    next-day return, r=-0.44) was explicitly marked unconfirmed pending more
+    data. With 218 rows instead of 57 it collapsed to r=-0.06 — noise, as
+    the caveat anticipated. Recorded here so it isn't re-investigated.
+  Conclusion: this is a price-momentum-driven signal, not evidence of the
+  broker-accumulation thesis SYSTEM.md is actually testing for. Do not
+  proceed to Roadmap #5/#6 (live trading, DDQN) on this result — SYSTEM.md
+  gates those on a validated edge, which this still isn't, and specifically
+  not a broker-driven one. kelly_sizing.py (Roadmap #4) stays inert; a
+  Sharpe of 0.94 built mostly on momentum isn't the edge Layer 1 exists to
+  find.
 
 Backfill caveats — read before trusting feature importances from this run:
   - Only `netval` is populated for backfilled rows; bval/sval/bavg/savg are
@@ -38,10 +54,11 @@ Backfill caveats — read before trusting feature importances from this run:
     2026-07-05/06 rows (within ~1-5%, from using close price as a stand-in
     for the true weighted avg trade price).
   - Broker coverage per ticker is whatever the site's own chart renders
-    (~11-21 codes typically), not the full BROKER_FLOW_CODES list.
+    (~14-20 codes typically), not the full BROKER_FLOW_CODES list.
   - ALJI, BTEL, BUMI have no /inventory/ chart at all (no backfill possible).
-  - `price_history` (date, ticker, open/high/low/close/volume; 2026-04-06
-    onward) is the forward-return price source used for the target below.
+  - `price_history` (date, ticker, open/high/low/close/volume; 2025-08-01
+    onward, per-ticker start may be later if it listed/IPO'd after that) is
+    the forward-return price source used for the target below.
 
 Feature set actually implemented (subset of SYSTEM.md's named features —
 order_size_uniformity and spread_bps need data this pipeline doesn't have:
@@ -62,12 +79,11 @@ individual order sizes and bid/ask quotes respectively):
 Target: forward_return = next trading day's (close - today's close) / today's close.
 
 Design (expanding window, adapted to however many usable dates build_panel()
-actually returns — was ~19 on the June8-Jul4-only backfill, now ~57 with the
-full April backfill):
+actually returns — was ~19 on the June8-Jul4-only backfill, ~57 with the
+April backfill, now ~218 with the full Aug-2025 backfill):
   - Expanding window: train grows each cycle, test is a fixed slice right
-    after. Defaults here (train_min=10, test_window=3) suit the smaller
-    window; call run_walk_forward(panel, train_min=30, test_window=6) for
-    the full ~57-day panel (4 cycles).
+    after. Defaults here (train_min=30, test_window=6) give 31 cycles on the
+    full panel.
   - Sharpe comes from a tradeable rule, not raw prediction error:
         position = 1 if pred > 0.005 else 0
         strategy_return = position * actual_return
@@ -228,7 +244,8 @@ if __name__ == "__main__":
         f"\nNOTE: this is pipeline validation on {panel['date'].nunique()} days of "
         "mostly-reconstructed (netval-only) data. A Sharpe > 1.5 here means the code "
         "runs end-to-end, not that the edge is real - see SYSTEM.md (needs 60+ days "
-        "of live NeoBDM history, sustained, to actually validate). The 2026-07-07 "
-        "run found no edge across broker-only/price-only/full feature sets or "
-        "1d/3d/5d horizons - see this module's docstring."
+        "of live NeoBDM history, sustained, to actually validate). The 2026-07-07 run "
+        "on the full 218-day backfill found a positive but sub-threshold Sharpe that "
+        "SHAP/ablation trace to price momentum, not broker flow - see this module's "
+        "docstring before treating this number as progress toward the actual thesis."
     )

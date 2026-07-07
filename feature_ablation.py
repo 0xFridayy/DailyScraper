@@ -9,11 +9,17 @@ against a naive "always predict zero return" baseline — a real model should
 beat naive MAE; if it doesn't, there's no usable signal at that
 configuration.
 
-2026-07-07 result (57 days, 45 tickers): every variant at every horizon was
-beaten by the naive baseline. See walk_forward_backtest.py's docstring and
-SYSTEM.md's Backtest Results Log for the numbers and the caveats (most of
-this data is netval-only reconstructed, not live-scraped). Rerun this as
-more live data accumulates from 2026-07-05 onward.
+2026-07-07 result (218 days, 45 tickers, after extending the backfill to the
+inventory chart's real ceiling of 2025-08-01 — see backfill_inventory.py):
+every variant's test MAE is still beaten by the naive baseline, but pooled
+Sharpe is now positive for all three (price-only actually scores BEST,
+better than the full or broker-only sets) — the opposite of what the
+broker-accumulation thesis would predict. See walk_forward_backtest.py's
+docstring and SYSTEM.md's Backtest Results Log for the numbers and caveats
+(most of this data is netval-only reconstructed, not live-scraped). Rerun
+this as more live data accumulates from 2026-07-05 onward — the historical
+backfill has hit its ceiling, so further sample growth only comes from time
+passing now.
 """
 
 import sqlite3
