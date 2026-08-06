@@ -670,9 +670,11 @@ def save_broker_flow(conn, date_str, rows):
 
 
 def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
+    """Logs full per-ticker progress and returns a short Telegram-friendly
+    summary (only logs are checked otherwise, and nobody checks CI logs daily)."""
     tickers = sorted(set(tickers))
     if not tickers:
-        return
+        return None
     placeholders = ",".join("?" * len(tickers))
     cur = conn.execute(
         f"SELECT ticker, COUNT(DISTINCT date) FROM broker_flow "
@@ -681,10 +683,21 @@ def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
     )
     counts = dict(cur.fetchall())
     log.info(f"=== Backfill progress (days of history / {target_days} target) ===")
+    pending = []
     for t in tickers:
         days = counts.get(t, 0)
         status = "done" if days >= target_days else f"{target_days - days} to go"
         log.info(f"  {t}: {days}/{target_days} days ({status})")
+        if days < target_days:
+            pending.append((t, days))
+
+    if not pending:
+        return f"✅ Backfill: all {len(tickers)}/{len(tickers)} tickers past {target_days}d target."
+
+    pending.sort(key=lambda x: x[1])
+    lines = [f"⏳ Backfill: {len(tickers) - len(pending)}/{len(tickers)} tickers past {target_days}d target."]
+    lines += [f"  {t}: {d}/{target_days}d ({target_days - d} to go)" for t, d in pending]
+    return "\n".join(lines)
 
 
 def save_daily_broker_flow(page):
@@ -694,7 +707,7 @@ def save_daily_broker_flow(page):
         rows = scrape_broker_flow_for_db(page, TRACKED_TICKERS)
         save_broker_flow(conn, date_str, rows)
         log.info(f"broker_flow: saved {len(rows)} rows for {date_str}")
-        log_backfill_progress(conn, TRACKED_TICKERS)
+        return log_backfill_progress(conn, TRACKED_TICKERS)
     finally:
         conn.close()
 
@@ -831,14 +844,18 @@ def run_all_jobs():
             dash_data = scrape_dashboard_presets(page)
             bs_data = scrape_broker_stalker(page)
 
+            backfill_progress = None
             try:
-                save_daily_broker_flow(page)
+                backfill_progress = save_daily_broker_flow(page)
             except Exception as e:
                 log.error(f"broker_flow persistence failed: {e}")
 
             browser.close()
 
-        send_telegram(format_combined_message(ms_data, dash_data, bs_data))
+        message = format_combined_message(ms_data, dash_data, bs_data)
+        if backfill_progress:
+            message = f"{message}\n\n{backfill_progress}"
+        send_telegram(message)
     except Exception as e:
         log.error(f"Job failed: {e}")
         try:
