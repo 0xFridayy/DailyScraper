@@ -23,8 +23,7 @@ positions — see walk_forward_backtest.py's docstring for the validation
 that caught this).
 
 Usage: py backfill_inventory.py TICKER1 TICKER2 ...
-(no args = all of TRACKED_TICKERS from neobdm_scraper, minus ones already
-known to have no chart at all)
+(no args = all of TRACKED_TICKERS from neobdm_scraper)
 """
 
 import sys
@@ -35,7 +34,6 @@ import time
 from playwright.sync_api import sync_playwright
 from neobdm_scraper import login, NEOBDM_INVENTORY_URL, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 
-KNOWN_NO_CHART = {"ALJI", "BTEL", "BUMI"}  # confirmed empty as of 2026-07-07; recheck if this list looks stale
 BACKFILL_END = "2026-07-04"  # never overwrite live-scraped rows from 07-05 onward
 
 EXTRACT_JS = """() => {

@@ -167,9 +167,9 @@ STOCK_OWNER = {
     "PTRO": "Prajogo", "CDIA": "Prajogo", "CUAN": "Prajogo", "BRPT": "Prajogo",
     "TPIA": "Prajogo", "BREN": "Prajogo",
     # Bakrie
-    "VIVA": "Bakrie", "JGLE": "Bakrie", "BTEL": "Bakrie", "ELTY": "Bakrie",
-    "MDIA": "Bakrie", "ALJI": "Bakrie", "DEWA": "Bakrie", "BNBR": "Bakrie",
-    "ENRG": "Bakrie", "VKTR": "Bakrie", "BUMI": "Bakrie", "BRMS": "Bakrie",
+    "VIVA": "Bakrie", "JGLE": "Bakrie", "ELTY": "Bakrie",
+    "MDIA": "Bakrie", "DEWA": "Bakrie", "BNBR": "Bakrie",
+    "ENRG": "Bakrie", "VKTR": "Bakrie", "BRMS": "Bakrie",
     # Aguan  (broker codes TBD)
     "PDPP": "Aguan", "JIHD": "Aguan", "ERAL": "Aguan", "INPC": "Aguan",
     "ERAA": "Aguan", "CBDK": "Aguan", "PANI": "Aguan",
