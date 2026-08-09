@@ -64,6 +64,23 @@ literature on RL for trading for context on why this matters here.
 
 Same anti-data-snooping discipline as strategy_variants.py: chronological
 70/30 search/holdout split by date, holdout never touched during training.
+
+2026-08-09 result (45 tickers, 2025-08-04 to 2026-07-06, 40 epochs): clean
+overfitting, exactly the failure mode flagged above before this was run.
+Search-period (train) trade-level Sharpe 1.68 (n=1241, hit_rate 48.4%)
+looks promising - then collapses to Sharpe -0.65 (n=569, hit_rate 36.9%)
+on the untouched holdout. Daily-level Sharpe (2.63 search vs -0.43 holdout)
+shows the same collapse; note the daily-level hit_rate numbers (20%/18%)
+are NOT comparable to the trade-level ones - flat (no-position) days score
+as a 0.0 return there, which counts as "not a win," dragging that stat
+down artificially, so read the trades:{} block for hit rate, not daily:{}.
+Not evidence the end-to-end approach is a dead end, but on this data size
+it has not found anything close to a robust policy - it's the same
+small-sample instability walk_forward_backtest.py's docstring documents
+for XGBoost at 19-57 days, evidently worse here since DDQN needs more
+data to generalize, not less. Rerun as live data accumulates (see
+DailyScraper's price_history gap, currently blocking that from happening -
+this needs fixing before rerunning this script is worth much).
 """
 
 import random
