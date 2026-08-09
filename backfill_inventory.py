@@ -33,9 +33,8 @@ import sqlite3
 import time
 
 from playwright.sync_api import sync_playwright
-from neobdm_scraper import login, NEOBDM_INVENTORY_URL, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH as _unused
+from neobdm_scraper import login, NEOBDM_INVENTORY_URL, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 
-DB_PATH = r"C:\Users\jason\Desktop\VsCode\Claude\neobdm.db"
 KNOWN_NO_CHART = {"ALJI", "BTEL", "BUMI"}  # confirmed empty as of 2026-07-07; recheck if this list looks stale
 BACKFILL_END = "2026-07-04"  # never overwrite live-scraped rows from 07-05 onward
 

@@ -95,12 +95,13 @@ April backfill, now ~218 with the full Aug-2025 backfill):
     reconstructed) NeoBDM history, sustained over 8+ weeks.
 """
 
+import os
 import sqlite3
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
-DB_PATH = r"C:\Users\jason\Desktop\VsCode\Claude\neobdm.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
 RETAIL_BROKERS = {"XL", "XC", "YP", "PD"}
 
 FEATURES = [
