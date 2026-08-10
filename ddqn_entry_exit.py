@@ -81,6 +81,19 @@ for XGBoost at 19-57 days, evidently worse here since DDQN needs more
 data to generalize, not less. Rerun as live data accumulates (see
 DailyScraper's price_history gap, currently blocking that from happening -
 this needs fixing before rerunning this script is worth much).
+
+UPDATE 2026-08-10, 45 tickers, 2025-08-04 to 2026-08-07 (price_history gap
+now fixed, 24 more days than the run above): the overfitting got WORSE, not
+better, with more data - the opposite of what happened for XGBoost between
+its 218- and 242-day runs (walk_forward_backtest.py's docstring). Search
+trade-level Sharpe rose to 3.37 (n=1453, hit_rate 58.0%, both up from 1.68
+/48.4%) while holdout Sharpe fell further to -1.90 (n=648, hit_rate 39.7%,
+both down from -0.65/36.9%) - the train/holdout Sharpe gap roughly doubled
+(~2.3 to ~5.3). One data point isn't a trend, but it's a real caution
+against assuming "just needs more data" applies here the same way it did
+for the much-less-sample-hungry XGBoost model - worth watching whether this
+pattern holds or reverses on the next few re-runs before reading much into
+either direction.
 """
 
 import random
