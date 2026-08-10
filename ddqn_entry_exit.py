@@ -56,6 +56,13 @@ inventing new market mechanics:
     (the single most consistent piece of advice from actual trader practice -
     see PR discussion) without hardcoding a fixed stop-loss %, so the agent
     can learn its OWN adaptive exit threshold instead of a rule we picked.
+  - MAX_HOLD_DAYS = 7: explicit user requirement, hold 1-7 trading days max.
+    Unlike the loss-aversion shaping above, this is NOT left for the agent
+    to learn - TickerEnv.step() forces an exit attempt once a position hits
+    this age, regardless of the agent's chosen action (still subject to the
+    same ARB fill-lock realism as any other exit). strategy_variants.py's
+    VARIANTS already all use 1/3/5-day holds, so this only actually changes
+    DDQN's behavior - added here since Q-learning had no cap before this.
 
 Double DQN specifics: decouples action selection (online network) from
 value estimation (target network) to reduce the Q-value overestimation bias
@@ -111,6 +118,7 @@ from ara_arb_simulation import annotate_limits
 TRANSACTION_COST = 0.0015   # one-way; ~0.3% round trip, conservative IDX retail placeholder
 LOSS_AVERSION = 1.5         # multiplier on negative daily P&L only ("cut losses" shaping)
 GAMMA = 0.97
+MAX_HOLD_DAYS = 7           # explicit user ceiling (1-7 trading days) - hard cap, not left to the agent to learn
 STATE_EXTRA = ["position", "days_in_position", "unrealized_return"]
 
 
@@ -188,9 +196,17 @@ class TickerEnv:
     def step(self, action):
         """Execute `action` (desired position) at close of day self.t,
         subject to ARA/ARB fill locks, then realize day t+1's return under
-        the resulting position. Returns (next_state, reward, done)."""
+        the resulting position. Returns (next_state, reward, done).
+
+        MAX_HOLD_DAYS is a hard cap, not a hint: once a position has been
+        held that long, an exit is forced regardless of what the agent
+        chose - it doesn't get to hold longer just because it prefers to.
+        The forced exit is still subject to the same ARB fill-lock realism
+        as any other exit (can't force a sell into a locked limit-down)."""
         prev_position = self.position
         desired = int(action)
+        if prev_position == 1 and self.days_in_position >= MAX_HOLD_DAYS:
+            desired = 0
 
         filled_position = prev_position
         if desired == 1 and prev_position == 0 and not self.at_ara[self.t]:
