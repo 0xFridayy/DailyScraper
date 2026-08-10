@@ -164,11 +164,13 @@ class TickerEnv:
     are pre-normalized; only the sequential position/reward bookkeeping
     happens here."""
 
-    def __init__(self, feats_z, daily_return, at_ara, at_arb):
+    def __init__(self, feats_z, daily_return, at_ara, at_arb, ticker=None, dates=None):
         self.feats_z = feats_z          # (T, len(FEATURES)) already z-scored
         self.daily_return = daily_return  # (T,)
         self.at_ara = at_ara
         self.at_arb = at_arb
+        self.ticker = ticker            # only used for trade-log reporting, not training
+        self.dates = dates
         self.T = len(daily_return)
         self.reset()
 
@@ -228,6 +230,7 @@ def make_envs(panel):
         envs.append(TickerEnv(
             feats, g["daily_return"].to_numpy(dtype=np.float32),
             g["at_ara"].to_numpy(dtype=bool), g["at_arb"].to_numpy(dtype=bool),
+            ticker=ticker, dates=g["date"].to_numpy(),
         ))
     return envs
 
@@ -359,6 +362,56 @@ def evaluate_policy(net, envs):
         trades=sharpe_from_returns(trade_returns),
         n_entries=n_entries, n_blocked_entries=n_blocked_entries, n_blocked_exits=n_blocked_exits,
     )
+
+
+def evaluate_policy_with_trade_log(net, envs, top_k_features=3):
+    """Same greedy rollout as evaluate_policy() (same trades, same stats),
+    but also returns a per-trade log: ticker, entry/exit date, the Q-value
+    margin (Q_long - Q_flat) behind each entry/exit decision - how strongly
+    the agent preferred that action over the alternative, not a causal
+    feature attribution the way SHAP is for the XGBoost side, since Q-values
+    aren't decomposable that way - plus the top_k_features by |z-score| at
+    the decision point, as a "what stood out that day" description rather
+    than a "why" explanation."""
+    trade_rows = []
+
+    for env in envs:
+        s = env.reset()
+        done = False
+        open_trade = None
+        while not done:
+            with torch.no_grad():
+                q = net(torch.tensor(s, dtype=torch.float32))
+            margin = float(q[1].item() - q[0].item())
+            a = int(q.argmax().item())
+            top_idx = np.argsort(-np.abs(s[:len(FEATURES)]))[:top_k_features]
+            notable = [(FEATURES[j], float(s[j])) for j in top_idx]
+
+            prev_position = env.position
+            decision_date = env.dates[env.t] if env.dates is not None else None
+
+            s2, r, done, info = env.step(a)
+
+            if prev_position == 0 and env.position == 1:
+                open_trade = dict(
+                    ticker=env.ticker, entry_date=decision_date, entry_margin=margin,
+                    entry_notable=notable, ret=0.0,
+                )
+            if env.position == 1 and open_trade is not None:
+                open_trade["ret"] = (1 + open_trade["ret"]) * (1 + info["realized_return"]) - 1
+            if prev_position == 1 and env.position == 0 and open_trade is not None:
+                open_trade.update(exit_date=decision_date, exit_margin=margin, exit_notable=notable, still_open=False)
+                trade_rows.append(open_trade)
+                open_trade = None
+            s = s2
+        if open_trade is not None:
+            open_trade.update(
+                exit_date=env.dates[env.t] if env.dates is not None else None,
+                exit_margin=None, exit_notable=None, still_open=True,
+            )
+            trade_rows.append(open_trade)
+
+    return pd.DataFrame(trade_rows)
 
 
 if __name__ == "__main__":

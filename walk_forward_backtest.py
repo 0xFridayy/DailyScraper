@@ -110,6 +110,7 @@ import os
 import sqlite3
 import numpy as np
 import pandas as pd
+import shap
 from xgboost import XGBRegressor
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
@@ -181,8 +182,11 @@ def build_panel(conn):
     return panel
 
 
+TRADE_THRESHOLD = 0.005
+
+
 def sharpe_stats(pred, actual):
-    position = (pred > 0.005).astype(int)
+    position = (pred > TRADE_THRESHOLD).astype(int)
     strategy_return = position * actual
     n_trades = int(position.sum())
     if n_trades == 0:
@@ -194,7 +198,14 @@ def sharpe_stats(pred, actual):
     return dict(sharpe=sharpe, n_trades=n_trades, hit_rate=hit_rate)
 
 
-def run_walk_forward(panel, train_min=30, test_window=6):
+def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
+    """Returns (cycle_results, pooled_stats, trade_log). trade_log is built
+    from the SAME model fit that produced each cycle's out-of-sample
+    predictions (not a separate fit) - one row per triggered trade
+    (pred > TRADE_THRESHOLD), with the top_k_features SHAP-driving features
+    for that specific prediction, so you can see WHY that trade fired, not
+    just the pooled Sharpe. shap.TreeExplainer is fast for XGBoost, so this
+    adds negligible cost per cycle."""
     dates = sorted(panel["date"].unique())
     n = len(dates)
     cycles = []
@@ -205,9 +216,10 @@ def run_walk_forward(panel, train_min=30, test_window=6):
 
     results = []
     all_preds, all_actuals = [], []
+    trade_rows = []
     for i, (train_dates, test_dates) in enumerate(cycles, 1):
         train_df = panel[panel["date"].isin(train_dates)]
-        test_df = panel[panel["date"].isin(test_dates)]
+        test_df = panel[panel["date"].isin(test_dates)].copy()
 
         split = int(len(train_df) * 0.8)
         fit_df, eval_df = train_df.iloc[:split], train_df.iloc[split:]
@@ -223,6 +235,7 @@ def run_walk_forward(panel, train_min=30, test_window=6):
         eval_mae = np.abs(model.predict(eval_df[FEATURES]) - eval_df["target"]).mean()
         test_pred = model.predict(test_df[FEATURES])
         test_mae = np.abs(test_pred - test_df["target"]).mean()
+        test_df["pred"] = test_pred
 
         stats = sharpe_stats(pd.Series(test_pred, index=test_df.index), test_df["target"])
         results.append(dict(
@@ -232,8 +245,24 @@ def run_walk_forward(panel, train_min=30, test_window=6):
         all_preds.append(test_pred)
         all_actuals.append(test_df["target"].values)
 
+        triggered = test_df[test_df["pred"] > TRADE_THRESHOLD]
+        if len(triggered):
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(triggered[FEATURES])
+            for row_i, (_, row) in enumerate(triggered.iterrows()):
+                top_idx = np.argsort(-np.abs(shap_vals[row_i]))[:top_k_features]
+                top_features = [(FEATURES[j], float(shap_vals[row_i][j])) for j in top_idx]
+                trade_rows.append(dict(
+                    cycle=i, ticker=row["ticker"], date=row["date"],
+                    pred=float(row["pred"]), actual=float(row["target"]),
+                    top_features=top_features,
+                ))
+
     pooled_stats = sharpe_stats(pd.Series(np.concatenate(all_preds)), pd.Series(np.concatenate(all_actuals)))
-    return pd.DataFrame(results), pooled_stats
+    trade_log = pd.DataFrame(trade_rows).sort_values("date").reset_index(drop=True) if trade_rows else pd.DataFrame(
+        columns=["cycle", "ticker", "date", "pred", "actual", "top_features"]
+    )
+    return pd.DataFrame(results), pooled_stats, trade_log
 
 
 if __name__ == "__main__":
@@ -244,7 +273,7 @@ if __name__ == "__main__":
     print(f"Panel: {len(panel)} ticker-day rows, {panel['date'].nunique()} dates, "
           f"{panel['ticker'].nunique()} tickers")
 
-    cycle_results, pooled = run_walk_forward(panel)
+    cycle_results, pooled, _trade_log = run_walk_forward(panel)
     print("\nPer-cycle results:")
     print(cycle_results.to_string(index=False))
 
