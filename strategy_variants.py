@@ -37,6 +37,11 @@ IMPORTANT CAVEATS before reading too much into this:
   - One single 70/30 split, not multiple splits - directionally reassuring,
     not definitive. A more rigorous check would repeat this with several
     different split points.
+
+Explicit user requirement: hold 1-7 trading days max (see MAX_HOLD_DAYS
+below). Every VARIANTS entry already satisfies this (hold_days is 1, 3, or
+5), asserted at import time so a future edit can't silently add a longer
+hold without that assertion failing loudly.
 """
 
 import sqlite3
@@ -44,6 +49,8 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+
+MAX_HOLD_DAYS = 7  # explicit user ceiling
 
 VARIANTS = [
     ("Baseline: >0.5%, 1d hold, no TP/SL", 0.005, 1, None, None),
@@ -58,6 +65,7 @@ VARIANTS = [
     ("Same entry, 3d hold, TP=2%/SL=2% (tight)", 0.005, 3, 0.02, 0.02),
     ("Tighter entry >1.0%, 3d hold, TP=5%/SL=3%", 0.010, 3, 0.05, 0.03),
 ]
+assert all(1 <= v[2] <= MAX_HOLD_DAYS for v in VARIANTS), "a variant's hold_days is outside the 1-7 day requirement"
 
 
 def get_walk_forward_predictions(panel):
