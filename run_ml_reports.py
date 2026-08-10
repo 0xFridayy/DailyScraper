@@ -111,5 +111,8 @@ if __name__ == "__main__":
 
     message = format_telegram_message(xgb_result, ddqn_result)
     print(message)
-    send_telegram(message)
+    try:
+        send_telegram(message)
+    except Exception as e:
+        print(f"Telegram delivery failed (job summary below still ran): {e}")
     write_step_summary(xgb_result, ddqn_result)
