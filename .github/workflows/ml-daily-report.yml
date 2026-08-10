@@ -1,4 +1,4 @@
-name: NeoBDM Weekly ML Report
+name: NeoBDM Daily ML Report
 
 # Runs the XGBoost walk-forward backtest and DDQN entry/exit agent against
 # the current neobdm.db and reports the headline numbers - a short Telegram
@@ -7,15 +7,18 @@ name: NeoBDM Weekly ML Report
 # neobdm.db, so there's no git push step and no race risk with
 # daily-scrape.yml / price-history-topup.yml.
 #
-# Weekly, not daily: results barely move day-to-day at this data size (see
+# Runs by request every evening (20:00 Asia/Jakarta, UTC+7, no DST) - well
+# after both the morning scrape (23:00 UTC prev day = 06:00 WIB) and the
+# price_history top-up (00:30 UTC = 07:30 WIB), so it always sees that
+# day's fresh data. Results move little day-to-day at this data size (see
 # walk_forward_backtest.py / ddqn_entry_exit.py docstrings for back-to-back
-# reruns that changed little) - a daily cron would just burn Actions
-# minutes for no real signal. Trigger manually any time from the Actions
-# tab if you want a result sooner.
+# reruns that changed little), so don't read a daily wiggle as a trend -
+# it's here for visibility, not because daily reruns are expected to find
+# something new most days.
 
 on:
   schedule:
-    - cron: "30 1 * * 1"  # Monday 01:30 UTC
+    - cron: "0 13 * * *"  # 20:00 Asia/Jakarta (UTC+7) daily
   workflow_dispatch:
 
 permissions:

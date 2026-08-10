@@ -1,5 +1,6 @@
 """
-Weekly automated report: runs the XGBoost walk-forward backtest
+Daily automated report (see ml-daily-report.yml): runs the XGBoost
+walk-forward backtest
 (walk_forward_backtest.py) and the DDQN entry/exit agent (ddqn_entry_exit.py)
 against the full current neobdm.db, then reports the headline numbers two
 ways - a short Telegram message (for checking on your phone) and a fuller
@@ -64,7 +65,7 @@ def run_ddqn_report(conn):
 
 def format_telegram_message(xgb, ddqn):
     return (
-        f"📈 Weekly ML report\n\n"
+        f"📈 Daily ML report\n\n"
         f"XGBoost walk-forward ({xgb['n_dates']}d, {xgb['n_tickers']} tickers, "
         f"{xgb['date_min']} to {xgb['date_max']}):\n"
         f"  Sharpe {xgb['sharpe']:.2f} | hit_rate {xgb['hit_rate']:.1%} | n_trades {xgb['n_trades']}\n\n"
@@ -85,7 +86,7 @@ def write_step_summary(xgb, ddqn):
     xt = ddqn["search"]["trades"]
     ht = ddqn["holdout"]["trades"]
     with open(path, "a") as f:
-        f.write("# Weekly ML Report\n\n")
+        f.write("# Daily ML Report\n\n")
         f.write(f"## XGBoost walk-forward\n\n")
         f.write(f"{xgb['n_dates']} dates ({xgb['date_min']} to {xgb['date_max']}), {xgb['n_tickers']} tickers\n\n")
         f.write("| Sharpe | Hit rate | n_trades |\n|---|---|---|\n")
