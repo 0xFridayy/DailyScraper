@@ -1,0 +1,44 @@
+name: NeoBDM Weekly ML Report
+
+# Runs the XGBoost walk-forward backtest and DDQN entry/exit agent against
+# the current neobdm.db and reports the headline numbers - a short Telegram
+# message (check from your phone) and a fuller table in this run's job
+# summary (check from a browser, no login needed). Read-only: never touches
+# neobdm.db, so there's no git push step and no race risk with
+# daily-scrape.yml / price-history-topup.yml.
+#
+# Weekly, not daily: results barely move day-to-day at this data size (see
+# walk_forward_backtest.py / ddqn_entry_exit.py docstrings for back-to-back
+# reruns that changed little) - a daily cron would just burn Actions
+# minutes for no real signal. Trigger manually any time from the Actions
+# tab if you want a result sooner.
+
+on:
+  schedule:
+    - cron: "30 1 * * 1"  # Monday 01:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ml-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run XGBoost + DDQN report
+        run: python run_ml_reports.py
