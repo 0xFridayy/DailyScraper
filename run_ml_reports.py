@@ -20,8 +20,11 @@ import requests
 from walk_forward_backtest import build_panel, run_walk_forward, DB_PATH
 from ddqn_entry_exit import (
     build_episode_frame, split_search_holdout, fit_normalizer,
-    normalize_features, make_envs, train_ddqn, evaluate_policy, FEATURES, STATE_EXTRA,
+    normalize_features, make_envs, train_ddqn, evaluate_policy,
+    evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
 )
+
+RECENT_TRADES_SHOWN = 15
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -34,13 +37,21 @@ def send_telegram(message):
         print(f"Telegram error {resp.status_code}: {resp.text}")
 
 
+def _format_features(pairs):
+    if not pairs:
+        return ""
+    return ", ".join(f"{name}({val:+.4f})" for name, val in pairs)
+
+
 def run_xgboost_report(conn):
     panel = build_panel(conn)
-    _, pooled = run_walk_forward(panel)
+    _, pooled, trade_log = run_walk_forward(panel)
+    recent = trade_log.tail(RECENT_TRADES_SHOWN).to_dict("records")
     return dict(
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
         sharpe=pooled["sharpe"], hit_rate=pooled["hit_rate"], n_trades=pooled["n_trades"],
+        recent_trades=recent,
     )
 
 
@@ -56,10 +67,18 @@ def run_ddqn_report(conn):
     holdout_envs = make_envs(holdout_df)
     net = train_ddqn(train_envs, state_dim=len(FEATURES) + len(STATE_EXTRA), n_epochs=40)
 
+    # evaluate_policy() gives the aggregate stats (unchanged, cheap inference);
+    # evaluate_policy_with_trade_log() reruns the same greedy holdout rollout
+    # to also capture per-trade Q-value margins - same trades, same numbers,
+    # just also recorded for the "why" detail.
+    holdout_trade_log = evaluate_policy_with_trade_log(net, holdout_envs)
+    recent = holdout_trade_log.tail(RECENT_TRADES_SHOWN).to_dict("records")
+
     return dict(
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
         search=evaluate_policy(net, train_envs), holdout=evaluate_policy(net, holdout_envs),
+        recent_holdout_trades=recent,
     )
 
 
@@ -100,8 +119,32 @@ def write_step_summary(xgb, ddqn):
             "Neither model has cleared the Sharpe > 1.5 validation bar. See "
             "`walk_forward_backtest.py` / `ddqn_entry_exit.py` docstrings for full caveats "
             "(small sample, backfilled-vs-live data, DDQN overfitting) before reading "
-            "either number as a real edge.\n"
+            "either number as a real edge.\n\n"
         )
+
+        f.write(f"## XGBoost: {len(xgb['recent_trades'])} most recent trades (of {xgb['n_trades']} total)\n\n")
+        f.write("Top 3 features by SHAP contribution behind each prediction - not a raw feature "
+                "value, but how much that feature pushed the prediction up (+) or down (-).\n\n")
+        f.write("| Date | Ticker | Pred | Actual | Top SHAP features |\n|---|---|---|---|---|\n")
+        for t in xgb["recent_trades"]:
+            f.write(f"| {t['date']} | {t['ticker']} | {t['pred']:+.4f} | {t['actual']:+.4f} | "
+                    f"{_format_features(t['top_features'])} |\n")
+        f.write("\n")
+
+        f.write(f"## DDQN holdout: {len(ddqn['recent_holdout_trades'])} most recent trades "
+                f"(of {ht['n_trades']} total)\n\n")
+        f.write("Q-margin = Q(long) - Q(flat) at the decision point - how strongly the agent "
+                "preferred that action, not a feature attribution. Notable features are the "
+                "top 3 by |z-score| at that point (\"what stood out\"), not a causal explanation "
+                "the way SHAP is for XGBoost.\n\n")
+        f.write("| Entry date | Exit date | Ticker | Return | Entry Q-margin | Entry notable features | Exit Q-margin |\n"
+                "|---|---|---|---|---|---|---|\n")
+        for t in ddqn["recent_holdout_trades"]:
+            exit_date = t["exit_date"] if not t.get("still_open") else f"{t['exit_date']} (still open)"
+            exit_margin = f"{t['exit_margin']:+.4f}" if t.get("exit_margin") is not None else "n/a"
+            f.write(f"| {t['entry_date']} | {exit_date} | {t['ticker']} | {t['ret']:+.2%} | "
+                    f"{t['entry_margin']:+.4f} | {_format_features(t['entry_notable'])} | {exit_margin} |\n")
+        f.write("\n")
 
 
 if __name__ == "__main__":
