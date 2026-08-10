@@ -43,6 +43,17 @@ suspected at the time. But this is NOT a validated edge:
   Sharpe of 0.94 built mostly on momentum isn't the edge Layer 1 exists to
   find.
 
+UPDATE 2026-08-10: price_history had silently stopped updating on
+2026-07-06 (a separate gap, now fixed - see price-history-topup.yml) while
+broker_flow kept accumulating; this is the first re-run since that fix,
+now on the full panel through 2026-08-06 (242 dates, 45 tickers, 24 more
+days than the 218-day run above). Pooled Sharpe: 0.81 (down from 0.94),
+hit_rate 42.8% (essentially unchanged). Within the noise this project has
+already documented between runs (per-cycle Sharpe still swings from -8.7
+to +12.0), not a meaningful move either direction - still below the 1.5
+bar, still the same picture. Re-run again once meaningfully more live data
+has accumulated rather than after every few days of drift.
+
 Backfill caveats — read before trusting feature importances from this run:
   - Only `netval` is populated for backfilled rows; bval/sval/bavg/savg are
     NULL (the inventory chart only exposes net position, not the buy/sell
