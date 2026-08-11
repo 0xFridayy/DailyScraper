@@ -700,6 +700,53 @@ def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
     return "\n".join(lines)
 
 
+def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
+    """Whenever a tracked 'konglo' ticker (TRACKED_TICKERS) shows up in any
+    of today's radar sections (Top Akum Bandar, Dashboard presets, Broker
+    Stalker), record it so its forward performance (highest % and drawdown
+    % from the signal-day close, over the next few trading days) can be
+    tracked later once price_history has caught up to those dates - see
+    run_konglo_watch_report() in run_ml_reports.py for the actual tracking/
+    Sharpe computation. This function only detects and persists the flag;
+    it does no price lookups itself (today's close for a just-flagged
+    ticker won't exist in price_history yet)."""
+    tracked = set(TRACKED_TICKERS)
+    hits = {}  # ticker -> set of source labels
+
+    for r in ms_data:
+        t = r.get("symbol")
+        if t in tracked:
+            hits.setdefault(t, set()).add("top_akum_bandar")
+
+    for label, _emoji, rows in dash_data:
+        for r in rows:
+            t = r.get("tick")
+            if t in tracked:
+                hits.setdefault(t, set()).add(f"dashboard_{label}")
+
+    for r in bs_data:
+        t = r.get("symbol")
+        if t in tracked:
+            hits.setdefault(t, set()).add("broker_stalker")
+
+    if not hits:
+        return
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS konglo_signal_watch (
+            flag_date TEXT NOT NULL, ticker TEXT NOT NULL, sources TEXT,
+            PRIMARY KEY (flag_date, ticker)
+        )
+    """)
+    for t, sources in hits.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO konglo_signal_watch (flag_date, ticker, sources) VALUES (?, ?, ?)",
+            (date_str, t, ",".join(sorted(sources))),
+        )
+    conn.commit()
+    log.info(f"konglo radar hits today: { {t: sorted(s) for t, s in hits.items()} }")
+
+
 def save_daily_broker_flow(page):
     date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
     conn = init_db()
@@ -849,6 +896,16 @@ def run_all_jobs():
                 backfill_progress = save_daily_broker_flow(page)
             except Exception as e:
                 log.error(f"broker_flow persistence failed: {e}")
+
+            try:
+                date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+                watch_conn = init_db()
+                try:
+                    record_konglo_signals(watch_conn, date_str, ms_data, dash_data, bs_data)
+                finally:
+                    watch_conn.close()
+            except Exception as e:
+                log.error(f"konglo signal tracking failed: {e}")
 
             browser.close()
 
