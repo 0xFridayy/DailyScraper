@@ -294,6 +294,12 @@ def scrape_market_summary(page):
 
     page.screenshot(path="market_page.png")
     log.info("Saved market_page.png")
+    try:
+        with open("market_page.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log.info("Saved market_page.html")
+    except Exception as e:
+        log.warning(f"Could not save market_page.html: {e}")
 
     # NOTE: this is a Dash DataTable — header <th> text is rendered via CSS
     # sprites/icons (inner_text() comes back blank), and data cells live in
@@ -384,6 +390,13 @@ def scrape_dashboard_presets(page):
     log.info("Loading dashboard screener...")
     page.goto(NEOBDM_DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(7000)
+    try:
+        page.screenshot(path="dashboard_page.png")
+        with open("dashboard_page.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log.info("Saved dashboard_page.png / dashboard_page.html")
+    except Exception as e:
+        log.warning(f"Could not save dashboard_page snapshot: {e}")
 
     results = []
     for label, value, emoji in DASHBOARD_PRESETS:
