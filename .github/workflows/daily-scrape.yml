@@ -37,6 +37,22 @@ jobs:
       - name: Run scraper (one-shot)
         run: python neobdm_scraper.py --now
 
+      # market_summary/dashboard scrapes have been silently failing
+      # (selector timeouts, likely a NeoBDM site update) without failing the
+      # job overall - upload the page snapshots neobdm_scraper.py saves so
+      # they can actually be inspected afterward instead of just a log line.
+      # if: always() so this still runs even if the scraper step errors out.
+      - name: Upload page snapshots for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-snapshots-${{ github.run_id }}
+          path: |
+            *.png
+            *.html
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Commit updated neobdm.db
         run: |
           git config user.name "github-actions[bot]"

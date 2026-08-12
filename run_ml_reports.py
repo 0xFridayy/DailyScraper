@@ -36,11 +36,12 @@ from strategy_variants import run_strategy_search
 from ddqn_entry_exit import (
     build_episode_frame, split_search_holdout, fit_normalizer,
     normalize_features, make_envs, train_ddqn, evaluate_policy,
-    evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
+    evaluate_policy_with_trade_log, sharpe_from_returns, FEATURES, STATE_EXTRA,
 )
 
 RECENT_TRADES_SHOWN = 15
 SATISFACTION_SHARPE = 1.5
+KONGLO_TRACK_DAYS = 3  # per explicit instruction: track flagged konglo tickers 1-3 trading days
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -113,7 +114,61 @@ def run_ddqn_report(conn):
     )
 
 
-def format_telegram_message(xgb, strat, ddqn):
+def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
+    """For every konglo ticker flagged by neobdm_scraper.record_konglo_signals()
+    (recorded live, whenever it shows up in the daily radar - Top Akum
+    Bandar / Dashboard / Broker Stalker), reports its performance since the
+    flag day's close over the next up-to-`max_days` trading days:
+    highest % reached (using intraday high, not just close) and max
+    drawdown % (using intraday low) - exactly as requested, not a
+    close-to-close approximation. A signal with days_elapsed < max_days is
+    still "active"; once it reaches max_days it's "resolved" and its final
+    (day-max_days close) return feeds a pooled Sharpe across all resolved
+    signals - a single signal's own Sharpe isn't statistically meaningful
+    (n=1), same caveat as every other Sharpe in this repo, so this only
+    reports one once there's more than a handful of resolved signals."""
+    try:
+        watch = pd.read_sql("SELECT flag_date, ticker, sources FROM konglo_signal_watch", conn)
+    except pd.errors.DatabaseError:
+        watch = pd.DataFrame(columns=["flag_date", "ticker", "sources"])
+    if watch.empty:
+        return dict(signals=[], resolved=dict(sharpe=float("nan"), n_trades=0, hit_rate=float("nan")))
+
+    px = pd.read_sql("SELECT date, ticker, high, low, close FROM price_history", conn)
+    px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
+
+    signals = []
+    resolved_returns = []
+    for _, row in watch.iterrows():
+        g = px_by_ticker.get(row["ticker"])
+        if g is None:
+            continue
+        idx = g.index[g["date"] == row["flag_date"]]
+        if len(idx) == 0:
+            continue  # price_history hasn't caught up to the flag day yet
+        i0 = idx[0]
+        window = g.iloc[i0 + 1: i0 + 1 + max_days]
+        if window.empty:
+            continue
+        entry_close = g.loc[i0, "close"]
+        days_elapsed = len(window)
+        resolved = days_elapsed >= max_days
+        entry = dict(
+            ticker=row["ticker"], flag_date=row["flag_date"], sources=row["sources"],
+            days_elapsed=days_elapsed, resolved=resolved,
+            current_pct=(window["close"].iloc[-1] - entry_close) / entry_close,
+            highest_pct=(window["high"].max() - entry_close) / entry_close,
+            drawdown_pct=(window["low"].min() - entry_close) / entry_close,
+        )
+        signals.append(entry)
+        if resolved:
+            resolved_returns.append(entry["current_pct"])
+
+    signals.sort(key=lambda e: e["flag_date"], reverse=True)
+    return dict(signals=signals, resolved=sharpe_from_returns(resolved_returns))
+
+
+def format_telegram_message(xgb, strat, ddqn, konglo):
     xgb_satisfied = xgb["sharpe"] >= SATISFACTION_SHARPE
     hits = []
     if xgb_satisfied:
@@ -128,6 +183,22 @@ def format_telegram_message(xgb, strat, ddqn):
         f"Nothing has cleared the Sharpe ≥ {SATISFACTION_SHARPE} target yet."
     )
 
+    active = [s for s in konglo["signals"] if not s["resolved"]]
+    konglo_lines = [f"\n🔭 Konglo radar watch ({KONGLO_TRACK_DAYS}d tracking, {len(active)} active):"]
+    for s in active[:8]:
+        konglo_lines.append(
+            f"  {s['ticker']} d{s['days_elapsed']} ({s['flag_date']}): "
+            f"now {s['current_pct']:+.1%} | high {s['highest_pct']:+.1%} | dd {s['drawdown_pct']:+.1%}"
+        )
+    if konglo["resolved"]["n_trades"] >= 5:
+        konglo_lines.append(
+            f"  Resolved pooled Sharpe: {konglo['resolved']['sharpe']:.2f} "
+            f"(n={konglo['resolved']['n_trades']}, hit_rate {konglo['resolved']['hit_rate']:.1%})"
+        )
+    elif konglo["resolved"]["n_trades"] > 0:
+        konglo_lines.append(f"  {konglo['resolved']['n_trades']} resolved so far - too few for a Sharpe yet.")
+    konglo_section = "\n".join(konglo_lines) if active or konglo["resolved"]["n_trades"] else ""
+
     return (
         f"📈 Daily ML report\n\n"
         f"XGBoost walk-forward ({xgb['n_dates']}d, {xgb['n_tickers']} tickers, "
@@ -140,7 +211,8 @@ def format_telegram_message(xgb, strat, ddqn):
         f"  search  Sharpe {ddqn['search']['trades']['sharpe']:.2f} | "
         f"hit_rate {ddqn['search']['trades']['hit_rate']:.1%}\n"
         f"  holdout Sharpe {ddqn['holdout']['trades']['sharpe']:.2f} | "
-        f"hit_rate {ddqn['holdout']['trades']['hit_rate']:.1%}\n\n"
+        f"hit_rate {ddqn['holdout']['trades']['hit_rate']:.1%}\n"
+        f"{konglo_section}\n\n"
         f"{bar_line}\n"
         f"Full run in GitHub Actions."
     )
@@ -152,7 +224,7 @@ def _write_variant_table(f, df):
         f.write(f"| {i} | {row['label']} | {row['sharpe']:.2f} | {row['hit_rate']:.1%} | {row['n_trades']} |\n")
 
 
-def write_step_summary(xgb, strat, ddqn):
+def write_step_summary(xgb, strat, ddqn, konglo):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
@@ -195,6 +267,30 @@ def write_step_summary(xgb, strat, ddqn):
             "reading any of these numbers as a real edge.\n\n"
         )
 
+        f.write(f"## Konglo radar watch ({KONGLO_TRACK_DAYS}-day tracking from signal-day close)\n\n")
+        f.write(
+            "Every time a tracked konglo ticker shows up in a daily radar section (Top Akum Bandar, "
+            "Dashboard presets, or Broker Stalker), it gets tracked here for the next "
+            f"{KONGLO_TRACK_DAYS} trading days. Highest % and drawdown % use intraday high/low "
+            "(not just close), same as strategy_variants.py's TP/SL checks. A signal only feeds "
+            f"the pooled Sharpe once it resolves ({KONGLO_TRACK_DAYS} days elapsed) - a single "
+            "signal's own Sharpe isn't statistically meaningful.\n\n"
+        )
+        if not konglo["signals"]:
+            f.write("No konglo tickers have appeared in the daily radar yet.\n\n")
+        else:
+            f.write("| Flag date | Ticker | Source(s) | Days elapsed | Status | Return so far | Highest % | Drawdown % |\n"
+                    "|---|---|---|---|---|---|---|---|\n")
+            for s in konglo["signals"]:
+                status = "resolved" if s["resolved"] else "active"
+                f.write(f"| {s['flag_date']} | {s['ticker']} | {s['sources']} | {s['days_elapsed']}/{KONGLO_TRACK_DAYS} | "
+                        f"{status} | {s['current_pct']:+.2%} | {s['highest_pct']:+.2%} | {s['drawdown_pct']:+.2%} |\n")
+            f.write("\n")
+            if konglo["resolved"]["n_trades"] > 0:
+                note = "" if konglo["resolved"]["n_trades"] >= 5 else " (too few resolved signals for this to mean much yet)"
+                f.write(f"Pooled Sharpe across {konglo['resolved']['n_trades']} resolved signals: "
+                        f"{konglo['resolved']['sharpe']:.2f}, hit_rate {konglo['resolved']['hit_rate']:.1%}{note}.\n\n")
+
         f.write(f"## XGBoost: {len(xgb['recent_trades'])} most recent trades (of {xgb['n_trades']} total)\n\n")
         f.write("Top 3 features by SHAP contribution behind each prediction - not a raw feature "
                 "value, but how much that feature pushed the prediction up (+) or down (-).\n\n")
@@ -225,12 +321,13 @@ if __name__ == "__main__":
     xgb_result = run_xgboost_report(conn)
     strat_result = run_strategy_variants_report(conn)
     ddqn_result = run_ddqn_report(conn)
+    konglo_result = run_konglo_watch_report(conn)
     conn.close()
 
-    message = format_telegram_message(xgb_result, strat_result, ddqn_result)
+    message = format_telegram_message(xgb_result, strat_result, ddqn_result, konglo_result)
     print(message)
     try:
         send_telegram(message)
     except Exception as e:
         print(f"Telegram delivery failed (job summary below still ran): {e}")
-    write_step_summary(xgb_result, strat_result, ddqn_result)
+    write_step_summary(xgb_result, strat_result, ddqn_result, konglo_result)

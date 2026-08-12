@@ -221,5 +221,5 @@ def run_backfill(tickers):
 
 
 if __name__ == "__main__":
-    targets = sys.argv[1:] or sorted(set(TRACKED_TICKERS) - KNOWN_NO_CHART)
+    targets = sys.argv[1:] or sorted(TRACKED_TICKERS)
     run_backfill(targets)

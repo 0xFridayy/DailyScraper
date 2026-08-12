@@ -5,8 +5,9 @@
 __pycache__/
 *.pyc
 
-# Scraper debug screenshots
+# Scraper debug screenshots / page snapshots
 *.png
+*.html
 
 # Unrelated files — not part of the bot
 idx-research-agent.jsx
