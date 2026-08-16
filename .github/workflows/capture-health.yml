@@ -1,0 +1,44 @@
+name: NeoBDM Capture Health
+
+# Daily shape-check on the ML capture panel, so a silent degradation gets caught
+# the next morning instead of on 2026-08-30 when the first signal evaluation is
+# due and two weeks of data turn out to be unusable.
+#
+# Runs here rather than on the local machine for two reasons: neobdm.db is
+# authoritative in THIS repo (daily-scrape.yml commits it back), so a local run
+# would only ever see the last `git pull`; and a local scheduled task simply
+# does not fire when the PC is off.
+#
+# Read-only: no push step, no race with daily-scrape.yml / price-history-topup.yml.
+
+on:
+  schedule:
+    # 01:15 UTC — after daily-scrape.yml (23:00 UTC, 35-min timeout) AND after
+    # price-history-topup.yml (00:30 UTC), so the db has settled before we look.
+    - cron: "15 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: python -m pip install --upgrade pip requests
+
+      # Exits non-zero when unhealthy, so the run goes red in the Actions tab
+      # as well as posting to Telegram.
+      - name: Check capture health
+        run: python check_capture_health.py --telegram

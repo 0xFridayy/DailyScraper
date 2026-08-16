@@ -1,0 +1,39 @@
+name: NeoBDM Signal Evaluation
+
+# Weekly read on whether the telebot entry signals actually work: signalled names
+# vs the unsignalled rest of the same universe on the same days, split by source.
+#
+# Lives here rather than in Windows Task Scheduler because neobdm.db is
+# authoritative in this repo — daily-scrape.yml commits it back each night, so a
+# local run would read whatever was last pulled and quietly report on stale data.
+#
+# Read-only: no push step, no race with the workflows that write neobdm.db.
+
+on:
+  schedule:
+    # 02:00 UTC Sunday = 09:00 Asia/Jakarta, after that night's scrape and top-up.
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: python -m pip install --upgrade pip requests
+
+      - name: Evaluate signals
+        run: python evaluate_signals.py --telegram
