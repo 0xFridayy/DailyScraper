@@ -52,10 +52,26 @@ _load_dotenv()
 # ─────────────────────────────────────────────
 NEOBDM_USERNAME    = _require_env("NEOBDM_USERNAME")
 NEOBDM_PASSWORD    = _require_env("NEOBDM_PASSWORD")
-NEOBDM_LOGIN_URL   = "https://neobdm.tech/accounts/login/"
+NEOBDM_LOGIN_URL   = "https://neobdm.tech/accounts/login/?next=/home/"
 NEOBDM_DATA_URL    = "https://neobdm.tech/market_summary/"
 NEOBDM_BROKER_URL  = "https://neobdm.tech/broker_stalker/"
 NEOBDM_DASHBOARD_URL = "https://neobdm.tech/dashboard/screener/"
+
+# 2026-07 patch: the old /market_summary/ Dash page was retired (now 500s).
+# Market Summary is a Tabulator grid backed by a JSON screener API (see the
+# section 2 comment). These drive the API-based replacement.
+NEOBDM_NEWMARKET_URL  = "https://neobdm.tech/new-market-summary/"
+API_BASE              = "https://neobdm.tech/api"
+MARKET_UNIVERSE       = "COMPOSITE"       # whole market (old Stock Universe = ALL)
+SCRAPER_SCREENER_NAME = "DAILY_SCRAPER"   # reusable screener the scraper owns
+MARKET_PAGE_SIZE      = 20                # API only accepts sizes 10/15/20
+# NeoBDM temporarily blocks "abnormal usage" (~50 rapid requests trips it), so we
+# do NOT walk all ~148 market pages. Top-2 needs only the top of the m_dn_0-desc
+# sort (first few pages); full-column persistence uses a small custom universe of
+# just the tracked tickers (~3 pages). Pace requests to stay under the throttle.
+MAX_TOP_PAGES         = 6                 # COMPOSITE pages scanned for Top-2 Akum
+API_PAGE_PAUSE        = 0.6               # seconds between page POSTs (anti-abuse)
+TRACKED_UNIVERSE_NAME = "DAILY_SCRAPER_TICKERS"  # custom universe = TRACKED_TICKERS
 
 # Raw broker-flow history for the ML backtest pipeline (Roadmap #2). Committed
 # back to the repo by the GH Actions workflow after each run — see
@@ -66,11 +82,15 @@ BACKFILL_TARGET_DAYS = 30
 # Dashboard "Top Akum" presets to pull (label, dropdown value, emoji). The
 # dashboard table is a Tabulator grid (#table-custom); rows keyed by
 # tabulator-field: tick, price, chg, history (5d flow), tx (=%M, rank metric).
+# Dashboard "Top Akum" lists. Post-patch these are dashboard SCREENERS served by
+# GET /api/screeners/dashboard + POST /api/market-summary/summary/{id}. Each tuple
+# is (display label, dashboard-screener name, rank field "%M", emoji).
 DASHBOARD_PRESETS = [
-    ("Bandarmologi", "neobdm-m-d",  "🏦"),
-    ("NonRetail",    "neobdm-nr-d", "🏢"),
-    ("Foreign",      "neobdm-f-d",  "🌏"),
+    ("Bandarmologi", "Top Akum Bandar",   "m_dn_0",  "🏦"),
+    ("NonRetail",    "Top Retail Jualan", "nr_dn_0", "🏢"),
+    ("Foreign",      "Top Akum Asing",    "f_dn_0",  "🌏"),
 ]
+DASH_TOP_N = 5  # tickers shown per dashboard list
 
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = _require_env("TELEGRAM_CHAT_ID")
@@ -219,8 +239,11 @@ def login(page):
     log.info("Going to login page...")
     page.goto(NEOBDM_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(3000)
-    page.screenshot(path="login_page.png")
-    log.info("Saved login_page.png")
+    try:
+        page.screenshot(path="login_page.png", timeout=10000)
+        log.info("Saved login_page.png")
+    except Exception as e:
+        log.warning(f"Could not save login_page.png (non-fatal): {e}")
 
     selectors = [
         'input[name="username"]',
@@ -241,7 +264,10 @@ def login(page):
 
     if not username_filled:
         log.error("Could not find username field!")
-        page.screenshot(path="debug_login_fail.png")
+        try:
+            page.screenshot(path="debug_login_fail.png", timeout=10000)
+        except Exception:
+            pass
         raise RuntimeError("Username field not found")
 
     pass_selectors = [
@@ -266,11 +292,20 @@ def login(page):
         except Exception:
             page.keyboard.press("Enter")
 
-    page.wait_for_load_state("networkidle", timeout=30000)
+    # networkidle is unreliable on pages with any background polling/websockets
+    # (common on a live trading dashboard) — wait for the deterministic thing
+    # we actually care about instead: having navigated away from the login URL.
+    try:
+        page.wait_for_url(lambda url: "login" not in url.lower(), timeout=30000)
+    except PlaywrightTimeout:
+        pass  # fall through to the explicit check below, which raises clearly
     page.wait_for_timeout(2000)
 
     log.info(f"After login URL: {page.url}")
-    page.screenshot(path="after_login.png")
+    try:
+        page.screenshot(path="after_login.png", timeout=10000)
+    except Exception as e:
+        log.warning(f"Could not save after_login.png (non-fatal): {e}")
 
     if "login" in page.url.lower():
         log.warning("Still on login page!")
@@ -280,144 +315,302 @@ def login(page):
 
 # ── 2. MARKET SUMMARY (Top 3 Akum Bandar) ────
 
+# The old Dash page was retired in the 2026-07 patch (/market_summary/ now 500s).
+# Market Summary is now a Tabulator grid backed by a JSON screener API:
+#   GET  /api/market-summary/columns       -> 385 column definitions (fields)
+#   GET  /api/stock-universe               -> universes (COMPOSITE = whole market)
+#   GET  /api/screeners                    -> saved screeners
+#   POST /api/screeners {name}             -> create a screener
+#   PATCH/api/screeners/{id} {columns,filters,stock_universe_id,sort_field,sort_direction}
+#   POST /api/market-summary/summary/{id}  -> rows (remote pagination)
+#        body {page,size,sort_field,sort_direction}; size MUST be 10/15/20;
+#        needs the X-CSRFToken header; resp {data:{data:[...]}, meta:{last_page}}
+# We keep a reusable screener (DAILY_SCRAPER) carrying ALL columns over COMPOSITE,
+# page through it, persist the full rows, and reduce to Top-2 Akum for Telegram.
+
+def _api_session(page):
+    """(request_ctx, headers) from the authenticated Playwright context. Visiting
+    the page first ensures the csrftoken cookie is set for this path."""
+    page.goto(NEOBDM_NEWMARKET_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2000)
+    ctx = page.context
+    csrf = next((c["value"] for c in ctx.cookies() if c["name"] == "csrftoken"), "")
+    headers = {"Content-Type": "application/json", "X-CSRFToken": csrf,
+               "Referer": NEOBDM_NEWMARKET_URL}
+    return ctx.request, headers
+
+
+def _api_json(resp):
+    import json as _json
+    try:
+        return _json.loads(resp.text())
+    except Exception:
+        return None
+
+
+def get_market_columns(req):
+    j = _api_json(req.get(f"{API_BASE}/market-summary/columns")) or {}
+    return [c["field"] for c in (j.get("data") or [])
+            if isinstance(c, dict) and c.get("field")]
+
+
+def get_universe_id(req, name=MARKET_UNIVERSE):
+    j = _api_json(req.get(f"{API_BASE}/stock-universe")) or {}
+    for u in (j.get("data") or []):
+        if str(u.get("name", "")).upper() == name.upper():
+            return u.get("id")
+    return None
+
+
+def ensure_scraper_screener(req, headers, columns, universe_id):
+    """Find-or-create the DAILY_SCRAPER screener and (re)set it to carry all
+    columns over the chosen universe with no filters. Returns its id."""
+    import json as _json
+    j = _api_json(req.get(f"{API_BASE}/screeners")) or {}
+    mine = next((s for s in (j.get("data") or [])
+                 if s.get("name") == SCRAPER_SCREENER_NAME), None)
+    if not mine:
+        r = req.post(f"{API_BASE}/screeners",
+                     data=_json.dumps({"name": SCRAPER_SCREENER_NAME}), headers=headers)
+        mine = (_api_json(r) or {}).get("data") or {}
+        log.info(f"Created screener '{SCRAPER_SCREENER_NAME}'")
+    sid = mine.get("id")
+    body = {"columns": columns, "filters": [], "stock_universe_id": universe_id,
+            "sort_field": "m_dn_0", "sort_direction": "desc"}
+    req.patch(f"{API_BASE}/screeners/{sid}", data=_json.dumps(body), headers=headers)
+    return sid
+
+
+def ensure_tracked_universe(req, headers, tickers):
+    """Find-or-create a custom stock-universe holding exactly `tickers`, so the
+    persistence fetch returns ~len(tickers) rows (a few pages) instead of the
+    whole ~3k-stock market. Returns its id, or None on failure (caller falls back
+    to persisting whatever tracked tickers appear in the top scan)."""
+    import json as _json
+    try:
+        j = _api_json(req.get(f"{API_BASE}/stock-universe")) or {}
+        mine = next((u for u in (j.get("data") or [])
+                     if u.get("name") == TRACKED_UNIVERSE_NAME), None)
+        body = {"name": TRACKED_UNIVERSE_NAME, "stocks": sorted(set(tickers))}
+        if mine:
+            req.put(f"{API_BASE}/stock-universe/{mine['id']}",
+                    data=_json.dumps(body), headers=headers)
+            return mine["id"]
+        r = req.post(f"{API_BASE}/stock-universe", data=_json.dumps(body), headers=headers)
+        return ((_api_json(r) or {}).get("data") or {}).get("id")
+    except Exception as e:
+        log.warning(f"tracked universe setup failed (will fall back): {e}")
+        return None
+
+
+def _fetch_summary_pages(req, headers, sid, max_pages=None):
+    """Page through /market-summary/summary/{sid} (sorted m_dn_0 desc), paced.
+    Stops at last_page or max_pages, whichever comes first."""
+    import json as _json
+    rows, page_no, last = [], 1, 1
+    while page_no <= last and (max_pages is None or page_no <= max_pages):
+        body = {"page": page_no, "size": MARKET_PAGE_SIZE,
+                "sort_field": "m_dn_0", "sort_direction": "desc"}
+        j = _api_json(req.post(f"{API_BASE}/market-summary/summary/{sid}",
+                               data=_json.dumps(body), headers=headers)) or {}
+        if not j.get("success"):
+            log.error(f"Summary fetch failed (p{page_no}): {j.get('message')}")
+            break
+        last = (j.get("meta") or {}).get("last_page", page_no)
+        d = j.get("data")
+        rows.extend((d.get("data") if isinstance(d, dict) else d) or [])
+        page_no += 1
+        time.sleep(API_PAGE_PAUSE)
+    return rows, last
+
+
+def fetch_market_summary(page):
+    """Two bounded, paced fetches (kept small to avoid NeoBDM's abuse throttle):
+      1. COMPOSITE, first MAX_TOP_PAGES pages -> top-of-market rows for Top-2 Akum.
+      2. Tracked-ticker universe, all pages   -> full-column rows to persist.
+    Returns (columns, top_rows, tracked_rows)."""
+    import json as _json
+    req, headers = _api_session(page)
+    columns = get_market_columns(req)
+    if not columns:
+        log.error("Market summary: no columns returned from API")
+        return [], [], []
+    composite = get_universe_id(req, MARKET_UNIVERSE)
+    sid = ensure_scraper_screener(req, headers, columns, composite)
+
+    top_rows, last = _fetch_summary_pages(req, headers, sid, max_pages=MAX_TOP_PAGES)
+    log.info(f"Market top scan: {len(top_rows)} rows (first {MAX_TOP_PAGES} of {last} pages)")
+
+    tracked_rows = []
+    tracked_uni = ensure_tracked_universe(req, headers, TRACKED_TICKERS)
+    if tracked_uni:
+        req.patch(f"{API_BASE}/screeners/{sid}", headers=headers, data=_json.dumps(
+            {"columns": columns, "filters": [], "stock_universe_id": tracked_uni,
+             "sort_field": "m_dn_0", "sort_direction": "desc"}))
+        tracked_rows, _ = _fetch_summary_pages(req, headers, sid)
+        log.info(f"Tracked-universe rows: {len(tracked_rows)}")
+    return columns, top_rows, tracked_rows
+
+
+# ── 2a. MARKET SUMMARY PERSISTENCE (full 385-col rows) ────────
+# Wide table whose schema is auto-derived from the API's column list and
+# auto-migrated when NeoBDM adds columns. List/dict values (e.g. top_5_buyer)
+# are JSON-encoded. keep_tickers bounds the DB (whole COMPOSITE market is ~3k
+# rows/day — too heavy for a git-committed .db), so by default we store only the
+# tracked konglo universe + today's screen hits. Set keep_tickers=None to store
+# the whole market.
+
+def _ms_ensure_columns(conn, fields):
+    have = {r[1] for r in conn.execute("PRAGMA table_info(market_summary_daily)")}
+    if not have:
+        conn.execute("CREATE TABLE market_summary_daily "
+                     "(date TEXT NOT NULL, ticker TEXT NOT NULL, "
+                     "PRIMARY KEY(date, ticker))")
+        have = {"date", "ticker"}
+    for f in fields:
+        if f not in have and f not in ("date", "ticker"):
+            conn.execute(f'ALTER TABLE market_summary_daily ADD COLUMN "{f}"')
+    conn.commit()
+
+
+def save_market_summary_daily(date_str, columns, rows, keep_tickers):
+    import json as _json
+    if not rows:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        _ms_ensure_columns(conn, columns)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(market_summary_daily)")]
+        payload = []
+        for row in rows:
+            tick = row.get("symbol")
+            if not tick or (keep_tickers is not None and tick not in keep_tickers):
+                continue
+            rec = {"date": date_str, "ticker": tick}
+            for f in columns:
+                v = row.get(f)
+                rec[f] = _json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v
+            payload.append(tuple(rec.get(c) for c in cols))
+        ph = ",".join("?" * len(cols))
+        quoted = ",".join('"' + c + '"' for c in cols)
+        conn.executemany(
+            f"INSERT OR REPLACE INTO market_summary_daily ({quoted}) VALUES ({ph})",
+            payload)
+        conn.commit()
+        log.info(f"market_summary_daily: saved {len(payload)} rows for {date_str}")
+    finally:
+        conn.close()
+
+
+# ── 2b. SCREEN -> Top-2 Akum for Telegram ────────────────────
+# Old rule: filter unusual=v, rank dn-0 desc > dn-3 desc > likuid, top 2,
+# caution if dn-0<10. New fields: is_unusual_volume(bool), m_dn_0/m_dn_3
+# (fractional net-flow), is_liquid(bool), close. NOTE: the net-flow SCALE
+# changed (old dn-0 ~10-35 integers; new m_dn_0 ~ -0.1..0.1 fraction), so
+# MARKET_DN0_MIN below is a fresh calibration knob, NOT the old 10.
+MARKET_DN0_MIN = 0.0  # TODO recalibrate strong-accumulation threshold on m_dn_0
+
+
+def _truthy(v):
+    return v is True or str(v).strip().lower() in ("true", "v", "1")
+
+
+def screen_market_summary(rows):
+    cands = [r for r in rows if _truthy(r.get("is_unusual_volume"))]
+    cands.sort(key=lambda r: (parse_num(r.get("m_dn_0")), parse_num(r.get("m_dn_3")),
+                              1 if _truthy(r.get("is_liquid")) else 0), reverse=True)
+    out = []
+    for r in cands[:2]:
+        out.append({
+            "symbol":  r.get("symbol", ""),
+            "unusual": "v" if _truthy(r.get("is_unusual_volume")) else "x",
+            "dn-0":    round(parse_num(r.get("m_dn_0")), 4),
+            "dn-3":    round(parse_num(r.get("m_dn_3")), 4),
+            "likuid":  "v" if _truthy(r.get("is_liquid")) else "x",
+            "price":   r.get("close"),
+            "_caution": parse_num(r.get("m_dn_0")) < MARKET_DN0_MIN,
+        })
+    log.info(f"{len(cands)} unusual stock(s); top {len(out)} selected")
+    return out
+
+
 def scrape_market_summary(page):
-    log.info("Loading market summary...")
-    page.goto(NEOBDM_DATA_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(5000)
-
+    """API-based Market Summary: bounded fetch, persist tracked rows, return Top-2."""
     try:
-        page.select_option("#summary-mode", "d")
-        log.info("Set summary-mode to Daily ('d')")
-        page.wait_for_timeout(3000)
+        columns, top_rows, tracked_rows = fetch_market_summary(page)
     except Exception as e:
-        log.warning(f"Could not set #summary-mode dropdown: {e}")
-
-    page.screenshot(path="market_page.png")
-    log.info("Saved market_page.png")
+        log.error(f"Market summary API failed: {e}")
+        return []
+    top = screen_market_summary(top_rows)
     try:
-        with open("market_page.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.info("Saved market_page.html")
+        date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+        hits = {t["symbol"] for t in top}
+        # tracked-universe rows (full set) + any Top-2 hit that isn't tracked.
+        # Fallback: if the tracked universe failed, keep tracked tickers that
+        # happened to appear in the bounded top scan.
+        rows_to_save = list(tracked_rows)
+        seen = {r.get("symbol") for r in rows_to_save}
+        for r in top_rows:
+            sym = r.get("symbol")
+            if sym in seen:
+                continue
+            if sym in hits or (not tracked_rows and sym in set(TRACKED_TICKERS)):
+                rows_to_save.append(r)
+                seen.add(sym)
+        save_market_summary_daily(date_str, columns, rows_to_save, keep_tickers=None)
     except Exception as e:
-        log.warning(f"Could not save market_page.html: {e}")
-
-    # NOTE: this is a Dash DataTable — header <th> text is rendered via CSS
-    # sprites/icons (inner_text() comes back blank), and data cells live in
-    # wrapper divs that inner_text() also can't see reliably. The real column
-    # name is in data-dash-column, and text_content() (unlike inner_text())
-    # reads it regardless of visibility. The table is also PAGINATED (~12 rows
-    # per page, ~35 pages); we must walk every page or we'd only ever rank the
-    # first 12 stocks — missing higher-scoring ones deeper in the list.
-    rows = []
-    try:
-        if not page.query_selector_all("table"):
-            log.warning("No tables found — check market_page.png")
-            return rows
-
-        try:
-            last_page = int(page.query_selector(".last-page").text_content().strip())
-        except Exception:
-            last_page = 1
-        log.info(f"Market summary has {last_page} page(s).")
-
-        for _ in range(last_page):
-            table = page.query_selector_all("table")[0]
-            for tr in table.query_selector_all("tr")[1:]:
-                tds = tr.query_selector_all("td")
-                if not tds:
-                    continue
-                row = {}
-                for td in tds:
-                    col = td.get_attribute("data-dash-column")
-                    if col:
-                        row[col] = td.text_content().strip()
-                if row:
-                    # symbol cell is prefixed with a ⭐ watchlist link
-                    row["symbol"] = row.get("symbol", "").replace("⭐", "").strip()
-                    rows.append(row)
-
-            nxt = page.query_selector(".next-page")
-            if not nxt or nxt.get_attribute("disabled") is not None:
-                break
-            nxt.click()
-            page.wait_for_timeout(600)
-
-        log.info(f"Scraped {len(rows)} rows across all pages.")
-    except Exception as e:
-        log.error(f"Market summary scrape error: {e}")
-
-    # Screening rules:
-    #   FILTER (must-have): unusual == 'v'
-    #   RANK survivors by, highest first:
-    #     P1 dn-0   (today's net flow)
-    #     P2 dn-3   (net flow 3 days ago)
-    #     P3 likuid ('v' ranks above 'x')
-    #   pinky is ignored entirely.
-    #   Always return TOP_N: stocks with dn-0 >= 10 are the strong picks; if
-    #   fewer than TOP_N clear that bar, fill the rest with the next-best
-    #   unusual=v stocks and flag them with a caution note (_caution).
-    DN0_MIN = 10
-    TOP_N = 2
-    def is_v(val):
-        return str(val).strip().lower() == "v"
-
-    candidates = [r for r in rows if is_v(r.get("unusual"))]
-    strong = [r for r in candidates if parse_num(r.get("dn-0", "")) >= DN0_MIN]
-    log.info(
-        f"{len(candidates)} stock(s) pass unusual=v "
-        f"({len(strong)} with dn-0>={DN0_MIN})."
-    )
-
-    candidates.sort(
-        key=lambda r: (
-            parse_num(r.get("dn-0", "")),
-            parse_num(r.get("dn-3", "")),
-            1 if is_v(r.get("likuid")) else 0,
-        ),
-        reverse=True,
-    )
-    top = candidates[:TOP_N]
-    for r in top:
-        r["_caution"] = parse_num(r.get("dn-0", "")) < DN0_MIN
+        log.error(f"market_summary_daily persistence failed: {e}")
     return top
 
 
 # ── 2b. DASHBOARD "TOP AKUM" PRESETS ──────────
 
+def _is_real_ticker(sym):
+    """Filter out warrants/rights/derivative codes (e.g. AADIBQCQ6A) — keep plain
+    <=4-letter equity tickers, matching what the dashboard lists used to show."""
+    return bool(sym) and sym.isalpha() and len(sym) <= 4
+
+
 def scrape_dashboard_presets(page):
-    """Pull the Dashboard Transaksi 'Top Akum' lists (Bandarmologi / NonRetail /
-    Foreign) from the Tabulator grid. Returns [(label, emoji, [rows]), ...]."""
-    log.info("Loading dashboard screener...")
-    page.goto(NEOBDM_DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(7000)
+    """Dashboard 'Top Akum' lists via the screener API. The Bandarmologi/NonRetail/
+    Foreign lists are now dashboard SCREENERS (GET /api/screeners/dashboard); we
+    POST /market-summary/summary/{id} for each and take the top tickers by its %M
+    rank field. Returns [(label, emoji, [rows with 'tick' + 'tx']), ...] — same
+    shape _dashboard_lines() expects."""
+    import json as _json
+    req, headers = _api_session(page)
     try:
-        page.screenshot(path="dashboard_page.png")
-        with open("dashboard_page.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        log.info("Saved dashboard_page.png / dashboard_page.html")
+        j = _api_json(req.get(f"{API_BASE}/screeners/dashboard")) or {}
+        by_name = {s.get("name"): s for s in (j.get("data") or [])}
     except Exception as e:
-        log.warning(f"Could not save dashboard_page snapshot: {e}")
+        log.error(f"Dashboard screeners list failed: {e}")
+        return [(lbl, emo, []) for lbl, _s, _f, emo in DASHBOARD_PRESETS]
 
     results = []
-    for label, value, emoji in DASHBOARD_PRESETS:
+    for label, sname, field, emoji in DASHBOARD_PRESETS:
         rows = []
-        try:
-            page.select_option("#preset-dropdown-custom", value)
-            page.wait_for_timeout(3500)
-            rows = page.evaluate("""() => {
-                const out = [];
-                document.querySelectorAll('#table-custom .tabulator-row').forEach(r => {
-                    const c = {};
-                    r.querySelectorAll('.tabulator-cell').forEach(cell => {
-                        c[cell.getAttribute('tabulator-field')] = cell.textContent.trim();
-                    });
-                    if (c.tick) out.push(c);
-                });
-                return out;
-            }""")
-        except Exception as e:
-            log.error(f"Dashboard preset {label} failed: {e}")
-        log.info(f"Dashboard {label}: {[r.get('tick') for r in rows]}")
+        s = by_name.get(sname)
+        if not s:
+            log.warning(f"Dashboard screener '{sname}' not found")
+        else:
+            try:
+                jj = _api_json(req.post(
+                    f"{API_BASE}/market-summary/summary/{s['id']}",
+                    data=_json.dumps({"page": 1, "size": MARKET_PAGE_SIZE,
+                                      "sort_field": field, "sort_direction": "desc"}),
+                    headers=headers)) or {}
+                d = jj.get("data")
+                batch = (d.get("data") if isinstance(d, dict) else d) or []
+                for r in batch:
+                    sym = r.get("symbol")
+                    if _is_real_ticker(sym):
+                        rows.append({"tick": sym, "tx": f"{parse_num(r.get(field)) * 100:.1f}%"})
+                    if len(rows) >= DASH_TOP_N:
+                        break
+                time.sleep(API_PAGE_PAUSE)
+            except Exception as e:
+                log.error(f"Dashboard preset {label} failed: {e}")
+        log.info(f"Dashboard {label}: {[r['tick'] for r in rows]}")
         results.append((label, emoji, rows))
     return results
 

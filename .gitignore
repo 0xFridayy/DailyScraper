@@ -1,5 +1,8 @@
 # Secrets — never commit
 .env
+gh token.txt
+*token*.txt
+*.token
 
 # Python
 __pycache__/
