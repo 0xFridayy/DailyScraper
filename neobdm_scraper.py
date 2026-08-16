@@ -201,6 +201,13 @@ STOCK_OWNER = {
 # actual watchlist.
 TRACKED_TICKERS = sorted(set(STOCK_OWNER.keys()))
 
+# Hard ceiling on the tracked-universe fetch: its page count plus one page of
+# slack. The custom universe should hold exactly TRACKED_TICKERS, so this cap is
+# never reached on a healthy run. It exists because a silently-ignored universe
+# filter turns that fetch into a full ~148-page market walk, which trips NeoBDM's
+# ~50-request abuse block mid-run and empties everything scraped after it.
+MAX_TRACKED_PAGES = -(-len(TRACKED_TICKERS) // MARKET_PAGE_SIZE) + 1
+
 # Broker codes to persist per-ticker flow for. Each code costs 2 get_netflow
 # calls (akum side + dist side), each a full page reload (~10-15s) — this
 # list size drives the nightly job's runtime. Trim it if the GH Actions
@@ -393,11 +400,19 @@ def ensure_tracked_universe(req, headers, tickers):
                      if u.get("name") == TRACKED_UNIVERSE_NAME), None)
         body = {"name": TRACKED_UNIVERSE_NAME, "stocks": sorted(set(tickers))}
         if mine:
-            req.put(f"{API_BASE}/stock-universe/{mine['id']}",
-                    data=_json.dumps(body), headers=headers)
-            return mine["id"]
-        r = req.post(f"{API_BASE}/stock-universe", data=_json.dumps(body), headers=headers)
-        return ((_api_json(r) or {}).get("data") or {}).get("id")
+            r = req.put(f"{API_BASE}/stock-universe/{mine['id']}",
+                        data=_json.dumps(body), headers=headers)
+        else:
+            r = req.post(f"{API_BASE}/stock-universe",
+                         data=_json.dumps(body), headers=headers)
+        # Check the write actually landed. Previously the id was returned
+        # unconditionally, so a rejected write left the screener on COMPOSITE and
+        # the "tracked" fetch silently walked the whole market.
+        j2 = _api_json(r) or {}
+        if not j2.get("success", r.ok):
+            log.warning(f"tracked universe write rejected: {j2.get('message')}")
+            return None
+        return ((j2.get("data") or {}).get("id")) or (mine or {}).get("id")
     except Exception as e:
         log.warning(f"tracked universe setup failed (will fall back): {e}")
         return None
@@ -447,8 +462,17 @@ def fetch_market_summary(page):
         req.patch(f"{API_BASE}/screeners/{sid}", headers=headers, data=_json.dumps(
             {"columns": columns, "filters": [], "stock_universe_id": tracked_uni,
              "sort_field": "m_dn_0", "sort_direction": "desc"}))
-        tracked_rows, _ = _fetch_summary_pages(req, headers, sid)
-        log.info(f"Tracked-universe rows: {len(tracked_rows)}")
+        tracked_rows, t_last = _fetch_summary_pages(req, headers, sid,
+                                                    max_pages=MAX_TRACKED_PAGES)
+        # last_page still reporting the whole market means the universe filter was
+        # ignored: these rows are top-of-market, not our tracked set. Drop them and
+        # let the caller fall back to tracked tickers found in the top scan.
+        if t_last > MAX_TRACKED_PAGES:
+            log.error(f"Tracked universe not applied (last_page={t_last} > "
+                      f"{MAX_TRACKED_PAGES}) — discarding {len(tracked_rows)} rows")
+            tracked_rows = []
+        else:
+            log.info(f"Tracked-universe rows: {len(tracked_rows)}")
     return columns, top_rows, tracked_rows
 
 
