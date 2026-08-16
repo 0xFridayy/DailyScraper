@@ -65,13 +65,42 @@ API_BASE              = "https://neobdm.tech/api"
 MARKET_UNIVERSE       = "COMPOSITE"       # whole market (old Stock Universe = ALL)
 SCRAPER_SCREENER_NAME = "DAILY_SCRAPER"   # reusable screener the scraper owns
 MARKET_PAGE_SIZE      = 20                # API only accepts sizes 10/15/20
-# NeoBDM temporarily blocks "abnormal usage" (~50 rapid requests trips it), so we
-# do NOT walk all ~148 market pages. Top-2 needs only the top of the m_dn_0-desc
-# sort (first few pages); full-column persistence uses a small custom universe of
-# just the tracked tickers (~3 pages). Pace requests to stay under the throttle.
-MAX_TOP_PAGES         = 6                 # COMPOSITE pages scanned for Top-2 Akum
-API_PAGE_PAUSE        = 0.6               # seconds between page POSTs (anti-abuse)
-TRACKED_UNIVERSE_NAME = "DAILY_SCRAPER_TICKERS"  # custom universe = TRACKED_TICKERS
+# NeoBDM temporarily blocks "abnormal usage" (~50 rapid requests trips it), so the
+# whole daily capture has to fit a small budget. We screen COMPOSITE down to the
+# liquid, non-gorengan names server-side (~200 stocks = ~10 pages) and page that
+# once: those rows are BOTH the Telegram Top-2 source and the ML feature capture.
+API_PAGE_PAUSE    = 0.6   # seconds between page POSTs (anti-abuse)
+MAX_CAPTURE_PAGES = 25    # hard ceiling (~500 names) so a mis-applied filter can
+                          # never turn the capture into a full ~148-page walk
+
+# Server-side "no gorengan" gate, mirroring the filters NeoBDM's own dashboard
+# screeners use: liquid names only, excluding pinky (potensi berkepentingan
+# khusus) and intraday crossing/tektok manipulation.
+GORENGAN_FILTERS = [
+    {"op": "=", "type": "boolean", "unit": "", "field": "is_liquid",   "value": "true"},
+    {"op": "=", "type": "boolean", "unit": "", "field": "is_pinky",    "value": "false"},
+    {"op": "=", "type": "boolean", "unit": "", "field": "is_crossing", "value": "false"},
+]
+
+# The screener accepts at most 15 columns (ERROR_SCREENER_004 above that) and the
+# summary response returns ONLY the configured columns -- so these 15 slots ARE the
+# daily feature set. Chosen to answer "does the telebot entry signal work?":
+#   identity/outcome   symbol, close, high, low  (high/low give MFE/MAE per entry,
+#                      so target/stop rules can be tested, not just close-to-close)
+#   the three signals  m_dn_0 (akum bandar), nr_dn_0 (retail jualan), f_dn_0 (asing)
+#   accumulation       m_cn_5 (5-candle cumulative), m_dn_3, top_5_buyer (who)
+#   screen conditions  is_unusual_volume, clean_score
+#   confound controls  tval, market_cap_t, pct_5 (is the signal just momentum?)
+# is_liquid/is_pinky/is_crossing are deliberately absent: GORENGAN_FILTERS makes
+# them constant, so they would burn slots carrying zero information.
+ML_COLUMNS = [
+    "symbol", "close", "high", "low",
+    "m_dn_0", "nr_dn_0", "f_dn_0",
+    "m_cn_5", "m_dn_3", "top_5_buyer",
+    "is_unusual_volume", "clean_score",
+    "tval", "market_cap_t", "pct_5",
+]
+CAPTURE_SORT_FIELD = "symbol"   # stable order => pages don't shift mid-walk
 
 # Raw broker-flow history for the ML backtest pipeline (Roadmap #2). Committed
 # back to the repo by the GH Actions workflow after each run — see
@@ -200,13 +229,6 @@ STOCK_OWNER = {
 # explicit ticker universe already in this file — confirm/replace with your
 # actual watchlist.
 TRACKED_TICKERS = sorted(set(STOCK_OWNER.keys()))
-
-# Hard ceiling on the tracked-universe fetch: its page count plus one page of
-# slack. The custom universe should hold exactly TRACKED_TICKERS, so this cap is
-# never reached on a healthy run. It exists because a silently-ignored universe
-# filter turns that fetch into a full ~148-page market walk, which trips NeoBDM's
-# ~50-request abuse block mid-run and empties everything scraped after it.
-MAX_TRACKED_PAGES = -(-len(TRACKED_TICKERS) // MARKET_PAGE_SIZE) + 1
 
 # Broker codes to persist per-ticker flow for. Each code costs 2 get_netflow
 # calls (akum side + dist side), each a full page reload (~10-15s) — this
@@ -369,9 +391,16 @@ def get_universe_id(req, name=MARKET_UNIVERSE):
     return None
 
 
-def ensure_scraper_screener(req, headers, columns, universe_id):
-    """Find-or-create the DAILY_SCRAPER screener and (re)set it to carry all
-    columns over the chosen universe with no filters. Returns its id."""
+def ensure_scraper_screener(req, headers, universe_id):
+    """Find-or-create the DAILY_SCRAPER screener and point it at `universe_id`
+    carrying ML_COLUMNS with GORENGAN_FILTERS applied. Returns its id, or None if
+    NeoBDM rejected the config.
+
+    The PATCH response MUST be checked: it answers HTTP 200 with success=False
+    (e.g. ERROR_SCREENER_004 when more than 15 columns are sent) and silently
+    keeps the previous config. That is exactly how this screener sat pinned to the
+    ALL universe -- warrants included -- while every run assumed otherwise.
+    """
     import json as _json
     j = _api_json(req.get(f"{API_BASE}/screeners")) or {}
     mine = next((s for s in (j.get("data") or [])
@@ -382,50 +411,26 @@ def ensure_scraper_screener(req, headers, columns, universe_id):
         mine = (_api_json(r) or {}).get("data") or {}
         log.info(f"Created screener '{SCRAPER_SCREENER_NAME}'")
     sid = mine.get("id")
-    body = {"columns": columns, "filters": [], "stock_universe_id": universe_id,
-            "sort_field": "m_dn_0", "sort_direction": "desc"}
-    req.patch(f"{API_BASE}/screeners/{sid}", data=_json.dumps(body), headers=headers)
+    body = {"columns": ML_COLUMNS, "filters": GORENGAN_FILTERS,
+            "stock_universe_id": universe_id,
+            "sort_field": CAPTURE_SORT_FIELD, "sort_direction": "asc"}
+    resp = _api_json(req.patch(f"{API_BASE}/screeners/{sid}",
+                               data=_json.dumps(body), headers=headers)) or {}
+    if not resp.get("success"):
+        log.error(f"Screener config REJECTED: {resp.get('message')}")
+        return None
     return sid
 
 
-def ensure_tracked_universe(req, headers, tickers):
-    """Find-or-create a custom stock-universe holding exactly `tickers`, so the
-    persistence fetch returns ~len(tickers) rows (a few pages) instead of the
-    whole ~3k-stock market. Returns its id, or None on failure (caller falls back
-    to persisting whatever tracked tickers appear in the top scan)."""
-    import json as _json
-    try:
-        j = _api_json(req.get(f"{API_BASE}/stock-universe")) or {}
-        mine = next((u for u in (j.get("data") or [])
-                     if u.get("name") == TRACKED_UNIVERSE_NAME), None)
-        body = {"name": TRACKED_UNIVERSE_NAME, "stocks": sorted(set(tickers))}
-        if mine:
-            r = req.put(f"{API_BASE}/stock-universe/{mine['id']}",
-                        data=_json.dumps(body), headers=headers)
-        else:
-            r = req.post(f"{API_BASE}/stock-universe",
-                         data=_json.dumps(body), headers=headers)
-        # Check the write actually landed. Previously the id was returned
-        # unconditionally, so a rejected write left the screener on COMPOSITE and
-        # the "tracked" fetch silently walked the whole market.
-        j2 = _api_json(r) or {}
-        if not j2.get("success", r.ok):
-            log.warning(f"tracked universe write rejected: {j2.get('message')}")
-            return None
-        return ((j2.get("data") or {}).get("id")) or (mine or {}).get("id")
-    except Exception as e:
-        log.warning(f"tracked universe setup failed (will fall back): {e}")
-        return None
-
-
-def _fetch_summary_pages(req, headers, sid, max_pages=None):
-    """Page through /market-summary/summary/{sid} (sorted m_dn_0 desc), paced.
-    Stops at last_page or max_pages, whichever comes first."""
+def _fetch_summary_pages(req, headers, sid, max_pages=None,
+                         sort_field=CAPTURE_SORT_FIELD, sort_direction="asc"):
+    """Page through /market-summary/summary/{sid}, paced. Stops at last_page or
+    max_pages, whichever comes first. Returns (rows, last_page)."""
     import json as _json
     rows, page_no, last = [], 1, 1
     while page_no <= last and (max_pages is None or page_no <= max_pages):
         body = {"page": page_no, "size": MARKET_PAGE_SIZE,
-                "sort_field": "m_dn_0", "sort_direction": "desc"}
+                "sort_field": sort_field, "sort_direction": sort_direction}
         j = _api_json(req.post(f"{API_BASE}/market-summary/summary/{sid}",
                                data=_json.dumps(body), headers=headers)) or {}
         if not j.get("success"):
@@ -440,40 +445,26 @@ def _fetch_summary_pages(req, headers, sid, max_pages=None):
 
 
 def fetch_market_summary(page):
-    """Two bounded, paced fetches (kept small to avoid NeoBDM's abuse throttle):
-      1. COMPOSITE, first MAX_TOP_PAGES pages -> top-of-market rows for Top-2 Akum.
-      2. Tracked-ticker universe, all pages   -> full-column rows to persist.
-    Returns (columns, top_rows, tracked_rows)."""
-    import json as _json
+    """One bounded, paced walk of the gorengan-free COMPOSITE slice (~200 names,
+    ~10 pages). These rows serve double duty: the Telegram Top-2 Akum pick AND the
+    daily ML feature capture, so the whole job costs ~10 page POSTs against
+    NeoBDM's ~50-request abuse budget. Returns (columns, rows)."""
     req, headers = _api_session(page)
-    columns = get_market_columns(req)
-    if not columns:
-        log.error("Market summary: no columns returned from API")
-        return [], [], []
     composite = get_universe_id(req, MARKET_UNIVERSE)
-    sid = ensure_scraper_screener(req, headers, columns, composite)
+    if not composite:
+        log.error(f"Market summary: universe '{MARKET_UNIVERSE}' not found")
+        return [], []
+    sid = ensure_scraper_screener(req, headers, composite)
+    if not sid:
+        return [], []
 
-    top_rows, last = _fetch_summary_pages(req, headers, sid, max_pages=MAX_TOP_PAGES)
-    log.info(f"Market top scan: {len(top_rows)} rows (first {MAX_TOP_PAGES} of {last} pages)")
-
-    tracked_rows = []
-    tracked_uni = ensure_tracked_universe(req, headers, TRACKED_TICKERS)
-    if tracked_uni:
-        req.patch(f"{API_BASE}/screeners/{sid}", headers=headers, data=_json.dumps(
-            {"columns": columns, "filters": [], "stock_universe_id": tracked_uni,
-             "sort_field": "m_dn_0", "sort_direction": "desc"}))
-        tracked_rows, t_last = _fetch_summary_pages(req, headers, sid,
-                                                    max_pages=MAX_TRACKED_PAGES)
-        # last_page still reporting the whole market means the universe filter was
-        # ignored: these rows are top-of-market, not our tracked set. Drop them and
-        # let the caller fall back to tracked tickers found in the top scan.
-        if t_last > MAX_TRACKED_PAGES:
-            log.error(f"Tracked universe not applied (last_page={t_last} > "
-                      f"{MAX_TRACKED_PAGES}) — discarding {len(tracked_rows)} rows")
-            tracked_rows = []
-        else:
-            log.info(f"Tracked-universe rows: {len(tracked_rows)}")
-    return columns, top_rows, tracked_rows
+    rows, last = _fetch_summary_pages(req, headers, sid, max_pages=MAX_CAPTURE_PAGES)
+    log.info(f"Capture: {len(rows)} rows over {min(last, MAX_CAPTURE_PAGES)}/{last} "
+             f"pages ({MARKET_UNIVERSE}, liquid + non-gorengan)")
+    if last > MAX_CAPTURE_PAGES:
+        log.error(f"Capture hit the page cap (last_page={last}) — the filters may "
+                  f"not have applied; rows are truncated")
+    return ML_COLUMNS, rows
 
 
 # ── 2a. MARKET SUMMARY PERSISTENCE (full 385-col rows) ────────
@@ -540,17 +531,21 @@ def _truthy(v):
 
 
 def screen_market_summary(rows):
+    """Top-2 Akum Bandar out of the whole captured universe. Every captured name is
+    already liquid / non-pinky / non-crossing (GORENGAN_FILTERS), so the old
+    is_liquid tiebreak is constant and drops out. This now screens ~200 filtered
+    names rather than the first 120 of an unsorted market walk."""
     cands = [r for r in rows if _truthy(r.get("is_unusual_volume"))]
-    cands.sort(key=lambda r: (parse_num(r.get("m_dn_0")), parse_num(r.get("m_dn_3")),
-                              1 if _truthy(r.get("is_liquid")) else 0), reverse=True)
+    cands.sort(key=lambda r: (parse_num(r.get("m_dn_0")), parse_num(r.get("m_dn_3"))),
+               reverse=True)
     out = []
     for r in cands[:2]:
         out.append({
             "symbol":  r.get("symbol", ""),
-            "unusual": "v" if _truthy(r.get("is_unusual_volume")) else "x",
+            "unusual": "v",
             "dn-0":    round(parse_num(r.get("m_dn_0")), 4),
             "dn-3":    round(parse_num(r.get("m_dn_3")), 4),
-            "likuid":  "v" if _truthy(r.get("is_liquid")) else "x",
+            "likuid":  "v",   # guaranteed by the server-side filter
             "price":   r.get("close"),
             "_caution": parse_num(r.get("m_dn_0")) < MARKET_DN0_MIN,
         })
@@ -559,29 +554,18 @@ def screen_market_summary(rows):
 
 
 def scrape_market_summary(page):
-    """API-based Market Summary: bounded fetch, persist tracked rows, return Top-2."""
+    """API-based Market Summary: one bounded capture, persist EVERY captured row,
+    return Top-2. The full capture is the ML panel -- signalled and unsignalled
+    names alike -- so forward returns have a control group to compare against."""
     try:
-        columns, top_rows, tracked_rows = fetch_market_summary(page)
+        columns, rows = fetch_market_summary(page)
     except Exception as e:
         log.error(f"Market summary API failed: {e}")
         return []
-    top = screen_market_summary(top_rows)
+    top = screen_market_summary(rows)
     try:
         date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-        hits = {t["symbol"] for t in top}
-        # tracked-universe rows (full set) + any Top-2 hit that isn't tracked.
-        # Fallback: if the tracked universe failed, keep tracked tickers that
-        # happened to appear in the bounded top scan.
-        rows_to_save = list(tracked_rows)
-        seen = {r.get("symbol") for r in rows_to_save}
-        for r in top_rows:
-            sym = r.get("symbol")
-            if sym in seen:
-                continue
-            if sym in hits or (not tracked_rows and sym in set(TRACKED_TICKERS)):
-                rows_to_save.append(r)
-                seen.add(sym)
-        save_market_summary_daily(date_str, columns, rows_to_save, keep_tickers=None)
+        save_market_summary_daily(date_str, columns, rows, keep_tickers=None)
     except Exception as e:
         log.error(f"market_summary_daily persistence failed: {e}")
     return top
@@ -931,11 +915,17 @@ def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
 
 
 def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
-    """Whenever a tracked 'konglo' ticker (TRACKED_TICKERS) shows up in any
-    of today's radar sections (Top Akum Bandar, Dashboard presets, Broker
-    Stalker), record it so its forward performance (highest % and drawdown
-    % from the signal-day close, over the next few trading days) can be
-    tracked later once price_history has caught up to those dates - see
+    """Record EVERY ticker that appears in any of today's radar sections (Top
+    Akum Bandar, Dashboard presets, Broker Stalker), with the sources that
+    flagged it, so forward performance can be measured later.
+
+    This used to gate hits on TRACKED_TICKERS, which is why four days of signals
+    produced six rows: the telebot signals fire across the whole liquid market and
+    the 45 konglo names are rarely among them. Validating the entry strategy needs
+    every signal, so `is_tracked` is a column now rather than a filter. Forward
+    prices come from the daily market_summary_daily capture (close/high/low over
+    the same ~200-name universe), not from price_history, which only ever covered
+    the tracked names - see
     run_konglo_watch_report() in run_ml_reports.py for the actual tracking/
     Sharpe computation. This function only detects and persists the flag;
     it does no price lookups itself (today's close for a just-flagged
@@ -945,18 +935,18 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
 
     for r in ms_data:
         t = r.get("symbol")
-        if t in tracked:
+        if t:
             hits.setdefault(t, set()).add("top_akum_bandar")
 
     for label, _emoji, rows in dash_data:
         for r in rows:
             t = r.get("tick")
-            if t in tracked:
+            if t:
                 hits.setdefault(t, set()).add(f"dashboard_{label}")
 
     for r in bs_data:
         t = r.get("symbol")
-        if t in tracked:
+        if t:
             hits.setdefault(t, set()).add("broker_stalker")
 
     if not hits:
@@ -968,13 +958,19 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
             PRIMARY KEY (flag_date, ticker)
         )
     """)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(konglo_signal_watch)")}
+    if "is_tracked" not in have:
+        conn.execute("ALTER TABLE konglo_signal_watch ADD COLUMN is_tracked INTEGER")
     for t, sources in hits.items():
         conn.execute(
-            "INSERT OR IGNORE INTO konglo_signal_watch (flag_date, ticker, sources) VALUES (?, ?, ?)",
-            (date_str, t, ",".join(sorted(sources))),
+            "INSERT OR REPLACE INTO konglo_signal_watch "
+            "(flag_date, ticker, sources, is_tracked) VALUES (?, ?, ?, ?)",
+            (date_str, t, ",".join(sorted(sources)), 1 if t in tracked else 0),
         )
     conn.commit()
-    log.info(f"konglo radar hits today: { {t: sorted(s) for t, s in hits.items()} }")
+    n_tracked = sum(1 for t in hits if t in tracked)
+    log.info(f"signal watch: {len(hits)} ticker(s) flagged "
+             f"({n_tracked} tracked): {sorted(hits)}")
 
 
 def save_daily_broker_flow(page):
@@ -1010,7 +1006,7 @@ def format_market_summary_message(data):
 def _market_summary_lines(data):
     lines = [
         "📊 Top 2 Akum Bandar (Daily)",
-        "Filter: unusual=v | Strong: dn-0≥10 | Rank: dn-0 > dn-3 > liquid",
+        "Universe: likuid, non-gorengan | Filter: unusual=v | Rank: dn-0 > dn-3",
     ]
     if not data:
         lines.append("No data scraped today.")
@@ -1025,7 +1021,7 @@ def _market_summary_lines(data):
         flag = " ⚠️" if row.get("_caution") else ""
         lines.append(f"{i}. {symbol}{flag} | {details}")
         if row.get("_caution"):
-            lines.append("   ⚠️ caution: dn-0 < 10, akumulasi lemah hari ini")
+            lines.append(f"   ⚠️ caution: dn-0 < {MARKET_DN0_MIN}, akumulasi lemah hari ini")
     return lines
 
 
