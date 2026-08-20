@@ -1,0 +1,51 @@
+name: NeoBDM Signal Integrity
+
+# Correctness gate on what the scrape just captured, as opposed to
+# capture-health.yml which checks that rows ARRIVED and columns are populated.
+# The two answer different questions, and the gap between them is where this
+# project has already been burned: the cross-ticker contamination in
+# price_history passed every shape check for months because the rows were
+# present and the numbers looked like plausible prices - they were just the
+# wrong stock's prices.
+#
+# NeoBDM is a third-party site that changes without notice (daily-scrape.yml
+# already carries a note about scrapes silently failing after a suspected site
+# update), so this is built to catch a scrape that SUCCEEDS and returns
+# something different from yesterday.
+#
+# Read-only: no push step, no race with daily-scrape.yml / price-history-topup.yml.
+
+on:
+  schedule:
+    # 01:45 UTC — after daily-scrape.yml (23:00 UTC, 35-min timeout),
+    # price-history-topup.yml (00:30 UTC) and capture-health.yml (01:15 UTC),
+    # so the db has fully settled before we compare the two scrape paths.
+    - cron: "45 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Only what price_audit.py needs — deliberately not requirements.txt,
+      # which would pull playwright and torch for a check that touches neither.
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pandas numpy requests
+
+      # Exits non-zero when the captured data is wrong, so the run goes red in
+      # the Actions tab as well as posting to Telegram.
+      - name: Check signal integrity
+        run: python check_signal_integrity.py --telegram

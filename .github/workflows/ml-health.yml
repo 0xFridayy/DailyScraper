@@ -1,0 +1,51 @@
+name: NeoBDM ML Health
+
+# Does the ML stack still run, and does it still produce sane numbers?
+#
+# Runs on every push and pull request as well as daily. Until now this repo had
+# no CI at all - a PR could break every model script and nothing would say so
+# until someone next ran one by hand. Catching it in the PR is the whole point;
+# the daily run additionally catches breakage that arrives without a commit,
+# which is the realistic failure mode here since requirements.txt pins nothing
+# and a pandas or xgboost release can change semantics underneath the repo.
+#
+# Read-only: never writes neobdm.db.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # 12:30 UTC — 30 minutes before ml-daily-report.yml (13:00 UTC), so a broken
+    # pipeline is known BEFORE the report runs on top of it.
+    - cron: "30 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ml-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately NOT requirements.txt: that pulls playwright and torch,
+      # which would roughly triple install time on every PR. check_ml_health.py
+      # degrades those two to a compile check and says so in its output, so the
+      # coverage lost is syntax-only.
+      - name: Install ML dependencies
+        run: python -m pip install --upgrade pip pandas numpy xgboost shap requests
+
+      # Telegram only on the scheduled run. A PR failing should show up as a red
+      # check on the PR, not as a phone notification.
+      - name: Check ML health
+        run: python check_ml_health.py ${{ github.event_name == 'schedule' && '--telegram' || '' }}
