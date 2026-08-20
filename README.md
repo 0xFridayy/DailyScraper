@@ -33,6 +33,7 @@ Yang benar-benar menyentuh NeoBDM.tech dan mengisi database. Satu-satunya lapisa
 | `neobdm_scraper.py` | live | Inti scraper. Login ke NeoBDM via Playwright, ambil Market Summary + Broker Stalker lewat API screener internal, tulis ke `neobdm.db`, kirim ringkasan Top-2 harian ke Telegram. Juga jalan sebagai bot terjadwal (7 pagi WIB) yang merespons perintah `/scrape`. |
 | `backfill_inventory.py` | live | Mengisi histori `broker_flow` & `price_history` dari chart Plotly di halaman `/inventory/`, dengan menggerakkan date-picker ke tanggal paling awal yang tersedia (bukan cuma default 3 bulan). Dijalankan harian untuk top-up data yang terlewat. |
 | `check_capture_health.py` | live | Health check harian atas panel ML: cek bentuk data (jumlah baris, coverage kolom, kebaruan tanggal), bukan cuma "ada isinya atau tidak". Exit code non-nol + alert Telegram kalau capture diam-diam rusak (filter berhenti kepakai, kolom jadi null). |
+| `check_signal_integrity.py` | live | Gerbang **kebenaran** data hasil scrape — bukan sekadar "datanya sampai" (itu tugas `check_capture_health.py`), tapi "nilainya benar". Membandingkan dua jalur scrape independen (API screener vs chart inventory) yang sama-sama membawa `close`, mendeteksi kontaminasi baru dalam 10 hari terakhir, dan menyapu seluruh ~340 kolom untuk regresi cakupan secara self-calibrating (kolom yang tidak pernah terisi diabaikan; kolom yang tadinya penuh lalu kosong = gagal). Exit non-nol + alert Telegram. |
 | `price_audit.py` | audit | Audit + perbaikan integritas `price_history`. Tiga detektor: `limit_violation` (gerakan di luar ARA/ARB — mustahil di IDX), `cross_ticker_dup` (OHLCV identik di ≥2 ticker pada satu tanggal), `series_break` (close melompat >5x / <0,2x versus rolling median sendiri). Mode: `audit` (laporan saja), `quarantine` (tandai, tidak menghapus), `repair corrected.csv` (perbaiki harga + rescale netval backfill). |
 
 ### 2. Fitur & model dasar
@@ -67,7 +68,8 @@ Mengukur sinyal produksi terhadap kenyataan, merangkum semuanya jadi laporan har
 |---|---|---|
 | `evaluate_signals.py` | live | Mengukur performa sinyal Telegram bot yang sesungguhnya: bandingkan saham yang di-flag vs sisa universe pada hari yang sama, dengan entry di close H+1 (bukan H, supaya tidak look-ahead). |
 | `run_ml_reports.py` | live | Orkestrator laporan harian: menjalankan `walk_forward_backtest`, `strategy_variants`, dan `ddqn_entry_exit` atas `neobdm.db` saat ini, lalu kirim ringkasan ke Telegram + tabel lengkap ke GitHub Actions job summary. Read-only. |
-| `test_pipeline.py` | tes | Tes regresi ringan (assert-based, tanpa framework) untuk `walk_forward_backtest.py` dan `kelly_sizing.py` — fokus khusus mendeteksi kebocoran data (leakage) dan kebenaran formula. |
+| `check_ml_health.py` | live | Gerbang **kode** ML (pasangan dari `check_signal_integrity.py` yang menjaga datanya). Mengimpor tiap modul (menangkap drift versi pandas/xgboost — `requirements.txt` tidak mem-pin apa pun), menjalankan `test_pipeline.py`, membangun panel asli dan menguji invariannya, lalu satu siklus walk-forward nyata. Memakai **budget cacat**: cacat yang sudah diketahui dan terjadwal dilaporkan sebagai peringatan dengan jumlah ter-pin, dan hanya gagal kalau jumlahnya bertambah — supaya bisa mendeteksi regresi tanpa merah permanen. Juga selalu melaporkan base rate di samping hit_rate. |
+| `test_pipeline.py` | tes | Tes regresi ringan (assert-based, tanpa framework) untuk `walk_forward_backtest.py`, `kelly_sizing.py`, dan gap guard di `price_audit.py` — fokus khusus mendeteksi kebocoran data (leakage) dan kebenaran formula. |
 
 ### 5. Otomasi & konfigurasi
 
@@ -78,6 +80,8 @@ Lima GitHub Actions workflow yang menjalankan file-file di atas secara terjadwal
 | `daily-scrape.yml` | `0 23 * * *` | `neobdm_scraper.py --now` |
 | `price-history-topup.yml` | `30 0 * * *` | `backfill_inventory.py` |
 | `capture-health.yml` | `15 1 * * *` | `check_capture_health.py --telegram` |
+| `signal-integrity.yml` | `45 1 * * *` | `check_signal_integrity.py --telegram` |
+| `ml-health.yml` | `30 12 * * *` + **tiap push & PR** | `check_ml_health.py` |
 | `ml-daily-report.yml` | `0 13 * * *` | `run_ml_reports.py` |
 | `signal-eval.yml` | `0 2 * * 0` (mingguan) | `evaluate_signals.py --telegram` |
 

@@ -255,6 +255,11 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       begitu harganya tersedia
 - [ ] Tambahkan ticker sinyal harian ke `TRACKED_TICKERS` supaya harganya
       ikut ter-capture
+- [ ] **Hati-hati saat men-join dua tabel ini.** `market_summary_daily.date`
+      adalah tanggal SCRAPE, bukan tanggal data — lihat Lampiran E. Begitu
+      ticker sinyal masuk `price_history`, join naif berdasarkan `date` akan
+      meleset satu hari. `check_signal_integrity.py` menegaskan offset ini
+      supaya perubahannya gagal keras, bukan diam-diam menggeser semua label.
 
 Ini yang paling langsung menjawab pertanyaan sebenarnya — **apakah sinyal
 harian ini akurat** — dan dalam 2–3 bulan sudah punya jawaban empiris.
@@ -381,3 +386,43 @@ Ini alasan tahap 5 dinaikkan jadi prasyarat.
   ke `neobdm.db` yang di-commit harian oleh workflow — jalankan lokal, jangan
   lewat PR), scraper belum diperbaiki, formula Sharpe belum diganti,
   `walk_forward_backtest.py` / `ddqn_entry_exit.py` belum pakai `clean_panel()`
+
+## E. `market_summary_daily.date` adalah tanggal SCRAPE, bukan tanggal data
+
+Ditemukan saat membangun `check_signal_integrity.py`. Scrape berjalan 23:00 UTC
+= 07:00 WIB **sebelum pasar buka**, jadi data screener paling segar adalah close
+sesi sebelumnya.
+
+```
+market_summary_daily.date - 1 hari  vs price_history.date : 34/37 cocok PERSIS (median deviasi 0,00%)
+market_summary_daily.date           vs price_history.date :  4/36 cocok        (median deviasi 2,19%)
+```
+
+Ketiga sisa yang tidak cocok setelah geser 1 hari **semuanya** ticker yang
+memang terkontaminasi (COIN, ELTY) — jadi offset itu memang alignment-nya, dan
+sisanya adalah cacat sungguhan. Kolom `last_date`, yang semestinya membawa
+tanggal data, **NULL di semua baris**.
+
+Saat ini belum ada kode yang men-join kedua tabel, jadi ini **bukan bug aktif** —
+`evaluate_signals.py` hanya memakai `market_summary_daily` secara konsisten, dan
+horizonnya tetap benar karena tiap tanggal scrape memetakan 1:1 ke satu hari
+bursa. Ini ranjau untuk tahap 5. `EXPECTED_DATE_OFFSET` di
+`check_signal_integrity.py` menegaskannya, dan checker itu menurunkan ulang
+offset-nya tiap hari — kalau NeoBDM mengubah waktu publikasi atau jadwal
+workflow bergeser, ia gagal dengan pesan sendiri alih-alih menyamar jadi
+kontaminasi massal.
+
+## F. Dua checker otomatis
+
+| | `check_signal_integrity.py` | `check_ml_health.py` |
+|---|---|---|
+| menjaga | **data** hasil scrape | **kode** yang mengonsumsinya |
+| jadwal | harian 01:45 UTC | harian 12:30 UTC + tiap push & PR |
+| gagal kalau | kontaminasi baru, dua jalur scrape tidak sepakat, offset tanggal berubah, kolom regresi | modul tidak import, tes gagal, panel kolaps, cacat melebihi budget |
+
+`check_ml_health.py` memakai **budget cacat**: `SQRT252_BUDGET = 4` dan
+`IMPOSSIBLE_TARGET_BUDGET = 88` di-pin ke kondisi sekarang. Cacat yang sudah
+diketahui dilaporkan sebagai peringatan; build hanya gagal kalau jumlahnya
+**bertambah**. Turunkan angkanya sambil tahap 1 dan 3 dikerjakan — keduanya
+seharusnya berakhir di 0. Ini disengaja: checker yang merah permanen melatih
+orang mengabaikannya, sementara budget tetap bisa menangkap regresi.
