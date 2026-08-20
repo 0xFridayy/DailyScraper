@@ -2,7 +2,19 @@
 
 Pipeline riset trading IDX: scrape data broker/harga saban hari dari NeoBDM, simpan ke SQLite, lalu diuji lewat serangkaian eksperimen fitur, model, dan strategi.
 
-Status ringkas: sinyal yang ada saat ini didorong **momentum harga**, bukan tesis akumulasi broker — Sharpe pooled masih di bawah target validasi 1.5 (lihat `walk_forward_backtest.py`).
+> **⚠️ Baca [`HANDOFF.md`](HANDOFF.md) sebelum menjalankan backtest apa pun.**
+>
+> Audit menemukan dua masalah yang membatalkan seluruh angka Sharpe yang tercatat di
+> docstring repo ini:
+>
+> 1. **`price_history` rusak** — 1.400 / 11.223 baris (12,5%) terkontaminasi silang
+>    antar-ticker; ikut merusak netval di 26.461 / 218.988 baris `broker_flow` (12,1%).
+> 2. **Formula Sharpe salah** — `mean/std * √252` diterapkan pada return *per-trade*
+>    yang overlapping cross-sectional, di 4 file.
+>
+> Konsekuensinya, kesimpulan lama "tesis broker flow gugur" **belum bisa ditarik** —
+> itu diukur di atas data rusak. `HANDOFF.md` memuat urutan kerja 5 tahap,
+> daftar yang jangan dikerjakan dulu, dan alasannya.
 
 ## Alur pipeline
 
@@ -21,6 +33,7 @@ Yang benar-benar menyentuh NeoBDM.tech dan mengisi database. Satu-satunya lapisa
 | `neobdm_scraper.py` | live | Inti scraper. Login ke NeoBDM via Playwright, ambil Market Summary + Broker Stalker lewat API screener internal, tulis ke `neobdm.db`, kirim ringkasan Top-2 harian ke Telegram. Juga jalan sebagai bot terjadwal (7 pagi WIB) yang merespons perintah `/scrape`. |
 | `backfill_inventory.py` | live | Mengisi histori `broker_flow` & `price_history` dari chart Plotly di halaman `/inventory/`, dengan menggerakkan date-picker ke tanggal paling awal yang tersedia (bukan cuma default 3 bulan). Dijalankan harian untuk top-up data yang terlewat. |
 | `check_capture_health.py` | live | Health check harian atas panel ML: cek bentuk data (jumlah baris, coverage kolom, kebaruan tanggal), bukan cuma "ada isinya atau tidak". Exit code non-nol + alert Telegram kalau capture diam-diam rusak (filter berhenti kepakai, kolom jadi null). |
+| `price_audit.py` | audit | Audit + perbaikan integritas `price_history`. Tiga detektor: `limit_violation` (gerakan di luar ARA/ARB — mustahil di IDX), `cross_ticker_dup` (OHLCV identik di ≥2 ticker pada satu tanggal), `series_break` (close melompat >5x / <0,2x versus rolling median sendiri). Mode: `audit` (laporan saja), `quarantine` (tandai, tidak menghapus), `repair corrected.csv` (perbaiki harga + rescale netval backfill). |
 
 ### 2. Fitur & model dasar
 
@@ -33,6 +46,7 @@ Membangun panel fitur dari data mentah dan menguji apakah ada sinyal yang bisa d
 | `multiday_features.py` | riset | Menguji apakah pola broker multi-hari (rolling average, streak beli beruntun) menangkap sinyal yang tak terlihat di snapshot harian tunggal. Hasil: tidak ada perbaikan. |
 | `smart_money_divergence.py` | riset | Menguji tesis spesifik: broker "smart money" net-beli sementara broker ritel net-jual pada saham yang sama (absorpsi). Hasil: konsisten arahnya tapi tidak signifikan secara statistik (p=0.18). |
 | `shap_analysis.py` | riset | Interpretasi feature importance model lewat SHAP + gain importance XGBoost + korelasi mentah. Hasil: `broker_concentration` peringkat 7 dari 8 — `momentum_1d` mendominasi. |
+| `horizon_scan.py` | riset — baru | Scan multi-horizon (h = 1/3/5/10/20) dengan metrik **IC / hit_rate / edge top-desil**, bukan Sharpe. Tiga varian target (`ret_h` close-to-close, `max_h` puncak dalam window, `mdd_h` drawdown terburuk) × empat feature set, plus **fitur cluster konglomerat** (netval per grup bandar dinormalisasi terhadap total \|netval\|) yang belum pernah dipakai di `FEATURES`. Tunggu data bersih dulu — lihat `HANDOFF.md` tahap 4. |
 
 ### 3. Strategi, eksekusi & risiko
 
