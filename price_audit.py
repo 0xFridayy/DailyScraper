@@ -50,12 +50,13 @@ corrected.csv columns: date,ticker,open,high,low,close,volume
 Get it from any reliable OHLCV source for the flagged (date, ticker) pairs.
 """
 
+import os
 import sys
 import sqlite3
 import numpy as np
 import pandas as pd
 
-DB_PATH = "neobdm.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 
@@ -104,6 +105,115 @@ def _reasons(row):
     return "+".join(
         r for r in ["limit_violation", "cross_ticker_dup", "series_break"] if row[r]
     )
+
+
+# ─────────────────────────────────────────────
+#  CLEAN-PANEL HELPERS
+#
+#  Import clean_panel() instead of reading price_history directly. Filtering
+#  the quarantine out is necessary but NOT sufficient: a plain
+#  groupby().shift(-h) does not know a row was removed, so it joins the last
+#  surviving row to the next surviving one ACROSS the gap and manufactures a
+#  return that never happened. Measured on this DB: filtering alone left
+#  50 fabricated targets, among them ELTY +92% and TEBE +51%, which by
+#  themselves pushed target kurtosis from 4.4 to 12.1 and kept 7 rows outside
+#  the ARA/ARB band that the filter was supposed to have eliminated. With the
+#  guard below, limit violations in the target drop to zero.
+# ─────────────────────────────────────────────
+
+def load_clean(conn, strict=False):
+    """price_history with quarantined (date, ticker) rows dropped.
+
+    Prefers the price_quarantine table written by the `quarantine` command. If
+    that table is absent the detectors are run in-memory instead, so a caller
+    that forgot to quarantine still gets clean rows rather than silently
+    training on dirty ones. Pass strict=True to require the table instead.
+    """
+    px = load(conn)
+    has_table = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
+    ).fetchone()[0]
+
+    if has_table:
+        q = pd.read_sql("SELECT date, ticker FROM price_quarantine", conn)
+    elif strict:
+        raise RuntimeError("price_quarantine missing — run: py price_audit.py quarantine")
+    else:
+        d = detect(px)
+        q = d.loc[d["suspect"], ["date", "ticker"]]
+
+    bad = set(zip(q["date"], q["ticker"]))
+    keep = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
+    return px[keep].reset_index(drop=True)
+
+
+def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
+    """Attach gap-guarded forward returns to a filtered price frame.
+
+    all_dates: every date in the UNFILTERED panel, in order. Positions on this
+    axis are what makes a removed row detectable — the surviving rows keep
+    their original spacing, so a hole shows up as a jump in position.
+
+    For each horizon h, `fwd_{h}` is only defined when the row h steps ahead in
+    the ticker's surviving series also sits exactly h dates ahead on the panel
+    axis. Because positions are strictly increasing, that single equality also
+    proves every intermediate step was contiguous — so the same mask makes the
+    `max_{h}` / `mdd_{h}` windows safe, not just the endpoint.
+
+    A ticker suspended for a day is treated the same as a quarantined row:
+    the window is dropped rather than bridged.
+    """
+    pos = {d: i for i, d in enumerate(all_dates)}
+    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
+    px["_pos"] = px["date"].map(pos)
+    g = px.groupby("ticker")
+
+    for h in horizons:
+        contig = (g["_pos"].shift(-h) - px["_pos"]) == h
+        px[f"fwd_{h}"] = np.where(contig, g["close"].shift(-h) / px["close"] - 1, np.nan)
+
+        if extremes:
+            # rolling(h) on the -h shifted series spans exactly rows i+1..i+h
+            hi = g["high"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).max())
+            lo = g["low"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).min())
+            px[f"max_{h}"] = np.where(contig, hi / px["close"] - 1, np.nan)
+            px[f"mdd_{h}"] = np.where(contig, lo / px["close"] - 1, np.nan)
+
+    return px.drop(columns=["_pos"])
+
+
+def add_lagged_returns(px, all_dates, lags=(1,)):
+    """Backward-looking returns under the same guard.
+
+    Features bridge a hole just as readily as targets do — a momentum_1d
+    computed across a removed row is the same fabricated +92% move, only
+    landing in X instead of y. It is the less dangerous of the two (a bad
+    feature adds noise; a bad target adds false labels), but it is still an
+    extreme value a tree will happily split on, so guard it too.
+    """
+    pos = {d: i for i, d in enumerate(all_dates)}
+    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
+    px["_pos"] = px["date"].map(pos)
+    g = px.groupby("ticker")
+
+    for k in lags:
+        contig = (px["_pos"] - g["_pos"].shift(k)) == k
+        px[f"lag_{k}"] = np.where(contig, px["close"] / g["close"].shift(k) - 1, np.nan)
+
+    return px.drop(columns=["_pos"])
+
+
+def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False):
+    """load_clean() + add_forward_returns() — the one call worth importing."""
+    all_dates = sorted(
+        r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history").fetchall()
+    )
+    px = add_forward_returns(
+        load_clean(conn, strict=strict), all_dates, horizons=horizons, extremes=extremes
+    )
+    if lags:
+        px = add_lagged_returns(px, all_dates, lags=lags)
+    return px
 
 
 def report(px):

@@ -177,12 +177,33 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 
 ### 1. Bersihkan data (BLOCKER — jangan lewati)
 
-- [ ] `py price_audit.py audit`, konfirmasi angkanya cocok dengan brief ini
+- [x] `py price_audit.py audit`, konfirmasi angkanya cocok dengan brief ini
+      → **cocok persis**, lihat Lampiran A
 - [ ] `py price_audit.py quarantine`
-- [ ] Buang COIN, CDIA, DOOH, ELTY dari universe training (rusak >90%,
-      re-fetch tidak sepadan). Sisa 41 ticker bersih × 251 hari — cukup.
-- [ ] Tambahkan `LEFT JOIN price_quarantine USING (date,ticker) WHERE ... IS NULL`
-      ke setiap `build_panel()` / `build_episode_frame()`
+- [ ] Buang COIN, CDIA, DOOH, ELTY **dan KIOS, RSGK** dari universe training.
+      Koreksi: KIOS (56,6%) dan RSGK (58,4%) juga rusak lebih dari separuh —
+      keduanya berbagi OHLCV *beserta volume persis sampai lembar* di 134
+      tanggal, jadi bukan false positive detektor. Sisanya **39** ticker,
+      bukan 41.
+- [ ] **Jangan** pakai `LEFT JOIN price_quarantine ... WHERE IS NULL` sendirian.
+      Filter itu perlu tapi **tidak cukup**: `groupby.shift(-h)` tidak tahu ada
+      baris yang dibuang, jadi ia menyambung baris bersih terakhir ke baris
+      bersih berikutnya dan **mengarang return yang tidak pernah terjadi**
+      (terukur: 50 target palsu, di antaranya ELTY +92% dan TEBE +51%; kurtosis
+      target 4,4 → 12,1; 7 pelanggaran ARA/ARB tersisa).
+      Pakai `price_audit.clean_panel()` — filter + gap guard sekaligus:
+
+      ```python
+      from price_audit import clean_panel
+      px = clean_panel(conn, horizons=(1, 3, 5), lags=(1, 5), extremes=True)
+      # -> fwd_1/fwd_3/fwd_5, lag_1/lag_5, max_h/mdd_h; semua NaN kalau
+      #    jendelanya melompati baris yang dibuang
+      ```
+
+      Sudah dipasang di `horizon_scan.py`. Masih perlu dipasang di
+      `walk_forward_backtest.build_panel()` dan
+      `ddqn_entry_exit.build_episode_frame()`.
+      Regresi: 3 tes di `test_pipeline.py` mengunci perilaku ini.
 
 ### 2. Perbaiki scraper agar tidak berulang
 
@@ -198,8 +219,12 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 
 ### 3. Ganti metrik
 
-- [ ] Ganti `sharpe_from_returns()` di ketiga file dengan IC / hit_rate /
-      edge top-decile
+- [ ] Ganti `sharpe_from_returns()` di **empat** file (bukan tiga) dengan
+      IC / hit_rate / edge top-decile. Yang terlewat di Temuan 2:
+      `ara_arb_simulation.py:98` punya ekspresi identik.
+- [ ] Laporkan **base rate** di samping setiap hit_rate. Tanpa itu angkanya
+      tidak bisa ditafsirkan — lihat Lampiran B, hit_rate 42,8% yang tercatat
+      di repo ternyata **persis sama** dengan base rate universe.
 - [ ] Tandai semua angka Sharpe di docstring repo sebagai **VOID** —
       jangan dihapus, beri catatan kenapa (dua alasan di Temuan 1 & 2)
 
@@ -211,7 +236,17 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 - [ ] Kalau broker flow tetap nol di semua horizon **di data bersih**, barulah
       tesisnya betul-betul gugur
 
-### 5. Catat sinyal harian (mulai sekarang, paralel dengan di atas)
+### 5. Catat sinyal harian — PRASYARAT, bukan pekerjaan paralel
+
+> **Reprioritisasi (lihat Lampiran C).** Semula ditulis "paralel dengan di
+> atas". Verifikasi menunjukkan hanya **19 dari 198** ticker
+> `market_summary_daily` yang pernah ada di universe latih (**9,6%**), dan 3
+> di antaranya justru yang rusak. Model sebagus apa pun di 45 nama konglo
+> tidak punya jalur ke tempat sinyal harian menembak. Tahap 4 tanpa tahap 5
+> paling banter menjawab pertanyaan akademis tentang saham yang bukan tempat
+> kamu trading. Kerjakan tahap 5 **sebelum atau bersamaan** dengan tahap 4,
+> jangan sesudahnya.
+
 
 - [ ] Tabel baru `daily_signals(date, ticker, source, rank, dn0, dn3, price)`
 - [ ] Parse output Telegram harian (Top 2 Akum Bandar, Dashboard EOD,
@@ -256,3 +291,93 @@ harian ini akurat** — dan dalam 2–3 bulan sudah punya jawaban empiris.
 - Kualitas docstring repo ini di atas rata-rata — hasil negatif dicatat
   jujur, lead yang gugur direkam supaya tidak diulang. Pertahankan
   kebiasaan itu saat menulis hasil run yang baru.
+
+---
+
+# LAMPIRAN — VERIFIKASI 2026-08-20
+
+Dijalankan terhadap `neobdm.db` yang sama. Semua angka di bawah reproducible.
+
+## A. Temuan brief ini terkonfirmasi
+
+`py price_audit.py audit` mereproduksi angka brief **persis**: 1.400/11.223
+baris suspect (12,5%), 91 `limit_violation` / 1.352 `cross_ticker_dup` / 107
+`series_break`, 26.461/218.988 baris broker_flow (12,1%).
+
+Mekanisme bug scraper juga terkonfirmasi lewat pola baru: **dua pasangan
+terparah bersebelahan persis di urutan scrape alfabetis** —
+CDIA→COIN (indeks 9→10, 231 tanggal identik) dan DOOH→ELTY (13→14, 221
+tanggal). Ini persis pola "chart ticker sebelumnya belum re-render". KIOS+RSGK
+(jarak 11) tidak cocok pola itu dan kolisinya mulai tepat 2025-09-01, hari
+pertama RSGK masuk universe — kemungkinan jalur kegagalan kedua. `wait_for_function`
+yang memverifikasi identitas chart menutup keduanya.
+
+## B. Kelayakan universe untuk training
+
+**Bisa diperbaiki pembersihan.** Distribusi target next-day:
+
+| | mean | std | skew | kurtosis | max |
+|---|---|---|---|---|---|
+| tanpa filter | +14,9% | 379% | +36,5 | +1568 | +21.190% |
+| filter quarantine saja | +0,35% | 6,14% | +1,20 | +12,1 | +91,7% |
+| + gap guard | +0,32% | 5,94% | +0,9 | **+4,4** | **+34,9%** |
+
+Setelah gap guard, pelanggaran ARA/ARB di target = **0**.
+
+**Tidak bisa diperbaiki pembersihan:**
+
+1. **Sampel efektif ~11x lebih kecil dari nominal.** Korelasi pairwise
+   rata-rata antar-ticker di data bersih **+0,275** (dalam grup konglomerat
+   +0,399; RAJA+RATU 0,83, JARR+TEBE 0,81, BRPT+PTRO 0,77). Itu setara
+   **~3,4 ticker independen** dari 39 → **~850 baris independen**, bukan 9.728.
+   Catatan penting: di data rusak korelasi terukur hanya +0,112 — kontaminasi
+   *menyamarkan* ketergantungan ini. Jadi kondisi sebenarnya lebih ketat
+   daripada yang terlihat sebelum dibersihkan, bukan lebih longgar.
+
+2. **`hit_rate` yang dilaporkan repo = base rate universe, selisih 0,00 pp.**
+
+   ```
+   base rate target positif (tanpa model apa pun) : 42,8%
+   hit_rate model di docstring repo               : 42,8%
+   ```
+
+   Model tidak menambah informasi arah sama sekali. Sharpe positif yang
+   tercatat murni berasal dari pemenang lebih besar dari pecundang.
+   Sebagai pembanding, desil momentum teratas mencapai 52,4% positif — sinyal
+   arah *ada* di data, modelnya yang tidak menangkapnya.
+
+3. **Drift arah +124%/tahun** (mean target harian +0,32%). Strategi long-only
+   apa pun terlihat bagus di periode ini. Setiap backtest wajib dibandingkan
+   terhadap baseline long-only, bukan terhadap nol.
+
+4. **95% broker_flow hanya punya `netval`.** Baris live (`bval` terisi) cuma
+   10.950/218.988, mulai 2026-07-05 (~30 hari bursa). Fitur apa pun yang
+   butuh pemisahan beli/jual praktis tidak punya data.
+
+**Implikasi untuk fitur cluster di `horizon_scan.py`:** dengan korelasi
+dalam-grup +0,399, "grup ini bergerak" hampir sama artinya dengan "pasarnya
+bergerak". Baca hasil cluster dengan diskon itu.
+
+## C. Universe latih vs universe sinyal
+
+| | |
+|---|---|
+| `market_summary_daily` (tempat sinyal harian menembak) | 198 ticker |
+| irisan dengan 45 ticker latih | **19 (9,6%)** |
+| di antaranya yang rusak berat | CDIA, COIN, ELTY |
+
+Ini alasan tahap 5 dinaikkan jadi prasyarat.
+
+## D. Status setelah sesi ini
+
+- `price_audit.py` — ditambah `clean_panel()` / `load_clean()` /
+  `add_forward_returns()` / `add_lagged_returns()`; `DB_PATH` jadi absolut
+  supaya bisa dipanggil dari mana saja
+- `horizon_scan.py` — sudah memakai `clean_panel()`; `build()` terverifikasi
+  jalan (9.234 baris, 249 tanggal; `ret_1` dalam [−15,0%, +34,9%] = tepat di
+  dalam pita ARB/ARA)
+- `test_pipeline.py` — 3 tes regresi gap guard; 11/11 lulus
+- **Belum dikerjakan**: quarantine belum dijalankan ke DB (menulis tabel baru
+  ke `neobdm.db` yang di-commit harian oleh workflow — jalankan lokal, jangan
+  lewat PR), scraper belum diperbaiki, formula Sharpe belum diganti,
+  `walk_forward_backtest.py` / `ddqn_entry_exit.py` belum pakai `clean_panel()`
