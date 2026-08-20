@@ -12,6 +12,9 @@ __pycache__/
 *.png
 *.html
 
+# Generated audit output (regenerate with: py price_audit.py audit)
+price_audit_suspects.csv
+
 # Unrelated files — not part of the bot
 idx-research-agent.jsx
 modern_ta_checklist.tsx
