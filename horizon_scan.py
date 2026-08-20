@@ -1,5 +1,10 @@
 """
-Multi-horizon signal-quality scan on the EXISTING neobdm.db panel.
+Multi-horizon signal-quality scan on the neobdm.db panel, quarantine-filtered.
+
+Prices come from price_audit.clean_panel(), not from price_history directly:
+~12% of that table is cross-ticker contaminated, and the naive fix (filter the
+bad rows, then shift) silently bridges the holes into targets that never
+happened. Both problems are handled there, once.
 
 Question: does the broker-flow signal show up at longer horizons than T+1,
 and does it show up better against a "max upside within the window" target
@@ -20,6 +25,7 @@ from xgboost import XGBRegressor
 from walk_forward_backtest import (
     DB_PATH, _broker_day_aggregates, _broker_correlation_1d, FEATURES, XGB_PARAMS,
 )
+from price_audit import clean_panel
 
 warnings.filterwarnings("ignore")
 
@@ -53,17 +59,19 @@ def cluster_features(bf):
 
 def build(conn):
     bf = pd.read_sql("SELECT date,ticker,broker_code,netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date,ticker,open,high,low,close,volume FROM price_history", conn)
 
     agg = _broker_day_aggregates(bf)
     agg = agg.merge(_broker_correlation_1d(bf), on=["ticker", "date"], how="left")
     agg = agg.merge(cluster_features(bf), on=["ticker", "date"], how="left")
 
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
+    # Quarantine-filtered prices with gap-guarded forward/backward returns.
+    # Reading price_history directly here would put ~12% contaminated rows into
+    # both X and y, and computing shift(-h) after filtering would bridge the
+    # removed rows into targets that never happened - see price_audit.py.
+    px = clean_panel(conn, horizons=HORIZONS, lags=(1, 5), extremes=True)
     g = px.groupby("ticker")
-    px["prev_close"] = g["close"].shift(1)
-    px["momentum_1d"] = px["close"] / px["prev_close"] - 1
-    px["momentum_5d"] = px["close"] / g["close"].shift(5) - 1
+    px["momentum_1d"] = px["lag_1"]
+    px["momentum_5d"] = px["lag_5"]
     px["vol_ma5"] = g["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
     px["atr_pct"] = g.apply(
@@ -71,15 +79,7 @@ def build(conn):
     ).reset_index(level=0, drop=True)
 
     for h in HORIZONS:
-        px[f"ret_{h}"] = g["close"].shift(-h) / px["close"] - 1
-        # max upside reachable within the window (what a trailing stop captures)
-        px[f"max_{h}"] = g["high"].transform(
-            lambda s: s.shift(-h).rolling(h, min_periods=1).max()
-        ) / px["close"] - 1
-        # worst drawdown within window (how wide a stop must be to survive)
-        px[f"mdd_{h}"] = g["low"].transform(
-            lambda s: s.shift(-h).rolling(h, min_periods=1).min()
-        ) / px["close"] - 1
+        px[f"ret_{h}"] = px[f"fwd_{h}"]
 
     keep = ["ticker", "date", "momentum_1d", "momentum_5d", "volume_ratio", "atr_pct"]
     keep += [f"ret_{h}" for h in HORIZONS] + [f"max_{h}" for h in HORIZONS] + [f"mdd_{h}" for h in HORIZONS]

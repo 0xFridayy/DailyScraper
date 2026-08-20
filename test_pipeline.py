@@ -17,6 +17,7 @@ from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, sharpe_stats,
 )
 from kelly_sizing import kelly_fraction, kelly_from_trades
+from price_audit import add_forward_returns, add_lagged_returns
 
 
 def test_broker_day_aggregates_basic():
@@ -142,7 +143,66 @@ def test_kelly_from_trades_matches_manual_calc():
     print("test_kelly_from_trades_matches_manual_calc passed")
 
 
+def test_forward_returns_never_bridge_a_removed_row():
+    # The whole point of the gap guard. Quarantine removes d3, so d2's "next
+    # row" is d4 - three days and a contamination-sized jump away. A plain
+    # shift(-1) would report that as a real +354% next-day return and feed it
+    # in as a training label.
+    px = pd.DataFrame({
+        "ticker": ["A"] * 4,
+        "date": ["d1", "d2", "d4", "d5"],
+        "close": [100.0, 110.0, 500.0, 505.0],
+    })
+    out = add_forward_returns(px, ["d1", "d2", "d3", "d4", "d5"], horizons=(1,))
+    by_date = out.set_index("date")["fwd_1"]
+    assert abs(by_date["d1"] - 0.10) < 1e-9, "contiguous row must still compute"
+    assert np.isnan(by_date["d2"]), "d2->d4 spans the removed d3 and must be NaN"
+    assert abs(by_date["d4"] - 0.01) < 1e-9, "contiguity resumes after the hole"
+    assert np.isnan(by_date["d5"]), "last row has no next row"
+    print("test_forward_returns_never_bridge_a_removed_row passed")
+
+
+def test_lagged_returns_guarded_the_same_way():
+    # Same hole, read backwards: d4's previous surviving row is d2, so a
+    # momentum feature there would be fabricated too.
+    px = pd.DataFrame({
+        "ticker": ["A"] * 4,
+        "date": ["d1", "d2", "d4", "d5"],
+        "close": [100.0, 110.0, 500.0, 505.0],
+    })
+    out = add_lagged_returns(px, ["d1", "d2", "d3", "d4", "d5"], lags=(1,))
+    by_date = out.set_index("date")["lag_1"]
+    assert np.isnan(by_date["d1"]), "first row has no previous row"
+    assert abs(by_date["d2"] - 0.10) < 1e-9
+    assert np.isnan(by_date["d4"]), "d2->d4 spans the removed d3 and must be NaN"
+    assert abs(by_date["d5"] - 0.01) < 1e-9
+    print("test_lagged_returns_guarded_the_same_way passed")
+
+
+def test_extreme_windows_share_the_contiguity_mask():
+    # max_h / mdd_h roll over the same h rows the endpoint spans, so a window
+    # that bridges a hole must be dropped, not just the endpoint return.
+    px = pd.DataFrame({
+        "ticker": ["A"] * 4,
+        "date": ["d1", "d2", "d4", "d5"],
+        "close": [100.0, 110.0, 500.0, 505.0],
+        "high": [105.0, 115.0, 520.0, 515.0],
+        "low": [95.0, 105.0, 480.0, 495.0],
+    })
+    out = add_forward_returns(px, ["d1", "d2", "d3", "d4", "d5"],
+                              horizons=(1,), extremes=True)
+    by_date = out.set_index("date")
+    assert np.isnan(by_date.loc["d2", "max_1"]), "bridged window must be NaN"
+    assert np.isnan(by_date.loc["d2", "mdd_1"]), "bridged window must be NaN"
+    assert abs(by_date.loc["d1", "max_1"] - 0.15) < 1e-9   # high 115 vs close 100
+    assert abs(by_date.loc["d1", "mdd_1"] - 0.05) < 1e-9   # low 105 vs close 100
+    print("test_extreme_windows_share_the_contiguity_mask passed")
+
+
 if __name__ == "__main__":
+    test_forward_returns_never_bridge_a_removed_row()
+    test_lagged_returns_guarded_the_same_way()
+    test_extreme_windows_share_the_contiguity_mask()
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()
     test_price_features_no_leakage()
