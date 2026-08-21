@@ -18,7 +18,7 @@ from walk_forward_backtest import (
 )
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
-                         series_signature, ticker_from_title)
+                         series_signature, ticker_from_title, should_fail_run)
 
 
 def test_broker_day_aggregates_basic():
@@ -240,7 +240,29 @@ def test_ticker_from_title_only_asserts_when_it_can():
     print("test_ticker_from_title_only_asserts_when_it_can passed")
 
 
+
+def test_should_fail_run_tolerates_a_few_failures():
+    # A handful of tickers legitimately fail (suspended, no chart). Reddening the
+    # workflow for those would train everyone to ignore it.
+    assert should_fail_run(0, 45) is False
+    assert should_fail_run(5, 45) is False       # 11%
+    assert should_fail_run(13, 45) is False      # 29%, just under the 30% limit
+    print("test_should_fail_run_tolerates_a_few_failures passed")
+
+
+def test_should_fail_run_catches_a_broken_scrape():
+    # The case this exists for: every ticker failed, price_history is unchanged,
+    # the contamination gate sees no growth and passes, and nothing is committed.
+    # Without this the run would go GREEN having done nothing at all.
+    assert should_fail_run(45, 45) is True
+    assert should_fail_run(14, 45) is True       # 31%, just over
+    assert should_fail_run(0, 0) is True         # nothing attempted is a failure
+    print("test_should_fail_run_catches_a_broken_scrape passed")
+
+
 if __name__ == "__main__":
+    test_should_fail_run_tolerates_a_few_failures()
+    test_should_fail_run_catches_a_broken_scrape()
     test_series_signature_distinguishes_two_stocks()
     test_series_signature_none_when_empty()
     test_ticker_from_title_only_asserts_when_it_can()

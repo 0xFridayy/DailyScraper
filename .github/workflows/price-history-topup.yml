@@ -57,6 +57,20 @@ jobs:
       - name: Top up price_history (all tracked tickers)
         run: python backfill_inventory.py
 
+      # backfill_inventory.py dumps one screenshot + page HTML on its FIRST
+      # failure. Without this upload a selector break leaves only stdout, and
+      # diagnosing it costs another day. Mirrors daily-scrape.yml.
+      - name: Upload failure snapshot for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: topup-failure-${{ github.run_id }}
+          path: |
+            topup-failure.png
+            topup-failure.html
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Fail if the scrape introduced new contamination
         run: |
           AFTER=$(python price_audit.py count)

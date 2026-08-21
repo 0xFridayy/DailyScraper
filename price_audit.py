@@ -149,6 +149,24 @@ def ticker_from_title(title):
     return m.group(1) if m else None
 
 
+def should_fail_run(n_failed, n_total, max_failure_rate=0.30):
+    """Should a backfill run exit non-zero?
+
+    run_backfill() used to print its failures and return 0 regardless. That made
+    a TOTAL failure indistinguishable from success at the workflow level: no
+    tickers scraped means price_history is unchanged, which means the
+    contamination gate sees no growth and passes, which means the commit step
+    finds nothing to commit — and the run goes green having done nothing.
+
+    A few failures are normal (a suspended ticker, a name with no chart), so the
+    threshold is a rate rather than "any failure at all". Lives here so it is
+    testable without playwright.
+    """
+    if n_total <= 0:
+        return True                       # nothing attempted is itself a failure
+    return (n_failed / n_total) > max_failure_rate
+
+
 # ─────────────────────────────────────────────
 #  CLEAN-PANEL HELPERS
 #
