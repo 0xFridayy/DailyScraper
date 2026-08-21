@@ -46,13 +46,24 @@ page.wait_for_timeout(15000)     # ← timeout tetap, bukan menunggu kondisi
 return page.evaluate(EXTRACT_JS)
 ```
 
-Tingkat kontaminasi 92% (bukan ~5%) menunjukkan ini **bukan** race condition
+> **KOREKSI 2026-08-21.** Paragraf di bawah ini keliru — lihat Lampiran G.
+> Rerun tanpa perubahan kode apa pun menyembuhkan CDIA dan COIN dari 231 baris
+> rusak menjadi 0. Kalau ini salah-pilih deterministik, itu mustahil terjadi.
+> Ini memang **race condition**; kemarin race-nya kalah, semalam menang.
+> Re-scrape TIDAK otomatis mereproduksi kesalahan yang sama — tapi juga tidak
+> otomatis memperbaikinya, jadi tahap 2 tetap perbaikan yang benar. Yang
+> berubah adalah alasannya: bukan "re-scrape percuma", melainkan "re-scrape
+> adalah undian, dan tahap 2 menghentikan undiannya".
+
+~~Tingkat kontaminasi 92% (bukan ~5%) menunjukkan ini **bukan** race condition
 acak, melainkan salah pilih yang konsisten: untuk pasangan ticker yang
 sama-sama muncul di hasil filter dropdown, `Enter` selalu mengambil yang
-salah. Pola 5% pada BREN/JARR/PGUN kemungkinan memang race yang berbeda.
+salah.~~ Pola 5% pada BREN/JARR/PGUN kemungkinan memang race yang berbeda.
 
-**Konsekuensi: re-scrape tanpa memperbaiki bug ini akan mereproduksi
-kesalahan yang sama.** Perbaiki dulu, baru scrape ulang.
+Bukti pendukung yang tetap berlaku: dua pasangan terparah **bersebelahan
+persis** di urutan scrape alfabetis (CDIA→COIN indeks 9→10, DOOH→ELTY 13→14).
+Itu justru konsisten dengan hipotesis chart-basi: ticker ke-N membaca chart
+ticker ke-(N−1) kalau render belum selesai.
 
 ### Penularan ke broker_flow
 
@@ -180,11 +191,18 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 - [x] `py price_audit.py audit`, konfirmasi angkanya cocok dengan brief ini
       → **cocok persis**, lihat Lampiran A
 - [ ] `py price_audit.py quarantine`
-- [ ] Buang COIN, CDIA, DOOH, ELTY **dan KIOS, RSGK** dari universe training.
-      Koreksi: KIOS (56,6%) dan RSGK (58,4%) juga rusak lebih dari separuh —
-      keduanya berbagi OHLCV *beserta volume persis sampai lembar* di 134
-      tanggal, jadi bukan false positive detektor. Sisanya **39** ticker,
-      bukan 41.
+- [ ] ~~Buang COIN, CDIA, DOOH, ELTY dari universe training (rusak >90%,
+      re-fetch tidak sepadan).~~ **DIBATALKAN 2026-08-21 — lihat Lampiran G.**
+      Re-fetch ternyata SANGAT sepadan: satu rerun `backfill_inventory.py`
+      tanpa perubahan kode apa pun menyembuhkan 899 dari 1.400 baris semalam
+      dan tidak merusak satu pun yang baru. CDIA dan COIN turun dari 231 baris
+      rusak menjadi **0**; ELTY 228→9, DOOH 230→12. Membuang keempatnya
+      sekarang justru membuang data bersih.
+- [ ] Yang masih perlu ditangani: **KIOS (142) dan RSGK (135)** — nol
+      perubahan setelah rerun, jadi jalur kegagalan yang berbeda. Keduanya
+      berbagi OHLCV *beserta volume persis sampai lembar* di 134 tanggal, jadi
+      bukan false positive detektor. Kalau tetap membandel setelah tahap 2,
+      barulah pertimbangkan membuangnya.
 - [ ] **Jangan** pakai `LEFT JOIN price_quarantine ... WHERE IS NULL` sendirian.
       Filter itu perlu tapi **tidak cukup**: `groupby.shift(-h)` tidak tahu ada
       baris yang dibuang, jadi ia menyambung baris bersih terakhir ke baris
@@ -204,18 +222,40 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       `walk_forward_backtest.build_panel()` dan
       `ddqn_entry_exit.build_episode_frame()`.
       Regresi: 3 tes di `test_pipeline.py` mengunci perilaku ini.
+- [ ] Pertimbangkan menjalankan `py backfill_inventory.py` beberapa kali
+      **setelah tahap 2 selesai**. Karena `insert_ticker_data()` menulis
+      `price_history` dengan `INSERT OR REPLACE` untuk seluruh rentang chart,
+      tiap rerun menimpa ulang sejarah — dengan scraper yang sudah benar, itu
+      jalur pembersihan paling murah, jauh lebih baik daripada membuang ticker.
 
 ### 2. Perbaiki scraper agar tidak berulang
 
-- [ ] Ganti `keyboard.type()` + `Enter` dengan pemilihan opsi eksplisit
-      (klik elemen `<option>` yang teksnya cocok persis)
-- [ ] Ganti `wait_for_timeout(15000)` dengan `wait_for_function` yang
-      memverifikasi judul chart / data point pertama cocok dengan ticker
-      yang diminta, sebelum `EXTRACT_JS` dibaca
-- [ ] Tambahkan assertion keras di `insert_ticker_data()`: tolak payload
-      kalau ticker di chart ≠ ticker yang diminta
-- [ ] Pasang `price_audit.py audit` sebagai step di `daily-scrape.yml` —
-      gagalkan workflow kalau ada `limit_violation` baru
+- [x] Ganti `keyboard.type()` + `Enter` dengan pemilihan opsi eksplisit
+      → `select_ticker()` mencocokkan teks opsi, mengklik lewat Playwright
+      (bukan `el.click()`, karena react-select v1 bereaksi pada `mousedown`),
+      lalu memastikan label kontrol benar-benar menampilkan ticker itu
+- [x] Ganti `wait_for_timeout(15000)` dengan `wait_for_function`
+      → chart di-fingerprint sebelum submit; menunggu fingerprint **berubah**
+      lalu **berhenti berubah**. Ini tidak bergantung pada markup judul yang
+      tidak bisa kami periksa dari sini, dan langsung menyasar kegagalannya:
+      chart ticker sebelumnya masih di layar saat ekstraksi
+- [x] Assertion keras di `insert_ticker_data()`
+      → `ticker_from_title()`; sengaja bersyarat: judul yang tidak memuat kode
+      4 huruf tidak dianggap mismatch (format judul tidak dijamin), tapi kalau
+      kodenya ADA dan berbeda, payload ditolak
+- [x] Guard ketiga yang tidak butuh pengetahuan halaman sama sekali: tolak
+      payload kalau seri OHLCV-nya identik dengan ticker sebelumnya
+      (`series_signature()`) — dua saham berbeda tidak mungkin identik
+- [x] Gerbang audit di workflow → `price-history-topup.yml` mencatat jumlah
+      kontaminasi sebelum & sesudah scrape dan **gagal sebelum commit** kalau
+      bertambah. Dipasang di sana, bukan `daily-scrape.yml`, karena yang
+      menulis `price_history` adalah `backfill_inventory.py`
+- [ ] **Belum diuji terhadap situs live** — tidak ada kredensial NeoBDM di
+      sesi ini. Yang sudah diuji: 16 tes perilaku JS terhadap DOM palsu
+      (termasuk skenario chart-basi), `node --check` atas seluruh snippet JS,
+      dan 3 tes regresi Python untuk guard-nya. Jalan pertama di produksi
+      perlu dilihat; kalau `select_ticker` gagal, kemungkinan besar selector
+      `.Select-option` berbeda di halaman itu.
 
 ### 3. Ganti metrik
 
@@ -426,3 +466,53 @@ diketahui dilaporkan sebagai peringatan; build hanya gagal kalau jumlahnya
 **bertambah**. Turunkan angkanya sambil tahap 1 dan 3 dikerjakan — keduanya
 seharusnya berakhir di 0. Ini disengaja: checker yang merah permanen melatih
 orang mengabaikannya, sementara budget tetap bisa menangkap regresi.
+
+## G. Kontaminasi sembuh sendiri semalam — ini race, bukan salah-pilih tetap
+
+Diukur 2026-08-21, membandingkan `neobdm.db` sebelum dan sesudah satu jalannya
+`price-history-topup.yml` (yang menjalankan `backfill_inventory.py` **tanpa
+perubahan kode apa pun**):
+
+| | 20 Agu | 21 Agu |
+|---|---|---|
+| baris suspect | 1.400 (12,5%) | **501 (4,4%)** |
+| sembuh (rusak→benar) | — | **899** |
+| baru rusak (benar→rusak) | — | **0** |
+
+Per ticker: **CDIA 231→0**, **COIN 231→0**, ELTY 228→9, DOOH 230→12.
+Yang **nol perubahan**: KIOS 142, RSGK 135, BREN 39, SINI 29, dan seluruh
+kelompok ~5%.
+
+### Ini benar-benar sembuh, bukan sekadar berhenti bertabrakan
+
+Kekhawatiran yang wajar: `cross_ticker_dup` berhenti menyala bisa saja berarti
+backfill menulis nilai salah yang *berbeda*, bukan nilai yang benar. Diuji
+terhadap arbiter independen (`market_summary_daily`, jalur scrape terpisah,
+offset 1 hari per Lampiran E): **5 dari 5** baris yang kemarin rusak dan bisa
+diverifikasi kini cocok persis dengan screener. Yang paling telak:
+
+```
+ELTY 2026-08-18   kemarin inventory=326 (harga DOOH)   hari ini inventory=39 = screener  ✓
+```
+
+Cek silang keseluruhan naik ke **56/56 (100%)**, dari 37 pasangan/92% sehari
+sebelumnya.
+
+### Kenapa rerun bisa menyembuhkan
+
+`insert_ticker_data()` menulis `price_history` dengan `INSERT OR REPLACE` untuk
+**seluruh rentang chart**, bukan hanya hari terakhir. Jadi tiap kali
+`backfill_inventory.py` jalan, ia menimpa ulang berbulan-bulan sejarah. Dengan
+scraper yang masih rusak itu berarti undian tiap malam; dengan scraper yang
+sudah diperbaiki (tahap 2), itu menjadi mekanisme pembersihan yang efektif dan
+gratis — jauh lebih baik daripada membuang ticker dari universe.
+
+### Konsekuensi
+
+1. Tahap 1 tidak lagi perlu membuang CDIA/COIN/DOOH/ELTY — sudah bersih.
+2. Tahap 2 naik prioritas: selama race-nya masih ada, tiap malam bisa merusak
+   ulang apa yang semalam sembuh.
+3. `IMPOSSIBLE_TARGET_BUDGET` di `check_ml_health.py` diturunkan 88 → 82.
+   Turunkan lagi tiap kali bisa; ada catatan ratchet di file itu.
+4. KIOS/RSGK yang nol perubahan menguatkan dugaan jalur kegagalan kedua —
+   kolisinya juga mulai tepat 2025-09-01, hari pertama RSGK masuk universe.

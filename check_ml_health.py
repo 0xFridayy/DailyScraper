@@ -73,11 +73,17 @@ LIMIT_TOLERANCE = 0.01
 # See KNOWN-DEFECT BUDGET above. Both ratchet down, never up.
 SQRT252_BUDGET = 4
 # build_panel() still reads price_history directly, so contaminated rows reach
-# the panel and 88 targets land outside the IDX limit band. Swapping it to
+# the panel and land outside the IDX limit band. Swapping it to
 # price_audit.clean_panel() (HANDOFF.md stage 1) takes this to 0. Pinned rather
 # than merely reported so that contamination getting WORSE still fails the
 # build, instead of hiding inside a number that was already red.
-IMPOSSIBLE_TARGET_BUDGET = 88
+#
+# Ratchet log - lower this every time it can be lowered, never raise it:
+#   2026-08-20  88   initial pin
+#   2026-08-21  82   an unchanged rerun of backfill_inventory.py healed 899 of
+#                    1,400 contaminated rows overnight (CDIA and COIN went from
+#                    231 bad rows each to 0) and broke zero new ones
+IMPOSSIBLE_TARGET_BUDGET = 82
 SHARPE_IMPLAUSIBLE = 4.0
 
 

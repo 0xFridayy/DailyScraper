@@ -4,14 +4,17 @@ price_history integrity audit + repair.
 WHY THIS EXISTS
 ---------------
 price_history contains ticker cross-contamination: identical OHLCV rows
-written under multiple tickers on the same date (see audit output). Suspected
-cause is scrape_ticker() in backfill_inventory.py selecting a ticker via
-keyboard.type() + fixed wait_for_timeout(), then reading EXTRACT_JS off a
-chart that has not finished re-rendering - so the PREVIOUS ticker's series
-gets stored under the CURRENT ticker's name. Fixed timeouts on a dynamic
-Plotly page are inherently racy; the fix upstream is to wait on a condition
-(chart title / first data point matching the requested ticker) rather than a
-duration. Until that is fixed, re-scraping will keep reintroducing this.
+written under multiple tickers on the same date (see audit output). The cause
+was scrape_ticker() in backfill_inventory.py selecting a ticker via
+keyboard.type() + Enter and then reading EXTRACT_JS after a fixed
+wait_for_timeout(), so the PREVIOUS ticker's series could still be on screen
+and get stored under the CURRENT ticker's name.
+
+Confirmed a race rather than a consistent mis-pick: on 2026-08-21 an unchanged
+rerun healed 899 of 1,400 contaminated rows and broke zero new ones, taking
+CDIA and COIN from 231 bad rows each to 0. Both fixed waits have since been
+replaced with waits on a condition, and the guards below back that up. The
+historical backlog still in the table is what this module is for.
 
 WHY IT ALSO CORRUPTS broker_flow
 ---------------------------------
@@ -43,6 +46,7 @@ DETECTORS
 USAGE
 -----
     py price_audit.py audit                  # report only, no writes
+    py price_audit.py count                  # suspect count only (CI gate)
     py price_audit.py quarantine             # mark bad rows, write audit table
     py price_audit.py repair corrected.csv   # apply fixes + rescale netval
 
@@ -51,6 +55,7 @@ Get it from any reliable OHLCV source for the flagged (date, ticker) pairs.
 """
 
 import os
+import re
 import sys
 import sqlite3
 import numpy as np
@@ -105,6 +110,43 @@ def _reasons(row):
     return "+".join(
         r for r in ["limit_violation", "cross_ticker_dup", "series_break"] if row[r]
     )
+
+
+# ─────────────────────────────────────────────
+#  SCRAPE-TIME GUARDS
+#
+#  Used by backfill_inventory.py while scraping. They live here, not there,
+#  because there they would be unimportable without playwright and NeoBDM
+#  credentials — and therefore untestable in CI, which is the one place a
+#  regression in them needs to be caught.
+# ─────────────────────────────────────────────
+
+def series_signature(price_payload):
+    """Cheap identity of a scraped OHLCV series.
+
+    Used by backfill_inventory.py as its last line of defence: two different
+    stocks cannot produce byte-identical OHLCV, so if consecutive tickers do,
+    the second one was read off a chart that had not re-rendered yet. Lives
+    here rather than in the scraper so it is importable — and therefore
+    testable in CI — without playwright or NeoBDM credentials.
+    """
+    p = price_payload or {}
+    if not p.get("x"):
+        return None
+    c = p.get("close") or []
+    return (len(p["x"]), tuple(p["x"][:3]), tuple(p["x"][-3:]),
+            tuple(c[:3]), tuple(c[-3:]))
+
+
+def ticker_from_title(title):
+    """The 4-letter code a chart title claims to be showing, or None.
+
+    Returning None for a title that carries no code is deliberate: the title
+    format is not guaranteed, so absence must not be treated as a mismatch.
+    When a code IS present it is authoritative.
+    """
+    m = re.search(r"\b([A-Z]{4})\b", str(title or ""))
+    return m.group(1) if m else None
 
 
 # ─────────────────────────────────────────────
@@ -261,6 +303,16 @@ def cmd_audit(conn):
           "- this is the (date,ticker) list to re-fetch prices for")
 
 
+def cmd_count(conn):
+    """Just the suspect count, for use as a CI regression gate.
+
+    The absolute number is not the point - the backlog is large and shrinking.
+    What matters is whether a scrape run made it BIGGER, so the workflow takes
+    a reading before and after and compares.
+    """
+    print(int(detect(load(conn))["suspect"].sum()))
+
+
 def cmd_quarantine(conn):
     px = detect(load(conn))
     bad = px[px["suspect"]].copy()
@@ -325,6 +377,8 @@ if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
     if cmd == "audit":
         cmd_audit(conn)
+    elif cmd == "count":
+        cmd_count(conn)
     elif cmd == "quarantine":
         cmd_quarantine(conn)
     elif cmd == "repair":

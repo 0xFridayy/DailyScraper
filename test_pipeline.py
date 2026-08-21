@@ -17,7 +17,8 @@ from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, sharpe_stats,
 )
 from kelly_sizing import kelly_fraction, kelly_from_trades
-from price_audit import add_forward_returns, add_lagged_returns
+from price_audit import (add_forward_returns, add_lagged_returns,
+                         series_signature, ticker_from_title)
 
 
 def test_broker_day_aggregates_basic():
@@ -199,7 +200,50 @@ def test_extreme_windows_share_the_contiguity_mask():
     print("test_extreme_windows_share_the_contiguity_mask passed")
 
 
+
+def test_series_signature_distinguishes_two_stocks():
+    # The scraper's last-line-of-defence guard. Two different stocks must never
+    # produce the same signature; the same series must always produce the same
+    # one, or the stale-chart check either never fires or fires constantly.
+    cdia = {"x": ["2026-01-01", "2026-01-02"], "close": [700.0, 715.0]}
+    coin = {"x": ["2026-01-01", "2026-01-02"], "close": [2560.0, 2600.0]}
+    assert series_signature(cdia) == series_signature(dict(cdia))
+    assert series_signature(cdia) != series_signature(coin)
+    # A stale chart hands back the PREVIOUS ticker's series verbatim - which is
+    # exactly the equality the guard trips on.
+    assert series_signature(cdia) == series_signature({"x": cdia["x"], "close": cdia["close"]})
+    print("test_series_signature_distinguishes_two_stocks passed")
+
+
+def test_series_signature_none_when_empty():
+    # No series means "nothing to compare", not "identical to the last one" -
+    # returning a truthy constant here would abort every empty scrape as a
+    # duplicate.
+    assert series_signature(None) is None
+    assert series_signature({}) is None
+    assert series_signature({"x": [], "close": []}) is None
+    print("test_series_signature_none_when_empty passed")
+
+
+def test_ticker_from_title_only_asserts_when_it_can():
+    # Present and authoritative.
+    assert ticker_from_title("CDIA - Chandra Daya Investasi") == "CDIA"
+    assert ticker_from_title("Inventory chart: COIN") == "COIN"
+    # Absent must be None, NOT a guess: the title format is not guaranteed, and
+    # treating "no code found" as a mismatch would abort every valid scrape.
+    assert ticker_from_title("") is None
+    assert ticker_from_title(None) is None
+    assert ticker_from_title("Broker inventory") is None
+    # Lowercase and wrong-length words are not codes.
+    assert ticker_from_title("cdia daily chart") is None
+    assert ticker_from_title("PT ABC") is None
+    print("test_ticker_from_title_only_asserts_when_it_can passed")
+
+
 if __name__ == "__main__":
+    test_series_signature_distinguishes_two_stocks()
+    test_series_signature_none_when_empty()
+    test_ticker_from_title_only_asserts_when_it_can()
     test_forward_returns_never_bridge_a_removed_row()
     test_lagged_returns_guarded_the_same_way()
     test_extreme_windows_share_the_contiguity_mask()

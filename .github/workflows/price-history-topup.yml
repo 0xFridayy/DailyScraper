@@ -46,8 +46,25 @@ jobs:
       - name: Install Playwright Chromium (+ system deps)
         run: python -m playwright install --with-deps chromium
 
+      # HANDOFF.md stage 2: gate the commit on the scrape not having made things
+      # worse. An absolute threshold would be useless here - the historical
+      # backlog is large and shrinking - so this compares before against after
+      # and only fails on a REGRESSION. Because the commit step below does not
+      # run when this fails, contaminated rows never reach master.
+      - name: Record contamination baseline
+        run: echo "CONTAM_BEFORE=$(python price_audit.py count)" >> "$GITHUB_ENV"
+
       - name: Top up price_history (all tracked tickers)
         run: python backfill_inventory.py
+
+      - name: Fail if the scrape introduced new contamination
+        run: |
+          AFTER=$(python price_audit.py count)
+          echo "contaminated price_history rows: $CONTAM_BEFORE -> $AFTER"
+          if [ "$AFTER" -gt "$CONTAM_BEFORE" ]; then
+            echo "::error::scrape added $((AFTER - CONTAM_BEFORE)) contaminated rows - not committing"
+            exit 1
+          fi
 
       - name: Commit updated neobdm.db
         run: |
