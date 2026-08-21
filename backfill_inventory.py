@@ -33,9 +33,15 @@ import time
 
 from playwright.sync_api import sync_playwright
 from neobdm_scraper import login, NEOBDM_INVENTORY_URL, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
-from price_audit import series_signature, ticker_from_title
+from price_audit import series_signature, ticker_from_title, should_fail_run
 
 BACKFILL_END = "2026-07-04"  # never overwrite live-scraped rows from 07-05 onward
+
+# Above this share of failed tickers the run exits non-zero. A few failures are
+# normal (suspended name, no chart); a wholesale failure must not look like
+# success - see price_audit.should_fail_run for why that mattered.
+MAX_FAILURE_RATE = 0.30
+FAILURE_SNAPSHOT = "topup-failure"   # .png / .html, uploaded as a CI artifact
 
 EXTRACT_JS = """() => {
     const el = document.querySelector('.js-plotly-plot');
@@ -163,28 +169,51 @@ READ_FINGERPRINT_JS = "() => { %s return __fp(); }" % _FINGERPRINT_FN
 CHART_CHANGED_JS = ("(prev) => { %s const fp = __fp(); "
                     "return fp !== null && fp !== prev; }" % _FINGERPRINT_FN)
 
-# react-select renders options as .Select-option; the label may be just the
-# code or "CODE - Company Name", so match the leading code either way.
+# The option list and the selected-value label are the only two selectors here
+# that were NOT already proven in production, so both are hedged with
+# alternatives. react-select v1 markup comes first, since the sibling selector
+# "#tick .Select-control" is proven and belongs to that same markup family; then
+# the ARIA role, then the virtualized-list class Dash uses for long lists.
+#
+# All candidates are tested inside ONE predicate rather than probed in sequence.
+# Sequential probing would multiply the timeout: 4 candidates x SELECT_TIMEOUT x
+# 45 tickers is far past the workflow's 35-minute budget, so a wrong first guess
+# would become a timeout rather than a fallback.
+OPTION_SELECTORS = ["#tick .Select-option", "#tick [role='option']",
+                    "#tick .VirtualizedSelectOption", "#tick .Select-menu-outer div"]
+VALUE_SELECTORS = ["#tick .Select-value-label", "#tick .Select-value",
+                   "#tick [role='combobox']"]
+
+# The label may be just the code or "CODE - Company Name", so match the leading
+# code either way. __pick returns the first selector that matches anything.
 _OPTION_CODE_JS = """
 function __code(el) {
     return el.textContent.replace(/\s+/g, ' ').trim().toUpperCase().split(/[^A-Z0-9]+/)[0];
 }
+function __pick(sels) {
+    for (const s of sels) {
+        const els = Array.from(document.querySelectorAll(s));
+        if (els.length) return {selector: s, els: els};
+    }
+    return {selector: null, els: []};
+}
 """
 
-OPTION_READY_JS = ("([want]) => { %s return Array.from("
-                   "document.querySelectorAll('#tick .Select-option'))"
-                   ".some(o => __code(o) === want.toUpperCase()); }" % _OPTION_CODE_JS)
+OPTION_READY_JS = ("([want, sels]) => { %s "
+                   "return __pick(sels).els.some(o => __code(o) === want.toUpperCase()); }"
+                   % _OPTION_CODE_JS)
 
-FIND_OPTION_JS = ("([want]) => { %s "
-                  "const opts = Array.from(document.querySelectorAll('#tick .Select-option'));"
-                  "return {index: opts.findIndex(o => __code(o) === want.toUpperCase()),"
-                  " texts: opts.slice(0, 8).map(o => o.textContent.replace(/\s+/g,' ').trim())}; }"
+FIND_OPTION_JS = ("([want, sels]) => { %s "
+                  "const hit = __pick(sels);"
+                  "return {selector: hit.selector,"
+                  " index: hit.els.findIndex(o => __code(o) === want.toUpperCase()),"
+                  " texts: hit.els.slice(0, 8).map(o => o.textContent.replace(/\s+/g,' ').trim())}; }"
                   % _OPTION_CODE_JS)
 
-VALUE_SETTLED_JS = ("([want]) => { %s "
-                    "const el = document.querySelector('#tick .Select-value-label')"
-                    " || document.querySelector('#tick .Select-value');"
-                    "return !!el && __code(el) === want.toUpperCase(); }" % _OPTION_CODE_JS)
+VALUE_SETTLED_JS = ("([want, sels]) => { %s "
+                    "const hit = __pick(sels);"
+                    "return hit.els.some(el => __code(el) === want.toUpperCase()); }"
+                    % _OPTION_CODE_JS)
 
 
 class TickerMismatch(RuntimeError):
@@ -202,16 +231,21 @@ def select_ticker(page, ticker):
     page.keyboard.press("Control+A")          # drop the previous ticker's text
     page.keyboard.type(ticker, delay=40)
 
-    page.wait_for_function(OPTION_READY_JS, arg=[ticker], timeout=SELECT_TIMEOUT)
+    page.wait_for_function(OPTION_READY_JS, arg=[ticker, OPTION_SELECTORS],
+                           timeout=SELECT_TIMEOUT)
 
-    found = page.evaluate(FIND_OPTION_JS, [ticker])
+    found = page.evaluate(FIND_OPTION_JS, [ticker, OPTION_SELECTORS])
     if found["index"] < 0:
-        raise TickerMismatch(f"{ticker}: no dropdown option matched (saw {found['texts']})")
+        raise TickerMismatch(
+            f"{ticker}: no dropdown option matched. tried={OPTION_SELECTORS} "
+            f"matched_selector={found['selector']!r} saw={found['texts']}")
 
     # Click through Playwright rather than el.click(): react-select v1 acts on
-    # mousedown, which a synthetic click() alone would not deliver.
-    page.locator("#tick .Select-option").nth(found["index"]).click()
-    page.wait_for_function(VALUE_SETTLED_JS, arg=[ticker], timeout=SELECT_TIMEOUT)
+    # mousedown, which a synthetic click() alone would not deliver. Click via the
+    # selector that actually matched, not a hardcoded one.
+    page.locator(found["selector"]).nth(found["index"]).click()
+    page.wait_for_function(VALUE_SETTLED_JS, arg=[ticker, VALUE_SELECTORS],
+                           timeout=SELECT_TIMEOUT)
 
 
 def scrape_ticker(page, ticker, date_range_already_set, prev_fingerprint=None):
@@ -346,6 +380,17 @@ def run_backfill(tickers):
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
             except Exception as e:
                 print(f"  FAILED: {e}")
+                if not failed:
+                    # First failure only: 45 dumps would be noise, and one is
+                    # enough to identify the markup. Wrapped so a failing
+                    # screenshot never masks the error we actually care about.
+                    try:
+                        page.screenshot(path=f"{FAILURE_SNAPSHOT}.png", full_page=True)
+                        with open(f"{FAILURE_SNAPSHOT}.html", "w", encoding="utf-8") as fh:
+                            fh.write(page.content())
+                        print(f"  saved {FAILURE_SNAPSHOT}.png / .html for diagnosis")
+                    except Exception as snap_err:
+                        print(f"  (could not save failure snapshot: {snap_err})")
                 failed.append(ticker)
                 # Re-read rather than carrying a fingerprint that may describe a
                 # chart we rejected, which would make the NEXT wait trivially true.
@@ -356,6 +401,14 @@ def run_backfill(tickers):
 
     conn.close()
     print(f"\nFailed tickers: {failed}")
+
+    if should_fail_run(len(failed), len(tickers), MAX_FAILURE_RATE):
+        rate = len(failed) / len(tickers) if tickers else 1.0
+        sys.exit(
+            f"ABORT: {len(failed)}/{len(tickers)} tickers failed ({rate:.0%}, "
+            f"limit {MAX_FAILURE_RATE:.0%}). Not a partial outage - treat this as "
+            f"the scrape being broken, and check {FAILURE_SNAPSHOT}.png/.html."
+        )
 
 
 if __name__ == "__main__":

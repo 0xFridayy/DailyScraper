@@ -250,6 +250,17 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       kontaminasi sebelum & sesudah scrape dan **gagal sebelum commit** kalau
       bertambah. Dipasang di sana, bukan `daily-scrape.yml`, karena yang
       menulis `price_history` adalah `backfill_inventory.py`
+- [x] Selector yang belum terbukti kini di-hedge → `OPTION_SELECTORS` dan
+      `VALUE_SELECTORS` menguji beberapa kandidat dalam **satu** predikat JS.
+      Bukan probe berurutan: 4 kandidat × 20 dtk × 45 ticker jauh melewati
+      batas 35 menit workflow, jadi tebakan pertama yang meleset akan jadi
+      timeout, bukan fallback
+- [x] Kegagalan massal kini exit non-nol → `should_fail_run()`. Sebelumnya
+      `run_backfill()` selalu exit 0, sehingga **kegagalan total tampak
+      seperti sukses**: tidak ada ticker ter-scrape → `price_history` tidak
+      berubah → gerbang kontaminasi lolos → tidak ada yang di-commit → hijau
+- [x] Bukti otomatis saat gagal → screenshot + HTML halaman disimpan pada
+      kegagalan **pertama** saja, diunggah sebagai artifact CI
 - [ ] **Belum diuji terhadap situs live** — tidak ada kredensial NeoBDM di
       sesi ini. Yang sudah diuji: 16 tes perilaku JS terhadap DOM palsu
       (termasuk skenario chart-basi), `node --check` atas seluruh snippet JS,
@@ -516,3 +527,32 @@ gratis — jauh lebih baik daripada membuang ticker dari universe.
    Turunkan lagi tiap kali bisa; ada catatan ratchet di file itu.
 4. KIOS/RSGK yang nol perubahan menguatkan dugaan jalur kegagalan kedua —
    kolisinya juga mulai tepat 2025-09-01, hari pertama RSGK masuk universe.
+
+## H. NeoBDM punya UI kedua: `/inventory-chart/`
+
+Screenshot 2026-08-21 menunjukkan halaman `neobdm.tech/inventory-chart/` dengan
+desain berbeda total dari yang di-scrape:
+
+| | `/inventory/` (dipakai scraper) | `/inventory-chart/` (baru) |
+|---|---|---|
+| pilih ticker | dropdown react-select | input teks biasa `Search ticker...` |
+| rentang tanggal | `DateRangePicker` (Start/End Date) | tombol preset 2W/1M/3M/6M/YTD/1Y |
+| memuat data | tombol `#submit-button` | tidak ada tombol submit |
+
+**Bukan keadaan darurat.** `/inventory/` masih hidup dan masih memberi data
+sampai hari ini (dikonfirmasi user), jadi scraper menyasar halaman yang benar.
+
+Dicatat karena dua hal:
+
+1. Ini bukti langsung NeoBDM sedang aktif mendesain ulang area ini — persis
+   kondisi yang di-hedge oleh `OPTION_SELECTORS`.
+2. Kalau suatu saat `/inventory/` dialihkan ke UI baru, yang dibutuhkan adalah
+   **penulisan ulang**, bukan tambal selector. Tidak ada tombol submit berarti
+   alur "pilih ticker → klik submit → tunggu chart" tidak berlaku lagi;
+   kemungkinan besar chart dimuat reaktif begitu ticker dipilih. Kalau gagal
+   nanti, diagnosis harus mulai dari sini, bukan dari daftar selector.
+
+Checker selector berkala sempat dipertimbangkan dan **ditolak user** — NeoBDM
+jarang mengubah hal yang merusak, dan kegagalannya sekarang sudah keras
+(exit non-nol + artifact). Kalau frekuensi perubahan naik, ini yang pertama
+perlu ditinjau ulang.
