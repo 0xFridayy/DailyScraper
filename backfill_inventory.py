@@ -31,7 +31,7 @@ import re
 import sqlite3
 import time
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from neobdm_scraper import login, NEOBDM_INVENTORY_URL, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 from price_audit import series_signature, ticker_from_title, should_fail_run
 
@@ -144,9 +144,22 @@ def extend_date_range_to_earliest(page, max_months_back=36):
 # ─────────────────────────────────────────────
 
 SELECT_TIMEOUT = 20_000
-CHART_RENDER_TIMEOUT = 60_000
 CHART_STABLE_TRIES = 20
 CHART_STABLE_PAUSE = 500
+
+# Run #15 (2026-08-22) showed the chart lagging exactly one request behind: the
+# N-th ticker rendered the (N-1)-th chart, for 40 of 45 tickers. BBHI, first in
+# the list and therefore with no predecessor, was the one early success. Cause is
+# almost certainly Dash state propagation - #submit-button fires a callback that
+# reads the dropdown value as State, and the click lands before the new selection
+# has reached Dash's store, so the callback renders the previous value.
+#
+# Waiting for the chart to merely CHANGE cannot catch that: it does change, just
+# to the wrong ticker. So the wait below checks chart IDENTITY, and re-clicks
+# submit when the chart comes back wrong.
+SUBMIT_SETTLE_PAUSE = 700     # throttle before submitting; see scrape_ticker
+CHART_ATTEMPT_TIMEOUT = 20_000
+MAX_SUBMIT_ATTEMPTS = 3       # 3 x 20s keeps the old 60s per-ticker budget
 
 # Shared by the read and the wait so both compute the identical fingerprint.
 _FINGERPRINT_FN = """
@@ -165,9 +178,41 @@ function __fp() {
 }
 """
 
+# Run #15 proved the chart title reliably carries the 4-letter code: every one
+# of the 40 mismatches reported a clean code (CUAN, DEWA, DOOH, ELTY, ...).
+# ticker_from_title() was written as a merely conditional guard because the title
+# format could not be verified without site access. It now can be, which is what
+# lets identity become the wait condition rather than a post-hoc check.
+# RAW string on purpose. In a normal Python string "\\b" is a BACKSPACE
+# character, which silently turns the word-boundary regex below into garbage —
+# __titleCode() then returns null for every chart and every wait quietly falls
+# back to the weak changed-fingerprint condition, undoing this whole fix. The
+# other JS constants here survive only because "\\s" happens not to be a
+# recognised Python escape; "\\b" is.
+_TITLE_CODE_FN = r"""
+function __titleCode() {
+    const el = document.querySelector('.js-plotly-plot');
+    if (!el) return null;
+    const lay = el.layout || {};
+    const t = (lay.title && (lay.title.text !== undefined ? lay.title.text : lay.title)) || '';
+    const m = String(t).match(/\b([A-Z]{4})\b/);
+    return m ? m[1] : null;
+}
+"""
+
 READ_FINGERPRINT_JS = "() => { %s return __fp(); }" % _FINGERPRINT_FN
+READ_TITLE_CODE_JS = "() => { %s return __titleCode(); }" % _TITLE_CODE_FN
 CHART_CHANGED_JS = ("(prev) => { %s const fp = __fp(); "
                     "return fp !== null && fp !== prev; }" % _FINGERPRINT_FN)
+
+# "Is the chart showing the ticker we asked for?" Falls back to the old
+# changed-fingerprint condition when the title carries no extractable code, so a
+# change in title format degrades to the previous behaviour instead of hanging.
+CHART_IS_JS = ("([want, prev]) => { %s %s "
+               "const code = __titleCode();"
+               "if (code) return code === want.toUpperCase();"
+               "const fp = __fp(); return fp !== null && fp !== prev; }"
+               % (_FINGERPRINT_FN, _TITLE_CODE_FN))
 
 # The option list and the selected-value label are the only two selectors here
 # that were NOT already proven in production, so both are hedged with
@@ -216,6 +261,21 @@ VALUE_SETTLED_JS = ("([want, sels]) => { %s "
                     % _OPTION_CODE_JS)
 
 
+# A stray Python escape inside any JS blob above becomes a control character and
+# silently breaks the regex it sits in — __titleCode() then returns null for every
+# chart and every identity wait quietly degrades to the weak fallback, undoing the
+# fix without erroring. That happened once during development. Fail at import
+# instead of discovering it 45 tickers into a scrape.
+for _name, _js in (("_FINGERPRINT_FN", _FINGERPRINT_FN),
+                   ("_TITLE_CODE_FN", _TITLE_CODE_FN),
+                   ("_OPTION_CODE_JS", _OPTION_CODE_JS)):
+    _bad = [c for c in _js if ord(c) < 32 and c not in "\n\r\t"]
+    if _bad:
+        raise RuntimeError(
+            f"{_name} contains control character {_bad[0]!r} — a Python escape "
+            f"leaked into the JS. Make it a raw string (r\"\"\"...\"\"\").")
+
+
 class TickerMismatch(RuntimeError):
     """The page is not showing the ticker we asked for. Never store the payload."""
 
@@ -256,11 +316,29 @@ def scrape_ticker(page, ticker, date_range_already_set, prev_fingerprint=None):
     if not date_range_already_set:
         extend_date_range_to_earliest(page)
 
-    page.click("#submit-button")
+    # A throttle, NOT a correctness assumption - nothing is read on the strength
+    # of it. It only makes the retry below rare, since a retry on every one of 45
+    # tickers would not fit the workflow budget. Correctness comes from the
+    # identity wait, which is what the fixed timeouts of the original code lacked.
+    page.wait_for_timeout(SUBMIT_SETTLE_PAUSE)
 
-    # 1. Wait for the chart to stop being whatever was on screen before.
-    page.wait_for_function(CHART_CHANGED_JS, arg=prev_fingerprint,
-                           timeout=CHART_RENDER_TIMEOUT)
+    # 1. Submit, then wait for the chart to show THIS ticker - not merely a
+    #    different one. If the callback ran against a stale selection the chart
+    #    renders the previous ticker and then sits there, so waiting alone would
+    #    time out; re-clicking submit is what actually resolves it.
+    seen = None
+    for _ in range(MAX_SUBMIT_ATTEMPTS):
+        page.click("#submit-button")
+        try:
+            page.wait_for_function(CHART_IS_JS, arg=[ticker, prev_fingerprint],
+                                   timeout=CHART_ATTEMPT_TIMEOUT)
+            break
+        except PlaywrightTimeout:
+            seen = page.evaluate(READ_TITLE_CODE_JS)
+    else:
+        raise TickerMismatch(
+            f"{ticker}: chart still showing {seen!r} after {MAX_SUBMIT_ATTEMPTS} "
+            f"submits — the selection is not reaching the callback")
 
     # 2. Wait for it to stop moving, so extraction cannot catch a partial redraw.
     fingerprint = page.evaluate(READ_FINGERPRINT_JS)

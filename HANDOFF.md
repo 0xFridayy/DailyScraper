@@ -556,3 +556,67 @@ Checker selector berkala sempat dipertimbangkan dan **ditolak user** — NeoBDM
 jarang mengubah hal yang merusak, dan kegagalannya sekarang sudah keras
 (exit non-nol + artifact). Kalau frekuensi perubahan naik, ini yang pertama
 perlu ditinjau ulang.
+
+## I. Mekanisme kontaminasi TERBUKTI — run #15, 2026-08-22
+
+Run pertama `price-history-topup.yml` dengan scraper hasil perbaikan
+(PR #18 + #19) **gagal, dan gagal persis seperti yang dirancang.**
+
+```
+=== DEWA ===  FAILED: chart is showing CUAN but we asked for DEWA
+=== DOOH ===  FAILED: chart is showing DEWA but we asked for DOOH
+=== ELTY ===  FAILED: chart is showing DOOH but we asked for ELTY
+```
+
+**Chart tertinggal tepat satu permintaan.** BBHI — pertama di daftar alfabetis,
+jadi tidak punya pendahulu — satu-satunya yang berhasil di awal. 40 dari 45
+ticker ditolak dengan pola ini.
+
+Ini menaikkan Temuan 1 dari **inferensi menjadi observasi langsung**. Dugaan
+"ticker ke-N membaca chart ticker ke-(N−1)" yang dulu ditarik dari baris
+duplikat kini terlihat apa adanya di log.
+
+### Guard-nya bekerja
+
+| | |
+|---|---|
+| baris terkontaminasi dicegah | ~8.000 (40 ticker × ~200 baris) |
+| `should_fail_run` | memicu exit 1 di 40/45 = 89% |
+| langkah commit | **di-skip** — tidak ada yang masuk master |
+| `CONTAM_BEFORE` | 501, tidak berubah |
+
+### Kenapa wait di PR #18 tidak menangkapnya
+
+`CHART_CHANGED_JS` menunggu "fingerprint berbeda dari sebelumnya". Syarat itu
+**terlalu lemah**: chart memang berubah — hanya saja ke ticker yang salah.
+Setelah menolak ticker N−1, blok `except` membaca ulang fingerprint, lalu pada
+ticker N chart bergerak dari N−2 ke N−1, fingerprint berbeda, wait lolos.
+Siklusnya menopang dirinya sendiri.
+
+Akar masalah: propagasi state Dash. `#submit-button` memicu callback yang
+membaca nilai dropdown sebagai State, dan klik mendarat sebelum pilihan baru
+sampai ke store Dash — jadi callback merender nilai sebelumnya.
+`VALUE_SETTLED_JS` memastikan label DOM sudah berubah, yang ternyata hal
+berbeda dari Dash sudah mencatatnya.
+
+### Perbaikan
+
+Wait sekarang mengecek **identitas** chart, bukan sekadar perubahannya, dan
+klik submit diulang (maks 3x) kalau chart kembali salah. Ini bisa dilakukan
+karena run #15 membuktikan judul chart selalu membawa kode 4 huruf —
+`ticker_from_title()` dulu dibuat bersyarat justru karena format judul belum
+bisa diverifikasi tanpa akses situs. Sekarang sudah.
+
+### Dua hal untuk diawasi di run #16
+
+1. **VIVA, VKTR, WIFI timeout berbeda** — `wait_for_function: Timeout 60000ms`,
+   chart berhenti berubah sama sekali, bukan menampilkan yang salah. Ketiganya
+   di ujung run 45 ticker, dan `neobdm_scraper.py` mencatat NeoBDM memicu
+   anti-abuse di sekitar 50 permintaan cepat. Kemungkinan rate limiting.
+   Sengaja belum disentuh: kegagalannya sudah keras, dan satu perubahan pada
+   satu waktu lebih mudah diatribusikan.
+2. **Lantai rentang tanggal bergeser** — ticker yang berhasil melaporkan
+   `2025-09-01 to 2026-08-21`, bukan `2025-08-01` yang dulu dicapai backfill.
+   Konsisten dengan jendela bergulir ~12 bulan yang docstring
+   `backfill_inventory.py` tandai belum terverifikasi. Artinya lantai historis
+   merayap maju dan baris lama tidak pernah disegarkan.

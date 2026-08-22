@@ -25,7 +25,10 @@ permissions:
 jobs:
   topup:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # Raised from 35 after run #15: the identity wait can re-click submit up to
+    # 3x per ticker, so a run where retries actually fire is materially slower.
+    # Being killed mid-run is a worse outcome than a slow green.
+    timeout-minutes: 45
     env:
       NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
       NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
