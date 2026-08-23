@@ -828,3 +828,51 @@ hanya Rp. Konfirmasi ini dari bentuk respons sebelum menulis parser.
 
 Response + Request URL lengkap dari `GET /api/inventory?symbol=...&start_date=...`.
 Setelah itu scraper baru bisa ditulis penuh tanpa menebak.
+
+## Lampiran N — RESPONS API tertangkap + scraper DITULIS ULANG (2026-08-23)
+
+Bentuk respons sudah dikonfirmasi dari sampel penuh (ENRG, jendela 1Y). `data`:
+
+| key | isi |
+|---|---|
+| `date[]` | hari bursa, **paralel** dengan `ohlc[]` dan setiap seri `nlot`/dst |
+| `blot / slot / nlot` | LOT beli / jual / **NET** per kode broker `{ "AK":[...], ... }` |
+| `bval / sval / nval` | nilai beli / jual / net dalam **Rupiah penuh** (5492217500, TIDAK truncate) |
+| `ohlc[]` | `{date, open, high, low, close, volume, volume_sma20}` |
+| `meta` | `{symbol, brokers, start_date, end_date, investor_type}` |
+
+Dua temuan yang mengubah desain:
+
+1. **`nlot` itu NET HARIAN, bukan kumulatif.** Terverifikasi: `nlot[0]` = `blot[0] − slot[0]` (128896 − 33790 = 95106) dan tandanya bolak-balik hari ke
+   hari. Jadi TIDAK perlu diff kumulatif seperti chart Plotly lama — langsung
+   `netval = nlot[hari] * 100 * close[hari] / 1e9`.
+2. **`nval` presisi penuh** (bukan display truncate), jadi peringatan VALUE/Lot di
+   Lampiran M sebetulnya moot untuk JSON ini. **Tetapi** netval tetap diturunkan
+   dari LOT — bukan pakai `nval` — supaya (a) patuh aturan "selalu dari lot", dan
+   (b) satuannya (miliar) SAMA dengan baris yang sudah ditulis backfill lama,
+   sehingga re-fetch MENYEMBUHKAN baris di tempat, bukan mencampur dua konvensi.
+
+`backfill_inventory.py` sudah ditulis ulang: SATU GET terautentikasi per ticker
+(login Playwright hanya untuk cookie sesi, lalu `page.context.request.get`).
+Seluruh mesin DOM/Plotly (EXTRACT_JS, select_ticker, date-picker, fingerprint,
+race chart-basi) DIHAPUS. `netval` lot-derived miliar; `bval/sval/bavg/savg`
+dibiarkan NULL persis seperti backfill lama. Workflow `price-history-topup.yml`
+disesuaikan (artifact `topup-failure.json`, timeout 45→20).
+
+### Tindak lanjut TERBUKA (belum dikerjakan)
+
+1. **Cakupan broker berubah.** Backfill lama membaca SEMUA broker di chart lalu
+   filter ke `BROKER_FLOW_CODES` (~30 kode). API butuh selector; sekarang dipakai
+   `INVENTORY_BROKERS = ["TOP_5_NB_LOT_C20","TOP_5_NS_LOT_C20"]` (tata bahasa
+   permintaan SITUS SENDIRI — dijamin diterima, tak berisiko 400 yang membakar
+   satu run) → 10 penggerak terbesar per lot, difilter ke `BROKER_FLOW_CODES`.
+   Untuk ENRG itu 8 dari 10 kode masuk. Tiap run mencetak `returned=` vs `kept=`
+   supaya cakupan terlihat. **Keputusan user:** apakah cukup, atau perlebar
+   (`TOP_8_*_ALL`), atau uji apakah kode broker eksplisit (`brokers=AK`) diterima
+   endpoint (satu tes URL 30 detik) untuk memulihkan semantik kurasi lama.
+2. **`get_inventory_bagholders` (neobdm_scraper.py:740) MASIH pakai `/inventory/`
+   Plotly yang pensiun** — fitur broker-stalker Telegram (bag-holder) juga rusak,
+   perlu migrasi API yang sama. Di luar cakupan rewrite backfill ini.
+3. **`bval/sval` kini tersedia dari API** tapi dibiarkan NULL sampai konvensi
+   satuan live-vs-backfill direkonsiliasi (live simpan angka page-derived via
+   `parse_num`, backfill simpan miliar). Mengisinya jadi perubahan satu baris.
