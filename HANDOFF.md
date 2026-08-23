@@ -620,3 +620,64 @@ bisa diverifikasi tanpa akses situs. Sekarang sudah.
    Konsisten dengan jendela bergulir ~12 bulan yang docstring
    `backfill_inventory.py` tandai belum terverifikasi. Artinya lantai historis
    merayap maju dan baris lama tidak pernah disegarkan.
+
+## J. Run #16 — teori retry gugur, dan kita ternyata buta
+
+Run #16 (2026-08-23), pertama dengan wait-identitas dari PR #21,
+**di-cancel di batas 45 menit.** Kegagalan ketiga berturut-turut, dan
+masing-masing memakan satu hari penuh untuk mempelajari satu fakta.
+
+### Kita buta
+
+Log-nya **tidak memuat satu pun baris `=== TICKER ===`** — kosong antara
+`02:09:37 Login successful!` dan `02:52:40 The operation was canceled`.
+
+Penyebabnya: stdout Python di-buffer blok saat bukan TTY. Run #15 sempat
+ter-flush waktu keluar — cirinya, semua baris ticker-nya bertimestamp sama
+(`02:05:15`). Run #16 dibunuh sebelum flush, jadi **seluruh output hilang.**
+Setiap timeout berikutnya akan sama tidak terdiagnosisnya.
+
+Sudah diperbaiki: `PYTHONUNBUFFERED: "1"` di `price-history-topup.yml`.
+
+### Retry submit tidak bekerja
+
+Dari aritmetika waktu:
+
+| | run #15 | run #16 |
+|---|---|---|
+| durasi scrape | ~6 menit | **43 menit** (kena batas) |
+| per ticker | ~8 dtk | ~61 dtk |
+
+61 dtk ≈ `SUBMIT_SETTLE_PAUSE 0,7 + 3 × CHART_ATTEMPT_TIMEOUT 20`. Artinya
+**hampir setiap ticker menghabiskan ketiga percobaan.** Kalau penyebabnya
+sekadar propagasi state Dash yang lambat, percobaan kedua pasti berhasil.
+Klik submit ulang memakai nilai basi yang sama.
+
+**Diagnosis di balik PR #21 salah.** Dicatat supaya tidak diulang.
+
+### Hipotesis yang tersisa — sengaja BELUM diperbaiki
+
+react-select v1 menyimpan teks ketikan dan nilai terpilih di elemen berbeda.
+Kalau `VALUE_SETTLED_JS` mencocokkan **teks ketikan** alih-alih **nilai
+terpilih**, maka konfirmasi "sudah terpilih" itu false positive: submit jalan
+dengan nilai lama, chart merender ticker lama, lalu klik opsi mendarat
+sesudahnya — persis menghasilkan pola tertinggal satu.
+
+Cocok dengan semua bukti. Tapi ini hipotesis ketiga dalam tiga hari, dan dua
+sebelumnya baru terbantah setelah membakar satu hari masing-masing.
+Hambatannya bukan kekurangan ide, melainkan **latensi observasi**.
+
+Jadi yang dikerjakan adalah alat observasi, bukan tebakan ketiga:
+
+- `DIAGNOSE_JS` membuang teks tiap selector kandidat + judul chart
+- `select_ticker()` mencetak selector mana yang memuaskan `VALUE_SETTLED_JS`
+  dan teks apa yang dikandungnya — **inilah datum yang menentukan**
+- `scrape_ticker()` mencetak satu baris per percobaan submit
+- Input `tickers` di `workflow_dispatch`: 3 ticker selesai ~2 menit
+
+### Langkah berikutnya
+
+Jalankan `price-history-topup.yml` manual dengan `tickers: BBHI BNBR BREN`.
+BBHI berhasil di run #15, BNBR gagal menampilkan BBHI — jadi tiga ticker itu
+mereproduksi bug-nya. Baris `selected via ...` untuk BNBR menentukan perbaikan
+berikutnya, dalam hitungan menit, bukan sehari.

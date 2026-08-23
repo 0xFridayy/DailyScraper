@@ -158,8 +158,12 @@ CHART_STABLE_PAUSE = 500
 # to the wrong ticker. So the wait below checks chart IDENTITY, and re-clicks
 # submit when the chart comes back wrong.
 SUBMIT_SETTLE_PAUSE = 700     # throttle before submitting; see scrape_ticker
-CHART_ATTEMPT_TIMEOUT = 20_000
-MAX_SUBMIT_ATTEMPTS = 3       # 3 x 20s keeps the old 60s per-ticker budget
+# Run #16 spent 43 minutes and was killed at the 45-minute cap: essentially every
+# ticker burned all three attempts (0.7 + 3x20 = 61s each). A retry that has never
+# once succeeded does not deserve three tries. Two keeps recovery from a genuinely
+# transient stall while bringing the worst case to ~31s, so 45 tickers fit.
+CHART_ATTEMPT_TIMEOUT = 15_000
+MAX_SUBMIT_ATTEMPTS = 2
 
 # Shared by the read and the wait so both compute the identical fingerprint.
 _FINGERPRINT_FN = """
@@ -231,7 +235,7 @@ VALUE_SELECTORS = ["#tick .Select-value-label", "#tick .Select-value",
 
 # The label may be just the code or "CODE - Company Name", so match the leading
 # code either way. __pick returns the first selector that matches anything.
-_OPTION_CODE_JS = """
+_OPTION_CODE_JS = r"""
 function __code(el) {
     return el.textContent.replace(/\s+/g, ' ').trim().toUpperCase().split(/[^A-Z0-9]+/)[0];
 }
@@ -244,6 +248,22 @@ function __pick(sels) {
 }
 """
 
+# What does the page actually say right now? Runs #15 and #16 each cost a day to
+# learn one fact, because the log never recorded what the dropdown reported at the
+# moment we submitted. This dumps every candidate selector's text plus the chart
+# title, so one diagnostic run settles what three rounds of inference could not.
+DIAGNOSE_JS = ("([optSels, valSels]) => { %s %s "
+               "const probe = (sels) => sels.map(s => ({selector: s,"
+               " texts: Array.from(document.querySelectorAll(s)).slice(0, 4)"
+               ".map(e => e.textContent.replace(/\\s+/g, ' ').trim())}))"
+               ".filter(r => r.texts.length);"
+               "const el = document.querySelector('.js-plotly-plot');"
+               "const lay = (el && el.layout) || {};"
+               "return {options: probe(optSels), values: probe(valSels),"
+               " chartTitle: String((lay.title && (lay.title.text !== undefined "
+               "? lay.title.text : lay.title)) || ''), chartCode: __titleCode()}; }"
+               % (_OPTION_CODE_JS, _TITLE_CODE_FN))
+
 OPTION_READY_JS = ("([want, sels]) => { %s "
                    "return __pick(sels).els.some(o => __code(o) === want.toUpperCase()); }"
                    % _OPTION_CODE_JS)
@@ -252,7 +272,7 @@ FIND_OPTION_JS = ("([want, sels]) => { %s "
                   "const hit = __pick(sels);"
                   "return {selector: hit.selector,"
                   " index: hit.els.findIndex(o => __code(o) === want.toUpperCase()),"
-                  " texts: hit.els.slice(0, 8).map(o => o.textContent.replace(/\s+/g,' ').trim())}; }"
+                  r" texts: hit.els.slice(0, 8).map(o => o.textContent.replace(/\s+/g,' ').trim())}; }"
                   % _OPTION_CODE_JS)
 
 VALUE_SETTLED_JS = ("([want, sels]) => { %s "
@@ -307,6 +327,15 @@ def select_ticker(page, ticker):
     page.wait_for_function(VALUE_SETTLED_JS, arg=[ticker, VALUE_SELECTORS],
                            timeout=SELECT_TIMEOUT)
 
+    # The datum runs #15 and #16 never recorded. If this reports the SEARCH TEXT
+    # rather than the SELECTED VALUE, the settled check is a false positive and
+    # submit is firing against the previous ticker - which is the leading theory
+    # for the one-behind pattern, and exactly what this line exists to settle.
+    for probe in page.evaluate(DIAGNOSE_JS, [OPTION_SELECTORS, VALUE_SELECTORS])["values"]:
+        if any(t.upper().startswith(ticker.upper()) for t in probe["texts"]):
+            print(f"  selected via {probe['selector']} -> {probe['texts'][:2]}")
+            break
+
 
 def scrape_ticker(page, ticker, date_range_already_set, prev_fingerprint=None):
     """Returns (payload, fingerprint). Caller passes the PREVIOUS ticker's
@@ -327,15 +356,20 @@ def scrape_ticker(page, ticker, date_range_already_set, prev_fingerprint=None):
     #    renders the previous ticker and then sits there, so waiting alone would
     #    time out; re-clicking submit is what actually resolves it.
     seen = None
-    for _ in range(MAX_SUBMIT_ATTEMPTS):
+    for attempt in range(1, MAX_SUBMIT_ATTEMPTS + 1):
+        before = page.evaluate(READ_TITLE_CODE_JS)
         page.click("#submit-button")
         try:
             page.wait_for_function(CHART_IS_JS, arg=[ticker, prev_fingerprint],
                                    timeout=CHART_ATTEMPT_TIMEOUT)
+            print(f"  submit {attempt}/{MAX_SUBMIT_ATTEMPTS}: chart {before} -> {ticker} OK")
             break
         except PlaywrightTimeout:
             seen = page.evaluate(READ_TITLE_CODE_JS)
+            print(f"  submit {attempt}/{MAX_SUBMIT_ATTEMPTS}: chart {before} -> {seen}, "
+                  f"wanted {ticker}")
     else:
+        print(f"  page state: {page.evaluate(DIAGNOSE_JS, [OPTION_SELECTORS, VALUE_SELECTORS])}")
         raise TickerMismatch(
             f"{ticker}: chart still showing {seen!r} after {MAX_SUBMIT_ATTEMPTS} "
             f"submits — the selection is not reaching the callback")

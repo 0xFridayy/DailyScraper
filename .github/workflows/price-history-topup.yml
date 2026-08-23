@@ -18,6 +18,16 @@ on:
     # (which has its own 35-min timeout), so that commit always lands first.
     - cron: "30 0 * * *"
   workflow_dispatch:
+    inputs:
+      tickers:
+        description: >-
+          Space-separated tickers to scrape, e.g. "BBHI BNBR BREN". Leave empty
+          for all tracked tickers. A 3-ticker run finishes in ~2 minutes, so a
+          hypothesis can be tested straight after a push instead of waiting for
+          the next nightly run — which is what made runs #15 and #16 cost a day
+          each to learn one fact.
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -30,6 +40,10 @@ jobs:
     # Being killed mid-run is a worse outcome than a slow green.
     timeout-minutes: 45
     env:
+      # Without this, Python block-buffers stdout when it is not a TTY and a
+      # killed run loses ALL progress output. Run #16 hit the timeout and its log
+      # showed nothing at all between login and cancellation.
+      PYTHONUNBUFFERED: "1"
       NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
       NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -57,8 +71,8 @@ jobs:
       - name: Record contamination baseline
         run: echo "CONTAM_BEFORE=$(python price_audit.py count)" >> "$GITHUB_ENV"
 
-      - name: Top up price_history (all tracked tickers)
-        run: python backfill_inventory.py
+      - name: Top up price_history
+        run: python backfill_inventory.py ${{ inputs.tickers }}
 
       # backfill_inventory.py dumps one screenshot + page HTML on its FIRST
       # failure. Without this upload a selector break leaves only stdout, and
