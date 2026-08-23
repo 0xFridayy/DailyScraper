@@ -16,19 +16,20 @@ or are one dependency bump away:
      the built panel (no returns outside the IDX limit band, feature NaN rates,
      plausible shape) catch a panel that is technically non-empty but unusable.
 
-  3. Metrics that cannot be true. This repo has recorded Sharpe 5.36 and 6.95
-     from a formula applying sqrt(252) to per-trade returns. A number like that
-     is not a discovery, it is a bug signature, and it went unchallenged for
-     weeks. Anything implausible is surfaced here rather than celebrated.
+  3. Metrics that cannot be true. This repo recorded Sharpe 5.36 and 6.95 from a
+     formula applying sqrt(252) to per-trade returns. A number like that is not
+     a discovery, it is a bug signature, and it went unchallenged for weeks.
+     Stage 3 removed every Sharpe (see signal_metrics.py); what this checks now
+     is the honest replacement - whether the top-decile hit rate actually beats
+     the universe base rate, and whether IC is distinguishable from zero.
 
 KNOWN-DEFECT BUDGET
 -------------------
-HANDOFF.md stage 3 has not been done yet, so the sqrt(252) defect is still
-present in four files. Failing the build on it would leave this check
-permanently red, which trains everyone to ignore it. Instead the count is
-pinned: the existing four are reported as outstanding, and the check fails only
-if a FIFTH appears. Lower SQRT252_BUDGET as stage 3 removes them - it is
-supposed to ratchet down to zero.
+Defects that are known and scheduled are pinned rather than failed on, because a
+check that is permanently red for a known condition trains everyone to skip it.
+The count fails only when it GROWS. SQRT252_BUDGET reached its target of 0 when
+stage 3 landed; IMPOSSIBLE_TARGET_BUDGET is still ratcheting down and should
+reach 0 once build_panel() sources price_audit.clean_panel().
 
 Run:  py check_ml_health.py            -> print status
       py check_ml_health.py --telegram -> also send it
@@ -71,7 +72,9 @@ ARB_MIN = -0.15
 LIMIT_TOLERANCE = 0.01
 
 # See KNOWN-DEFECT BUDGET above. Both ratchet down, never up.
-SQRT252_BUDGET = 4
+#   2026-08-20  4   initial pin
+#   2026-08-23  0   stage 3 landed: all four sites replaced by signal_metrics.py
+SQRT252_BUDGET = 0
 # build_panel() still reads price_history directly, so contaminated rows reach
 # the panel and land outside the IDX limit band. Swapping it to
 # price_audit.clean_panel() (HANDOFF.md stage 1) takes this to 0. Pinned rather
@@ -84,7 +87,8 @@ SQRT252_BUDGET = 4
 #                    1,400 contaminated rows overnight (CDIA and COIN went from
 #                    231 bad rows each to 0) and broke zero new ones
 IMPOSSIBLE_TARGET_BUDGET = 82
-SHARPE_IMPLAUSIBLE = 4.0
+# SHARPE_IMPLAUSIBLE is gone with stage 3: no code path emits a Sharpe to
+# sanity-check any more. What replaces it is the hit-edge/IC check below.
 
 
 def _load_dotenv():
@@ -234,27 +238,27 @@ def check_model_runs(panel, problems, notes, stats):
         problems.append(f"run_walk_forward() produced no cycles on a {len(dates)}-day slice")
         return
 
-    sharpe = pooled.get("sharpe")
     stats["cycles"] = len(cycles)
-    stats["pooled_sharpe"] = None if sharpe is None or np.isnan(sharpe) else round(float(sharpe), 2)
-    stats["pooled_hit"] = (None if pooled.get("hit_rate") is None
-                           or np.isnan(pooled["hit_rate"]) else round(float(pooled["hit_rate"]), 3))
 
-    if sharpe is not None and not np.isnan(sharpe) and abs(sharpe) > SHARPE_IMPLAUSIBLE:
+    def _r(key, nd=3):
+        v = pooled.get(key)
+        return None if v is None or (isinstance(v, float) and np.isnan(v)) else round(float(v), nd)
+
+    stats["pooled_ic"] = _r("ic")
+    stats["pooled_hit"] = _r("top_hit")
+    stats["pooled_hit_edge"] = _r("top_hit_edge")
+    stats["pooled_edge"] = _r("edge", 4)
+
+    # The number that actually answers "is the signal any good". A top-decile
+    # hit rate means nothing next to a base rate it matches - this repo reported
+    # 42.8% for months while the base rate was also 42.8%.
+    if stats["pooled_hit_edge"] is not None and abs(stats["pooled_hit_edge"]) < 0.005:
         notes.append(
-            f"pooled Sharpe {sharpe:.2f} is outside anything a real strategy "
-            f"sustains (>{SHARPE_IMPLAUSIBLE}). With no transaction costs and "
-            f"sqrt(252) applied to per-trade returns, read it as a metric bug, "
-            f"not an edge — HANDOFF.md stage 3.")
-
-    if stats["pooled_hit"] is not None and stats.get("base_rate") is not None:
-        edge = stats["pooled_hit"] - stats["base_rate"]
-        stats["hit_vs_base"] = round(edge, 3)
-        if abs(edge) < 0.005:
-            notes.append(
-                f"hit_rate {stats['pooled_hit']:.1%} matches the universe base "
-                f"rate {stats['base_rate']:.1%} to within 0.5pp — the model is "
-                f"adding no directional information.")
+            f"top-decile hit {stats['pooled_hit']:.1%} matches the universe base "
+            f"rate {pooled.get('base_rate', float('nan')):.1%} to within 0.5pp — "
+            f"the model is adding no directional information.")
+    if stats["pooled_ic"] is not None and abs(stats["pooled_ic"]) < 0.02:
+        notes.append(f"IC {stats['pooled_ic']:+.3f} is indistinguishable from zero.")
 
 
 def _sqrt252_sites():
@@ -328,10 +332,12 @@ def format_report(problems, notes, stats):
         lines.append(" | ".join(bits))
 
     m = []
-    if stats.get("pooled_sharpe") is not None:
-        m.append(f"Sharpe {stats['pooled_sharpe']}")
+    if stats.get("pooled_ic") is not None:
+        m.append(f"IC {stats['pooled_ic']:+.3f}")
     if stats.get("pooled_hit") is not None:
-        m.append(f"hit {stats['pooled_hit']:.1%}")
+        m.append(f"top-hit {stats['pooled_hit']:.1%}")
+    if stats.get("pooled_hit_edge") is not None:
+        m.append(f"edge {stats['pooled_hit_edge']:+.1%}")
     if stats.get("base_rate") is not None:
         m.append(f"base {stats['base_rate']:.1%}")
     if "impossible_targets" in stats:

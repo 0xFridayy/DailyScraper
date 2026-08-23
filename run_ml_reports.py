@@ -8,10 +8,14 @@ your phone) and a fuller markdown table written to the GitHub Actions job
 summary (for checking from a browser when you're at a PC). Read-only:
 never touches neobdm.db.
 
-SATISFACTION_SHARPE is the holdout bar the user set as "satisfied" (grow a
-small portfolio, safest + highest risk-adjusted return, RR = Sharpe 1.5+) -
-matches the Sharpe > 1.5 validation bar already documented throughout this
-project, not a new number invented for this report. Only strategy_variants
+This report no longer computes a Sharpe. The one this repo used was wrong twice
+over - per-trade returns annualised with the daily sqrt(252) factor, and 45
+cross-sectionally correlated tickers counted as 45 independent draws - so both
+the numbers and the SATISFACTION_SHARPE = 1.5 bar they were compared against are
+VOID. The bar was the user's target for a CORRECT statistic, so choosing its
+replacement is their call; this script reports what was measured (IC,
+top-decile hit rate against the universe base rate, return edge) and declares no
+winner. See signal_metrics.py. Only strategy_variants
 .py's EXISTING 11 variants are searched here (per explicit instruction:
 wire in the existing grid first, compare against a bigger one later) - do
 not silently expand VARIANTS without that being a deliberate, separate
@@ -36,11 +40,18 @@ from strategy_variants import run_strategy_search
 from ddqn_entry_exit import (
     build_episode_frame, split_search_holdout, fit_normalizer,
     normalize_features, make_envs, train_ddqn, evaluate_policy,
-    evaluate_policy_with_trade_log, sharpe_from_returns, FEATURES, STATE_EXTRA,
+    evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
 )
+from signal_metrics import trade_stats, format_trade_stats
 
 RECENT_TRADES_SHOWN = 15
-SATISFACTION_SHARPE = 1.5
+
+# SATISFACTION_SHARPE = 1.5 used to gate this report. It is gone, not moved:
+# nothing here computes a Sharpe any more, because the one this repo computed was
+# wrong twice over (see signal_metrics.py). The 1.5 bar was the USER's stated
+# target, so replacing it with some other number is the user's call, not this
+# script's. Until they set one, the report states what was measured and refuses
+# to declare a winner.
 KONGLO_TRACK_DAYS = 3  # per explicit instruction: track flagged konglo tickers 1-3 trading days
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -67,8 +78,7 @@ def run_xgboost_report(conn):
     return dict(
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
-        sharpe=pooled["sharpe"], hit_rate=pooled["hit_rate"], n_trades=pooled["n_trades"],
-        recent_trades=recent,
+        pooled=pooled, recent_trades=recent,
     )
 
 
@@ -78,10 +88,9 @@ def run_strategy_variants_report(conn):
     result = run_strategy_search(panel, px)
     return dict(
         winner_label=result["winner_label"],
-        search_sharpe=result["winner_search_sharpe"],
-        holdout_sharpe=result["winner_holdout_sharpe"],
+        search_mean=result["winner_search_mean"],
+        holdout_mean=result["winner_holdout_mean"],
         holdout_n=result["winner_holdout_n"],
-        satisfied=bool(result["winner_holdout_sharpe"] >= SATISFACTION_SHARPE),
         search_results=result["search_results"],
         holdout_results=result["holdout_results"],
     )
@@ -132,7 +141,7 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     except pd.errors.DatabaseError:
         watch = pd.DataFrame(columns=["flag_date", "ticker", "sources"])
     if watch.empty:
-        return dict(signals=[], resolved=dict(sharpe=float("nan"), n_trades=0, hit_rate=float("nan")))
+        return dict(signals=[], resolved=trade_stats([]))
 
     px = pd.read_sql("SELECT date, ticker, high, low, close FROM price_history", conn)
     px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
@@ -165,22 +174,25 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
             resolved_returns.append(entry["current_pct"])
 
     signals.sort(key=lambda e: e["flag_date"], reverse=True)
-    return dict(signals=signals, resolved=sharpe_from_returns(resolved_returns))
+    return dict(signals=signals, resolved=trade_stats(resolved_returns))
 
 
 def format_telegram_message(xgb, strat, ddqn, konglo):
-    xgb_satisfied = xgb["sharpe"] >= SATISFACTION_SHARPE
-    hits = []
-    if xgb_satisfied:
-        hits.append("XGBoost default strategy")
-    if strat["satisfied"]:
-        hits.append(f"strategy search winner ({strat['winner_label']})")
-    if ddqn["holdout"]["trades"]["sharpe"] >= SATISFACTION_SHARPE:
-        hits.append("DDQN holdout")
+    # No pass/fail line any more. The old one compared a Sharpe that was wrong
+    # twice over against a bar the user set for a correct one; keeping the shape
+    # while changing the metric underneath would be worse than dropping it.
+    # The number that answers "is the signal any good" is hit_edge: the
+    # top-decile hit rate MINUS the universe base rate. Zero means no
+    # directional information, whatever the raw hit rate looks like.
+    p = xgb["pooled"]
+    edge_line = (
+        f"Signal edge: top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
+        f"= {p['top_hit_edge']:+.1%}, IC {p['ic']:+.3f}"
+    )
     bar_line = (
-        f"🎯 TARGET HIT (holdout Sharpe ≥ {SATISFACTION_SHARPE}): " + ", ".join(hits) + "!"
-        if hits else
-        f"Nothing has cleared the Sharpe ≥ {SATISFACTION_SHARPE} target yet."
+        edge_line + "\n"
+        "No Sharpe target line: Sharpe is no longer computed (see signal_metrics.py). "
+        "A replacement bar needs your call."
     )
 
     active = [s for s in konglo["signals"] if not s["resolved"]]
@@ -192,26 +204,26 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         )
     if konglo["resolved"]["n_trades"] >= 5:
         konglo_lines.append(
-            f"  Resolved pooled Sharpe: {konglo['resolved']['sharpe']:.2f} "
-            f"(n={konglo['resolved']['n_trades']}, hit_rate {konglo['resolved']['hit_rate']:.1%})"
+            "  Resolved: " + format_trade_stats(konglo["resolved"])
         )
     elif konglo["resolved"]["n_trades"] > 0:
-        konglo_lines.append(f"  {konglo['resolved']['n_trades']} resolved so far - too few for a Sharpe yet.")
+        konglo_lines.append(f"  {konglo['resolved']['n_trades']} resolved so far - too few to read.")
     konglo_section = "\n".join(konglo_lines) if active or konglo["resolved"]["n_trades"] else ""
 
     return (
         f"📈 Daily ML report\n\n"
         f"XGBoost walk-forward ({xgb['n_dates']}d, {xgb['n_tickers']} tickers, "
         f"{xgb['date_min']} to {xgb['date_max']}):\n"
-        f"  Sharpe {xgb['sharpe']:.2f} | hit_rate {xgb['hit_rate']:.1%} | n_trades {xgb['n_trades']}\n\n"
+        f"  IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
+        f"({p['top_hit_edge']:+.1%}) | return edge {p['edge']:+.2%}\n"
+        f"  threshold rule: n={p['n_trades']} mean {p['trade_mean']:+.2%} "
+        f"hit {p['trade_hit']:.1%} ({p['trade_hit_edge']:+.1%})\n\n"
         f"Strategy search ({len(strat['search_results'])} entry/exit variants), winner: {strat['winner_label']}\n"
-        f"  search  Sharpe {strat['search_sharpe']:.2f}\n"
-        f"  holdout Sharpe {strat['holdout_sharpe']:.2f} (n={strat['holdout_n']})\n\n"
+        f"  search  mean/trade {strat['search_mean']:+.2%}\n"
+        f"  holdout mean/trade {strat['holdout_mean']:+.2%} (n={strat['holdout_n']})\n\n"
         f"DDQN entry/exit ({ddqn['n_dates']}d, {ddqn['n_tickers']} tickers):\n"
-        f"  search  Sharpe {ddqn['search']['trades']['sharpe']:.2f} | "
-        f"hit_rate {ddqn['search']['trades']['hit_rate']:.1%}\n"
-        f"  holdout Sharpe {ddqn['holdout']['trades']['sharpe']:.2f} | "
-        f"hit_rate {ddqn['holdout']['trades']['hit_rate']:.1%}\n"
+        f"  search  {format_trade_stats(ddqn['search']['trades'])}\n"
+        f"  holdout {format_trade_stats(ddqn['holdout']['trades'])}\n"
         f"{konglo_section}\n\n"
         f"{bar_line}\n"
         f"Full run in GitHub Actions."
@@ -219,9 +231,13 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
 
 
 def _write_variant_table(f, df):
-    f.write("| Rank | Strategy | Sharpe | Hit rate | n_trades |\n|---|---|---|---|---|\n")
+    f.write("| Rank | Strategy | Mean/trade | Median | Hit rate | vs base | ret/risk | n |\n"
+            "|---|---|---|---|---|---|---|---|\n")
     for i, (_, row) in enumerate(df.iterrows(), 1):
-        f.write(f"| {i} | {row['label']} | {row['sharpe']:.2f} | {row['hit_rate']:.1%} | {row['n_trades']} |\n")
+        base = "n/a" if pd.isna(row.get("hit_edge")) else f"{row['hit_edge']:+.1%}"
+        rpr = "n/a" if pd.isna(row.get("ret_per_risk")) else f"{row['ret_per_risk']:.2f}"
+        f.write(f"| {i} | {row['label']} | {row['mean_ret']:+.2%} | {row['median_ret']:+.2%} | "
+                f"{row['hit_rate']:.1%} | {base} | {rpr} | {row['n_trades']} |\n")
 
 
 def write_step_summary(xgb, strat, ddqn, konglo):
@@ -234,14 +250,23 @@ def write_step_summary(xgb, strat, ddqn, konglo):
         f.write("# Daily ML Report\n\n")
         f.write(f"## XGBoost walk-forward (default strategy: >0.5% threshold, 1d hold, no TP/SL)\n\n")
         f.write(f"{xgb['n_dates']} dates ({xgb['date_min']} to {xgb['date_max']}), {xgb['n_tickers']} tickers\n\n")
-        f.write("| Sharpe | Hit rate | n_trades |\n|---|---|---|\n")
-        f.write(f"| {xgb['sharpe']:.2f} | {xgb['hit_rate']:.1%} | {xgb['n_trades']} |\n\n")
+        p = xgb["pooled"]
+        f.write("| IC | Top-decile hit | Base rate | Hit edge | Return edge | n |\n"
+                "|---|---|---|---|---|---|\n")
+        f.write(f"| {p['ic']:+.3f} | {p['top_hit']:.1%} | {p['base_rate']:.1%} | "
+                f"{p['top_hit_edge']:+.1%} | {p['edge']:+.2%} | {p['n']} |\n\n")
+        f.write("**Hit edge is the number that matters.** A top-decile hit rate only means "
+                "something next to the base rate of the same rows; this repo reported 42.8% "
+                "for months while the base rate was also 42.8%, i.e. no directional "
+                "information at all. See `signal_metrics.py`.\n\n")
+        f.write(f"Threshold rule (>{0.5}% pred): n={p['n_trades']}, mean {p['trade_mean']:+.2%}, "
+                f"hit {p['trade_hit']:.1%} ({p['trade_hit_edge']:+.1%} vs base)\n\n")
 
         f.write(f"## Strategy search ({len(strat['search_results'])} entry/exit variants on the same XGBoost signal)\n\n")
         f.write(
-            f"Winner (by search-period Sharpe): **{strat['winner_label']}** - "
-            f"search Sharpe {strat['search_sharpe']:.2f}, holdout Sharpe {strat['holdout_sharpe']:.2f} "
-            f"(n={strat['holdout_n']}){' - **hit the Sharpe >= ' + str(SATISFACTION_SHARPE) + ' target**' if strat['satisfied'] else ''}\n\n"
+            f"Winner (by search-period mean return per trade): **{strat['winner_label']}** - "
+            f"search {strat['search_mean']:+.2%}/trade, holdout {strat['holdout_mean']:+.2%}/trade "
+            f"(n={strat['holdout_n']})\n\n"
         )
         f.write("### Search period (all variants, ranked)\n\n")
         _write_variant_table(f, strat["search_results"])
@@ -257,11 +282,17 @@ def write_step_summary(xgb, strat, ddqn, konglo):
 
         f.write(f"## DDQN entry/exit\n\n")
         f.write(f"{ddqn['n_dates']} dates ({ddqn['date_min']} to {ddqn['date_max']}), {ddqn['n_tickers']} tickers\n\n")
-        f.write("| Split | Trade Sharpe | Trade hit rate | n_trades |\n|---|---|---|---|\n")
-        f.write(f"| Search (train) | {xt['sharpe']:.2f} | {xt['hit_rate']:.1%} | {xt['n_trades']} |\n")
-        f.write(f"| Holdout | {ht['sharpe']:.2f} | {ht['hit_rate']:.1%} | {ht['n_trades']} |\n\n")
+        f.write("| Split | Mean/trade | Median | Hit rate | ret/risk | n |\n|---|---|---|---|---|---|\n")
+        for name, d in (("Search (train)", xt), ("Holdout", ht)):
+            rpr = "n/a" if pd.isna(d["ret_per_risk"]) else f"{d['ret_per_risk']:.2f}"
+            f.write(f"| {name} | {d['mean_ret']:+.2%} | {d['median_ret']:+.2%} | "
+                    f"{d['hit_rate']:.1%} | {rpr} | {d['n_trades']} |\n")
+        f.write("\n")
         f.write(
-            f"Target: holdout Sharpe >= {SATISFACTION_SHARPE}. See "
+            "No Sharpe and no target line: the Sharpe this repo used was wrong twice over "
+            "(per-trade returns annualised as if daily, and cross-sectionally overlapping "
+            "observations counted as independent), and the 1.5 bar was set for a correct one. "
+            "A replacement bar is the user's call. See `signal_metrics.py`, and "
             "`walk_forward_backtest.py` / `strategy_variants.py` / `ddqn_entry_exit.py` docstrings "
             "for full caveats (small sample, backfilled-vs-live data, DDQN overfitting) before "
             "reading any of these numbers as a real edge.\n\n"
@@ -288,8 +319,8 @@ def write_step_summary(xgb, strat, ddqn, konglo):
             f.write("\n")
             if konglo["resolved"]["n_trades"] > 0:
                 note = "" if konglo["resolved"]["n_trades"] >= 5 else " (too few resolved signals for this to mean much yet)"
-                f.write(f"Pooled Sharpe across {konglo['resolved']['n_trades']} resolved signals: "
-                        f"{konglo['resolved']['sharpe']:.2f}, hit_rate {konglo['resolved']['hit_rate']:.1%}{note}.\n\n")
+                f.write(f"Across {konglo['resolved']['n_trades']} resolved signals: "
+                        + format_trade_stats(konglo["resolved"]) + f"{note}.\n\n")
 
         f.write(f"## XGBoost: {len(xgb['recent_trades'])} most recent trades (of {xgb['n_trades']} total)\n\n")
         f.write("Top 3 features by SHAP contribution behind each prediction - not a raw feature "

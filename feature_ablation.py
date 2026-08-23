@@ -1,4 +1,11 @@
 """
+VOID: every Sharpe figure in this docstring came from `mean/std * sqrt(252)`
+applied to per-trade, cross-sectionally overlapping returns - wrong twice over.
+Kept rather than deleted so the conclusions are not re-derived and believed
+again. The comparisons BETWEEN feature sets may still hold directionally, since
+all of them shared the same defect; the levels do not. Re-run and read IC and
+hit-edge instead. See signal_metrics.py.
+
 Broker-flow vs price-only feature ablation, across forward-return horizons.
 
 Tests the core question SYSTEM.md's Layer 1 exists to answer: does the
@@ -27,7 +34,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import (
-    _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, sharpe_stats, DB_PATH,
+    _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH,
 )
 
 BROKER_FEATURES = ["broker_concentration", "net_flow_total", "n_brokers",
@@ -79,7 +86,7 @@ def walk_forward(panel, features, target_col, train_min=30, test_window=6):
         all_preds.append(test_pred)
         all_actuals.append(test_df[target_col].values)
 
-    pooled = sharpe_stats(pd.Series(np.concatenate(all_preds)), pd.Series(np.concatenate(all_actuals)))
+    pooled = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals))
     naive_mae = p[target_col].abs().mean()
     return dict(pooled=pooled, mean_test_mae=np.mean(maes), naive_mae=naive_mae, n=len(p))
 
@@ -99,8 +106,9 @@ if __name__ == "__main__":
         beat_naive = "beats naive" if r["mean_test_mae"] < r["naive_mae"] else "WORSE than naive"
         print(f"{name}: test_mae={r['mean_test_mae']:.4f} naive_mae={r['naive_mae']:.4f} ({beat_naive})")
         if r["pooled"]["n_trades"]:
-            print(f"  sharpe={r['pooled']['sharpe']:.2f} n_trades={r['pooled']['n_trades']} "
-                  f"hit_rate={r['pooled']['hit_rate']:.2%}")
+            p = r["pooled"]
+            print(f"  IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base "
+                  f"{p['base_rate']:.1%} (edge {p['top_hit_edge']:+.1%}) | n_trades {p['n_trades']}")
         else:
             print("  no trades triggered")
 
@@ -110,7 +118,8 @@ if __name__ == "__main__":
         beat_naive = "beats naive" if r["mean_test_mae"] < r["naive_mae"] else "WORSE than naive"
         print(f"{h}d: test_mae={r['mean_test_mae']:.4f} naive_mae={r['naive_mae']:.4f} ({beat_naive})", end=" ")
         if r["pooled"]["n_trades"]:
-            print(f"| sharpe={r['pooled']['sharpe']:.2f} n_trades={r['pooled']['n_trades']} "
-                  f"hit_rate={r['pooled']['hit_rate']:.2%}")
+            p = r["pooled"]
+            print(f"| IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base "
+                  f"{p['base_rate']:.1%} (edge {p['top_hit_edge']:+.1%})")
         else:
             print("| no trades triggered")

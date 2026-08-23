@@ -114,6 +114,7 @@ import torch.nn as nn
 
 from walk_forward_backtest import FEATURES, DB_PATH, _broker_day_aggregates, _broker_correlation_1d
 from ara_arb_simulation import annotate_limits
+from signal_metrics import trade_stats, format_trade_stats
 
 TRANSACTION_COST = 0.0015   # one-way; ~0.3% round trip, conservative IDX retail placeholder
 LOSS_AVERSION = 1.5         # multiplier on negative daily P&L only ("cut losses" shaping)
@@ -327,19 +328,26 @@ def train_ddqn(train_envs, state_dim, n_epochs=40, batch_size=64, lr=1e-3,
 
 
 def sharpe_from_returns(returns):
-    returns = np.array(returns)
-    n = len(returns)
-    if n == 0:
-        return dict(sharpe=np.nan, n_trades=0, hit_rate=np.nan)
-    std = returns.std()
-    sharpe = (returns.mean() / std * np.sqrt(252)) if std > 0 else np.nan
-    return dict(sharpe=sharpe, n_trades=n, hit_rate=(returns > 0).mean())
+    """Kept as a thin alias so existing imports keep working; the Sharpe is gone.
+
+    This module applied the old function to TWO different things: `daily_returns`
+    (daily scale, where sqrt(252) is at least dimensionally defensible) and
+    `trade_returns` (per-trade, where it is not). Both now go through
+    trade_stats, because even the daily series fails the independence
+    assumption - it is a flat concatenation across ~46 ticker episodes moved by
+    the same market. See signal_metrics.py.
+    """
+    return trade_stats(returns)
 
 
 def evaluate_policy(net, envs):
-    """Greedy (epsilon=0) rollout. Reports per-day strategy returns (for
-    Sharpe, comparable to sharpe_stats() elsewhere in this repo) and
-    round-trip trade returns (entry to exit) separately."""
+    """Greedy (epsilon=0) rollout. Reports per-day strategy returns and
+    round-trip trade returns (entry to exit) separately.
+
+    Neither is annualised. The daily series is a flat concatenation across ~46
+    ticker episodes moved by the same market, so it fails the independence
+    assumption a Sharpe needs just as the per-trade series fails the scale
+    assumption. See signal_metrics.py."""
     daily_returns = []
     trade_returns = []
     n_entries = n_blocked_entries = n_blocked_exits = 0
@@ -457,17 +465,13 @@ if __name__ == "__main__":
     holdout_result = evaluate_policy(net, holdout_envs)
 
     print("\n=== SEARCH (train) period, greedy policy ===")
-    print(f"  daily : sharpe={search_result['daily']['sharpe']:.2f} n={search_result['daily']['n_trades']} "
-          f"hit_rate={search_result['daily']['hit_rate']:.2%}")
-    print(f"  trades: sharpe={search_result['trades']['sharpe']:.2f} n={search_result['trades']['n_trades']} "
-          f"hit_rate={search_result['trades']['hit_rate']:.2%}")
+    print("  " + format_trade_stats(search_result["daily"], "daily "))
+    print("  " + format_trade_stats(search_result["trades"], "trades"))
     print(f"  entries={search_result['n_entries']} blocked_entries(ARA)={search_result['n_blocked_entries']} "
           f"blocked_exits(ARB)={search_result['n_blocked_exits']}")
 
     print("\n=== HOLDOUT period, greedy policy (never touched during training) ===")
-    print(f"  daily : sharpe={holdout_result['daily']['sharpe']:.2f} n={holdout_result['daily']['n_trades']} "
-          f"hit_rate={holdout_result['daily']['hit_rate']:.2%}")
-    print(f"  trades: sharpe={holdout_result['trades']['sharpe']:.2f} n={holdout_result['trades']['n_trades']} "
-          f"hit_rate={holdout_result['trades']['hit_rate']:.2%}")
+    print("  " + format_trade_stats(holdout_result["daily"], "daily "))
+    print("  " + format_trade_stats(holdout_result["trades"], "trades"))
     print(f"  entries={holdout_result['n_entries']} blocked_entries(ARA)={holdout_result['n_blocked_entries']} "
           f"blocked_exits(ARB)={holdout_result['n_blocked_exits']}")

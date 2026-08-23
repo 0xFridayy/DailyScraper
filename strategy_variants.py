@@ -1,4 +1,20 @@
 """
+================================================================================
+VOID — every Sharpe figure quoted below (0.94, 0.81, 5.36, 6.95, and the
+"Sharpe > 1.5" bar) was produced by `mean/std * sqrt(252)` applied to per-trade,
+cross-sectionally overlapping returns. Both halves of that are wrong and they
+compound. The numbers are kept, not deleted, so nobody re-derives them and
+believes them a second time. See signal_metrics.py for what replaced them.
+
+Stage 3 (2026-08-23) first honest read, same 249-day panel:
+  IC -0.025 | top-decile hit 43.5% vs base 42.3% (edge +1.2pp)
+  threshold rule hit 42.4% (edge +0.1pp vs base)
+i.e. no directional information, exactly as the base-rate finding predicted.
+Return-based edges from this run are NOT usable yet: 82 contaminated rows drag
+the panel mean from +0.32% to +14.38%, so mean-based figures stay meaningless
+until build_panel() sources price_audit.clean_panel() (HANDOFF stage 1).
+================================================================================
+
 Strategy (not feature) variation: same trained model/entry-signal as
 walk_forward_backtest.py, but tests different EXIT mechanics (entry
 threshold, holding period, take-profit/stop-loss using actual daily
@@ -49,6 +65,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+from signal_metrics import trade_stats
 
 MAX_HOLD_DAYS = 7  # explicit user ceiling
 
@@ -126,17 +143,8 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     return None
 
 
-def sharpe_from_returns(returns):
-    returns = np.array(returns)
-    n = len(returns)
-    if n == 0:
-        return dict(sharpe=np.nan, n_trades=0, hit_rate=np.nan)
-    std = returns.std()
-    sharpe = (returns.mean() / std * np.sqrt(252)) if std > 0 else np.nan
-    return dict(sharpe=sharpe, n_trades=n, hit_rate=(returns > 0).mean())
-
-
-def eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_days, tp, sl):
+def eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_days, tp, sl,
+                 base_rate=None):
     triggered = preds_subset[preds_subset["pred"] > thresh]
     trade_returns = [
         r for r in (
@@ -144,7 +152,7 @@ def eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_da
             for _, row in triggered.iterrows()
         ) if r is not None
     ]
-    return sharpe_from_returns(trade_returns)
+    return trade_stats(trade_returns, base_rate=base_rate)
 
 
 def run_strategy_search(panel, px, search_frac=0.7):
@@ -160,11 +168,16 @@ def run_strategy_search(panel, px, search_frac=0.7):
     holdout_preds = preds[preds["date"].isin(holdout_dates)]
 
     def score_all(preds_subset):
+        # The base rate every hit rate below must be read against: how often the
+        # next-day return of ANY row in this slice was positive. Without it a
+        # hit rate is unreadable - see signal_metrics.py.
+        base_rate = float((preds_subset["target"] > 0).mean()) if len(preds_subset) else None
         rows = []
         for label, thresh, hold_days, tp, sl in VARIANTS:
-            stats = eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_days, tp, sl)
+            stats = eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker,
+                                 thresh, hold_days, tp, sl, base_rate=base_rate)
             rows.append(dict(label=label, thresh=thresh, hold_days=hold_days, tp=tp, sl=sl, **stats))
-        return pd.DataFrame(rows).sort_values("sharpe", ascending=False)
+        return pd.DataFrame(rows).sort_values("mean_ret", ascending=False)
 
     search_df = score_all(search_preds)
     holdout_df = score_all(holdout_preds)
@@ -177,8 +190,8 @@ def run_strategy_search(panel, px, search_frac=0.7):
         search_results=search_df,
         holdout_results=holdout_df,
         winner_label=winner_label,
-        winner_search_sharpe=search_df.iloc[0]["sharpe"],
-        winner_holdout_sharpe=winner_holdout["sharpe"],
+        winner_search_mean=search_df.iloc[0]["mean_ret"],
+        winner_holdout_mean=winner_holdout["mean_ret"],
         winner_holdout_n=winner_holdout["n_trades"],
     )
 
@@ -197,9 +210,12 @@ if __name__ == "__main__":
 
     print("=== SEARCH PERIOD ===")
     print(result["search_results"].to_string(index=False))
-    print(f"\nWinner: {result['winner_label']} (search sharpe={result['winner_search_sharpe']:.2f})")
+    print(f"\nWinner: {result['winner_label']} "
+          f"(search mean return/trade {result['winner_search_mean']:+.2%})")
 
     print("\n=== HOLDOUT PERIOD (all variants shown for context; only the winner matters) ===")
     print(result["holdout_results"].to_string(index=False))
-    print(f"\nWinner's holdout performance: sharpe={result['winner_holdout_sharpe']:.2f} "
-          f"(n={result['winner_holdout_n']})")
+    print(f"\nWinner's holdout performance: mean return/trade "
+          f"{result['winner_holdout_mean']:+.2%} (n={result['winner_holdout_n']})")
+    print("\nNo Sharpe here by design - these are per-trade, cross-sectionally "
+          "overlapping returns, which sqrt(252) cannot annualise. See signal_metrics.py.")

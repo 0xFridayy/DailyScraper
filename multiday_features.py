@@ -1,4 +1,11 @@
 """
+VOID: every Sharpe figure in this docstring came from `mean/std * sqrt(252)`
+applied to per-trade, cross-sectionally overlapping returns - wrong twice over.
+Kept rather than deleted so the conclusions are not re-derived and believed
+again. The comparisons BETWEEN feature sets may still hold directionally, since
+all of them shared the same defect; the levels do not. Re-run and read IC and
+hit-edge instead. See signal_metrics.py.
+
 Tests whether framing broker features as MULTI-DAY patterns (rolling
 averages, consecutive-buy-day streaks) rather than single-day snapshots
 reveals signal the single-day features miss. Motivation: "hidden broker
@@ -23,7 +30,7 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
-from walk_forward_backtest import _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, sharpe_stats, DB_PATH
+from walk_forward_backtest import _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH
 
 MULTI_DAY_BROKER = ["net_flow_total_roll5", "net_flow_total_roll10",
                     "broker_concentration_roll5", "broker_concentration_roll10",
@@ -93,7 +100,7 @@ def walk_forward(panel, features, train_min=30, test_window=6):
         maes.append(np.abs(test_pred - test_df["target"]).mean())
         all_preds.append(test_pred)
         all_actuals.append(test_df["target"].values)
-    pooled = sharpe_stats(pd.Series(np.concatenate(all_preds)), pd.Series(np.concatenate(all_actuals)))
+    pooled = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals))
     return dict(pooled=pooled, mean_test_mae=np.mean(maes), naive_mae=p["target"].abs().mean(), n=len(p))
 
 
@@ -115,8 +122,9 @@ if __name__ == "__main__":
         beat = "beats naive" if r["mean_test_mae"] < r["naive_mae"] else "worse than naive"
         print(f"{name} (n={r['n']}): test_mae={r['mean_test_mae']:.4f} naive_mae={r['naive_mae']:.4f} ({beat})")
         if r["pooled"]["n_trades"]:
-            print(f"  sharpe={r['pooled']['sharpe']:.2f} n_trades={r['pooled']['n_trades']} "
-                  f"hit_rate={r['pooled']['hit_rate']:.2%}")
+            p = r["pooled"]
+            print(f"  IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base "
+                  f"{p['base_rate']:.1%} (edge {p['top_hit_edge']:+.1%}) | n_trades {p['n_trades']}")
         else:
             print("  no trades triggered")
         print()

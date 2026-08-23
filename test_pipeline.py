@@ -6,7 +6,7 @@ none yet and these checks are simple enough not to need one. Focus is
 specifically on leakage and formula correctness, since a silent bug here
 (e.g. a "lagged" feature that actually sees today's data) would quietly
 invalidate every backtest number in SYSTEM.md's log without ever raising an
-exception. Run after touching build_panel(), sharpe_stats(), or
+exception. Run after touching build_panel(), signal_quality(), or
 kelly_fraction() — before trusting a new backtest run's results.
 """
 
@@ -14,8 +14,9 @@ import pandas as pd
 import numpy as np
 
 from walk_forward_backtest import (
-    _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, sharpe_stats,
+    _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, signal_quality,
 )
+from signal_metrics import spearman_ic, signal_stats, trade_stats
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run)
@@ -95,26 +96,103 @@ def test_price_features_no_leakage():
     print("test_price_features_no_leakage passed")
 
 
-def test_sharpe_stats_formula():
+def test_spearman_ic_direction():
+    x = pd.Series([1.0, 2, 3, 4, 5])
+    assert abs(spearman_ic(x, x * 3 + 1) - 1.0) < 1e-9, "monotonic up must be +1"
+    assert abs(spearman_ic(x, -x) + 1.0) < 1e-9, "monotonic down must be -1"
+    # rank-based, so one wild outlier must NOT dominate the way it would Pearson
+    assert abs(spearman_ic(x, pd.Series([1.0, 2, 3, 4, 500])) - 1.0) < 1e-9
+    assert np.isnan(spearman_ic(x, pd.Series([7.0] * 5))), "constant -> undefined, not 0"
+    assert np.isnan(spearman_ic(pd.Series([1.0]), pd.Series([1.0]))), "too few points"
+    print("test_spearman_ic_direction passed")
+
+
+def test_signal_stats_detects_a_useless_signal():
+    # THE case this repo missed for months: hit_rate 42.8% was reported as a
+    # result while the universe base rate was also 42.8%. A hit rate without its
+    # base rate is unreadable, so hit_edge must come out ~0 here even though the
+    # raw hit rate looks like a number worth quoting.
+    rng = np.random.default_rng(0)
+    actual = pd.Series(rng.normal(0.004, 0.03, 4000))
+    pred = pd.Series(rng.normal(0, 0.01, 4000))          # independent of actual
+    s = signal_stats(pred, actual)
+    assert abs(s["ic"]) < 0.05, f"independent series should have ~0 IC, got {s['ic']}"
+    assert abs(s["hit_edge"]) < 0.06, f"no edge expected, got {s['hit_edge']}"
+    assert abs(s["edge"]) < 0.01
+    assert s["base_rate"] > 0.5, "sanity: this generator has a positive drift"
+    print("test_signal_stats_detects_a_useless_signal passed")
+
+
+def test_signal_stats_reports_a_negative_edge_as_negative():
+    # A signal that is actively WRONG must not be flattered into looking flat.
+    actual = pd.Series(np.linspace(-0.1, 0.1, 200))
+    pred = pd.Series(np.linspace(0.1, -0.1, 200))        # perfectly inverted
+    s = signal_stats(pred, actual)
+    assert s["ic"] < -0.99
+    assert s["edge"] < 0, "top decile of an inverted signal must underperform"
+    assert s["hit_edge"] < 0
+    print("test_signal_stats_reports_a_negative_edge_as_negative passed")
+
+
+def test_trade_stats_has_no_annualisation():
+    # mean/std with NO sqrt(anything). If someone reintroduces a scale factor
+    # this pins it down numerically.
+    r = [0.02, -0.01, 0.03, -0.02, 0.01]
+    s = trade_stats(r)
+    arr = np.array(r)
+    assert s["n_trades"] == 5
+    assert abs(s["mean_ret"] - arr.mean()) < 1e-12
+    assert abs(s["ret_per_risk"] - arr.mean() / pd.Series(r).std()) < 1e-12
+    assert abs(s["hit_rate"] - 0.6) < 1e-12
+    print("test_trade_stats_has_no_annualisation passed")
+
+
+def test_trade_stats_edges():
+    assert trade_stats([])["n_trades"] == 0
+    # zero variance must give NaN, never inf - an inf would rank top of any sort
+    assert np.isnan(trade_stats([0.01, 0.01, 0.01])["ret_per_risk"])
+    # base_rate is optional, but when given the edge must be computed
+    s = trade_stats([0.01, -0.01, 0.01, 0.01], base_rate=0.5)
+    assert abs(s["hit_edge"] - 0.25) < 1e-12
+    assert np.isnan(trade_stats([0.01, -0.01])["hit_edge"]), "no base rate -> no edge claim"
+    print("test_trade_stats_edges passed")
+
+
+def test_signal_quality_scores_every_row_not_just_triggered():
+    # The old sharpe_stats() computed its statistic over TRIGGERED rows only, so
+    # every day the rule sat out vanished from the denominator. The signal half
+    # must score all rows; the trade half only the triggered ones.
     pred = pd.Series([0.01, 0.02, -0.01, 0.006, 0.001])
     actual = pd.Series([0.02, -0.01, 0.03, 0.01, -0.05])
-    stats = sharpe_stats(pred, actual)
-    # only pred > 0.005 trigger a position: indices 0,1,3 (0.01, 0.02, 0.006)
-    assert stats["n_trades"] == 3
-    traded_actual = actual.iloc[[0, 1, 3]]
-    expected_hit_rate = (traded_actual > 0).mean()
-    assert abs(stats["hit_rate"] - expected_hit_rate) < 1e-9
-    print("test_sharpe_stats_formula passed")
+    q = signal_quality(pred, actual)
+    assert q["n"] == 5, "signal half must see every row"
+    assert q["n_trades"] == 3, "threshold >0.005 triggers indices 0,1,3"
+    assert abs(q["base_rate"] - 0.6) < 1e-12, "3 of 5 actuals are positive"
+    assert abs(q["trade_hit"] - (2 / 3)) < 1e-12
+    assert "sharpe" not in q, "Sharpe must be gone, not renamed"
+    print("test_signal_quality_scores_every_row_not_just_triggered passed")
 
 
-def test_sharpe_stats_no_trades():
-    pred = pd.Series([0.001, -0.01, 0.002])
-    actual = pd.Series([0.01, 0.02, -0.01])
-    stats = sharpe_stats(pred, actual)
-    assert stats["n_trades"] == 0
-    assert np.isnan(stats["sharpe"])
-    assert np.isnan(stats["hit_rate"])
-    print("test_sharpe_stats_no_trades passed")
+def test_no_sqrt_252_anywhere():
+    # The defect this whole change removes. AST-based so prose about it in
+    # docstrings does not count as a reoccurrence.
+    import ast as _ast, os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    hits = []
+    for fn in sorted(f for f in _os.listdir(here) if f.endswith(".py")):
+        if fn == "check_ml_health.py":      # its own budget guard mentions it
+            continue
+        try:
+            tree = _ast.parse(open(_os.path.join(here, fn), encoding="utf-8").read())
+        except (OSError, SyntaxError):
+            continue
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.Call) and len(node.args) == 1
+                    and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == "sqrt"
+                    and isinstance(node.args[0], _ast.Constant) and node.args[0].value == 252):
+                hits.append(f"{fn}:{node.lineno}")
+    assert not hits, f"sqrt(252) is back at {hits}"
+    print("test_no_sqrt_252_anywhere passed")
 
 
 def test_kelly_fraction_known_example():
@@ -272,8 +350,13 @@ if __name__ == "__main__":
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()
     test_price_features_no_leakage()
-    test_sharpe_stats_formula()
-    test_sharpe_stats_no_trades()
+    test_spearman_ic_direction()
+    test_signal_stats_detects_a_useless_signal()
+    test_signal_stats_reports_a_negative_edge_as_negative()
+    test_trade_stats_has_no_annualisation()
+    test_trade_stats_edges()
+    test_signal_quality_scores_every_row_not_just_triggered()
+    test_no_sqrt_252_anywhere()
     test_kelly_fraction_known_example()
     test_kelly_fraction_negative_edge_returns_zero()
     test_kelly_from_trades_matches_manual_calc()
