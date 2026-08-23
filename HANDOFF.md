@@ -190,7 +190,15 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 
 - [x] `py price_audit.py audit`, konfirmasi angkanya cocok dengan brief ini
       → **cocok persis**, lihat Lampiran A
-- [ ] `py price_audit.py quarantine`
+- [x] `py price_audit.py quarantine` → **501 baris ter-quarantine 2026-08-23**
+      (KIOS 142, RSGK 135, BREN 39, SINI 29, sisanya ekor). `price_history`
+      utuh — tidak ada yang dihapus.
+      **Quarantine itu SNAPSHOT, bukan kebenaran permanen.** Baris bisa sembuh
+      (Lampiran G: 899 sembuh dalam semalam). Karena `load_clean()` mengutamakan
+      tabel ini begitu ada, quarantine yang basi akan membuang baris yang
+      sebenarnya sudah bersih — konservatif, tapi memboroskan data.
+      **Jalankan ulang setiap kali scrape berhasil menyembuhkan baris**, dan
+      pasti setelah tahap 2 selesai.
 - [ ] ~~Buang COIN, CDIA, DOOH, ELTY dari universe training (rusak >90%,
       re-fetch tidak sepadan).~~ **DIBATALKAN 2026-08-21 — lihat Lampiran G.**
       Re-fetch ternyata SANGAT sepadan: satu rerun `backfill_inventory.py`
@@ -681,3 +689,50 @@ Jalankan `price-history-topup.yml` manual dengan `tickers: BBHI BNBR BREN`.
 BBHI berhasil di run #15, BNBR gagal menampilkan BBHI — jadi tiga ticker itu
 mereproduksi bug-nya. Baris `selected via ...` untuk BNBR menentukan perbaikan
 berikutnya, dalam hitungan menit, bukan sehari.
+
+## K. Dua alert diperbaiki supaya berhenti menyerigala — 2026-08-23
+
+### Alert kontaminasi menyalahkan hal yang salah
+
+Pagi 2026-08-23 `check_signal_integrity.py` melaporkan baris tanggal 08-06
+sampai 08-13 sebagai *"the scraper's ticker-selection defect is writing bad rows
+again"* — padahal `price_history` **beku di 08-20** karena topup gagal sejak
+run #15. Scraper tidak menulis apa pun. Itu true positive soal kondisi data,
+tapi false alarm soal penyebabnya.
+
+Akar masalahnya: kode menyamakan **"belum di-quarantine"** dengan **"baru
+ditulis"**. Sekarang dibedakan tiga kondisi:
+
+| kondisi | pelaporan |
+|---|---|
+| tabel `price_quarantine` belum ada | peringatan + perintah persisnya |
+| scrape tidak maju (`price_history` basi) | peringatan: **backlog**, bukan kerusakan baru |
+| scrape maju tapi tetap ada suspect | **gagal** — cacatnya memang aktif lagi |
+
+### Sinyal tak terukur diberi ambang, bukan dihapus
+
+`1 of 13 signalled ticker(s) ... have no captured close (TPIA)` dulu gagal
+keras. TPIA ada di `price_history` tapi hari itu tidak lolos filter likuiditas
+panel screener — churn struktural, bukan bug. Diukur atas 115 sinyal:
+
+```
+2026-08-16..08-21  0%      2026-08-22  8%      2026-08-23  8%
+total 8/115 = 7,0%
+```
+
+(08-12 dan 08-13 tercatat 100% hanya karena `market_summary_daily` baru mulai
+terisi 08-16.)
+
+Gagal karena satu nama akan membuat checker merah hampir tiap pagi untuk hal
+yang tidak bisa ditindaklanjuti siapa pun. Ambang `MAX_UNMEASURABLE_SIGNALS =
+0.30` tetap menangkap panel yang menyusut atau sumber sinyal yang melenceng
+dari universe.
+
+### Prinsipnya
+
+Sama dengan budget cacat di `check_ml_health.py`: **checker yang merah permanen
+untuk kondisi yang sudah diketahui melatih orang mengabaikannya.** Yang dijaga
+adalah kemampuan mendeteksi perubahan, bukan jumlah alarm.
+
+Status sesudahnya: `signal integrity OK` dengan dua peringatan jujur —
+kontaminasi 0/445 di jendela, dan TPIA sebagai churn normal.

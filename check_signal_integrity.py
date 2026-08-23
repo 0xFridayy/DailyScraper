@@ -85,6 +85,15 @@ MIN_COVERAGE = 0.90
 MIN_BASELINE_COVERAGE = 0.90
 MIN_BASELINE_DAYS = 2
 
+# A signalled ticker with no captured close cannot be scored. Some churn is
+# normal and structural: the screener panel applies liquidity filters, so a
+# tracked name can drop out on any given day (TPIA on 2026-08-23, for instance,
+# is in price_history but missed the panel). Measured over 115 signals it runs
+# at 7%, and 0% on most days. Failing on one name would make this red most
+# mornings for a condition nobody can act on; a threshold still catches the
+# panel actually shrinking or the signal source drifting off-universe.
+MAX_UNMEASURABLE_SIGNALS = 0.30
+
 
 def _load_dotenv():
     path = os.path.join(HERE, ".env")
@@ -131,10 +140,20 @@ def check_freshness(conn, problems):
             problems.append(f"{table} STALE — newest {row} ({stale} weekdays ago)")
 
 
-def check_new_contamination(conn, problems, stats):
-    """Audit detectors, scoped to the recent window and to rows not already
-    quarantined. Historical suspects are a known backlog; a NEW one means the
-    scraper defect is live again."""
+def check_new_contamination(conn, problems, notes, stats):
+    """Unquarantined suspect rows in the recent window.
+
+    "Unquarantined" is not the same as "newly written", and conflating the two
+    made this alert blame the wrong thing. On 2026-08-23 it reported rows dated
+    08-06 through 08-13 as the scraper "writing bad rows again" while
+    price_history had in fact been frozen at 08-20 for two days because the
+    topup was failing — the scraper had written nothing at all. An alert that
+    misattributes the cause every morning is one people learn to skip.
+
+    So the row age is interpreted against whether the scrape is actually
+    advancing, and the absence of a quarantine baseline is called out as its own
+    condition rather than silently inflating the count.
+    """
     window = set(_recent_dates(conn, "price_history", WINDOW_DAYS))
     if not window:
         return
@@ -150,21 +169,49 @@ def check_new_contamination(conn, problems, stats):
         known = set(map(tuple, conn.execute(
             "SELECT date, ticker FROM price_quarantine").fetchall()))
 
-    fresh = recent[recent["suspect"] & ~pd.Series(
+    flagged = recent[recent["suspect"] & ~pd.Series(
         [(d, t) in known for d, t in zip(recent["date"], recent["ticker"])],
         index=recent.index)]
 
     stats["window_rows"] = len(recent)
-    stats["fresh_suspects"] = len(fresh)
-    if len(fresh):
-        by_reason = {r: int(fresh[r].sum()) for r in
-                     ("limit_violation", "cross_ticker_dup", "series_break")
-                     if fresh[r].any()}
-        sample = ", ".join(f"{r.date} {r.ticker}" for r in fresh.head(4).itertuples())
+    stats["fresh_suspects"] = len(flagged)
+    if not len(flagged):
+        return
+
+    by_reason = {r: int(flagged[r].sum()) for r in
+                 ("limit_violation", "cross_ticker_dup", "series_break")
+                 if flagged[r].any()}
+    sample = ", ".join(f"{r.date} {r.ticker}" for r in flagged.head(4).itertuples())
+
+    # Is the scrape actually writing? If price_history has not advanced, nothing
+    # in it can be a fresh write, whatever the quarantine table does or does not
+    # contain.
+    latest = conn.execute("SELECT MAX(date) FROM price_history").fetchone()[0]
+    try:
+        stale_days = weekdays_between(
+            datetime.strptime(latest, "%Y-%m-%d").date(), date.today())
+    except (TypeError, ValueError):
+        stale_days = 0
+
+    if not has_q:
+        notes.append(
+            f"{len(flagged)} suspect row(s) in the last {WINDOW_DAYS} scrape days "
+            f"({by_reason}) — e.g. {sample}. No price_quarantine table exists, so "
+            f"the whole backlog counts as unresolved. Run `py price_audit.py "
+            f"quarantine` once to set the baseline; after that this only fires on "
+            f"rows the scrape adds.")
+    elif stale_days > MAX_STALE_WEEKDAYS:
+        notes.append(
+            f"{len(flagged)} unquarantined suspect row(s) ({by_reason}) — e.g. "
+            f"{sample}. These are BACKLOG, not new damage: price_history has not "
+            f"advanced past {latest} in {stale_days} weekdays, so the scraper has "
+            f"written nothing. The staleness itself is the problem to chase.")
+    else:
         problems.append(
-            f"{len(fresh)} NEW contaminated price_history row(s) in the last "
-            f"{WINDOW_DAYS} scrape days ({by_reason}) — e.g. {sample}. The "
-            f"scraper's ticker-selection defect is writing bad rows again.")
+            f"{len(flagged)} NEW contaminated price_history row(s) in the last "
+            f"{WINDOW_DAYS} scrape days ({by_reason}) — e.g. {sample}. The scrape "
+            f"IS advancing (newest {latest}), so the ticker-selection defect is "
+            f"writing bad rows again.")
 
 
 def check_cross_source(conn, problems, notes, stats):
@@ -314,10 +361,17 @@ def check_signals_measurable(conn, problems, notes, stats):
                         f"is not firing")
         return
     gap = [t for t in sig if t not in priced]
-    if gap:
+    if not gap:
+        return
+    share = len(gap) / len(sig)
+    detail = (f"{len(gap)} of {len(sig)} signalled ticker(s) on {latest} have no "
+              f"captured close ({', '.join(gap[:4])}) — they can never be scored")
+    if share > MAX_UNMEASURABLE_SIGNALS:
         problems.append(
-            f"{len(gap)} of {len(sig)} signalled ticker(s) on {latest} have no "
-            f"captured close ({', '.join(gap[:4])}) — they can never be scored")
+            f"{detail}. That is {share:.0%}, past the {MAX_UNMEASURABLE_SIGNALS:.0%} "
+            f"limit — the panel has shrunk or the signal source drifted off-universe.")
+    else:
+        notes.append(f"{detail} ({share:.0%}, normal panel churn)")
 
 
 def check_value_sanity(conn, problems):
@@ -340,7 +394,7 @@ def check(conn):
     problems, notes, stats = [], [], {}
     check_freshness(conn, problems)
     check_schema_and_coverage(conn, problems, notes, stats)
-    check_new_contamination(conn, problems, stats)
+    check_new_contamination(conn, problems, notes, stats)
     check_cross_source(conn, problems, notes, stats)
     check_signals_measurable(conn, problems, notes, stats)
     check_value_sanity(conn, problems)
