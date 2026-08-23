@@ -35,10 +35,12 @@ permissions:
 jobs:
   topup:
     runs-on: ubuntu-latest
-    # Raised from 35 after run #15: the identity wait can re-click submit up to
-    # 3x per ticker, so a run where retries actually fire is materially slower.
-    # Being killed mid-run is a worse outcome than a slow green.
-    timeout-minutes: 45
+    # backfill_inventory.py now issues ONE authenticated JSON GET per ticker
+    # (the /inventory/ Plotly page and its per-ticker re-click race are gone), so
+    # a full ~50-ticker run is a couple of minutes. The generous ceiling stays
+    # only as headroom for a slow login or transient API stalls — being killed
+    # mid-run is a worse outcome than a slow green.
+    timeout-minutes: 20
     env:
       # Without this, Python block-buffers stdout when it is not a TTY and a
       # killed run loses ALL progress output. Run #16 hit the timeout and its log
@@ -74,17 +76,16 @@ jobs:
       - name: Top up price_history
         run: python backfill_inventory.py ${{ inputs.tickers }}
 
-      # backfill_inventory.py dumps one screenshot + page HTML on its FIRST
-      # failure. Without this upload a selector break leaves only stdout, and
-      # diagnosing it costs another day. Mirrors daily-scrape.yml.
+      # backfill_inventory.py dumps the raw JSON of its FIRST failed response
+      # (topup-failure.json). With the API there is no page to screenshot — the
+      # response body IS the diagnostic. Without this upload an API break leaves
+      # only stdout, and diagnosing it costs another day.
       - name: Upload failure snapshot for debugging
         if: always()
         uses: actions/upload-artifact@v6
         with:
           name: topup-failure-${{ github.run_id }}
-          path: |
-            topup-failure.png
-            topup-failure.html
+          path: topup-failure.json
           if-no-files-found: ignore
           retention-days: 7
 
