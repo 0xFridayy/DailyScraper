@@ -4,6 +4,7 @@ schedule
 pytz
 pandas
 numpy
+scipy
 xgboost
 shap
 torch

@@ -1,4 +1,20 @@
 """
+================================================================================
+VOID — every Sharpe figure quoted below (0.94, 0.81, 5.36, 6.95, and the
+"Sharpe > 1.5" bar) was produced by `mean/std * sqrt(252)` applied to per-trade,
+cross-sectionally overlapping returns. Both halves of that are wrong and they
+compound. The numbers are kept, not deleted, so nobody re-derives them and
+believes them a second time. See signal_metrics.py for what replaced them.
+
+Stage 3 (2026-08-23) first honest read, same 249-day panel:
+  IC -0.025 | top-decile hit 43.5% vs base 42.3% (edge +1.2pp)
+  threshold rule hit 42.4% (edge +0.1pp vs base)
+i.e. no directional information, exactly as the base-rate finding predicted.
+Return-based edges from this run are NOT usable yet: 82 contaminated rows drag
+the panel mean from +0.32% to +14.38%, so mean-based figures stay meaningless
+until build_panel() sources price_audit.clean_panel() (HANDOFF stage 1).
+================================================================================
+
 Roadmap #2 — XGBoost walk-forward backtest.
 
 Data status (2026-07-07): neobdm_scraper.py started writing live broker_flow
@@ -113,6 +129,8 @@ import pandas as pd
 import shap
 from xgboost import XGBRegressor
 
+from signal_metrics import signal_stats, trade_stats
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
 RETAIL_BROKERS = {"XL", "XC", "YP", "PD"}
 
@@ -185,17 +203,36 @@ def build_panel(conn):
 TRADE_THRESHOLD = 0.005
 
 
-def sharpe_stats(pred, actual):
-    position = (pred > TRADE_THRESHOLD).astype(int)
-    strategy_return = position * actual
-    n_trades = int(position.sum())
-    if n_trades == 0:
-        return dict(sharpe=np.nan, n_trades=0, hit_rate=np.nan)
-    traded = strategy_return[position == 1]
-    std = traded.std()
-    sharpe = (traded.mean() / std * np.sqrt(252)) if std > 0 else np.nan
-    hit_rate = (actual[position == 1] > 0).mean()
-    return dict(sharpe=sharpe, n_trades=n_trades, hit_rate=hit_rate)
+def signal_quality(pred, actual):
+    """Replaces sharpe_stats(). See signal_metrics.py for why Sharpe is gone.
+
+    Two questions, kept separate because they are separate:
+
+      1. Is the SIGNAL informative?  IC over every row, plus the top-decile hit
+         rate and mean return against the base rate and mean of the whole
+         universe. No threshold, no sizing, no annualisation.
+      2. What did the TRADE_THRESHOLD rule actually capture?  The same rows the
+         old function scored, summarised without pretending to annualise.
+
+    Note what the old version did wrong beyond sqrt(252): it computed its
+    statistic over TRIGGERED rows only, so every day the rule sat out vanished
+    from the denominator. The signal half below always scores every row.
+    """
+    p = pd.Series(np.asarray(pred, dtype=float)).reset_index(drop=True)
+    a = pd.Series(np.asarray(actual, dtype=float)).reset_index(drop=True)
+
+    sig = signal_stats(p, a)
+    traded = a[p > TRADE_THRESHOLD]
+    tr = trade_stats(traded, base_rate=sig["base_rate"])
+
+    return dict(
+        n=sig["n"], ic=sig["ic"], base_rate=sig["base_rate"],
+        top_n=sig["n_top"], top_hit=sig["hit_rate"], top_hit_edge=sig["hit_edge"],
+        top_mean=sig["top_mean"], all_mean=sig["all_mean"], edge=sig["edge"],
+        n_trades=tr["n_trades"], trade_mean=tr["mean_ret"],
+        trade_hit=tr["hit_rate"], trade_hit_edge=tr["hit_edge"],
+        trade_ret_per_risk=tr["ret_per_risk"],
+    )
 
 
 def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
@@ -237,7 +274,7 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
         test_mae = np.abs(test_pred - test_df["target"]).mean()
         test_df["pred"] = test_pred
 
-        stats = sharpe_stats(pd.Series(test_pred, index=test_df.index), test_df["target"])
+        stats = signal_quality(test_pred, test_df["target"])
         results.append(dict(
             cycle=i, train_days=len(train_dates), test_days=len(test_dates),
             train_mae=train_mae, eval_mae=eval_mae, test_mae=test_mae, **stats,
@@ -258,7 +295,7 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
                     top_features=top_features,
                 ))
 
-    pooled_stats = sharpe_stats(pd.Series(np.concatenate(all_preds)), pd.Series(np.concatenate(all_actuals)))
+    pooled_stats = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals))
     trade_log = pd.DataFrame(trade_rows).sort_values("date").reset_index(drop=True) if trade_rows else pd.DataFrame(
         columns=["cycle", "ticker", "date", "pred", "actual", "top_features"]
     )
@@ -277,16 +314,25 @@ if __name__ == "__main__":
     print("\nPer-cycle results:")
     print(cycle_results.to_string(index=False))
 
-    print(f"\nPooled across all test cycles: sharpe={pooled['sharpe']:.2f} "
-          f"n_trades={pooled['n_trades']} hit_rate={pooled['hit_rate']:.2%}"
-          if pooled["n_trades"] else "\nPooled: no trades triggered across any test cycle.")
+    print("\nPooled across all test cycles:")
+    print(f"  n={pooled['n']} IC {pooled['ic']:+.3f} | top-decile n={pooled['top_n']} "
+          f"hit {pooled['top_hit']:.1%} vs base {pooled['base_rate']:.1%} "
+          f"(edge {pooled['top_hit_edge']:+.1%}) | return {pooled['top_mean']:+.2%} vs "
+          f"{pooled['all_mean']:+.2%} (edge {pooled['edge']:+.2%})")
+    if pooled["n_trades"]:
+        print(f"  threshold rule (>{TRADE_THRESHOLD:.1%}): n={pooled['n_trades']} "
+              f"mean {pooled['trade_mean']:+.2%} hit {pooled['trade_hit']:.1%} "
+              f"({pooled['trade_hit_edge']:+.1%} vs base)")
+    else:
+        print("  threshold rule: no trades triggered across any test cycle.")
 
     print(
-        f"\nNOTE: this is pipeline validation on {panel['date'].nunique()} days of "
-        "mostly-reconstructed (netval-only) data. A Sharpe > 1.5 here means the code "
-        "runs end-to-end, not that the edge is real - see SYSTEM.md (needs 60+ days "
-        "of live NeoBDM history, sustained, to actually validate). The 2026-07-07 run "
-        "on the full 218-day backfill found a positive but sub-threshold Sharpe that "
-        "SHAP/ablation trace to price momentum, not broker flow - see this module's "
-        "docstring before treating this number as progress toward the actual thesis."
+        f"\nNOTE: pipeline validation on {panel['date'].nunique()} days of "
+        "mostly-reconstructed (netval-only) data. Read hit_edge, not hit rate: a "
+        "top-decile hit rate only means something next to the base rate of the same "
+        "rows, and this repo reported 42.8% for months while the base rate was also "
+        "42.8%. No Sharpe appears here any more - the one this module used was wrong "
+        "twice over, see signal_metrics.py. SHAP/ablation trace whatever signal exists "
+        "to price momentum rather than broker flow; see this module's docstring before "
+        "treating any of it as progress toward the actual thesis."
     )

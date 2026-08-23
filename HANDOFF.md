@@ -278,12 +278,17 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 
 ### 3. Ganti metrik
 
-- [ ] Ganti `sharpe_from_returns()` di **empat** file (bukan tiga) dengan
-      IC / hit_rate / edge top-decile. Yang terlewat di Temuan 2:
-      `ara_arb_simulation.py:98` punya ekspresi identik.
-- [ ] Laporkan **base rate** di samping setiap hit_rate. Tanpa itu angkanya
-      tidak bisa ditafsirkan — lihat Lampiran B, hit_rate 42,8% yang tercatat
-      di repo ternyata **persis sama** dengan base rate universe.
+- [x] Ganti `sharpe_from_returns()` di **empat** file → `signal_metrics.py`.
+      Ternyata ada **tiga konsumen lagi** yang tidak terdaftar di Temuan 2:
+      `feature_ablation.py`, `multiday_features.py`, `smart_money_divergence.py`
+      semuanya mengimpor `sharpe_stats`. `check_ml_health.py` yang menangkapnya
+      (jumlah modul yang bisa diimpor turun 10 → 8).
+- [x] Laporkan **base rate** di samping setiap hit_rate → `format_trade_stats()`
+      dan `format_signal_stats()` menolak mencetak hit rate tanpanya.
+- [x] `SQRT252_BUDGET` diturunkan 4 → **0**.
+- [ ] **Tetapkan bar pengganti `SATISFACTION_SHARPE = 1.5`.** Sengaja tidak saya
+      putuskan: 1,5 adalah target yang *kamu* set untuk statistik yang benar,
+      jadi penggantinya keputusanmu. Laporan sekarang tidak menyatakan pemenang.
 - [ ] Tandai semua angka Sharpe di docstring repo sebagai **VOID** —
       jangan dihapus, beri catatan kenapa (dua alasan di Temuan 1 & 2)
 
@@ -736,3 +741,51 @@ adalah kemampuan mendeteksi perubahan, bukan jumlah alarm.
 
 Status sesudahnya: `signal integrity OK` dengan dua peringatan jujur —
 kontaminasi 0/445 di jendela, dan TPIA sebagai churn normal.
+
+## L. Tahap 3 selesai — pembacaan jujur pertama, 2026-08-23
+
+Keempat situs `sqrt(252)` dihapus, diganti `signal_metrics.py`. Nol tersisa
+(dijaga tes AST di `test_pipeline.py`).
+
+### Hasilnya
+
+Panel yang sama, 249 hari:
+
+```
+IC                       -0,025      (tak bisa dibedakan dari nol)
+top-desil hit            43,5%  vs base 42,3%   → edge +1,2 pp
+aturan ambang (>0,5%)    42,4%  vs base 42,3%   → edge +0,1 pp
+```
+
+**Model tidak menambah informasi arah.** Persis seperti yang diprediksi temuan
+base-rate di Lampiran B. Sekarang angkanya terlihat langsung di laporan, bukan
+tersembunyi di balik Sharpe yang salah.
+
+### Metrik berbasis rata-rata BELUM bisa dipakai
+
+Run yang sama melaporkan `return +97,79% vs +15,80%`. Itu bukan hasil — itu
+kontaminasi:
+
+```
+mean target panel        +14,38%
+tanpa 82 baris mustahil   +0,32%     ← distorsi 45×
+```
+
+82 baris (0,77% panel) menguasai rata-ratanya. Jadi `edge`, `top_mean`,
+`mean_ret` **tidak bermakna sampai tahap 1 selesai** (`build_panel()` →
+`clean_panel()`).
+
+Ini justru membenarkan pilihan metriknya: IC dan hit_rate berbasis peringkat dan
+tanda, jadi kebal terhadap outlier itu; edge berbasis rata-rata hancur. Baca dua
+yang pertama sekarang, yang ketiga setelah tahap 1.
+
+### Yang ditemukan sambil jalan
+
+- **`scipy` tidak ada di `requirements.txt`** padahal diimpor `horizon_scan.py`
+  dan `smart_money_divergence.py` — instalasi bersih tidak bisa menjalankan
+  keduanya. Sudah ditambahkan.
+- `signal_metrics.py` sengaja hanya bergantung numpy + pandas (Spearman lewat
+  `pandas.rank()` yang merata-ratakan ties) supaya `check_ml_health.py` bisa
+  mengimpornya di CI tanpa stack ML.
+- Angka Sharpe lama **ditandai VOID di lima docstring**, tidak dihapus — supaya
+  tidak diturunkan ulang lalu dipercaya untuk kedua kalinya.

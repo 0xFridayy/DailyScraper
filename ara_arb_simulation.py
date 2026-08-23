@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 from walk_forward_backtest import build_panel, DB_PATH
 from strategy_variants import get_walk_forward_predictions
+from signal_metrics import trade_stats, format_trade_stats
 
 NEAR_LIMIT_TOLERANCE = 0.01  # within 1 percentage point of the theoretical limit counts as "stuck"
 
@@ -89,16 +90,6 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
     return (exit_price - entry_price) / entry_price, (j - i0)
 
 
-def sharpe_from_returns(returns):
-    returns = np.array(returns)
-    n = len(returns)
-    if n == 0:
-        return dict(sharpe=np.nan, n_trades=0, hit_rate=np.nan)
-    std = returns.std()
-    sharpe = (returns.mean() / std * np.sqrt(252)) if std > 0 else np.nan
-    return dict(sharpe=sharpe, n_trades=n, hit_rate=(returns > 0).mean())
-
-
 def run_ara_arb_check(threshold=0.020):
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
@@ -138,8 +129,8 @@ def run_ara_arb_check(threshold=0.020):
         if hold_days > 1:
             n_exit_delayed += 1
 
-    naive_stats = sharpe_from_returns(naive_returns)
-    adjusted_stats = sharpe_from_returns(adjusted_returns)
+    naive_stats = trade_stats(naive_returns)
+    adjusted_stats = trade_stats(adjusted_returns)
 
     return dict(
         threshold=threshold,
@@ -161,8 +152,8 @@ if __name__ == "__main__":
     print(f"  Mean hold days once ARB roll-forward applied: {result['mean_hold_days']:.2f} (vs 1.0 assumed)")
     print()
     print(f"NAIVE (ignores ARA/ARB, assumes every close is fillable):")
-    print(f"  sharpe={result['naive']['sharpe']:.2f} n_trades={result['naive']['n_trades']} "
-          f"hit_rate={result['naive']['hit_rate']:.2%}")
+    print("  " + format_trade_stats(result["naive"]))
     print(f"ARA/ARB-ADJUSTED (entry-blocked trades excluded, ARB-stuck exits rolled forward):")
-    print(f"  sharpe={result['adjusted']['sharpe']:.2f} n_trades={result['adjusted']['n_trades']} "
-          f"hit_rate={result['adjusted']['hit_rate']:.2%}")
+    print("  " + format_trade_stats(result["adjusted"]))
+    print("\nThe comparison that matters is naive vs adjusted, not either number "
+          "on its own. No Sharpe: see signal_metrics.py.")
