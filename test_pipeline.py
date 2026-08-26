@@ -19,7 +19,8 @@ from walk_forward_backtest import (
 from signal_metrics import spearman_ic, signal_stats, trade_stats
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
-                         series_signature, ticker_from_title, should_fail_run)
+                         series_signature, ticker_from_title, should_fail_run,
+                         detect)
 
 
 def test_broker_day_aggregates_basic():
@@ -319,6 +320,63 @@ def test_ticker_from_title_only_asserts_when_it_can():
 
 
 
+def _price_frame(rows):
+    """Minimal price_history-shaped frame for the detectors."""
+    df = pd.DataFrame(rows, columns=["date", "ticker", "open", "high", "low",
+                                     "close", "volume"])
+    df.insert(0, "rid", range(1, len(df) + 1))
+    return df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+
+def _steady(ticker, start, days, price):
+    # A flat, unremarkable series — no detector should ever flag these.
+    return [(f"2026-08-{start + i:02d}", ticker, price, price, price, price, 1000)
+            for i in range(days)]
+
+
+def test_commit_gate_ignores_legitimate_volatility():
+    # The gate the topup workflow runs counts cross_ticker_dup ONLY. A correct
+    # scrape adds real IDX volatility — a +30% ARA day, a corporate action — that
+    # trips limit_violation (and, on a big enough jump, series_break). Those must
+    # NOT count against the gate, or every honest nightly scrape reddens it and
+    # price_history stops advancing. This is the bug that froze it at 2026-08-21.
+    base = _price_frame(_steady("AAA", 1, 6, 1000))
+    d0 = detect(base)
+
+    # Same series plus one legitimate +30% jump on a fresh day (prev close 1000 ->
+    # ara bound 25%, so this is outside the band and trips limit_violation).
+    after = _price_frame(_steady("AAA", 1, 6, 1000) + [("2026-08-07", "AAA",
+                         1300, 1300, 1300, 1300, 1000)])
+    d1 = detect(after)
+
+    assert int(d1["limit_violation"].sum()) > int(d0["limit_violation"].sum()), \
+        "a +30% day should register as a limit_violation"
+    # ...but the metric the gate actually reads did not move.
+    assert int(d1["cross_ticker_dup"].sum()) == int(d0["cross_ticker_dup"].sum()) == 0, \
+        "legitimate volatility must not raise the cross-ticker-dup gate"
+    print("test_commit_gate_ignores_legitimate_volatility passed")
+
+
+def test_commit_gate_catches_a_recontaminated_scrape():
+    # The regression the gate exists for: the scraper writes one ticker's OHLCV
+    # under another's name. Two different real stocks cannot share byte-identical
+    # open/high/low/close/volume, so this is exactly what cross_ticker_dup means,
+    # and the gate must see it rise.
+    clean = _price_frame(_steady("AAA", 1, 4, 1000) + _steady("BBB", 1, 4, 500))
+    d0 = detect(clean)
+    assert int(d0["cross_ticker_dup"].sum()) == 0
+
+    # BBB's 08-04 row now carries AAA's exact OHLCV — the contamination signature.
+    contaminated = _price_frame(
+        _steady("AAA", 1, 4, 1000)
+        + _steady("BBB", 1, 3, 500)
+        + [("2026-08-04", "BBB", 1000, 1000, 1000, 1000, 1000)])
+    d1 = detect(contaminated)
+    assert int(d1["cross_ticker_dup"].sum()) > 0, \
+        "identical OHLCV under two tickers on one date must raise cross_ticker_dup"
+    print("test_commit_gate_catches_a_recontaminated_scrape passed")
+
+
 def test_should_fail_run_tolerates_a_few_failures():
     # A handful of tickers legitimately fail (suspended, no chart). Reddening the
     # workflow for those would train everyone to ignore it.
@@ -339,6 +397,8 @@ def test_should_fail_run_catches_a_broken_scrape():
 
 
 if __name__ == "__main__":
+    test_commit_gate_ignores_legitimate_volatility()
+    test_commit_gate_catches_a_recontaminated_scrape()
     test_should_fail_run_tolerates_a_few_failures()
     test_should_fail_run_catches_a_broken_scrape()
     test_series_signature_distinguishes_two_stocks()

@@ -46,7 +46,8 @@ DETECTORS
 USAGE
 -----
     py price_audit.py audit                  # report only, no writes
-    py price_audit.py count                  # suspect count only (CI gate)
+    py price_audit.py count                  # total suspect count
+    py price_audit.py count cross_ticker_dup # one detector only (the CI gate)
     py price_audit.py quarantine             # mark bad rows, write audit table
     py price_audit.py repair corrected.csv   # apply fixes + rescale netval
 
@@ -321,14 +322,43 @@ def cmd_audit(conn):
           "- this is the (date,ticker) list to re-fetch prices for")
 
 
-def cmd_count(conn):
-    """Just the suspect count, for use as a CI regression gate.
+DETECTORS = ("limit_violation", "cross_ticker_dup", "series_break")
+
+
+def cmd_count(conn, reason=None):
+    """Suspect count, for use as a CI regression gate.
 
     The absolute number is not the point - the backlog is large and shrinking.
     What matters is whether a scrape run made it BIGGER, so the workflow takes
     a reading before and after and compares.
+
+    With no argument this totals all three detectors. With a detector name it
+    counts only that one, and the topup workflow deliberately passes
+    `cross_ticker_dup`:
+
+      cross_ticker_dup is the ONLY detector whose growth means the SCRAPER
+      regressed. It fires when one ticker's OHLCV is stored under another's
+      name - exactly the bug this whole module exists for - and two different
+      real IDX stocks cannot share byte-identical open/high/low/close/volume,
+      so a correct scrape never raises it (it only ever heals old dups, taking
+      the count down).
+
+      limit_violation and series_break, gated against the total, froze
+      price_history instead. They also fire on legitimate data: a +25% ARA day
+      or a corporate action trips limit_violation (the module's own doctrine is
+      to REVIEW those, not auto-act), and series_break's centered rolling median
+      shifts at the fresh end of every series as new days arrive. So each
+      correct nightly scrape added ~1 such row, the total ticked up, the gate
+      blocked the commit, and price_history stopped advancing - the staleness
+      check_signal_integrity.py then reported. See HANDOFF.md Appendix O.
     """
-    print(int(detect(load(conn))["suspect"].sum()))
+    px = detect(load(conn))
+    if reason is None:
+        print(int(px["suspect"].sum()))
+    elif reason in DETECTORS:
+        print(int(px[reason].sum()))
+    else:
+        raise SystemExit(f"unknown detector {reason!r}; choose one of {', '.join(DETECTORS)}")
 
 
 def cmd_quarantine(conn):
@@ -396,7 +426,7 @@ if __name__ == "__main__":
     if cmd == "audit":
         cmd_audit(conn)
     elif cmd == "count":
-        cmd_count(conn)
+        cmd_count(conn, sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "quarantine":
         cmd_quarantine(conn)
     elif cmd == "repair":
