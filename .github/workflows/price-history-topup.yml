@@ -70,8 +70,18 @@ jobs:
       # backlog is large and shrinking - so this compares before against after
       # and only fails on a REGRESSION. Because the commit step below does not
       # run when this fails, contaminated rows never reach master.
+      #
+      # The gate counts cross_ticker_dup ONLY, not all three detectors. That is
+      # the sole detector whose growth means the scraper regressed (one ticker's
+      # OHLCV stored under another's name); two different real stocks cannot share
+      # byte-identical OHLCV, so a correct scrape never raises it. Gating on the
+      # total instead froze price_history: limit_violation / series_break also
+      # fire on legitimate IDX moves (a +25% ARA day, a corporate action) and on
+      # the centered rolling median shifting at each series' fresh end, so every
+      # correct nightly scrape added ~1 and the gate blocked the commit forever.
+      # See price_audit.cmd_count and HANDOFF.md Appendix O.
       - name: Record contamination baseline
-        run: echo "CONTAM_BEFORE=$(python price_audit.py count)" >> "$GITHUB_ENV"
+        run: echo "CONTAM_BEFORE=$(python price_audit.py count cross_ticker_dup)" >> "$GITHUB_ENV"
 
       - name: Top up price_history
         run: python backfill_inventory.py ${{ inputs.tickers }}
@@ -89,12 +99,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Fail if the scrape introduced new contamination
+      - name: Fail if the scrape introduced new cross-ticker contamination
         run: |
-          AFTER=$(python price_audit.py count)
-          echo "contaminated price_history rows: $CONTAM_BEFORE -> $AFTER"
+          AFTER=$(python price_audit.py count cross_ticker_dup)
+          echo "cross-ticker contaminated rows: $CONTAM_BEFORE -> $AFTER"
           if [ "$AFTER" -gt "$CONTAM_BEFORE" ]; then
-            echo "::error::scrape added $((AFTER - CONTAM_BEFORE)) contaminated rows - not committing"
+            echo "::error::scrape added $((AFTER - CONTAM_BEFORE)) cross-ticker contaminated rows - not committing"
             exit 1
           fi
 

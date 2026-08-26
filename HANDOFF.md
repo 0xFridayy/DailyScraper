@@ -258,6 +258,15 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       kontaminasi sebelum & sesudah scrape dan **gagal sebelum commit** kalau
       bertambah. Dipasang di sana, bukan `daily-scrape.yml`, karena yang
       menulis `price_history` adalah `backfill_inventory.py`
+      > **KOREKSI 2026-08-26 — lihat Lampiran O.** Gerbang ini semula menghitung
+      > **total** ketiga detektor, dan itu **membekukan** `price_history` di
+      > 2026-08-21: scraper API yang sudah benar tetap menambah ~1 baris
+      > `limit_violation`/`series_break` sah tiap malam (hari ARA +25%, aksi
+      > korporasi, geser rolling-median di ujung seri), jadi `AFTER > BEFORE`
+      > selalu benar dan commit selalu di-skip. Sekarang gerbang menghitung
+      > **`cross_ticker_dup` saja** — satu-satunya detektor yang naik hanya kalau
+      > scraper benar-benar regres (OHLCV satu ticker tersimpan atas nama ticker
+      > lain). `py price_audit.py count cross_ticker_dup`.
 - [x] Selector yang belum terbukti kini di-hedge → `OPTION_SELECTORS` dan
       `VALUE_SELECTORS` menguji beberapa kandidat dalam **satu** predikat JS.
       Bukan probe berurutan: 4 kandidat × 20 dtk × 45 ticker jauh melewati
@@ -876,3 +885,79 @@ disesuaikan (artifact `topup-failure.json`, timeout 45→20).
 3. **`bval/sval` kini tersedia dari API** tapi dibiarkan NULL sampai konvensi
    satuan live-vs-backfill direkonsiliasi (live simpan angka page-derived via
    `parse_num`, backfill simpan miliar). Mengisinya jadi perubahan satu baris.
+
+## Lampiran O — gerbang kontaminasi membekukan `price_history` (2026-08-26)
+
+Gejala yang dilaporkan `check_signal_integrity.py` pagi ini:
+
+```
+🔴 SIGNAL INTEGRITY FAILED
+2026-08-26: 204 panel rows | 15 signals | offset=1d n=75 agree=100%
+new contamination in last 10d: 0 of 443 rows
+❌ price_history STALE — newest 2026-08-21 (3 weekdays ago)
+```
+
+Satu-satunya kegagalan adalah **staleness** — bukan kontaminasi. Cross-source
+`agree=100%`, contamination `0 of 443`. Jadi jalur scrape lain (screener,
+broker live) segar sampai 08-26; hanya `price_history` yang macet di 08-21.
+
+### Akar masalah — bukan scraper, tapi GERBANG-nya
+
+Scraper API baru (Lampiran N) **berhasil** tiap malam. Log run #19 (08-25) dan
+#20 (08-26) sama persis: `Failed tickers: []`, semua 45 ticker menarik data
+sampai 08-24. Yang gagal adalah langkah gerbang:
+
+```
+cross_ticker_dup? BUKAN — kontaminasi rows: 501 -> 502
+##[error]scrape added 1 contaminated rows - not committing
+```
+
+Gerbang menghitung **total** ketiga detektor sebelum vs sesudah scrape dan gagal
+kalau naik. Tapi scraper yang benar **menulis ulang seluruh jendela 1Y tiap
+malam** (`INSERT OR REPLACE`) dan menambah hari bursa baru. Volatilitas IDX yang
+sah — hari ARA +25%, ARB −15%, aksi korporasi — memicu `limit_violation`; dan
+median bergulir **terpusat** (`center=True`) di `series_break` bergeser di ujung
+tiap seri saat hari baru masuk. Salah satunya menambah ~1 baris tiap malam, jadi
+`AFTER > BEFORE` **selalu** benar → commit selalu di-skip → `price_history` tidak
+pernah maju. `check_signal_integrity` lalu melaporkan staleness-nya. Persis pola
+"checker merah permanen" yang berulang di Lampiran F & K, kali ini di sisi
+commit, bukan sisi alert.
+
+Bukti bahwa +1 itu **bukan** kontaminasi sungguhan: cross-source setuju 100% atas
+75 pasang di offset yang benar — baris baru cocok persis dengan screener yang
+di-scrape jalur terpisah. Kalau OHLCV-nya salah-ticker, keduanya tidak mungkin
+cocok.
+
+### Perbaikan
+
+Gerbang sekarang menghitung **`cross_ticker_dup` saja**
+(`py price_audit.py count cross_ticker_dup`). Alasannya:
+
+- Itu **satu-satunya** detektor yang naik hanya kalau scraper regres: OHLCV satu
+  ticker tersimpan atas nama ticker lain. Dua saham IDX berbeda tidak mungkin
+  punya open/high/low/close/**volume** byte-identik, jadi scrape yang benar tak
+  pernah menaikkannya — hanya menyembuhkan dup lama (angkanya turun).
+- `limit_violation` & `series_break` memang detektor triase backlog; doktrin
+  modulnya sendiri: **direview, bukan di-auto-act** (aksi korporasi memicunya).
+  Memakainya sebagai penghadang commit itu keliru sejak awal.
+
+Guard lain tetap ada dan tidak dilonggarkan: assert `meta.symbol`,
+`series_signature` vs ticker sebelumnya di `backfill_inventory.py`, dan
+`check_signal_integrity.py` tetap mengecek cross-source + kontaminasi jendela
+tiap hari (01:45 UTC). Jadi `limit_violation`/`series_break` tidak jadi tak
+terjaga — hanya berhenti memblokir commit.
+
+`price_audit.cmd_count` menerima argumen detektor opsional; default tetap total
+untuk pemakaian lain. Dua tes baru di `test_pipeline.py`
+(`test_commit_gate_ignores_legitimate_volatility`,
+`test_commit_gate_catches_a_recontaminated_scrape`) mengunci: lonjakan +30% sah
+menaikkan `limit_violation` tapi **tidak** `cross_ticker_dup`; OHLCV identik di
+dua ticker **menaikkannya**.
+
+### Setelah ini di-merge
+
+Sekali workflow `price-history-topup.yml` jalan dengan gerbang baru, ia akan
+commit data 08-24/08-25/08-26 yang selama ini ditolak, dan `price_history` maju
+lagi. `check_signal_integrity` hijau tanpa perubahan apa pun di checker itu —
+kegagalannya benar; yang salah ada di hulu. Bisa juga dipicu manual lewat
+`workflow_dispatch` untuk tidak menunggu cron 00:30 UTC berikutnya.
