@@ -85,10 +85,30 @@ def load(conn):
     return px.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
-def detect(px):
+def detect(px, trusted=None):
+    """Flag suspect rows. `trusted` is an optional boolean mask aligned to px.
+
+    A row that is NOT trusted (typically: already quarantined) still gets
+    judged itself, but is never used as the PREVIOUS close another row is
+    measured against. Without that, one known-bad close manufactures a
+    limit_violation on the perfectly good row that follows it:
+
+        MDIA  08-13  95   <- KIOS's price, quarantined weeks ago
+              08-24  252  <- correct, and unique, but 95 -> 252 is +171%
+
+    which then gets reported as the scraper "writing bad rows again". It is the
+    same mistake add_forward_returns() guards against at the target end — a
+    window that spans a removed row describes a move that never happened — so
+    the baseline is dropped rather than bridged to the last surviving close: a
+    multi-day jump cannot be judged against a one-day ARA/ARB band either.
+    """
     px = px.copy()
     g = px.groupby("ticker")
-    px["prev_close"] = g["close"].shift(1)
+    if trusted is None:
+        px["prev_close"] = g["close"].shift(1)
+    else:
+        base = px["close"].where(np.asarray(trusted, dtype=bool))
+        px["prev_close"] = base.groupby(px["ticker"]).shift(1)
     px["pct_chg"] = px["close"] / px["prev_close"] - 1
     px["ara"] = px["prev_close"].apply(ara_bound)
 

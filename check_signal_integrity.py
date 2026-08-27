@@ -158,9 +158,6 @@ def check_new_contamination(conn, problems, notes, stats):
     if not window:
         return
 
-    px = detect(load(conn))
-    recent = px[px["date"].isin(window)]
-
     has_q = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
     ).fetchone()[0]
@@ -168,6 +165,16 @@ def check_new_contamination(conn, problems, notes, stats):
     if has_q:
         known = set(map(tuple, conn.execute(
             "SELECT date, ticker FROM price_quarantine").fetchall()))
+
+    # Quarantined rows must not serve as the baseline the NEXT row's daily move
+    # is measured against, or old damage keeps manufacturing fresh alarms: on
+    # 2026-08-27 this reported a clean, unique MDIA row for 08-24 as the scraper
+    # "writing bad rows again", purely because the close before it was KIOS's
+    # price, flagged and quarantined two weeks earlier. See price_audit.detect.
+    raw = load(conn)
+    trusted = [(d, t) not in known for d, t in zip(raw["date"], raw["ticker"])]
+    px = detect(raw, trusted=trusted)
+    recent = px[px["date"].isin(window)]
 
     flagged = recent[recent["suspect"] & ~pd.Series(
         [(d, t) in known for d, t in zip(recent["date"], recent["ticker"])],

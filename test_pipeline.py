@@ -383,6 +383,53 @@ def _inventory_payload(nlot, nval):
             "meta": {"symbol": "SINI"}}
 
 
+def test_quarantined_row_is_not_a_baseline_for_the_next_row():
+    # The 2026-08-27 false alarm: MDIA's 08-13 close was KIOS's price (95), was
+    # flagged and quarantined weeks earlier, and its real price is ~250. The next
+    # clean row then read as +171% and got reported as the scraper "writing bad
+    # rows again". A known-bad close must never be the baseline a good row is
+    # judged against.
+    rows = [(d, "AAA", 250, 250, 250, 250, 1000)
+            for d in ("2026-08-01", "2026-08-02", "2026-08-03")]
+    rows.append(("2026-08-04", "AAA", 95, 95, 95, 95, 1000))    # contaminated
+    rows.append(("2026-08-05", "AAA", 252, 252, 252, 252, 1000))  # clean
+    px = _price_frame(rows)
+
+    naive = detect(px)
+    bad = naive[naive["date"] == "2026-08-05"].iloc[0]
+    assert bool(bad["limit_violation"]), "95 -> 252 must look like a violation untrusted"
+
+    # Same data, with the contaminated row marked untrusted.
+    trusted = [d != "2026-08-04" for d in px["date"]]
+    guarded = detect(px, trusted=trusted)
+    row = guarded[guarded["date"] == "2026-08-05"].iloc[0]
+    assert not bool(row["limit_violation"]), \
+        "a clean row after a quarantined one must not be flagged"
+    # The baseline is DROPPED, not bridged to the last good close: a multi-day
+    # move cannot be judged against a one-day ARA/ARB band either.
+    assert pd.isna(row["prev_close"])
+    print("test_quarantined_row_is_not_a_baseline_for_the_next_row passed")
+
+
+def test_trusted_mask_leaves_real_contamination_detectable():
+    # The mask must only relax the limit_violation BASELINE. cross_ticker_dup is
+    # what actually proves the scraper regressed, and it must survive untouched —
+    # otherwise this fix would blind the check it is meant to keep credible.
+    rows = [("2026-08-01", "AAA", 100, 100, 100, 100, 500),
+            ("2026-08-02", "AAA", 100, 100, 100, 100, 500),
+            ("2026-08-01", "BBB", 100, 100, 100, 100, 500),
+            ("2026-08-02", "BBB", 100, 100, 100, 100, 500)]
+    px = _price_frame(rows)
+    trusted = [False] * len(px)           # even with everything distrusted
+    guarded = detect(px, trusted=trusted)
+    assert int(guarded["cross_ticker_dup"].sum()) == 4, \
+        "identical OHLCV across tickers must still be caught"
+    assert bool(guarded["suspect"].any())
+    # And the default path is unchanged for every existing caller.
+    assert int(detect(px)["cross_ticker_dup"].sum()) == 4
+    print("test_trusted_mask_leaves_real_contamination_detectable passed")
+
+
 def test_bagholders_sum_per_day_lots_not_last_value():
     # nlot is PER-DAY net lot, not a cumulative series, so the position is its
     # sum. Reading the last element (what a cumulative series would need) would
@@ -453,6 +500,8 @@ def test_should_fail_run_catches_a_broken_scrape():
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
+    test_quarantined_row_is_not_a_baseline_for_the_next_row()
+    test_trusted_mask_leaves_real_contamination_detectable()
     test_bagholders_sum_per_day_lots_not_last_value()
     test_bagholders_exclude_net_sellers()
     test_bagholders_survive_a_malformed_payload()

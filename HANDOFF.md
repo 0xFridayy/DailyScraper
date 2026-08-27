@@ -1051,3 +1051,103 @@ respons yang **sudah terkonfirmasi** di Lampiran N, `py_compile`, dan
 `check_ml_health` hijau (27 tes). Jalan pertama di produksi perlu dilihat —
 kalau gagal, pesannya kini eksplisit di Telegram (`⚠️ gagal ambil`) dan di log,
 bukan lagi `-` yang membisu.
+
+## Lampiran Q — alarm kontaminasi salah tuduh lagi, kali ini karena tetangga terkarantina (2026-08-27)
+
+`check_signal_integrity.py` melaporkan:
+
+```
+❌ 1 NEW contaminated price_history row(s) in the last 10 scrape days
+   ({'limit_violation': 1}) — e.g. 2026-08-24 MDIA. The scrape IS advancing
+   (newest 2026-08-26), so the ticker-selection defect is writing bad rows again.
+```
+
+### Ini false positive — barisnya justru bersih
+
+Seri MDIA:
+
+```
+2026-08-12  close=280      wajar (harga MDIA ~200-280)
+2026-08-13  close=95   ⚠️  TERKARANTINA (limit_violation+cross_ticker_dup)
+2026-08-14  close=93   ⚠️  TERKARANTINA (cross_ticker_dup)
+2026-08-24  close=252      ← baris "tertuduh"
+```
+
+Baris 95/93 itu **harga KIOS** yang nyasar — kontaminasi lama, sudah masuk
+`price_quarantine` sejak dua minggu sebelumnya. Baris 08-24 (252) sendiri:
+nilainya pas di rentang normal MDIA, dan **tidak ada satu pun ticker lain yang
+berbagi OHLCV dengannya**. Cross-source hari itu `agree=100%` di 113 pasang.
+
+Pemicunya: `detect()` menghitung `pct_chg` terhadap baris sebelumnya di tabel
+**mentah** — yaitu close 93 yang sudah diketahui salah. 93 → 252 = **+171%**,
+langsung kena `limit_violation`. Baris bersih dituduh gara-gara tetangganya.
+
+Ini kesalahan yang **persis sama** dengan yang sudah dijaga `add_forward_returns()`
+di sisi target ("mengarang return yang tidak pernah terjadi"), hanya saja terjadi
+di sisi detektor. Doktrinnya sudah ada di repo; detektornya yang belum memakainya.
+
+Saudara kandung Lampiran O juga: **tiga detektor diperlakukan sama padahal
+artinya beda.** Lampiran O di sisi commit, Lampiran Q di sisi alert.
+
+### Perbaikan
+
+`detect(px, trusted=None)` menerima mask opsional. Baris yang **tidak** trusted
+(praktisnya: yang sudah terkarantina) tetap dinilai sendiri, tapi **tidak pernah
+dipakai sebagai `prev_close`** baris sesudahnya. Baseline-nya **dibuang**, bukan
+disambung ke close bersih terakhir — lompatan multi-hari juga tidak bisa dinilai
+dengan pita ARA/ARB harian.
+
+`check_new_contamination()` membangun mask itu dari `price_quarantine`.
+Default `trusted=None` = perilaku lama, jadi semua pemanggil lain
+(`cmd_count`, `load_clean`, gerbang commit) **tidak berubah**.
+
+Terukur di DB yang sama:
+
+| | sebelum | sesudah |
+|---|---|---|
+| fresh suspect di jendela | 1 (MDIA) | **0** |
+| `limit_violation` total | 84 | **32** |
+| `cross_ticker_dup` | 466 | **466** (utuh) |
+| `series_break` | 100 | **100** (utuh) |
+
+Lebih dari separuh `limit_violation` di seluruh tabel ternyata artefak tetangga
+terkarantina, bukan cuma MDIA. Deteksi kontaminasi asli tidak berkurang sedikit
+pun — dan itu yang dikunci tes `test_trusted_mask_leaves_real_contamination_detectable`.
+
+### BAHAYA TERBUKA — `workflow_dispatch` di luar jam pra-buka merusak offset tanggal
+
+Ditemukan dengan cara paling mahal: **saya sendiri melakukannya.** Memicu
+`daily-scrape.yml` manual pada 2026-08-27 13:09 UTC (**21:09 WIB, sesudah pasar
+tutup**) untuk memverifikasi Lampiran P.
+
+Seluruh pipeline mengasumsikan `market_summary_daily.date − 1 = tanggal data`
+(Lampiran E), yang hanya benar kalau scrape jalan **sebelum pasar buka** (23:00
+UTC = 07:00 WIB). Dijalankan sesudah tutup, screener mengembalikan close **hari
+itu sendiri** dan `INSERT OR REPLACE` menimpa baris pagi yang sudah benar:
+
+```
+market_summary_daily 2026-08-27   VIVA  PSKT  BRMS  ERAA
+  sebelum run manual (benar)        48   220   720   468   = price_history 08-26 ✓
+  sesudah run manual (salah)        52   236   765   496   = close 08-27 sendiri ✗
+```
+
+Akibatnya `check_signal_integrity` gagal dengan **true positive**:
+`the two scrape paths DISAGREE — only 85% of 113`. Checker-nya benar; datanya
+yang rusak. 205 baris `market_summary_daily` untuk 08-27 dan
+`konglo_signal_watch` 08-27 (25 sinyal, dari yang seharusnya 12) ikut terpengaruh.
+
+**Belum diperbaiki.** Nilai yang benar masih ada persis di git (commit `8b454b0`,
+sebelum run manual), jadi pemulihannya exact — tapi menulis `neobdm.db` lewat PR
+bertabrakan dengan commit harian workflow, jadi harus dijalankan lokal (catatan
+yang sama seperti quarantine di Lampiran D).
+
+Dua hal yang perlu diputuskan:
+
+1. **Pulihkan** baris `market_summary_daily` + `konglo_signal_watch` tanggal
+   2026-08-27 dari `8b454b0`.
+2. **Pasang pagar** supaya ini tidak bisa terulang — `daily-scrape.yml` /
+   `neobdm_scraper.py` tidak punya apa pun yang menolak atau memperingatkan
+   ketika dijalankan di luar jendela pra-buka, padahal seluruh konvensi tanggal
+   bergantung padanya. Idealnya scraper mencatat tanggal data sebenarnya
+   (kolom `last_date` yang selama ini NULL) alih-alih menyandarkan semuanya pada
+   tanggal scrape.
