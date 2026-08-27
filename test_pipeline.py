@@ -20,7 +20,7 @@ from signal_metrics import spearman_ic, signal_stats, trade_stats
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
-                         detect)
+                         detect, bagholders_from_payload)
 
 
 def test_broker_day_aggregates_basic():
@@ -377,6 +377,60 @@ def test_commit_gate_catches_a_recontaminated_scrape():
     print("test_commit_gate_catches_a_recontaminated_scrape passed")
 
 
+def _inventory_payload(nlot, nval):
+    # Shape confirmed against a real /api/inventory response (HANDOFF Appendix N).
+    return {"success": True, "data": {"nlot": nlot, "nval": nval},
+            "meta": {"symbol": "SINI"}}
+
+
+def test_bagholders_sum_per_day_lots_not_last_value():
+    # nlot is PER-DAY net lot, not a cumulative series, so the position is its
+    # sum. Reading the last element (what a cumulative series would need) would
+    # report 10 lot for AK here instead of 300.
+    payload = _inventory_payload(
+        nlot={"AK": [100, 200, 10], "BK": [50, 25, 25]},
+        nval={"AK": [1e6, 2e6, 1e5], "BK": [5e5, 2.5e5, 2.5e5]},
+    )
+    holders = bagholders_from_payload(payload, n=2)
+    assert [h["code"] for h in holders] == ["AK", "BK"], "must rank by cumulative net lot"
+    assert holders[0]["cum"] == 310
+    assert holders[1]["cum"] == 100
+    # avg = sum(nval) / (sum(nlot) * 100 shares) = 3.1e6 / 31000
+    assert abs(holders[0]["avg"] - 100.0) < 1e-9
+    print("test_bagholders_sum_per_day_lots_not_last_value passed")
+
+
+def test_bagholders_exclude_net_sellers():
+    # The term means ACCUMULATOR. The retired implementation sorted by cumulative
+    # net and took the top n unconditionally, so on a ticker everyone was dumping
+    # it would print a net seller as the "bag holder".
+    payload = _inventory_payload(
+        nlot={"AK": [-500, -200], "BK": [-10, -5], "CC": [40, 60]},
+        nval={"AK": [-5e6, -2e6], "BK": [-1e5, -5e4], "CC": [4e5, 6e5]},
+    )
+    holders = bagholders_from_payload(payload, n=2)
+    assert [h["code"] for h in holders] == ["CC"], "only net accumulators qualify"
+    # Everyone selling must yield an EMPTY list, not a least-bad seller.
+    all_selling = _inventory_payload(nlot={"AK": [-5], "BK": [-1]},
+                                     nval={"AK": [-5e4], "BK": [-1e4]})
+    assert bagholders_from_payload(all_selling, n=2) == []
+    print("test_bagholders_exclude_net_sellers passed")
+
+
+def test_bagholders_survive_a_malformed_payload():
+    # A retired endpoint / changed schema must degrade to "no holders", never
+    # raise into the daily signal. None entries appear in real series.
+    assert bagholders_from_payload(None) == []
+    assert bagholders_from_payload({}) == []
+    assert bagholders_from_payload({"success": True, "data": {}}) == []
+    holed = _inventory_payload(nlot={"AK": [100, None, 50]}, nval={"AK": [1e6, None, 5e5]})
+    assert bagholders_from_payload(holed)[0]["cum"] == 150
+    # A broker present in nlot but absent from nval must not divide by nothing.
+    no_val = _inventory_payload(nlot={"AK": [100]}, nval={})
+    assert no_val and bagholders_from_payload(no_val)[0]["avg"] == 0
+    print("test_bagholders_survive_a_malformed_payload passed")
+
+
 def test_should_fail_run_tolerates_a_few_failures():
     # A handful of tickers legitimately fail (suspended, no chart). Reddening the
     # workflow for those would train everyone to ignore it.
@@ -399,6 +453,9 @@ def test_should_fail_run_catches_a_broken_scrape():
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
+    test_bagholders_sum_per_day_lots_not_last_value()
+    test_bagholders_exclude_net_sellers()
+    test_bagholders_survive_a_malformed_payload()
     test_should_fail_run_tolerates_a_few_failures()
     test_should_fail_run_catches_a_broken_scrape()
     test_series_signature_distinguishes_two_stocks()

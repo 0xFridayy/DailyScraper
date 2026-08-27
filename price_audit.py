@@ -150,6 +150,47 @@ def ticker_from_title(title):
     return m.group(1) if m else None
 
 
+def bagholders_from_payload(payload, n=2):
+    """Rank brokers by cumulative NET LOT in an /api/inventory response.
+
+    Lives here for the same reason as the guards above: inside neobdm_scraper.py
+    it would be unimportable without playwright, and therefore untestable in CI.
+    That mattered — the DOM version of this feature broke when NeoBDM retired
+    /inventory/ and printed "Bag holder: -" every day for weeks, because an empty
+    result is indistinguishable from "no data" at the formatting layer and
+    nothing could exercise it.
+
+    `nlot` is per-day net lot per broker (verified in HANDOFF Appendix N: NOT
+    cumulative), so the bag-holder position is its sum over the window. Average
+    cost comes from `nval`, which the same appendix confirms is full-precision
+    Rupiah rather than a truncated display string:
+
+        avg = sum(nval) / (sum(nlot) * 100 shares)
+
+    Only net ACCUMULATORS are returned. The old code sorted by cumulative net and
+    took the top n unconditionally, so on a ticker every broker was dumping it
+    would report a net SELLER as a "bag holder" — the opposite of the term.
+    """
+    data = (payload or {}).get("data") or {}
+    nlot = data.get("nlot") or {}
+    nval = data.get("nval") or {}
+
+    def _total(series):
+        return sum(v for v in (series or []) if isinstance(v, (int, float)))
+
+    holders = []
+    for code, lots in nlot.items():
+        cum = _total(lots)
+        if cum <= 0:
+            continue                      # net seller: not a bag holder
+        shares = cum * 100                # 1 lot = 100 shares
+        holders.append({"code": code, "cum": cum,
+                        "avg": (_total(nval.get(code)) / shares) if shares else 0})
+
+    holders.sort(key=lambda h: h["cum"], reverse=True)
+    return holders[:n]
+
+
 def should_fail_run(n_failed, n_total, max_failure_rate=0.30):
     """Should a backfill run exit non-zero?
 
