@@ -879,9 +879,10 @@ disesuaikan (artifact `topup-failure.json`, timeout 45→20).
    supaya cakupan terlihat. **Keputusan user:** apakah cukup, atau perlebar
    (`TOP_8_*_ALL`), atau uji apakah kode broker eksplisit (`brokers=AK`) diterima
    endpoint (satu tes URL 30 detik) untuk memulihkan semantik kurasi lama.
-2. **`get_inventory_bagholders` (neobdm_scraper.py:740) MASIH pakai `/inventory/`
+2. ~~**`get_inventory_bagholders` (neobdm_scraper.py:740) MASIH pakai `/inventory/`
    Plotly yang pensiun** — fitur broker-stalker Telegram (bag-holder) juga rusak,
-   perlu migrasi API yang sama. Di luar cakupan rewrite backfill ini.
+   perlu migrasi API yang sama. Di luar cakupan rewrite backfill ini.~~
+   **SELESAI 2026-08-27 — lihat Lampiran P.**
 3. **`bval/sval` kini tersedia dari API** tapi dibiarkan NULL sampai konvensi
    satuan live-vs-backfill direkonsiliasi (live simpan angka page-derived via
    `parse_num`, backfill simpan miliar). Mengisinya jadi perubahan satu baris.
@@ -961,3 +962,92 @@ commit data 08-24/08-25/08-26 yang selama ini ditolak, dan `price_history` maju
 lagi. `check_signal_integrity` hijau tanpa perubahan apa pun di checker itu —
 kegagalannya benar; yang salah ada di hulu. Bisa juga dipicu manual lewat
 `workflow_dispatch` untuk tidak menunggu cron 00:30 UTC berikutnya.
+
+**TERKONFIRMASI 2026-08-26.** Run #21 (dispatch manual, sesudah merge) exit
+success, commit `Top up price_history (2026-08-26)` masuk master, dan
+`price_history` maju **2026-08-21 → 2026-08-24** (44 baris). Gerbang lolos,
+tidak ada kontaminasi baru.
+
+## Lampiran P — bag holder Telegram kosong ("-") sejak `/inventory/` pensiun (2026-08-27)
+
+Gejala yang dilaporkan user: di sinyal harian, blok Broker Stalker menampilkan
+angka retail jual dengan benar tapi bag holder-nya selalu kosong:
+
+```
+1. SINI | retail jual -36.9  savg: 8759.9
+   🎒 Bag holder: -
+2. EMAS | retail jual -31    savg: 8354.5
+   🎒 Bag holder: -
+```
+
+### Akar masalah — sisa dari halaman yang pensiun, bukan data nol
+
+`get_inventory_bagholders()` masih men-scrape `/inventory/` Plotly yang **sudah
+dipensiunkan** NeoBDM (Lampiran H/I/M): `page.click("#tick .Select-control")`,
+`#submit-button`, lalu baca `.js-plotly-plot`. Selector itu tidak ada lagi, jadi
+tiap lookup entah mengembalikan `[]` atau melempar exception yang ditelan
+`except` di pemanggilnya jadi `holders = []`. Formatter menutupnya:
+
+```python
+bag = ", ".join(...) or "-"     # list kosong → "-"
+```
+
+Jadi fitur yang **mati** tampil identik dengan "memang tidak ada akumulator".
+Itu sebabnya rusaknya berminggu-minggu tanpa ada yang menyadari.
+
+Ini persis follow-up #2 yang ditulis terbuka di Lampiran N: waktu itu **hanya
+`backfill_inventory.py`** yang dimigrasikan ke `/api/inventory`, pemanggil ini
+sengaja ditinggal. Bukti bahwa yang rusak cuma jalur ini: `get_netflow()` di
+halaman broker (`NEOBDM_BROKER_URL`) masih hidup — angka "retail jual" di sinyal
+yang sama tetap benar.
+
+### Perbaikan
+
+Migrasi ke endpoint JSON yang sama seperti backfill: **satu GET terautentikasi
+per ticker**, tanpa dropdown, tanpa submit, tanpa tunggu-render, tanpa race
+chart-basi. Cookie di-prime **sekali** sebelum loop (dulu: satu `goto` + ~18 dtk
+tunggu **per ticker**).
+
+Perhitungannya langsung dari respons:
+
+```
+cum_lot = sum(nlot[code])            # nlot = net HARIAN (Lampiran N), jadi dijumlahkan
+avg     = sum(nval[code]) / (cum_lot * 100)
+```
+
+Dua koreksi semantik yang ikut dibetulkan:
+
+1. **Hanya akumulator.** Kode lama mengurutkan cum desc lalu ambil top-n tanpa
+   syarat — di ticker yang semua broker-nya jualan, itu melaporkan **net seller**
+   sebagai "bag holder", kebalikan dari istilahnya. Sekarang `cum <= 0` dibuang.
+2. **Kegagalan tidak lagi menyamar jadi "-".** `holders_failed` dibawa ke
+   formatter: gagal ambil → `⚠️ gagal ambil`, sukses tapi nihil → `tidak ada
+   akumulator`. Prinsip yang sama dengan Lampiran F/K, dipasang di sisi tampilan.
+
+### Kenapa fungsinya ada di `price_audit.py`
+
+`bagholders_from_payload()` (murni, tanpa playwright) diparkir di `price_audit.py`
+bersama `series_signature`/`should_fail_run`, dengan alasan yang **sudah
+didokumentasikan modul itu**: di `neobdm_scraper.py` ia tidak bisa diimpor tanpa
+playwright + kredensial, jadi tidak bisa diuji di CI — dan CI justru satu-satunya
+tempat regresi ini tertangkap. `ml-health.yml` memang tidak menginstal playwright.
+Tiga tes baru mengunci: nlot dijumlahkan (bukan ambil elemen terakhir), net
+seller dibuang, dan payload rusak/`None` degrade ke `[]` bukan exception.
+
+### Catatan cakupan broker (KEPUTUSAN TERBUKA)
+
+`BAGHOLDER_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]` — tata bahasa
+permintaan situs sendiri, dijamin diterima (tak berisiko 400 yang membakar run).
+**Tapi seleksinya recency-weighted** (20 candle terakhir), sementara bag holder
+dimaksudkan ~3 bulan: broker yang akumulasi besar 2 bulan lalu lalu berhenti bisa
+terlewat. Melebarkan ke `TOP_8_*_ALL` cuma satu edit, tapi ejaan itu **belum
+pernah terlihat dikirim situsnya** — verifikasi dulu (satu tes URL) sebelum
+dipakai.
+
+### Belum diuji terhadap situs live
+
+Tidak ada kredensial NeoBDM di sesi ini. Yang sudah diuji: 3 tes unit atas bentuk
+respons yang **sudah terkonfirmasi** di Lampiran N, `py_compile`, dan
+`check_ml_health` hijau (27 tes). Jalan pertama di produksi perlu dilihat —
+kalau gagal, pesannya kini eksplisit di Telegram (`⚠️ gagal ambil`) dan di log,
+bukan lagi `-` yang membisu.

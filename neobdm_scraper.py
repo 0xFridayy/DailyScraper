@@ -13,8 +13,13 @@ import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 import os
 import pytz
+
+# Pure, playwright-free helper parked in price_audit so CI can test it — see the
+# note above bagholders_from_payload for why that placement is deliberate.
+from price_audit import bagholders_from_payload
 
 
 # ─────────────────────────────────────────────
@@ -713,63 +718,64 @@ def get_netflow(page, codes, duration="Today", side="dist"):
 
 # ── INVENTORY (per-ticker top "bag holders") ──
 
-NEOBDM_INVENTORY_URL = "https://neobdm.tech/inventory/"
+INVENTORY_CHART_URL = "https://neobdm.tech/inventory-chart/"
+INVENTORY_API = f"{API_BASE}/inventory"
+
+# The Telegram line claims "~3 bln" of accumulation, so ask for that window
+# explicitly instead of inheriting whatever the old page defaulted to.
+BAGHOLDER_WINDOW_DAYS = 90
+
+# Which brokers the endpoint resolves. This is the site's OWN request grammar and
+# the exact pair /inventory-chart/ sends, so it is guaranteed accepted — no risk
+# of a 400 burning a run. It resolves to the 5 largest net buyers + 5 largest net
+# sellers BY LOT over the last 20 candles, then returns their per-day flow across
+# the whole window. Caveat worth knowing: the SELECTION is recency-weighted (last
+# 20 candles), so a broker who accumulated hard two months ago and then stopped
+# can be missed. Widening to TOP_8_*_ALL is one edit here, but that spelling is
+# documented grammar we have not seen the site itself send — verify before using.
+BAGHOLDER_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
 
 
-def _parse_rp(s):
-    """'Rp 1.66Trl' -> 1.66e12, 'Rp -31.86Mlr' -> -31.86e9, 'Rp 0.24Trl', etc."""
-    if not s:
-        return 0.0
-    s = s.replace("Rp", "").replace(" ", "").strip()
-    mult = 1.0
-    for suf, m in (("Trl", 1e12), ("Mlr", 1e9), ("jt", 1e6), ("rb", 1e3)):
-        if s.endswith(suf):
-            s, mult = s[:-len(suf)], m
-            break
-    try:
-        return float(s) * mult
-    except ValueError:
-        return 0.0
+def _inventory_window(days=BAGHOLDER_WINDOW_DAYS):
+    end = datetime.now(pytz.timezone(TIMEZONE)).date()
+    return (end - timedelta(days=days)).isoformat(), end.isoformat()
 
 
 def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
-    """Top-n 'bag holders' of a ticker = brokers with the highest cumulative net
-    inventory (Net Akum) over the page's default ~3-month window, from the
-    Plotly inventory chart. Each broker has a 'markers+text' end-point trace
-    whose last y = cumulative net (lot) and customdata = [cum lot str, cum Rp str];
-    avg buy price (cost basis) = cum Rp / (cum lot * 100 shares)."""
-    page.goto(NEOBDM_INVENTORY_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(7000)
-    # ticker = react-select dropdown #tick (same widget family as #broker)
-    page.click("#tick .Select-control")
-    page.wait_for_timeout(400)
-    page.keyboard.type(ticker)
-    page.wait_for_timeout(1500)
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(800)
-    page.click("#submit-button")     # Fetch (default date range; no calendar touched)
-    page.wait_for_timeout(11000)     # Plotly render
-    holders = page.evaluate(
-        """() => {
-            const el = document.querySelector('.js-plotly-plot');
-            if (!el || !el.data) return [];
-            return el.data
-                .filter(t => (t.mode||'').includes('markers') && t.name &&
-                             Array.isArray(t.y) && t.y.length)
-                .map(t => ({
-                    code: t.name,
-                    cum: t.y[t.y.length-1],
-                    netval: (t.customdata && t.customdata.length)
-                            ? t.customdata[t.customdata.length-1][1] : ''
-                }))
-                .filter(t => typeof t.cum === 'number')
-                .sort((a, b) => b.cum - a.cum);
-        }"""
-    )
-    for h in holders:
-        shares = h["cum"] * 100  # 1 lot = 100 shares
-        h["avg"] = (_parse_rp(h.get("netval", "")) / shares) if shares else 0
-    return holders[:n]
+    """Top-n 'bag holders' of a ticker = brokers with the largest cumulative net
+    inventory over ~3 months.
+
+    REWRITTEN OFF THE RETIRED PAGE. This used to drive /inventory/ — a
+    react-select dropdown, a #submit-button and a Plotly chart read out of the
+    DOM. NeoBDM retired that page (HANDOFF Appendices H/I/M), so every lookup
+    either found no elements or threw, the caller swallowed it into `holders =
+    []`, and the Telegram signal printed "Bag holder: -" every single day. The
+    feature had been dead since the page went away; nothing failed loudly because
+    an empty list formats as "-".
+
+    backfill_inventory.py was migrated to the /api/inventory JSON endpoint at the
+    time and this caller was left as follow-up (Appendix N, item 2). This is that
+    follow-up: one authenticated GET, no DOM, no render race.
+    """
+    start_date, end_date = _inventory_window()
+    query = [("symbol", ticker), ("start_date", start_date),
+             ("end_date", end_date), ("investor_type", "A")]
+    query += [("brokers", b) for b in BAGHOLDER_BROKERS]
+
+    resp = page.context.request.get(f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
+    payload = _api_json(resp)
+    if not payload or not payload.get("success"):
+        raise RuntimeError(
+            f"{ticker}: inventory API status={resp.status} "
+            f"success={(payload or {}).get('success')}")
+
+    # The endpoint is symbol-keyed, but never trust a payload whose meta disagrees
+    # with what we asked for — the same gate backfill_inventory.py applies.
+    shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
+    if shown and shown != ticker.upper():
+        raise RuntimeError(f"inventory API returned {shown} for requested {ticker}")
+
+    return bagholders_from_payload(payload, n)
 
 
 def _fmt_lot(v):
@@ -798,21 +804,35 @@ def scrape_broker_stalker(page):
     if not top:
         return []
 
-    # 2) per ticker -> top bag holders from the inventory chart
+    # 2) per ticker -> top bag holders from the inventory JSON API.
+    # Prime the inventory path ONCE so its session cookies are set; the GETs below
+    # all ride this same authenticated context, so there is no per-ticker page
+    # load (the retired DOM version did one goto + an 18s wait per ticker).
+    try:
+        page.goto(INVENTORY_CHART_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
+    except Exception as e:
+        log.error(f"inventory-chart prime failed: {e}")
+
     results = []
     for r in top:
         symbol = r["symbol"]
+        # One ticker failing must not kill the whole daily signal, but the failure
+        # must stay VISIBLE: printing a broken fetch as "-" is exactly how this
+        # feature stayed dead for weeks after /inventory/ was retired.
+        failed = False
         try:
             holders = get_inventory_bagholders(page, symbol)
         except Exception as e:
             log.error(f"inventory bagholders {symbol} failed: {e}")
-            holders = []
+            holders, failed = [], True
         log.info(f"{symbol} bag holders: {[(h['code'], round(h['cum'])) for h in holders]}")
         results.append({
             "symbol":  symbol,
             "netval":  r.get("netval", ""),
             "savg":    r.get("savg", ""),
             "holders": holders,
+            "holders_failed": failed,
         })
     return results
 
@@ -1041,7 +1061,7 @@ def _broker_stalker_lines(data):
         holders = row.get("holders", [])
         bag = ", ".join(
             f"{h['code']} {_fmt_lot(h['cum'])} @{h.get('avg', 0):.0f}" for h in holders
-        ) or "-"
+        ) or ("⚠️ gagal ambil" if row.get("holders_failed") else "tidak ada akumulator")
         lines.append(f"{i}. {row['symbol']} | retail jual {row['netval']}  savg: {row['savg']}")
         lines.append(f"   🎒 Bag holder: {bag}")
     return lines
