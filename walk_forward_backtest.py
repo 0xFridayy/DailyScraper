@@ -134,6 +134,7 @@ from signal_metrics import signal_stats, trade_stats
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
 RETAIL_BROKERS = {"XL", "XC", "YP", "PD"}
+RANDOM_SEED = 17
 
 FEATURES = [
     "broker_concentration", "net_flow_total", "n_brokers", "net_buy_ratio",
@@ -144,6 +145,7 @@ XGB_PARAMS = dict(
     max_depth=4, learning_rate=0.05, n_estimators=100,
     subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
     early_stopping_rounds=10, eval_metric="mae",
+    random_state=RANDOM_SEED, n_jobs=1,
 )
 
 
@@ -243,7 +245,8 @@ def signal_quality(pred, actual, dates=None):
 
     return dict(
         n=sig["n"], ic=sig["ic"], daily_ic=sig["daily_ic"],
-        daily_ic_median=sig["daily_ic_median"], n_daily_ic=sig["n_daily_ic"],
+        daily_ic_median=sig["daily_ic_median"],
+        positive_ic_days=sig["positive_ic_days"], n_daily_ic=sig["n_daily_ic"],
         base_rate=sig["base_rate"],
         top_n=sig["n_top"], top_hit=sig["hit_rate"], top_hit_edge=sig["hit_edge"],
         top_mean=sig["top_mean"], all_mean=sig["all_mean"], edge=sig["edge"],
@@ -338,6 +341,7 @@ if __name__ == "__main__":
     print("\nPooled across all test cycles:")
     print(f"  n={pooled['n']} IC {pooled['ic']:+.3f} | daily IC mean "
           f"{pooled['daily_ic']:+.3f}, median {pooled['daily_ic_median']:+.3f} "
+          f"positive {pooled['positive_ic_days']:.1%} "
           f"({pooled['n_daily_ic']}d) | top-decile n={pooled['top_n']} "
           f"hit {pooled['top_hit']:.1%} vs base {pooled['base_rate']:.1%} "
           f"(edge {pooled['top_hit_edge']:+.1%}) | return {pooled['top_mean']:+.2%} vs "

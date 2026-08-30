@@ -25,6 +25,11 @@ from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
                          detect, bagholders_from_payload, bagholders_from_payloads,
                          inventory_date_blocks, date_offset_holds)
+from ml_v2_experiment_1 import (
+    EXPERIMENT_XGB_PARAMS, FLOW_WINDOWS, PRICE_FEATURES,
+    _historical_net_lots, build_broker_identity_features,
+    feature_sets_for_columns, make_walk_forward_splits,
+)
 
 
 def test_broker_day_aggregates_basic():
@@ -149,9 +154,86 @@ def test_signal_stats_ranks_cross_sectionally_each_day():
     s = signal_stats(pred, actual, groups=dates)
     assert abs(s["daily_ic"]) < 1e-12
     assert abs(s["daily_ic_median"]) < 1e-12
+    assert abs(s["positive_ic_days"] - 0.5) < 1e-12
     assert s["n_daily_ic"] == 2
     assert s["n_top"] == 2, "top decile must select the best-ranked name each day"
     print("test_signal_stats_ranks_cross_sectionally_each_day passed")
+
+
+def test_ml_v2_xgboost_seed_is_locked():
+    assert isinstance(EXPERIMENT_XGB_PARAMS["random_state"], int)
+    assert EXPERIMENT_XGB_PARAMS["n_jobs"] == 1
+    assert EXPERIMENT_XGB_PARAMS["tree_method"] == "hist"
+    print("test_ml_v2_xgboost_seed_is_locked passed")
+
+
+def test_ml_v2_feature_sets_keep_the_same_price_controls():
+    identity = ["broker_AK_flow_1d", "broker_BK_flow_1d"]
+    inventory = ["broker_AK_observable_inventory", "broker_BK_observable_inventory"]
+    sets = feature_sets_for_columns(identity, inventory)
+    assert list(sets) == [
+        "price_only", "existing_broker_aggregate", "broker_identity",
+        "broker_identity + observable_inventory",
+    ]
+    for features in sets.values():
+        assert set(PRICE_FEATURES).issubset(features)
+    assert identity[0] in sets["broker_identity"], "broker code must survive in the feature name"
+    assert not any("observable_inventory" in f for f in sets["broker_identity"])
+    assert all(f in sets["broker_identity + observable_inventory"] for f in inventory)
+    print("test_ml_v2_feature_sets_keep_the_same_price_controls passed")
+
+
+def test_broker_identity_flows_and_observable_inventory_use_net_lots():
+    dates = [f"2026-01-{day:02d}" for day in range(1, 22)]
+    px = pd.DataFrame({
+        "ticker": ["AAA"] * len(dates), "date": dates,
+        "close": [100.0] * len(dates), "volume": [10_000.0] * len(dates),
+        **{f"lag_{window}": [1.0] * len(dates) for window in FLOW_WINDOWS},
+    })
+    rows = []
+    for date in dates:
+        for code, lots in (("AK", 10.0), ("BK", -5.0)):
+            rows.append({
+                "ticker": "AAA", "date": date, "broker_code": code,
+                "bval": np.nan, "sval": np.nan, "bavg": np.nan, "savg": np.nan,
+                "netval": lots * 100.0 * 100.0 / 1e9, "close": 100.0,
+            })
+    bf = pd.DataFrame(rows)
+    out, flow, inventory = build_broker_identity_features(px, bf)
+    last = out.iloc[-1]
+    assert len(flow) == 2 * len(FLOW_WINDOWS)
+    assert len(inventory) == 2
+    assert abs(last["broker_AK_flow_1d"] - 0.10) < 1e-12
+    assert abs(last["broker_AK_flow_3d"] - 0.10) < 1e-12
+    assert abs(last["broker_BK_flow_20d"] + 0.05) < 1e-12
+    assert abs(last["broker_AK_observable_inventory"] - 2.10) < 1e-12
+    assert abs(last["broker_BK_observable_inventory"] + 1.05) < 1e-12
+
+    # A clean-panel gap restarts cumulative observable inventory rather than
+    # assuming the missing interval carried zero flow.
+    gapped = px.copy()
+    gapped.loc[10, "lag_1"] = np.nan
+    reset, _, _ = build_broker_identity_features(gapped, bf)
+    assert abs(reset.iloc[-1]["broker_AK_observable_inventory"] - 1.10) < 1e-12
+
+    live = pd.DataFrame([{
+        "bval": 10 * 100 * 100 / 1e9, "sval": 2 * 100 * 100 / 1e9,
+        "bavg": 100.0, "savg": 100.0, "netval": 0.0, "close": 100.0,
+    }])
+    assert abs(_historical_net_lots(live).iloc[0]["net_lots"] - 8.0) < 1e-12
+    print("test_broker_identity_flows_and_observable_inventory_use_net_lots passed")
+
+
+def test_ml_v2_walk_forward_splits_are_strictly_chronological():
+    panel = pd.DataFrame({"date": [f"d{i:03d}" for i in range(50)]})
+    splits = make_walk_forward_splits(panel, train_min=30, test_window=6)
+    assert len(splits) == 3
+    for split in splits:
+        assert set(split["fit"]).isdisjoint(split["eval"])
+        assert set(split["fit"]).isdisjoint(split["test"])
+        assert set(split["eval"]).isdisjoint(split["test"])
+        assert max(split["fit"]) < min(split["eval"]) < min(split["test"])
+    print("test_ml_v2_walk_forward_splits_are_strictly_chronological passed")
 
 
 def test_trade_stats_has_no_annualisation():
@@ -754,6 +836,10 @@ if __name__ == "__main__":
     test_signal_stats_detects_a_useless_signal()
     test_signal_stats_reports_a_negative_edge_as_negative()
     test_signal_stats_ranks_cross_sectionally_each_day()
+    test_ml_v2_xgboost_seed_is_locked()
+    test_ml_v2_feature_sets_keep_the_same_price_controls()
+    test_broker_identity_flows_and_observable_inventory_use_net_lots()
+    test_ml_v2_walk_forward_splits_are_strictly_chronological()
     test_trade_stats_has_no_annualisation()
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()

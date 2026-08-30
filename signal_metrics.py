@@ -72,6 +72,7 @@ def signal_stats(pred, actual, top_q=TOP_QUANTILE, groups=None):
       ic          rank correlation over all rows
       daily_ic    mean cross-sectional rank correlation within each date
       daily_ic_median median of those daily correlations
+      positive_ic_days fraction of defined daily ICs above zero
       base_rate   fraction of ALL rows with a positive return
       hit_rate    fraction of TOP-slice rows with a positive return
       hit_edge    hit_rate - base_rate, the number that says whether the
@@ -92,7 +93,8 @@ def signal_stats(pred, actual, top_q=TOP_QUANTILE, groups=None):
     n = len(p)
     empty = dict(n=0, n_top=0, ic=np.nan, base_rate=np.nan, hit_rate=np.nan,
                  hit_edge=np.nan, top_mean=np.nan, all_mean=np.nan, edge=np.nan,
-                 daily_ic=np.nan, daily_ic_median=np.nan, n_daily_ic=0)
+                 daily_ic=np.nan, daily_ic_median=np.nan,
+                 positive_ic_days=np.nan, n_daily_ic=0)
     if n == 0:
         return empty
 
@@ -113,10 +115,12 @@ def signal_stats(pred, actual, top_q=TOP_QUANTILE, groups=None):
 
     daily_ic = float(np.mean(daily_ics)) if daily_ics else np.nan
     daily_ic_median = float(np.median(daily_ics)) if daily_ics else np.nan
+    positive_ic_days = float(np.mean(np.asarray(daily_ics) > 0)) if daily_ics else np.nan
     if len(top) == 0:
         return {**empty, "n": n, "ic": spearman_ic(p, a),
                 "base_rate": float((a > 0).mean()), "all_mean": float(a.mean()),
                 "daily_ic": daily_ic, "daily_ic_median": daily_ic_median,
+                "positive_ic_days": positive_ic_days,
                 "n_daily_ic": len(daily_ics)}
 
     base_rate = float((a > 0).mean())
@@ -124,7 +128,8 @@ def signal_stats(pred, actual, top_q=TOP_QUANTILE, groups=None):
     all_mean, top_mean = float(a.mean()), float(top.mean())
     return dict(
         n=n, n_top=len(top), ic=spearman_ic(p, a), daily_ic=daily_ic,
-        daily_ic_median=daily_ic_median, n_daily_ic=len(daily_ics),
+        daily_ic_median=daily_ic_median, positive_ic_days=positive_ic_days,
+        n_daily_ic=len(daily_ics),
         base_rate=base_rate, hit_rate=hit_rate, hit_edge=hit_rate - base_rate,
         top_mean=top_mean, all_mean=all_mean, edge=top_mean - all_mean,
     )
@@ -180,7 +185,8 @@ def format_signal_stats(s, label=""):
     daily = ""
     if not np.isnan(s.get("daily_ic", np.nan)):
         daily = (f" | daily IC mean {s['daily_ic']:+.3f}, "
-                 f"median {s['daily_ic_median']:+.3f} ({s['n_daily_ic']}d)")
+                 f"median {s['daily_ic_median']:+.3f}, "
+                 f"positive {s['positive_ic_days']:.1%} ({s['n_daily_ic']}d)")
     return (f"{head}n={s['n']} IC {ic}{daily} | top{int((1 - TOP_QUANTILE) * 100)}% "
             f"n={s['n_top']} hit {s['hit_rate']:.1%} vs base {s['base_rate']:.1%} "
             f"(edge {s['hit_edge']:+.1%}) | ret {s['top_mean']:+.2%} vs "
