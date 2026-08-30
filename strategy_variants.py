@@ -65,6 +65,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+from price_audit import clean_panel
 from signal_metrics import trade_stats
 
 MAX_HOLD_DAYS = 7  # explicit user ceiling
@@ -137,6 +138,8 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     for k in range(1, hold_days + 1):
         if i0 + k >= len(g):
             break
+        if "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
+            return None  # quarantine/suspension gap: never bridge it as a hold day
         day = g.loc[i0 + k]
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct
@@ -203,7 +206,7 @@ def run_strategy_search(panel, px, search_frac=0.7):
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = clean_panel(conn, horizons=(1,), lags=(1,))
     conn.close()
 
     result = run_strategy_search(panel, px)

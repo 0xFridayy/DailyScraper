@@ -30,9 +30,12 @@ Treatment of a stuck-limit trade:
     tends to continue down before it stabilizes, so this is not a
     favorable assumption for the strategy).
 
+VOID — the historical Sharpe comparison below used the invalid repo-wide
+metric. Current runs report non-annualized trade statistics only.
+
 2026-07-07 result: see run_ara_arb_check() - a modest fraction of trades are
 entry-blocked (excluded) and exit-delayed (rolled forward), and the impact on
-the winning strategy's Sharpe is reported both including and excluding this
+the winning strategy's historical Sharpe was reported both including and excluding this
 adjustment for direct comparison.
 """
 
@@ -60,7 +63,10 @@ ARB_BOUND = -0.15
 def annotate_limits(px):
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["pct_chg"] = (px["close"] - px["prev_close"]) / px["prev_close"]
+    px["pct_chg"] = px["lag_1"] if "lag_1" in px else (
+        (px["close"] - px["prev_close"]) / px["prev_close"]
+    )
+    px["prev_close"] = px["close"] / (1 + px["pct_chg"])
     px["ara_bound"] = px["prev_close"].apply(ara_bound)
     px["at_ara"] = px["pct_chg"] >= (px["ara_bound"] - NEAR_LIMIT_TOLERANCE)
     px["at_arb"] = px["pct_chg"] <= (ARB_BOUND + NEAR_LIMIT_TOLERANCE)
@@ -79,10 +85,14 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
         return None  # entry blocked: can't reliably buy into a locked limit-up
     if i0 + 1 >= len(g):
         return None
+    if "fwd_1" in g and pd.isna(g.loc[i0, "fwd_1"]):
+        return None  # the next surviving bar is across a quarantine/suspension gap
     entry_price = g.loc[i0, "close"]
 
     j = i0 + 1
     while j < len(g) and g.loc[j, "at_arb"] and j < i0 + 20:  # cap the roll-forward search
+        if "fwd_1" in g and pd.isna(g.loc[j - 1, "fwd_1"]):
+            return None
         j += 1
     if j >= len(g):
         j = len(g) - 1
@@ -91,9 +101,11 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
 
 
 def run_ara_arb_check(threshold=0.020):
+    from price_audit import clean_panel
+
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = clean_panel(conn, horizons=(1,), lags=(1,))
     conn.close()
 
     px = annotate_limits(px)
@@ -115,7 +127,7 @@ def run_ara_arb_check(threshold=0.020):
         if g is None or row["date"] not in idx_map:
             continue
         i0 = idx_map[row["date"]]
-        if i0 + 1 >= len(g):
+        if i0 + 1 >= len(g) or pd.isna(g.loc[i0, "fwd_1"]):
             continue
         naive_returns.append((g.loc[i0 + 1, "close"] - g.loc[i0, "close"]) / g.loc[i0, "close"])
 

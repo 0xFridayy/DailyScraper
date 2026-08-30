@@ -1,6 +1,11 @@
 """
 Roadmap #4 — Kelly criterion position sizing.
 
+VOID — every historical Sharpe and the "Sharpe > 1.5" gate quoted below used
+the invalid per-trade/cross-sectional formula documented in signal_metrics.py.
+They remain only so the old experiment is not rediscovered. No replacement
+threshold has been chosen, and this module remains inert.
+
 DORMANT: not wired into anything yet. Feed kelly_fraction a negative or zero
 edge (equal-ish avg_win/avg_loss with hit_rate <= 50%) and it correctly
 returns 0 — but a positive number out of the formula is NOT the same thing
@@ -22,9 +27,8 @@ docstring and SYSTEM.md's Backtest Results Log for the full diagnostic —
 this module is still inert; see the __main__ block below for why a positive
 number out of the formula doesn't change that.
 
-This module exists so the formula is ready and tested for whenever a real
-edge shows up (Layer 1 Sharpe > 1.5 sustained, per SYSTEM.md), not because
-it's safe to use today.
+This module exists so the formula is ready and tested if a real edge is later
+validated under criteria chosen by the user, not because it is safe to use now.
 """
 
 def kelly_fraction(win_rate, avg_win, avg_loss, fraction_cap=0.5):

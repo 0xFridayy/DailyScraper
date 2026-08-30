@@ -20,12 +20,12 @@ Metrics deliberately avoid the sqrt(252)-on-per-trade-returns problem:
 """
 import sqlite3, warnings
 import numpy as np, pandas as pd
-from scipy.stats import spearmanr
 from xgboost import XGBRegressor
 from walk_forward_backtest import (
     DB_PATH, _broker_day_aggregates, _broker_correlation_1d, FEATURES, XGB_PARAMS,
 )
 from price_audit import clean_panel
+from signal_metrics import signal_stats
 
 warnings.filterwarnings("ignore")
 
@@ -68,15 +68,17 @@ def build(conn):
     # Reading price_history directly here would put ~12% contaminated rows into
     # both X and y, and computing shift(-h) after filtering would bridge the
     # removed rows into targets that never happened - see price_audit.py.
-    px = clean_panel(conn, horizons=HORIZONS, lags=(1, 5), extremes=True)
+    px = clean_panel(conn, horizons=HORIZONS, lags=(1, 5, 10), extremes=True)
     g = px.groupby("ticker")
     px["momentum_1d"] = px["lag_1"]
     px["momentum_5d"] = px["lag_5"]
     px["vol_ma5"] = g["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
+    px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
     px["atr_pct"] = g.apply(
         lambda d: ((d["high"] - d["low"]) / d["close"]).rolling(10).mean()
     ).reset_index(level=0, drop=True)
+    px["atr_pct"] = px["atr_pct"].where(px["lag_10"].notna())
 
     for h in HORIZONS:
         px[f"ret_{h}"] = px[f"fwd_{h}"]
@@ -102,7 +104,7 @@ SETS = {
 def walk_forward(panel, feats, target, train_min=60, test_window=10):
     df = panel.dropna(subset=[target] + feats).copy()
     dates = sorted(df["date"].unique())
-    preds, actuals = [], []
+    preds, actuals, test_dates = [], [], []
     te = train_min
     while te + test_window <= len(dates):
         tr = df[df["date"].isin(dates[:te])]
@@ -114,15 +116,16 @@ def walk_forward(panel, feats, target, train_min=60, test_window=10):
                   eval_set=[(tr[feats].iloc[sp:], tr[target].iloc[sp:])], verbose=False)
             preds.append(m.predict(ts[feats]))
             actuals.append(ts[target].values)
+            test_dates.append(ts["date"].values)
         te += test_window
     if not preds:
         return None
-    p, a = np.concatenate(preds), np.concatenate(actuals)
-    ic = spearmanr(p, a).correlation
-    cut = np.quantile(p, 0.9)
-    top = a[p >= cut]
-    return dict(n=len(p), ic=ic, n_top=len(top), hit=(top > 0).mean(),
-                top_ret=top.mean(), base_ret=a.mean(), edge=top.mean() - a.mean())
+    s = signal_stats(np.concatenate(preds), np.concatenate(actuals),
+                     groups=np.concatenate(test_dates))
+    return dict(n=s["n"], ic=s["ic"], daily_ic=s["daily_ic"],
+                daily_ic_median=s["daily_ic_median"], n_top=s["n_top"],
+                hit=s["hit_rate"], base_hit=s["base_rate"], hit_edge=s["hit_edge"],
+                top_ret=s["top_mean"], base_ret=s["all_mean"], edge=s["edge"])
 
 
 if __name__ == "__main__":
@@ -142,7 +145,7 @@ if __name__ == "__main__":
                     rows.append(dict(h=h, features=sname, **r))
         d = pd.DataFrame(rows)
         d["ic"] = d["ic"].round(4)
-        for c in ["hit", "top_ret", "base_ret", "edge"]:
+        for c in ["hit", "base_hit", "hit_edge", "top_ret", "base_ret", "edge"]:
             d[c] = (d[c] * 100).round(2)
         print(d.to_string(index=False), "\n")
 

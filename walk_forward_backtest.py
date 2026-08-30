@@ -129,6 +129,7 @@ import pandas as pd
 import shap
 from xgboost import XGBRegressor
 
+from price_audit import clean_panel
 from signal_metrics import signal_stats, trade_stats
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
@@ -178,17 +179,28 @@ def _broker_correlation_1d(bf):
 def _price_features_and_target(px):
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
+    px["momentum_1d"] = px["lag_1"] if "lag_1" in px else (
+        (px["close"] - px["prev_close"]) / px["prev_close"]
+    )
     px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
+    if "lag_5" in px:
+        px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["next_close"] = px.groupby("ticker")["close"].shift(-1)
-    px["target"] = (px["next_close"] - px["close"]) / px["close"]
+    if "fwd_1" in px:
+        px["target"] = px["fwd_1"]
+    else:
+        px["next_close"] = px.groupby("ticker")["close"].shift(-1)
+        px["target"] = (px["next_close"] - px["close"]) / px["close"]
     return px[["ticker", "date", "momentum_1d", "volume_ratio", "target"]]
 
 
 def build_panel(conn):
+    px = clean_panel(conn, horizons=(1,), lags=(1, 5))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, close, volume FROM price_history", conn)
+    # Backfilled netval was derived from the same close that was contaminated.
+    # Dropping bad price keys from y but retaining their broker rows in X would
+    # only move the defect from the target into the features.
+    bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
@@ -196,6 +208,10 @@ def build_panel(conn):
     pxf = _price_features_and_target(px)
 
     panel = agg.merge(pxf, on=["ticker", "date"], how="inner")
+    # Correlation is a one-day feature too. If the price lag says a quarantine
+    # or suspension made the day non-contiguous, do not compare broker vectors
+    # across that same hole.
+    panel.loc[panel["momentum_1d"].isna(), "broker_correlation_1d"] = np.nan
     panel = panel.dropna(subset=["target"]).sort_values("date").reset_index(drop=True)
     return panel
 
@@ -203,7 +219,7 @@ def build_panel(conn):
 TRADE_THRESHOLD = 0.005
 
 
-def signal_quality(pred, actual):
+def signal_quality(pred, actual, dates=None):
     """Replaces sharpe_stats(). See signal_metrics.py for why Sharpe is gone.
 
     Two questions, kept separate because they are separate:
@@ -221,12 +237,14 @@ def signal_quality(pred, actual):
     p = pd.Series(np.asarray(pred, dtype=float)).reset_index(drop=True)
     a = pd.Series(np.asarray(actual, dtype=float)).reset_index(drop=True)
 
-    sig = signal_stats(p, a)
+    sig = signal_stats(p, a, groups=dates)
     traded = a[p > TRADE_THRESHOLD]
     tr = trade_stats(traded, base_rate=sig["base_rate"])
 
     return dict(
-        n=sig["n"], ic=sig["ic"], base_rate=sig["base_rate"],
+        n=sig["n"], ic=sig["ic"], daily_ic=sig["daily_ic"],
+        daily_ic_median=sig["daily_ic_median"], n_daily_ic=sig["n_daily_ic"],
+        base_rate=sig["base_rate"],
         top_n=sig["n_top"], top_hit=sig["hit_rate"], top_hit_edge=sig["hit_edge"],
         top_mean=sig["top_mean"], all_mean=sig["all_mean"], edge=sig["edge"],
         n_trades=tr["n_trades"], trade_mean=tr["mean_ret"],
@@ -252,7 +270,7 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
         train_end += test_window
 
     results = []
-    all_preds, all_actuals = [], []
+    all_preds, all_actuals, all_test_dates = [], [], []
     trade_rows = []
     for i, (train_dates, test_dates) in enumerate(cycles, 1):
         train_df = panel[panel["date"].isin(train_dates)]
@@ -274,13 +292,14 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
         test_mae = np.abs(test_pred - test_df["target"]).mean()
         test_df["pred"] = test_pred
 
-        stats = signal_quality(test_pred, test_df["target"])
+        stats = signal_quality(test_pred, test_df["target"], test_df["date"])
         results.append(dict(
             cycle=i, train_days=len(train_dates), test_days=len(test_dates),
             train_mae=train_mae, eval_mae=eval_mae, test_mae=test_mae, **stats,
         ))
         all_preds.append(test_pred)
         all_actuals.append(test_df["target"].values)
+        all_test_dates.append(test_df["date"].values)
 
         triggered = test_df[test_df["pred"] > TRADE_THRESHOLD]
         if len(triggered):
@@ -295,7 +314,9 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
                     top_features=top_features,
                 ))
 
-    pooled_stats = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals))
+    pooled_stats = signal_quality(
+        np.concatenate(all_preds), np.concatenate(all_actuals), np.concatenate(all_test_dates)
+    )
     trade_log = pd.DataFrame(trade_rows).sort_values("date").reset_index(drop=True) if trade_rows else pd.DataFrame(
         columns=["cycle", "ticker", "date", "pred", "actual", "top_features"]
     )
@@ -315,7 +336,9 @@ if __name__ == "__main__":
     print(cycle_results.to_string(index=False))
 
     print("\nPooled across all test cycles:")
-    print(f"  n={pooled['n']} IC {pooled['ic']:+.3f} | top-decile n={pooled['top_n']} "
+    print(f"  n={pooled['n']} IC {pooled['ic']:+.3f} | daily IC mean "
+          f"{pooled['daily_ic']:+.3f}, median {pooled['daily_ic_median']:+.3f} "
+          f"({pooled['n_daily_ic']}d) | top-decile n={pooled['top_n']} "
           f"hit {pooled['top_hit']:.1%} vs base {pooled['base_rate']:.1%} "
           f"(edge {pooled['top_hit_edge']:+.1%}) | return {pooled['top_mean']:+.2%} vs "
           f"{pooled['all_mean']:+.2%} (edge {pooled['edge']:+.2%})")

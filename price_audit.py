@@ -170,6 +170,61 @@ def ticker_from_title(title):
     return m.group(1) if m else None
 
 
+def bagholders_from_payloads(payloads, n=2):
+    """Rank observable broker inventory accumulated across API time blocks.
+
+    Each block may expose a different top-broker set. Aggregating blocks keeps
+    an older accumulator visible even if it stopped buying recently. This is
+    observable broker inventory, not beneficial ownership: nominees, transfers,
+    and brokers outside each block's top list are not visible here.
+    """
+    totals = {}
+    observed_dates = set()
+
+    def _total(series):
+        return sum(v for v in (series or []) if isinstance(v, (int, float)))
+
+    for payload in payloads or []:
+        data = (payload or {}).get("data") or {}
+        nlot = data.get("nlot") or {}
+        nval = data.get("nval") or {}
+        observed_dates.update(str(d) for d in (data.get("date") or []) if d)
+        for code, lots in nlot.items():
+            row = totals.setdefault(code, {"cum": 0.0, "value": 0.0})
+            row["cum"] += _total(lots)
+            row["value"] += _total(nval.get(code))
+
+    holders = []
+    for code, row in totals.items():
+        cum = row["cum"]
+        if cum <= 0:
+            continue
+        shares = cum * 100
+        holders.append({
+            "code": code, "cum": cum,
+            "avg": (row["value"] / shares) if shares else 0,
+            "observed_trading_days": len(observed_dates),
+        })
+    holders.sort(key=lambda h: h["cum"], reverse=True)
+    return holders[:n]
+
+
+def inventory_date_blocks(payload, trading_days=60, block_days=20):
+    """Exact non-overlapping trading-date blocks discovered from API data."""
+    data = (payload or {}).get("data") or {}
+    dates = [str(d) for d in (data.get("date") or []) if d]
+    if not dates:
+        dates = [str(row.get("date")) for row in (data.get("ohlc") or [])
+                 if isinstance(row, dict) and row.get("date")]
+    dates = sorted(set(dates))[-trading_days:]
+    blocks = []
+    for i in range(0, len(dates), block_days):
+        chunk = dates[i:i + block_days]
+        if chunk:
+            blocks.append((chunk[0], chunk[-1]))
+    return blocks
+
+
 def bagholders_from_payload(payload, n=2):
     """Rank brokers by cumulative NET LOT in an /api/inventory response.
 
@@ -191,24 +246,7 @@ def bagholders_from_payload(payload, n=2):
     took the top n unconditionally, so on a ticker every broker was dumping it
     would report a net SELLER as a "bag holder" — the opposite of the term.
     """
-    data = (payload or {}).get("data") or {}
-    nlot = data.get("nlot") or {}
-    nval = data.get("nval") or {}
-
-    def _total(series):
-        return sum(v for v in (series or []) if isinstance(v, (int, float)))
-
-    holders = []
-    for code, lots in nlot.items():
-        cum = _total(lots)
-        if cum <= 0:
-            continue                      # net seller: not a bag holder
-        shares = cum * 100                # 1 lot = 100 shares
-        holders.append({"code": code, "cum": cum,
-                        "avg": (_total(nval.get(code)) / shares) if shares else 0})
-
-    holders.sort(key=lambda h: h["cum"], reverse=True)
-    return holders[:n]
+    return bagholders_from_payloads([payload], n=n)
 
 
 # The scheduled scrape runs 07:00 Asia/Kuala_Lumpur, before IDX opens, which is
@@ -315,18 +353,32 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
     px["_pos"] = px["date"].map(pos)
     g = px.groupby("ticker")
 
+    one_contig = (g["_pos"].shift(-1) - px["_pos"]) == 1
+    one_return = g["close"].shift(-1) / px["close"] - 1
+    one_upper = px["close"].apply(ara_bound) + TOL
+    px["_step_valid"] = one_contig & one_return.between(ARB_BOUND - TOL, one_upper)
+    g = px.groupby("ticker")
+
     for h in horizons:
         contig = (g["_pos"].shift(-h) - px["_pos"]) == h
-        px[f"fwd_{h}"] = np.where(contig, g["close"].shift(-h) / px["close"] - 1, np.nan)
+        raw_return = g["close"].shift(-h) / px["close"] - 1
+        # Every daily transition inside a multi-day window must be tradeable.
+        # This masks a 3/5/10/20-day target that crosses a stock split just as
+        # firmly as the one-day target on the split itself.
+        step_window = g["_step_valid"].transform(
+            lambda s: s.rolling(h, min_periods=h).sum().shift(-(h - 1)).eq(h)
+        )
+        valid = contig & step_window
+        px[f"fwd_{h}"] = np.where(valid, raw_return, np.nan)
 
         if extremes:
             # rolling(h) on the -h shifted series spans exactly rows i+1..i+h
             hi = g["high"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).max())
             lo = g["low"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).min())
-            px[f"max_{h}"] = np.where(contig, hi / px["close"] - 1, np.nan)
-            px[f"mdd_{h}"] = np.where(contig, lo / px["close"] - 1, np.nan)
+            px[f"max_{h}"] = np.where(valid, hi / px["close"] - 1, np.nan)
+            px[f"mdd_{h}"] = np.where(valid, lo / px["close"] - 1, np.nan)
 
-    return px.drop(columns=["_pos"])
+    return px.drop(columns=["_pos", "_step_valid"])
 
 
 def add_lagged_returns(px, all_dates, lags=(1,)):
@@ -343,11 +395,24 @@ def add_lagged_returns(px, all_dates, lags=(1,)):
     px["_pos"] = px["date"].map(pos)
     g = px.groupby("ticker")
 
+    previous_one = g["close"].shift(1)
+    one_contig = (px["_pos"] - g["_pos"].shift(1)) == 1
+    one_return = px["close"] / previous_one - 1
+    one_upper = previous_one.apply(ara_bound) + TOL
+    px["_step_valid"] = one_contig & one_return.between(ARB_BOUND - TOL, one_upper)
+    g = px.groupby("ticker")
+
     for k in lags:
         contig = (px["_pos"] - g["_pos"].shift(k)) == k
-        px[f"lag_{k}"] = np.where(contig, px["close"] / g["close"].shift(k) - 1, np.nan)
+        previous = g["close"].shift(k)
+        raw_return = px["close"] / previous - 1
+        step_window = g["_step_valid"].transform(
+            lambda s: s.rolling(k, min_periods=k).sum().eq(k)
+        )
+        valid = contig & step_window
+        px[f"lag_{k}"] = np.where(valid, raw_return, np.nan)
 
-    return px.drop(columns=["_pos"])
+    return px.drop(columns=["_pos", "_step_valid"])
 
 
 def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False):

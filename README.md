@@ -33,7 +33,7 @@ Yang benar-benar menyentuh NeoBDM.tech dan mengisi database. Satu-satunya lapisa
 | File | Status | Fungsi |
 |---|---|---|
 | `neobdm_scraper.py` | live | Inti scraper. Login ke NeoBDM via Playwright, ambil Market Summary + Broker Stalker lewat API screener internal, tulis ke `neobdm.db`, kirim ringkasan Top-2 harian ke Telegram. Juga jalan sebagai bot terjadwal (7 pagi WIB) yang merespons perintah `/scrape`. |
-| `backfill_inventory.py` | live | Mengisi histori `broker_flow` & `price_history` dari chart Plotly di halaman `/inventory/`, dengan menggerakkan date-picker ke tanggal paling awal yang tersedia (bukan cuma default 3 bulan). Dijalankan harian untuk top-up data yang terlewat. Pemilihan ticker dan penungguan render keduanya menunggu **kondisi**, bukan durasi — `select_ticker()` mencocokkan teks opsi lalu memastikan kontrol menampilkannya, dan chart di-fingerprint sampai berubah *lalu* berhenti berubah, supaya ekstraksi tidak pernah membaca chart ticker sebelumnya. Tiga guard berlapis menolak payload yang mencurigakan. |
+| `backfill_inventory.py` | live | Mengisi histori `broker_flow` & `price_history` lewat endpoint JSON `/api/inventory`; Playwright hanya dipakai untuk memperoleh sesi login. Payload wajib cocok dengan ticker yang diminta dan duplikasi seri lintas-ticker ditolak sebelum penyimpanan. |
 | `check_capture_health.py` | live | Health check harian atas panel ML: cek bentuk data (jumlah baris, coverage kolom, kebaruan tanggal), bukan cuma "ada isinya atau tidak". Exit code non-nol + alert Telegram kalau capture diam-diam rusak (filter berhenti kepakai, kolom jadi null). |
 | `check_signal_integrity.py` | live | Gerbang **kebenaran** data hasil scrape — bukan sekadar "datanya sampai" (itu tugas `check_capture_health.py`), tapi "nilainya benar". Membandingkan dua jalur scrape independen (API screener vs chart inventory) yang sama-sama membawa `close`, mendeteksi kontaminasi baru dalam 10 hari terakhir, dan menyapu seluruh ~340 kolom untuk regresi cakupan secara self-calibrating (kolom yang tidak pernah terisi diabaikan; kolom yang tadinya penuh lalu kosong = gagal). Exit non-nol + alert Telegram. |
 | `price_audit.py` | audit | Audit + perbaikan integritas `price_history`. Tiga detektor: `limit_violation` (gerakan di luar ARA/ARB — mustahil di IDX), `cross_ticker_dup` (OHLCV identik di ≥2 ticker pada satu tanggal), `series_break` (close melompat >5x / <0,2x versus rolling median sendiri). Mode: `audit` (laporan saja), `quarantine` (tandai, tidak menghapus), `repair corrected.csv` (perbaiki harga + rescale netval backfill). |
@@ -44,8 +44,8 @@ Membangun panel fitur dari data mentah dan menguji apakah ada sinyal yang bisa d
 
 | File | Status | Fungsi |
 |---|---|---|
-| `walk_forward_backtest.py` | riset — inti | Backtest XGBoost walk-forward: bangun panel fitur (agregat broker_flow + momentum/volume harga), latih-uji bergulir per siklus. Modul referensi — `build_panel`, `FEATURES`, `DB_PATH` dipakai ulang oleh hampir semua file lain di repo ini. Hasil terkini: Sharpe pooled 0.81 (242 hari), hit-rate 42.8%. |
-| `feature_ablation.py` | riset | Membandingkan tiga set fitur (lengkap / broker-saja / harga-saja) di tiga horizon (1/3/5 hari) untuk menjawab: apakah data broker menambah sesuatu, atau sinyalnya cuma momentum harga? Hasil: fitur harga-saja justru skor Sharpe terbaik. |
+| `walk_forward_backtest.py` | riset — inti | Backtest XGBoost walk-forward: bangun panel bersih (agregat broker_flow + momentum/volume harga), latih-uji bergulir per siklus. Modul referensi — `build_panel`, `FEATURES`, `DB_PATH` dipakai ulang oleh hampir semua file lain. Sharpe 0,81 lama **VOID**; laporan sekarang memakai pooled IC, daily cross-sectional IC, top-decile hit/base/hit-edge, dan return edge. |
+| `feature_ablation.py` | riset | Membandingkan tiga set fitur (lengkap / broker-saja / harga-saja) di tiga horizon (1/3/5 hari). Klaim lama bahwa price-only menang berdasarkan Sharpe adalah **VOID** dan harus dibaca ulang dari metrik ranking/edge pada data bersih. |
 | `multiday_features.py` | riset | Menguji apakah pola broker multi-hari (rolling average, streak beli beruntun) menangkap sinyal yang tak terlihat di snapshot harian tunggal. Hasil: tidak ada perbaikan. |
 | `smart_money_divergence.py` | riset | Menguji tesis spesifik: broker "smart money" net-beli sementara broker ritel net-jual pada saham yang sama (absorpsi). Hasil: konsisten arahnya tapi tidak signifikan secara statistik (p=0.18). |
 | `shap_analysis.py` | riset | Interpretasi feature importance model lewat SHAP + gain importance XGBoost + korelasi mentah. Hasil: `broker_concentration` peringkat 7 dari 8 — `momentum_1d` mendominasi. |
@@ -57,10 +57,10 @@ Mengambil sinyal dari panel di atas dan menguji cara masuk/keluar posisi yang re
 
 | File | Status | Fungsi |
 |---|---|---|
-| `strategy_variants.py` | riset | Grid-search 11 varian exit (ambang entry, lama holding, take-profit/stop-loss) di atas sinyal model yang sama, dengan split search/holdout untuk menghindari overfitting. Hasil: varian terbaik Sharpe 6.95 di holdout — tapi belum memodelkan biaya transaksi & ARA/ARB. |
+| `strategy_variants.py` | riset | Grid-search 11 varian exit (ambang entry, lama holding, take-profit/stop-loss) di atas sinyal model yang sama, dengan split search/holdout. Sharpe holdout 6,95 lama **VOID**; laporan aktif hanya menyajikan statistik trade non-annualized dan base rate. |
 | `ara_arb_simulation.py` | riset | Mensimulasikan aturan Auto Rejection Atas/Bawah IDX terhadap strategi pemenang di atas — entry di hari ARA dibuang, exit yang macet di ARB digeser maju ke hari berikutnya yang tidak macet. |
 | `ddqn_entry_exit.py` | riset | Agen Double DQN yang belajar kapan masuk *dan* keluar posisi sekaligus (bukan model entry + aturan exit terpisah), dengan realisme ARA/ARB, biaya transaksi, dan reward shaping loss-aversion. |
-| `kelly_sizing.py` | dorman | Rumus ukuran posisi Kelly Criterion (dengan fraction cap / "half Kelly"). Formula sudah teruji tapi sengaja belum dipakai — nunggu sampai Layer 1 benar-benar punya edge tervalidasi (Sharpe > 1.5). |
+| `kelly_sizing.py` | dorman | Rumus ukuran posisi Kelly Criterion (dengan fraction cap / "half Kelly"). Tetap tidak dipakai sampai Layer 1 punya edge tervalidasi; tidak ada threshold pengganti Sharpe yang ditetapkan. |
 
 ### 4. Evaluasi, laporan & tes
 

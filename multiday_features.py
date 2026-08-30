@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH
+from price_audit import clean_panel
 
 MULTI_DAY_BROKER = ["net_flow_total_roll5", "net_flow_total_roll10",
                     "broker_concentration_roll5", "broker_concentration_roll10",
@@ -55,8 +56,9 @@ def _buy_streak(s, w):
 
 
 def build_panel_with_multiday(conn):
+    px = clean_panel(conn, horizons=(1,), lags=(1, 5, 10))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, close, volume FROM price_history", conn)
+    bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
@@ -69,14 +71,21 @@ def build_panel_with_multiday(conn):
     agg["buy_days_10"] = agg.groupby("ticker")["net_flow_total"].transform(lambda s: _buy_streak(s, 10))
 
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
+    px["momentum_1d"] = px["lag_1"]
     px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
+    px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["target"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
+    px["target"] = px["fwd_1"]
 
     panel = agg.merge(px[["ticker", "date", "momentum_1d", "volume_ratio", "target"]],
                        on=["ticker", "date"], how="inner")
+    panel.loc[panel["momentum_1d"].isna(), "broker_correlation_1d"] = np.nan
+    for days in (5, 10):
+        invalid = px.set_index(["ticker", "date"])[f"lag_{days}"].isna()
+        keys = pd.MultiIndex.from_frame(panel[["ticker", "date"]])
+        mask = invalid.reindex(keys, fill_value=True).to_numpy()
+        cols = [c for c in MULTI_DAY_BROKER if c.endswith(str(days))]
+        panel.loc[mask, cols] = np.nan
     return panel.dropna(subset=["target"])
 
 
@@ -87,7 +96,7 @@ def walk_forward(panel, features, train_min=30, test_window=6):
     while train_end + test_window <= len(dates):
         cycles.append((dates[:train_end], dates[train_end:train_end + test_window]))
         train_end += test_window
-    all_preds, all_actuals, maes = [], [], []
+    all_preds, all_actuals, all_dates, maes = [], [], [], []
     for train_dates, test_dates in cycles:
         train_df = p[p["date"].isin(train_dates)]
         test_df = p[p["date"].isin(test_dates)]
@@ -100,7 +109,9 @@ def walk_forward(panel, features, train_min=30, test_window=6):
         maes.append(np.abs(test_pred - test_df["target"]).mean())
         all_preds.append(test_pred)
         all_actuals.append(test_df["target"].values)
-    pooled = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals))
+        all_dates.append(test_df["date"].values)
+    pooled = signal_quality(np.concatenate(all_preds), np.concatenate(all_actuals),
+                            np.concatenate(all_dates))
     return dict(pooled=pooled, mean_test_mae=np.mean(maes), naive_mae=p["target"].abs().mean(), n=len(p))
 
 

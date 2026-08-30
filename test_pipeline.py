@@ -12,17 +12,19 @@ kelly_fraction() — before trusting a new backtest run's results.
 
 import pandas as pd
 import numpy as np
+import sqlite3
 
 from walk_forward_backtest import (
-    _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, signal_quality,
-    FEATURES,
+    _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target,
+    build_panel, signal_quality, FEATURES,
 )
 from signal_metrics import spearman_ic, signal_stats, trade_stats
-from strategy_variants import get_walk_forward_predictions
+from strategy_variants import get_walk_forward_predictions, simulate_trade, _index_price_history
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
-                         detect, bagholders_from_payload, date_offset_holds)
+                         detect, bagholders_from_payload, bagholders_from_payloads,
+                         inventory_date_blocks, date_offset_holds)
 
 
 def test_broker_day_aggregates_basic():
@@ -137,6 +139,21 @@ def test_signal_stats_reports_a_negative_edge_as_negative():
     print("test_signal_stats_reports_a_negative_edge_as_negative passed")
 
 
+def test_signal_stats_ranks_cross_sectionally_each_day():
+    # Day 1 is ranked perfectly, day 2 perfectly backwards. Pooling levels can
+    # obscure that structure; daily IC must expose the +1/-1 cancellation and
+    # top-decile must choose one name per date, not a global score cutoff.
+    pred = pd.Series([1, 2, 3, 4, 10, 20, 30, 40], dtype=float)
+    actual = pd.Series([1, 2, 3, 4, 4, 3, 2, 1], dtype=float)
+    dates = pd.Series(["d1"] * 4 + ["d2"] * 4)
+    s = signal_stats(pred, actual, groups=dates)
+    assert abs(s["daily_ic"]) < 1e-12
+    assert abs(s["daily_ic_median"]) < 1e-12
+    assert s["n_daily_ic"] == 2
+    assert s["n_top"] == 2, "top decile must select the best-ranked name each day"
+    print("test_signal_stats_ranks_cross_sectionally_each_day passed")
+
+
 def test_trade_stats_has_no_annualisation():
     # mean/std with NO sqrt(anything). If someone reintroduces a scale factor
     # this pins it down numerically.
@@ -179,10 +196,17 @@ def test_signal_quality_scores_every_row_not_just_triggered():
 def test_no_sqrt_252_anywhere():
     # The defect this whole change removes. AST-based so prose about it in
     # docstrings does not count as a reoccurrence.
-    import ast as _ast, os as _os
+    import ast as _ast, os as _os, subprocess as _subprocess
     here = _os.path.dirname(_os.path.abspath(__file__))
+    listed = _subprocess.run(
+        ["git", "ls-files", "--", "*.py"], cwd=here,
+        capture_output=True, text=True, check=False,
+    )
+    files = listed.stdout.splitlines() if listed.returncode == 0 else [
+        fn for fn in _os.listdir(here) if fn.endswith(".py")
+    ]
     hits = []
-    for fn in sorted(f for f in _os.listdir(here) if f.endswith(".py")):
+    for fn in sorted(files):
         if fn == "check_ml_health.py":      # its own budget guard mentions it
             continue
         try:
@@ -279,6 +303,125 @@ def test_extreme_windows_share_the_contiguity_mask():
     assert abs(by_date.loc["d1", "max_1"] - 0.15) < 1e-9   # high 115 vs close 100
     assert abs(by_date.loc["d1", "mdd_1"] - 0.05) < 1e-9   # low 105 vs close 100
     print("test_extreme_windows_share_the_contiguity_mask passed")
+
+
+def test_one_day_targets_mask_corporate_actions_and_other_impossible_moves():
+    px = pd.DataFrame({
+        "ticker": ["A", "A", "A"],
+        "date": ["d1", "d2", "d3"],
+        "close": [2710.0, 534.0, 562.0],
+        "high": [2770.0, 550.0, 566.0],
+        "low": [2700.0, 532.0, 532.0],
+    })
+    out = add_forward_returns(px, ["d1", "d2", "d3"], horizons=(1,), extremes=True)
+    by_date = out.set_index("date")
+    assert np.isnan(by_date.loc["d1", "fwd_1"]), \
+        "a stock split is not a tradeable -80% one-day model target"
+    assert np.isnan(by_date.loc["d1", "max_1"])
+    assert np.isnan(by_date.loc["d1", "mdd_1"])
+    assert abs(by_date.loc["d2", "fwd_1"] - (562 / 534 - 1)) < 1e-12
+    print("test_one_day_targets_mask_corporate_actions_and_other_impossible_moves passed")
+
+
+def test_one_day_features_mask_corporate_actions_too():
+    px = pd.DataFrame({
+        "ticker": ["A", "A", "A"],
+        "date": ["d1", "d2", "d3"],
+        "close": [2710.0, 534.0, 562.0],
+    })
+    out = add_lagged_returns(px, ["d1", "d2", "d3"], lags=(1,))
+    by_date = out.set_index("date")["lag_1"]
+    assert np.isnan(by_date["d2"]), "the split must not become a -80% momentum/reward feature"
+    assert abs(by_date["d3"] - (562 / 534 - 1)) < 1e-12
+    print("test_one_day_features_mask_corporate_actions_too passed")
+
+
+def test_multi_day_windows_cannot_cross_a_corporate_action():
+    px = pd.DataFrame({
+        "ticker": ["A"] * 6,
+        "date": [f"d{i}" for i in range(1, 7)],
+        "close": [2700.0, 2710.0, 534.0, 562.0, 570.0, 580.0],
+        "high": [2710.0, 2770.0, 550.0, 566.0, 575.0, 585.0],
+        "low": [2690.0, 2700.0, 532.0, 532.0, 565.0, 575.0],
+    })
+    dates = px["date"].tolist()
+    fwd = add_forward_returns(px, dates, horizons=(3,), extremes=True).set_index("date")
+    lag = add_lagged_returns(px, dates, lags=(3,)).set_index("date")
+    assert np.isnan(fwd.loc["d1", "fwd_3"]), "3d target spans the d2->d3 split"
+    assert np.isnan(fwd.loc["d1", "max_3"])
+    assert np.isnan(lag.loc["d4", "lag_3"]), "3d momentum spans the d2->d3 split"
+    assert not np.isnan(fwd.loc["d3", "fwd_3"]), "windows wholly after the split stay valid"
+    print("test_multi_day_windows_cannot_cross_a_corporate_action passed")
+
+
+def _contaminated_test_db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE price_history (
+        date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
+    )""")
+    conn.execute("CREATE TABLE price_quarantine (date TEXT, ticker TEXT)")
+    conn.execute("""CREATE TABLE broker_flow (
+        date TEXT, ticker TEXT, broker_code TEXT, netval REAL
+    )""")
+    dates = [f"2026-01-{d:02d}" for d in range(1, 9)]
+    closes = {"AAA": [100, 110, 1000, 500, 505, 510, 515, 520],
+              "BBB": [200, 201, 202, 203, 204, 205, 206, 207]}
+    for ticker, series in closes.items():
+        for date, close in zip(dates, series):
+            conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                         (date, ticker, close, close, close, close, 1000))
+            for code, netval in (("AK", 10.0), ("BK", -5.0), ("CC", 2.0)):
+                conn.execute("INSERT INTO broker_flow VALUES (?,?,?,?)",
+                             (date, ticker, code, netval))
+    # Removing AAA d3 makes a naive shift join d2=110 to d4=500 (+354.5%).
+    conn.execute("INSERT INTO price_quarantine VALUES (?,?)", (dates[2], "AAA"))
+    conn.commit()
+    return conn
+
+
+def test_build_panel_cannot_recreate_impossible_target_returns():
+    conn = _contaminated_test_db()
+    panel = build_panel(conn)
+    conn.close()
+    aaa = panel[panel["ticker"] == "AAA"].set_index("date")
+    assert "2026-01-02" not in aaa.index, \
+        "the row before quarantine must lose its target, not bridge to the next clean bar"
+    assert not ((panel["target"] > 0.35) | (panel["target"] < -0.15)).any(), \
+        "an impossible ARA/ARB target reappeared in the production panel"
+    print("test_build_panel_cannot_recreate_impossible_target_returns passed")
+
+
+def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
+    px = pd.DataFrame({
+        "ticker": ["AAA", "AAA", "AAA"],
+        "date": ["d1", "d2", "d4"],
+        "open": [100.0, 110.0, 500.0], "high": [100.0, 110.0, 500.0],
+        "low": [100.0, 110.0, 500.0], "close": [100.0, 110.0, 500.0],
+        "fwd_1": [0.10, np.nan, np.nan],
+    })
+    by_ticker, by_date = _index_price_history(px)
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d2", 1, None, None)
+    assert ret is None, "a multi-day strategy must not treat d4 as the next bar after d2"
+    print("test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap passed")
+
+
+def test_all_tracked_model_price_consumers_use_clean_panel():
+    # The low-level audit/check/scrape modules may inspect raw storage, but a
+    # model, strategy, or report must not source its target/simulation from it.
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    consumers = [
+        "walk_forward_backtest.py", "ddqn_entry_exit.py", "feature_ablation.py",
+        "multiday_features.py", "smart_money_divergence.py", "strategy_variants.py",
+        "ara_arb_simulation.py", "run_ml_reports.py", "horizon_scan.py",
+    ]
+    offenders = []
+    for fn in consumers:
+        source = open(_os.path.join(here, fn), encoding="utf-8").read()
+        if "FROM price_history" in source:
+            offenders.append(fn)
+    assert not offenders, f"raw contaminated price reads remain in {offenders}"
+    print("test_all_tracked_model_price_consumers_use_clean_panel passed")
 
 
 
@@ -379,9 +522,12 @@ def test_commit_gate_catches_a_recontaminated_scrape():
     print("test_commit_gate_catches_a_recontaminated_scrape passed")
 
 
-def _inventory_payload(nlot, nval):
+def _inventory_payload(nlot, nval, dates=None):
     # Shape confirmed against a real /api/inventory response (HANDOFF Appendix N).
-    return {"success": True, "data": {"nlot": nlot, "nval": nval},
+    data = {"nlot": nlot, "nval": nval}
+    if dates is not None:
+        data["date"] = dates
+    return {"success": True, "data": data,
             "meta": {"symbol": "SINI"}}
 
 
@@ -530,6 +676,32 @@ def test_bagholders_survive_a_malformed_payload():
     print("test_bagholders_survive_a_malformed_payload passed")
 
 
+def test_observable_inventory_uses_three_exact_twenty_session_blocks():
+    dates = [f"d{i:03d}" for i in range(1, 76)]
+    discovery = _inventory_payload({}, {}, dates=dates)
+    blocks = inventory_date_blocks(discovery, trading_days=60, block_days=20)
+    assert blocks == [("d016", "d035"), ("d036", "d055"), ("d056", "d075")]
+    print("test_observable_inventory_uses_three_exact_twenty_session_blocks passed")
+
+
+def test_old_accumulator_remains_visible_across_sixty_session_inventory():
+    # AK accumulated in the oldest block and then disappeared from the recent
+    # top lists. A single recency-selected C20 request would miss it entirely.
+    blocks = [
+        _inventory_payload({"AK": [100] * 20}, {"AK": [1e6] * 20},
+                           dates=[f"d{i:02d}" for i in range(1, 21)]),
+        _inventory_payload({"BK": [20] * 20}, {"BK": [2e5] * 20},
+                           dates=[f"d{i:02d}" for i in range(21, 41)]),
+        _inventory_payload({"BK": [20] * 20}, {"BK": [2e5] * 20},
+                           dates=[f"d{i:02d}" for i in range(41, 61)]),
+    ]
+    holders = bagholders_from_payloads(blocks, n=2)
+    assert [h["code"] for h in holders] == ["AK", "BK"]
+    assert holders[0]["cum"] == 2000
+    assert holders[0]["observed_trading_days"] == 60
+    print("test_old_accumulator_remains_visible_across_sixty_session_inventory passed")
+
+
 def test_should_fail_run_tolerates_a_few_failures():
     # A handful of tickers legitimately fail (suspended, no chart). Reddening the
     # workflow for those would train everyone to ignore it.
@@ -559,6 +731,8 @@ if __name__ == "__main__":
     test_bagholders_sum_per_day_lots_not_last_value()
     test_bagholders_exclude_net_sellers()
     test_bagholders_survive_a_malformed_payload()
+    test_observable_inventory_uses_three_exact_twenty_session_blocks()
+    test_old_accumulator_remains_visible_across_sixty_session_inventory()
     test_should_fail_run_tolerates_a_few_failures()
     test_should_fail_run_catches_a_broken_scrape()
     test_series_signature_distinguishes_two_stocks()
@@ -567,12 +741,19 @@ if __name__ == "__main__":
     test_forward_returns_never_bridge_a_removed_row()
     test_lagged_returns_guarded_the_same_way()
     test_extreme_windows_share_the_contiguity_mask()
+    test_one_day_targets_mask_corporate_actions_and_other_impossible_moves()
+    test_one_day_features_mask_corporate_actions_too()
+    test_multi_day_windows_cannot_cross_a_corporate_action()
+    test_build_panel_cannot_recreate_impossible_target_returns()
+    test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
+    test_all_tracked_model_price_consumers_use_clean_panel()
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()
     test_price_features_no_leakage()
     test_spearman_ic_direction()
     test_signal_stats_detects_a_useless_signal()
     test_signal_stats_reports_a_negative_edge_as_negative()
+    test_signal_stats_ranks_cross_sectionally_each_day()
     test_trade_stats_has_no_annualisation()
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()

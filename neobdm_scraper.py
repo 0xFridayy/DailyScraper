@@ -17,9 +17,9 @@ from urllib.parse import urlencode
 import os
 import pytz
 
-# Pure, playwright-free helper parked in price_audit so CI can test it — see the
-# note above bagholders_from_payload for why that placement is deliberate.
-from price_audit import bagholders_from_payload, date_offset_holds
+# Pure, playwright-free helpers parked in price_audit so CI can test them.
+from price_audit import (bagholders_from_payloads, inventory_date_blocks,
+                         date_offset_holds)
 
 
 # ─────────────────────────────────────────────
@@ -748,29 +748,32 @@ def get_netflow(page, codes, duration="Today", side="dist"):
 INVENTORY_CHART_URL = "https://neobdm.tech/inventory-chart/"
 INVENTORY_API = f"{API_BASE}/inventory"
 
-# The Telegram line claims "~3 bln" of accumulation, so ask for that window
-# explicitly instead of inheriting whatever the old page defaulted to.
-BAGHOLDER_WINDOW_DAYS = 90
+# Resolve the intended ~3-month concept as exchange sessions, not a renamed
+# calendar-day constant.
+BAGHOLDER_DISCOVERY_CALENDAR_DAYS = 120
+BAGHOLDER_TRADING_DAYS = 60
+BAGHOLDER_BLOCK_TRADING_DAYS = 20
 
 # Which brokers the endpoint resolves. This is the site's OWN request grammar and
 # the exact pair /inventory-chart/ sends, so it is guaranteed accepted — no risk
 # of a 400 burning a run. It resolves to the 5 largest net buyers + 5 largest net
 # sellers BY LOT over the last 20 candles, then returns their per-day flow across
-# the whole window. Caveat worth knowing: the SELECTION is recency-weighted (last
-# 20 candles), so a broker who accumulated hard two months ago and then stopped
-# can be missed. Widening to TOP_8_*_ALL is one edit here, but that spelling is
-# documented grammar we have not seen the site itself send — verify before using.
+# its requested window. We apply it to three separate 20-session blocks and
+# aggregate them, instead of inventing an unverified C60/ALL selector. A broker
+# selected two months ago remains observable even if it later stopped buying.
+# This is still not beneficial ownership or complete custody coverage.
 BAGHOLDER_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
 
 
-def _inventory_window(days=BAGHOLDER_WINDOW_DAYS):
+def _inventory_window(days=BAGHOLDER_DISCOVERY_CALENDAR_DAYS):
     end = datetime.now(pytz.timezone(TIMEZONE)).date()
     return (end - timedelta(days=days)).isoformat(), end.isoformat()
 
 
 def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
-    """Top-n 'bag holders' of a ticker = brokers with the largest cumulative net
-    inventory over ~3 months.
+    """Top-n observable accumulators over ~60 trading sessions.
+
+    This is broker-level observable inventory, not beneficial ownership.
 
     REWRITTEN OFF THE RETIRED PAGE. This used to drive /inventory/ — a
     react-select dropdown, a #submit-button and a Plotly chart read out of the
@@ -782,27 +785,35 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
 
     backfill_inventory.py was migrated to the /api/inventory JSON endpoint at the
     time and this caller was left as follow-up (Appendix N, item 2). This is that
-    follow-up: one authenticated GET, no DOM, no render race.
+    follow-up: authenticated JSON GETs, no DOM and no render race.
     """
+    def fetch(start_date, end_date):
+        query = [("symbol", ticker), ("start_date", start_date),
+                 ("end_date", end_date), ("investor_type", "A")]
+        query += [("brokers", b) for b in BAGHOLDER_BROKERS]
+        resp = page.context.request.get(
+            f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
+        payload = _api_json(resp)
+        if not payload or not payload.get("success"):
+            raise RuntimeError(
+                f"{ticker}: inventory API status={resp.status} "
+                f"success={(payload or {}).get('success')}")
+        shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
+        if shown and shown != ticker.upper():
+            raise RuntimeError(f"inventory API returned {shown} for requested {ticker}")
+        return payload
+
+    # Discover actual exchange sessions first. Each exact 20-session block uses
+    # the verified C20 selector, then the observed flows are aggregated across
+    # the latest ~60 trading days.
     start_date, end_date = _inventory_window()
-    query = [("symbol", ticker), ("start_date", start_date),
-             ("end_date", end_date), ("investor_type", "A")]
-    query += [("brokers", b) for b in BAGHOLDER_BROKERS]
-
-    resp = page.context.request.get(f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
-    payload = _api_json(resp)
-    if not payload or not payload.get("success"):
-        raise RuntimeError(
-            f"{ticker}: inventory API status={resp.status} "
-            f"success={(payload or {}).get('success')}")
-
-    # The endpoint is symbol-keyed, but never trust a payload whose meta disagrees
-    # with what we asked for — the same gate backfill_inventory.py applies.
-    shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
-    if shown and shown != ticker.upper():
-        raise RuntimeError(f"inventory API returned {shown} for requested {ticker}")
-
-    return bagholders_from_payload(payload, n)
+    discovery = fetch(start_date, end_date)
+    blocks = inventory_date_blocks(
+        discovery, BAGHOLDER_TRADING_DAYS, BAGHOLDER_BLOCK_TRADING_DAYS)
+    if not blocks:
+        raise RuntimeError(f"{ticker}: inventory API returned no trading dates")
+    payloads = [fetch(start, end) for start, end in blocks]
+    return bagholders_from_payloads(payloads, n)
 
 
 def _fmt_lot(v):
@@ -1079,7 +1090,7 @@ def format_broker_stalker_message(data):
 def _broker_stalker_lines(data):
     lines = [
         "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
-        "(bag holder = akumulasi inventory terbesar, ~3 bln)",
+        "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
     ]
     if not data:
         lines.append("Tidak ada retail net sell hari ini.")

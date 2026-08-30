@@ -114,6 +114,7 @@ import torch.nn as nn
 
 from walk_forward_backtest import FEATURES, DB_PATH, _broker_day_aggregates, _broker_correlation_1d
 from ara_arb_simulation import annotate_limits
+from price_audit import clean_panel
 from signal_metrics import trade_stats, format_trade_stats
 
 TRANSACTION_COST = 0.0015   # one-way; ~0.3% round trip, conservative IDX retail placeholder
@@ -127,23 +128,37 @@ def build_episode_frame(conn):
     """Like walk_forward_backtest.build_panel(), but keeps daily_return and
     ARA/ARB flags per ticker/date instead of collapsing to an aggregated
     Sharpe - the DDQN environment needs to step through days in order."""
+    px = clean_panel(conn, horizons=(), lags=(1, 5))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close, volume FROM price_history", conn)
+    bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
     agg = agg.merge(corr, on=["ticker", "date"], how="left")
 
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
+    px["momentum_1d"] = px["lag_1"]
     px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
+    px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
     px["daily_return"] = px["momentum_1d"]  # today's close-over-close return, same quantity walk_forward_backtest calls "target" one day earlier
     px = annotate_limits(px)  # adds at_ara / at_arb, using the same tiered/flat bounds as ara_arb_simulation.py
 
+    # An environment must never step from the last clean row before a hole to
+    # the first clean row after it. Segment each ticker on the unfiltered market
+    # date axis; make_envs() below turns every segment into its own episode.
+    all_dates = sorted(px["date"].unique())
+    date_pos = {date: i for i, date in enumerate(all_dates)}
+    px["_date_pos"] = px["date"].map(date_pos)
+    date_gap = px.groupby("ticker")["_date_pos"].diff().ne(1)
+    # A corporate action is masked from lag_1 just like an impossible target.
+    # It also starts a new episode, otherwise dropping that row below would let
+    # the environment step straight across the split.
+    px["episode_id"] = (date_gap | px["lag_1"].isna()).groupby(px["ticker"]).cumsum()
+
     panel = agg.merge(
-        px[["ticker", "date", "momentum_1d", "volume_ratio", "daily_return", "at_ara", "at_arb"]],
+        px[["ticker", "date", "momentum_1d", "volume_ratio", "daily_return",
+            "at_ara", "at_arb", "episode_id"]],
         on=["ticker", "date"], how="inner",
     )
     panel = panel.dropna(subset=["daily_return"]).sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -239,7 +254,9 @@ class TickerEnv:
 
 def make_envs(panel):
     envs = []
-    for ticker, g in panel.groupby("ticker"):
+    group_cols = ["ticker", "episode_id"] if "episode_id" in panel else ["ticker"]
+    for key, g in panel.groupby(group_cols):
+        ticker = key[0] if isinstance(key, tuple) else key
         g = g.sort_values("date").reset_index(drop=True)
         if len(g) < 10:
             continue

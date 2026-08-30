@@ -28,8 +28,8 @@ KNOWN-DEFECT BUDGET
 Defects that are known and scheduled are pinned rather than failed on, because a
 check that is permanently red for a known condition trains everyone to skip it.
 The count fails only when it GROWS. SQRT252_BUDGET reached its target of 0 when
-stage 3 landed; IMPOSSIBLE_TARGET_BUDGET is still ratcheting down and should
-reach 0 once build_panel() sources price_audit.clean_panel().
+stage 3 landed; IMPOSSIBLE_TARGET_BUDGET reached 0 when every model target was
+routed through price_audit.clean_panel().
 
 Run:  py check_ml_health.py            -> print status
       py check_ml_health.py --telegram -> also send it
@@ -75,18 +75,13 @@ LIMIT_TOLERANCE = 0.01
 #   2026-08-20  4   initial pin
 #   2026-08-23  0   stage 3 landed: all four sites replaced by signal_metrics.py
 SQRT252_BUDGET = 0
-# build_panel() still reads price_history directly, so contaminated rows reach
-# the panel and land outside the IDX limit band. Swapping it to
-# price_audit.clean_panel() (HANDOFF.md stage 1) takes this to 0. Pinned rather
-# than merely reported so that contamination getting WORSE still fails the
-# build, instead of hiding inside a number that was already red.
-#
-# Ratchet log - lower this every time it can be lowered, never raise it:
+# Ratchet log - never raise this:
 #   2026-08-20  88   initial pin
 #   2026-08-21  82   an unchanged rerun of backfill_inventory.py healed 899 of
 #                    1,400 contaminated rows overnight (CDIA and COIN went from
 #                    231 bad rows each to 0) and broke zero new ones
-IMPOSSIBLE_TARGET_BUDGET = 82
+#   2026-08-30   0   all model targets now source clean_panel() with gap guards
+IMPOSSIBLE_TARGET_BUDGET = 0
 # SHARPE_IMPLAUSIBLE is gone with stage 3: no code path emits a Sharpe to
 # sanity-check any more. What replaces it is the hit-edge/IC check below.
 
@@ -192,11 +187,7 @@ def check_panel(problems, notes, stats):
             f"GROWING. The scraper defect is writing new bad rows; see "
             f"HANDOFF.md stage 2.")
     elif impossible:
-        notes.append(
-            f"{impossible} target(s) outside the IDX limit band (within the "
-            f"pinned budget of {IMPOSSIBLE_TARGET_BUDGET}) — build_panel() still "
-            f"reads price_history directly. Swap it to price_audit.clean_panel() "
-            f"and this goes to 0; HANDOFF.md stage 1.")
+        notes.append(f"{impossible} target(s) outside the pinned limit budget")
 
     # Base rate belongs next to any hit_rate that gets quoted. Recorded here so
     # a model that merely reproduces it cannot look like a finding.
@@ -245,6 +236,7 @@ def check_model_runs(panel, problems, notes, stats):
         return None if v is None or (isinstance(v, float) and np.isnan(v)) else round(float(v), nd)
 
     stats["pooled_ic"] = _r("ic")
+    stats["daily_ic"] = _r("daily_ic")
     stats["pooled_hit"] = _r("top_hit")
     stats["pooled_hit_edge"] = _r("top_hit_edge")
     stats["pooled_edge"] = _r("edge", 4)
@@ -269,9 +261,16 @@ def _sqrt252_sites():
     and this file all mention it. Parsing means only executable code counts, and
     the description of a bug never registers as the bug.
     """
+    listed = subprocess.run(
+        ["git", "ls-files", "--", "*.py"], cwd=HERE,
+        capture_output=True, text=True, check=False,
+    )
+    files = listed.stdout.splitlines() if listed.returncode == 0 else [
+        fn for fn in os.listdir(HERE) if fn.endswith(".py")
+    ]
     hits = []
-    for fn in sorted(os.listdir(HERE)):
-        if not fn.endswith(".py") or fn == os.path.basename(__file__):
+    for fn in sorted(files):
+        if fn.replace("\\", "/") == os.path.basename(__file__):
             continue
         try:
             tree = ast.parse(open(os.path.join(HERE, fn), encoding="utf-8").read())
@@ -334,6 +333,8 @@ def format_report(problems, notes, stats):
     m = []
     if stats.get("pooled_ic") is not None:
         m.append(f"IC {stats['pooled_ic']:+.3f}")
+    if stats.get("daily_ic") is not None:
+        m.append(f"daily IC {stats['daily_ic']:+.3f}")
     if stats.get("pooled_hit") is not None:
         m.append(f"top-hit {stats['pooled_hit']:.1%}")
     if stats.get("pooled_hit_edge") is not None:

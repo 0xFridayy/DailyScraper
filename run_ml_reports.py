@@ -43,6 +43,7 @@ from ddqn_entry_exit import (
     evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
 )
 from signal_metrics import trade_stats, format_trade_stats
+from price_audit import clean_panel
 
 RECENT_TRADES_SHOWN = 15
 
@@ -84,7 +85,7 @@ def run_xgboost_report(conn):
 
 def run_strategy_variants_report(conn):
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = clean_panel(conn, horizons=(1,), lags=(1,))
     result = run_strategy_search(panel, px)
     return dict(
         winner_label=result["winner_label"],
@@ -132,10 +133,9 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     drawdown % (using intraday low) - exactly as requested, not a
     close-to-close approximation. A signal with days_elapsed < max_days is
     still "active"; once it reaches max_days it's "resolved" and its final
-    (day-max_days close) return feeds a pooled Sharpe across all resolved
-    signals - a single signal's own Sharpe isn't statistically meaningful
-    (n=1), same caveat as every other Sharpe in this repo, so this only
-    reports one once there's more than a handful of resolved signals."""
+    (day-max_days close) return feeds pooled non-annualized trade statistics.
+    A handful of observations is still not meaningful, so small n is called
+    out explicitly."""
     try:
         watch = pd.read_sql("SELECT flag_date, ticker, sources FROM konglo_signal_watch", conn)
     except pd.errors.DatabaseError:
@@ -143,7 +143,7 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     if watch.empty:
         return dict(signals=[], resolved=trade_stats([]))
 
-    px = pd.read_sql("SELECT date, ticker, high, low, close FROM price_history", conn)
+    px = clean_panel(conn, horizons=(1,), lags=(1,))
     px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
 
     signals = []
@@ -156,7 +156,12 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
         if len(idx) == 0:
             continue  # price_history hasn't caught up to the flag day yet
         i0 = idx[0]
-        window = g.iloc[i0 + 1: i0 + 1 + max_days]
+        rows = []
+        for i in range(i0 + 1, min(i0 + 1 + max_days, len(g))):
+            if pd.isna(g.loc[i - 1, "fwd_1"]):
+                break
+            rows.append(g.loc[i])
+        window = pd.DataFrame(rows)
         if window.empty:
             continue
         entry_close = g.loc[i0, "close"]
@@ -187,7 +192,7 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
     p = xgb["pooled"]
     edge_line = (
         f"Signal edge: top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
-        f"= {p['top_hit_edge']:+.1%}, IC {p['ic']:+.3f}"
+        f"= {p['top_hit_edge']:+.1%}, IC {p['ic']:+.3f}, daily IC {p['daily_ic']:+.3f}"
     )
     bar_line = (
         edge_line + "\n"
@@ -214,7 +219,9 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         f"📈 Daily ML report\n\n"
         f"XGBoost walk-forward ({xgb['n_dates']}d, {xgb['n_tickers']} tickers, "
         f"{xgb['date_min']} to {xgb['date_max']}):\n"
-        f"  IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
+        f"  IC {p['ic']:+.3f} | daily IC {p['daily_ic']:+.3f} "
+        f"(median {p['daily_ic_median']:+.3f}) | top-decile hit "
+        f"{p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
         f"({p['top_hit_edge']:+.1%}) | return edge {p['edge']:+.2%}\n"
         f"  threshold rule: n={p['n_trades']} mean {p['trade_mean']:+.2%} "
         f"hit {p['trade_hit']:.1%} ({p['trade_hit_edge']:+.1%})\n\n"
@@ -251,9 +258,10 @@ def write_step_summary(xgb, strat, ddqn, konglo):
         f.write(f"## XGBoost walk-forward (default strategy: >0.5% threshold, 1d hold, no TP/SL)\n\n")
         f.write(f"{xgb['n_dates']} dates ({xgb['date_min']} to {xgb['date_max']}), {xgb['n_tickers']} tickers\n\n")
         p = xgb["pooled"]
-        f.write("| IC | Top-decile hit | Base rate | Hit edge | Return edge | n |\n"
-                "|---|---|---|---|---|---|\n")
-        f.write(f"| {p['ic']:+.3f} | {p['top_hit']:.1%} | {p['base_rate']:.1%} | "
+        f.write("| IC | Daily IC mean | Daily IC median | Top-decile hit | Base rate | Hit edge | Return edge | n |\n"
+                "|---|---|---|---|---|---|---|---|\n")
+        f.write(f"| {p['ic']:+.3f} | {p['daily_ic']:+.3f} | {p['daily_ic_median']:+.3f} | "
+                f"{p['top_hit']:.1%} | {p['base_rate']:.1%} | "
                 f"{p['top_hit_edge']:+.1%} | {p['edge']:+.2%} | {p['n']} |\n\n")
         f.write("**Hit edge is the number that matters.** A top-decile hit rate only means "
                 "something next to the base rate of the same rows; this repo reported 42.8% "
@@ -304,8 +312,8 @@ def write_step_summary(xgb, strat, ddqn, konglo):
             "Dashboard presets, or Broker Stalker), it gets tracked here for the next "
             f"{KONGLO_TRACK_DAYS} trading days. Highest % and drawdown % use intraday high/low "
             "(not just close), same as strategy_variants.py's TP/SL checks. A signal only feeds "
-            f"the pooled Sharpe once it resolves ({KONGLO_TRACK_DAYS} days elapsed) - a single "
-            "signal's own Sharpe isn't statistically meaningful.\n\n"
+            f"pooled non-annualized trade stats once it resolves "
+            f"({KONGLO_TRACK_DAYS} days elapsed).\n\n"
         )
         if not konglo["signals"]:
             f.write("No konglo tickers have appeared in the daily radar yet.\n\n")

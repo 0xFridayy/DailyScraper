@@ -65,11 +65,13 @@ def spearman_ic(pred, actual):
     return float(np.corrcoef(pr, ar)[0, 1])
 
 
-def signal_stats(pred, actual, top_q=TOP_QUANTILE):
+def signal_stats(pred, actual, top_q=TOP_QUANTILE, groups=None):
     """Does a higher prediction actually mean a higher realised return?
 
     Returns, for the top-quantile slice and for everything:
       ic          rank correlation over all rows
+      daily_ic    mean cross-sectional rank correlation within each date
+      daily_ic_median median of those daily correlations
       base_rate   fraction of ALL rows with a positive return
       hit_rate    fraction of TOP-slice rows with a positive return
       hit_edge    hit_rate - base_rate, the number that says whether the
@@ -79,25 +81,50 @@ def signal_stats(pred, actual, top_q=TOP_QUANTILE):
       edge        top_mean - all_mean
     """
     p, a = _as_series(pred).reset_index(drop=True), _as_series(actual).reset_index(drop=True)
+    group = None if groups is None else (
+        groups if isinstance(groups, pd.Series) else pd.Series(np.asarray(groups))
+    ).reset_index(drop=True)
     ok = p.notna() & a.notna()
-    p, a = p[ok], a[ok]
+    if group is not None:
+        ok &= group.notna()
+        group = group[ok].reset_index(drop=True)
+    p, a = p[ok].reset_index(drop=True), a[ok].reset_index(drop=True)
     n = len(p)
     empty = dict(n=0, n_top=0, ic=np.nan, base_rate=np.nan, hit_rate=np.nan,
-                 hit_edge=np.nan, top_mean=np.nan, all_mean=np.nan, edge=np.nan)
+                 hit_edge=np.nan, top_mean=np.nan, all_mean=np.nan, edge=np.nan,
+                 daily_ic=np.nan, daily_ic_median=np.nan, n_daily_ic=0)
     if n == 0:
         return empty
 
-    cut = p.quantile(top_q)
-    top = a[p >= cut]
+    daily_ics = []
+    if group is None:
+        cut = p.quantile(top_q)
+        top = a[p >= cut]
+    else:
+        frame = pd.DataFrame({"pred": p, "actual": a, "group": group})
+        top_idx = []
+        for _, day in frame.groupby("group", sort=False):
+            ic = spearman_ic(day["pred"], day["actual"])
+            if not np.isnan(ic):
+                daily_ics.append(ic)
+            n_top = max(1, int(np.ceil(len(day) * (1 - top_q))))
+            top_idx.extend(day.nlargest(n_top, "pred").index)
+        top = frame.loc[top_idx, "actual"]
+
+    daily_ic = float(np.mean(daily_ics)) if daily_ics else np.nan
+    daily_ic_median = float(np.median(daily_ics)) if daily_ics else np.nan
     if len(top) == 0:
         return {**empty, "n": n, "ic": spearman_ic(p, a),
-                "base_rate": float((a > 0).mean()), "all_mean": float(a.mean())}
+                "base_rate": float((a > 0).mean()), "all_mean": float(a.mean()),
+                "daily_ic": daily_ic, "daily_ic_median": daily_ic_median,
+                "n_daily_ic": len(daily_ics)}
 
     base_rate = float((a > 0).mean())
     hit_rate = float((top > 0).mean())
     all_mean, top_mean = float(a.mean()), float(top.mean())
     return dict(
-        n=n, n_top=len(top), ic=spearman_ic(p, a),
+        n=n, n_top=len(top), ic=spearman_ic(p, a), daily_ic=daily_ic,
+        daily_ic_median=daily_ic_median, n_daily_ic=len(daily_ics),
         base_rate=base_rate, hit_rate=hit_rate, hit_edge=hit_rate - base_rate,
         top_mean=top_mean, all_mean=all_mean, edge=top_mean - all_mean,
     )
@@ -150,7 +177,11 @@ def format_signal_stats(s, label=""):
     if not s["n"]:
         return f"{head}no rows"
     ic = "n/a" if np.isnan(s["ic"]) else f"{s['ic']:+.3f}"
-    return (f"{head}n={s['n']} IC {ic} | top{int((1 - TOP_QUANTILE) * 100)}% "
+    daily = ""
+    if not np.isnan(s.get("daily_ic", np.nan)):
+        daily = (f" | daily IC mean {s['daily_ic']:+.3f}, "
+                 f"median {s['daily_ic_median']:+.3f} ({s['n_daily_ic']}d)")
+    return (f"{head}n={s['n']} IC {ic}{daily} | top{int((1 - TOP_QUANTILE) * 100)}% "
             f"n={s['n_top']} hit {s['hit_rate']:.1%} vs base {s['base_rate']:.1%} "
             f"(edge {s['hit_edge']:+.1%}) | ret {s['top_mean']:+.2%} vs "
             f"{s['all_mean']:+.2%} (edge {s['edge']:+.2%})")
