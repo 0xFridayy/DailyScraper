@@ -20,7 +20,7 @@ from signal_metrics import spearman_ic, signal_stats, trade_stats
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
-                         detect, bagholders_from_payload)
+                         detect, bagholders_from_payload, date_offset_holds)
 
 
 def test_broker_day_aggregates_basic():
@@ -383,6 +383,27 @@ def _inventory_payload(nlot, nval):
             "meta": {"symbol": "SINI"}}
 
 
+def test_date_offset_only_holds_before_the_open():
+    # The invariant every date join rests on (Appendix E) is "scrape date - 1 ==
+    # data date", and it is true ONLY because the scheduled run beats the open.
+    # The screener serves the last COMPLETED session, so after the open it hands
+    # back today's close instead.
+    from datetime import datetime as _dt
+    sched = _dt(2026, 8, 27, 7, 0)            # 07:00, the cron's own slot
+    assert date_offset_holds(sched)
+    assert date_offset_holds(_dt(2026, 8, 27, 0, 30))
+    assert date_offset_holds(_dt(2026, 8, 27, 9, 59))
+
+    # 22:09 local == the 21:09 WIB manual dispatch that overwrote 2026-08-27's
+    # correctly-offset rows with same-day closes and dropped cross-source
+    # agreement from 100% to 85%.
+    assert not date_offset_holds(_dt(2026, 8, 27, 22, 9))
+    # IDX opens 09:00 WIB (UTC+7) == 10:00 in the UTC+8 scrape timezone.
+    assert not date_offset_holds(_dt(2026, 8, 27, 10, 0)), "the open itself is already unsafe"
+    assert not date_offset_holds(_dt(2026, 8, 27, 16, 30))
+    print("test_date_offset_only_holds_before_the_open passed")
+
+
 def test_quarantined_row_is_not_a_baseline_for_the_next_row():
     # The 2026-08-27 false alarm: MDIA's 08-13 close was KIOS's price (95), was
     # flagged and quarantined weeks earlier, and its real price is ~250. The next
@@ -500,6 +521,7 @@ def test_should_fail_run_catches_a_broken_scrape():
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
+    test_date_offset_only_holds_before_the_open()
     test_quarantined_row_is_not_a_baseline_for_the_next_row()
     test_trusted_mask_leaves_real_contamination_detectable()
     test_bagholders_sum_per_day_lots_not_last_value()

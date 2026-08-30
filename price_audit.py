@@ -211,6 +211,31 @@ def bagholders_from_payload(payload, n=2):
     return holders[:n]
 
 
+# The scheduled scrape runs 07:00 Asia/Kuala_Lumpur, before IDX opens, which is
+# the ONLY reason `scrape date - 1 == data date` (Appendix E) holds. IDX opens
+# 09:00 WIB (UTC+7) = 10:00 in the UTC+8 timezone this repo schedules on.
+IDX_OPEN_HOUR_LOCAL = 10
+
+
+def date_offset_holds(now_local):
+    """Is `market_summary_daily.date - 1 == data date` true for a run started now?
+
+    Only before the market opens. The screener serves the last COMPLETED
+    session, so a pre-open run gets yesterday's close and the whole pipeline's
+    one-day offset is correct. Run after the close and it serves TODAY's close,
+    which then gets stored under today's date and silently breaks the offset for
+    that date.
+
+    Learned by doing it: a manual `workflow_dispatch` at 21:09 WIB on 2026-08-27
+    overwrote that morning's correctly-offset rows with same-day closes, and
+    check_signal_integrity's cross-source check went from 100% to 85%. Nothing
+    in the workflow or the scraper refused or even warned. See HANDOFF Appendix Q.
+
+    `now_local` is a datetime already in the scrape timezone.
+    """
+    return now_local.hour < IDX_OPEN_HOUR_LOCAL
+
+
 def should_fail_run(n_failed, n_total, max_failure_rate=0.30):
     """Should a backfill run exit non-zero?
 
