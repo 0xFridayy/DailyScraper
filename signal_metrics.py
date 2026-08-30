@@ -156,6 +156,62 @@ def trade_stats(returns, base_rate=None):
     )
 
 
+def daily_ic(dates, pred, actual, min_names=10):
+    """Cross-sectional Spearman IC per DATE, not pooled over everything.
+
+    Roadmap section 28. A pooled IC over 45 tickers x 250 days treats 11,000
+    rows as 11,000 draws, when a day's 45 names are largely one draw moved by
+    the same market - the identical mistake that inflated this repo's Sharpe
+    (mean pairwise daily correlation here is +0.275). Ranking WITHIN a day
+    removes the common factor by construction: the question becomes "on this
+    day, did the model rank these names correctly", which is the question a
+    cross-sectional signal is actually making a claim about.
+
+    Days with fewer than `min_names` names are skipped - a rank correlation
+    over five names is noise with a decimal point.
+
+    Returns a Series of IC indexed by date.
+    """
+    df = pd.DataFrame({
+        "date": np.asarray(dates),
+        "pred": _as_series(pred).to_numpy(),
+        "actual": _as_series(actual).to_numpy(),
+    }).dropna()
+    out = {}
+    for d, g in df.groupby("date"):
+        if len(g) >= min_names:
+            out[d] = spearman_ic(g["pred"], g["actual"])
+    return pd.Series(out, dtype=float).dropna()
+
+
+def ic_summary(daily):
+    """mean / median / ICIR / share of positive days, from daily_ic()'s output.
+
+    ICIR is mean/std of the DAILY IC series. It is deliberately not scaled by
+    sqrt(n_days): that would be the same annualisation mistake in a new costume.
+    Read it as a signal-to-noise ratio on the day-to-day IC, nothing more.
+    """
+    d = _as_series(daily).dropna()
+    if d.empty:
+        return dict(n_days=0, mean_ic=np.nan, median_ic=np.nan, icir=np.nan, pct_positive=np.nan)
+    sd = float(d.std())
+    return dict(
+        n_days=len(d),
+        mean_ic=float(d.mean()),
+        median_ic=float(d.median()),
+        icir=(float(d.mean()) / sd) if sd > 0 else np.nan,
+        pct_positive=float((d > 0).mean()),
+    )
+
+
+def format_ic_summary(s, label=""):
+    head = f"{label}: " if label else ""
+    if not s["n_days"]:
+        return f"{head}no scoreable days"
+    return (f"{head}daily IC mean {s['mean_ic']:+.3f} med {s['median_ic']:+.3f} "
+            f"ICIR {s['icir']:+.2f} | {s['pct_positive']:.0%} of {s['n_days']} days positive")
+
+
 def evaluation_scorecard(ic, base_rate, hit_rate, top_mean, all_mean):
     """The four evaluation metrics on one line, always together.
 

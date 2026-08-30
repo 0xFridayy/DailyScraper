@@ -706,7 +706,102 @@ def test_broker_selector_falls_back_instead_of_burning_the_run():
 
 
 
+# ─── ML V2 (roadmap): the two places a wrong answer would be invisible ───────
+
+def test_embargo_keeps_the_target_window_out_of_training():
+    """Roadmap section 29. A 10-day target on training day t is realised at
+    t+10, so the last 10 training dates carry outcomes from inside the test
+    window. Without the purge the model is graded partly on what it saw."""
+    from model_v2_ablation import purged_cycles
+
+    dates = [f"d{i:03d}" for i in range(100)]
+    horizon = 10
+    cycles = purged_cycles(dates, horizon, train_min=60, test_window=10)
+    assert cycles, "no cycles produced"
+
+    for train_dates, test_dates in cycles:
+        first_test = dates.index(test_dates[0])
+        last_train = dates.index(train_dates[-1])
+        gap = first_test - last_train
+        assert gap > horizon, (
+            f"only {gap} dates between the last training day and the first test "
+            f"day; a {horizon}-day target reaches {horizon} days forward")
+
+    # And the embargo must actually cost something - a version that silently
+    # did nothing would pass the check above if train/test were already apart.
+    unpurged = purged_cycles(dates, 0, train_min=60, test_window=10)
+    assert len(unpurged[0][0]) - len(cycles[0][0]) == horizon
+    print("test_embargo_keeps_the_target_window_out_of_training passed")
+
+
+def test_daily_ic_scores_within_a_day_not_across_days():
+    """Roadmap section 28. Pooled IC counts 45 names on one day as 45 draws.
+    A prediction that ranks names correctly WITHIN each day, while carrying a
+    per-day offset that destroys the pooled ordering, is a good signal - and
+    pooled IC calls it worthless."""
+    from signal_metrics import daily_ic, ic_summary, spearman_ic
+
+    dates, pred, actual = [], [], []
+    for d in range(20):
+        offset = 100.0 * ((-1) ** d)      # a huge, alternating per-day level
+        for i in range(15):
+            dates.append(f"d{d:02d}")
+            actual.append(offset + i)      # within a day, actual rises with i
+            pred.append(-offset + i)       # so does pred - but the offset flips
+    ics = ic_summary(daily_ic(dates, pred, actual))
+
+    assert ics["mean_ic"] > 0.99, ics["mean_ic"]
+    assert ics["pct_positive"] == 1.0
+    # The pooled IC does not merely miss this signal, it inverts it: the
+    # alternating level dominates the ranking, so pooling reports a strong
+    # NEGATIVE correlation for a prediction that is right every single day.
+    assert spearman_ic(pred, actual) < -0.5, (
+        "the pooled IC is supposed to be fooled here - if it is not, this test "
+        "no longer demonstrates why daily IC exists")
+    print("test_daily_ic_scores_within_a_day_not_across_days passed")
+
+
+def test_identity_features_are_normalised_not_raw_rupiah():
+    """A per-broker net flow in billions of Rupiah is not comparable between a
+    Rp 300 small-cap and a Rp 30tn name, so the model would learn ticker size
+    instead of broker behaviour. Doubling price and value together must leave
+    the feature unchanged - it is a ratio to the same window's turnover."""
+    import sqlite3
+    from broker_identity_features import build_identity_panel
+
+    def _make(scale):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE price_history (date TEXT, ticker TEXT, open REAL,"
+                     " high REAL, low REAL, close REAL, volume REAL)")
+        conn.execute("CREATE TABLE broker_flow (date TEXT, ticker TEXT,"
+                     " broker_code TEXT, netval REAL)")
+        for i in range(40):
+            d = f"2026-01-{i + 1:02d}"
+            c = 1000.0 * scale
+            conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                         (d, "AAA", c, c, c, c, 1e6))
+            # netval scales with price, exactly as the scraper derives it
+            conn.execute("INSERT INTO broker_flow VALUES (?,?,?,?)",
+                         (d, "AAA", "CC", 0.1 * scale))
+        conn.commit()
+        panel = build_identity_panel(conn, horizons=(1,), min_coverage=0.5,
+                                     inventory_window=10)
+        conn.close()
+        return panel
+
+    a, b = _make(1.0), _make(2.0)
+    col = "CC_net_5d"
+    va, vb = a[col].dropna().iloc[-1], b[col].dropna().iloc[-1]
+    assert abs(va - vb) < 1e-9, f"feature moved with price level: {va} vs {vb}"
+    assert 0 < va < 1, f"expected a share of turnover, got {va}"
+    print("test_identity_features_are_normalised_not_raw_rupiah passed")
+
+
+
 if __name__ == "__main__":
+    test_embargo_keeps_the_target_window_out_of_training()
+    test_daily_ic_scores_within_a_day_not_across_days()
+    test_identity_features_are_normalised_not_raw_rupiah()
     test_simulate_trade_refuses_a_window_that_spans_a_removed_row()
     test_annotate_limits_does_not_measure_across_a_gap()
     test_stale_quarantine_snapshot_cannot_hide_new_damage()

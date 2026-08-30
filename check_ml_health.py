@@ -60,7 +60,11 @@ DB_PATH = os.path.join(HERE, "neobdm.db")
 CORE_MODULES = ["price_audit", "walk_forward_backtest", "strategy_variants",
                 "feature_ablation", "multiday_features", "smart_money_divergence",
                 "shap_analysis", "kelly_sizing", "ara_arb_simulation",
-                "horizon_scan", "evaluate_signals"]
+                "horizon_scan", "evaluate_signals",
+                # ML V2 (roadmap). Import-checked here from the day they land, so
+                # a rename in walk_forward_backtest or price_audit breaks the
+                # build rather than the next experiment run.
+                "broker_identity_features", "model_v2_ablation"]
 OPTIONAL_MODULES = ["ddqn_entry_exit"]
 
 # Panel shape. Wide bands - this catches "the panel collapsed", not drift.

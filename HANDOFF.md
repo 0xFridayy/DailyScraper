@@ -1341,3 +1341,144 @@ Tujuh tes di `test_pipeline.py`, empat di antaranya baru:
 `test_stale_quarantine_snapshot_cannot_hide_new_damage`,
 `test_ddqn_episodes_split_where_days_are_missing`. Total 37 tes hijau,
 `check_ml_health` hijau dengan `impossible targets 0`.
+
+## Lampiran S — ML V2 Experiment #1: apakah IDENTITAS broker menambah sesuatu? (2026-08-30)
+
+Roadmap `ML_NEXT_STEP_BROKER_IDENTITY_ROADMAP.md` §50 memberi urutan: (1) selesaikan
+clean panel, (2) buat `broker_identity_features.py`, (3) jalankan Experiment #1.
+Tahap 1 selesai di Lampiran R. Ini tahap 2 dan 3.
+
+### Kenapa pertanyaannya memang belum pernah ditanyakan
+
+Semua fitur broker yang pernah dipakai repo ini **meruntuhkan dimensi broker
+sebelum model melihatnya**:
+
+```
+broker_concentration, net_flow_total, n_brokers,
+net_buy_ratio, retail_presence_pct, broker_correlation_1d
+```
+
+Dua saham bisa punya `net_flow_total` dan `broker_concentration` identik dengan
+pembeli yang sama sekali berbeda. Jadi kesimpulan lama "broker flow tidak
+menunjukkan edge" **bukan temuan tentang broker flow** — itu temuan tentang enam
+statistik ringkasan. Ditambah panel yang kotor, dua-duanya sekarang berubah.
+
+### Yang dibangun
+
+`broker_identity_features.py`:
+
+- **Level 2 — per broker.** Net flow trailing 5d dan 10d untuk 19 broker yang
+  muncul di ≥70% ticker-day (dari 29 broker; ekornya di bawah 65% dan "net flow
+  10 hari"-nya lebih menggambarkan apakah brokernya muncul sama sekali).
+  Dinormalisasi terhadap **turnover jendela yang sama**, jadi bacaannya "net
+  flow broker ini X% dari yang diperdagangkan" — tak berdimensi, sebanding
+  antar-ticker. 38 fitur.
+- **Level 1/3 — agregat inventory (§9).** Observable inventory = `cumsum(net
+  lot)` dalam jendela bergulir 60 hari. Lot-nya **dipulihkan persis**, bukan
+  ditaksir: scraper menurunkan `netval = nlot × 100 × close / 1e9`, jadi
+  inversinya eksak. Lalu `inv_top1_share`, `inv_top3_share`, `inv_hhi`,
+  `inv_pct_lots`, `inv_chg_3/5/10d`. 7 fitur, bukan satu kolom per broker.
+
+Sengaja **tidak** dibangun: entity/ownership graph, owner-broker affinity,
+historical broker alpha. §43 menggerbangi ketiganya di belakang eksperimen ini.
+
+### Yang membuat ini uji yang adil
+
+1. **Baris identik.** Inventory butuh jendela 60 hari dan membuang seperlima
+   awal tiap ticker. Membiarkan D jalan di irisan yang lebih akhir daripada A
+   akan membuat perbandingannya bias persis ke arah yang menyanjung fitur baru.
+   Semua set dinilai di 4.533 baris yang sama.
+2. **Purge/embargo (§29).** Target 10 hari pada hari latih *t* baru terealisasi
+   di *t+10*, jadi 10 tanggal latih terakhir membawa hasil dari **dalam** jendela
+   uji. Itu satu jendela penuh, bukan detail pembulatan. `purged_cycles()`
+   membuangnya, dan tesnya memverifikasi jaraknya benar-benar > horizon.
+3. **IC cross-sectional harian (§28)**, bukan pooled. Pooled menghitung 45 nama
+   berkorelasi di satu hari sebagai 45 observasi bebas.
+4. **Excess return (§35).** Rata-rata cross-sectional harian dibuang, untuk
+   menguji apakah edge-nya cuma "menemukan hari saat seluruh pasar naik".
+
+### Hasil — 4.533 baris, 187 tanggal, 45 ticker
+
+**Target `ret_10`**
+
+| set | fitur | daily IC | ICIR | % hari + | hit edge | return edge | excess edge |
+|---|---|---|---|---|---|---|---|
+| A price_only | 3 | +0,025 | 0,12 | 57% | +10,7% | +5,69% | +1,68% |
+| B broker_aggregate | 9 | +0,023 | 0,10 | 57% | **+12,8%** | **+7,14%** | **+3,08%** |
+| C broker_identity | 41 | **+0,070** | **0,34** | **62%** | +3,5% | +1,76% | +1,81% |
+| D identity+inventory | 48 | +0,044 | 0,26 | 59% | +4,1% | +1,98% | +2,42% |
+
+**Target `max_10`**
+
+| set | daily IC | ICIR | % hari + | return edge |
+|---|---|---|---|---|
+| A price_only | +0,101 | 0,42 | 70% | +6,61% |
+| B broker_aggregate | **+0,122** | **0,59** | 69% | **+8,39%** |
+| C broker_identity | −0,010 | −0,05 | 50% | +2,35% |
+| D identity+inventory | +0,007 | 0,03 | 55% | −0,17% |
+
+(Hit rate tidak dibaca di `max_10`: base rate-nya 94,4% — puncak 10 hari hampir
+selalu di atas close entry, jadi angkanya nyaris tanpa informasi.)
+
+### Verdict: identity menang **1 dari 6**. Ini BUKAN lolos.
+
+Satu yang dimenangkannya nyata dan bukan kebetulan: di `ret_10`, C adalah
+**satu-satunya set yang IC hariannya positif di ketiga sepertiga periode**
+(+0,014 / +0,110 / +0,085). A dan B keduanya negatif di salah satu sepertiga.
+Itu justru gate §38 nomor 2 — "median daily IC tidak bergantung pada satu bulan
+ekstrem" — dan hanya identity yang melewatinya. ICIR 0,34 atas 119 hari.
+
+Tapi di semua metrik lain identity **kalah**, dan di `max_10` kalah telak.
+
+### Diagnostik: bukan soal jumlah fitur
+
+38 kolom identity atas 4.533 baris jelas mencurigakan, jadi saya uji dua versi
+sempit — **setelah** melihat hasil di atas, dan karena itu ditandai `(diag)` dan
+**tidak boleh dipakai untuk lolos gate**; set yang dipilih sambil melihat
+jawabannya harus diuji ulang di data yang belum dilihatnya.
+
+| set diagnostik | fitur | daily IC | return edge | excess edge |
+|---|---|---|---|---|
+| C1 10d saja | 22 | −0,034 | −1,10% | −1,04% |
+| C2 8 broker teratas | 19 | +0,062 | +0,90% | **−0,54%** |
+
+C2 mempertahankan hampir seluruh keunggulan IC harian dengan separuh fitur —
+**tapi return edge-nya tetap jauh di bawah B, dan excess edge-nya negatif.**
+Jadi hipotesis "kalah karena kelebaran" **tidak didukung**. Memangkas fitur
+mempertahankan manfaat ranking dan tetap tidak memperbaiki return.
+
+### Bacaan yang paling jujur
+
+> Identitas broker memperbaiki **urutan rata-rata di dalam hari**, tapi
+> urutannya **tidak terkonversi jadi return**, dan begitu rata-rata pasar
+> dibuang, keunggulannya hilang atau negatif.
+
+Itu temuan yang berbeda dari "broker flow tidak berguna", dan berbeda juga dari
+"tesisnya terbukti". Ia mengatakan sesuatu yang lebih spesifik: sinyalnya ada di
+*peringkat*, bukan di *besaran*.
+
+### Konsekuensi langsung (§43)
+
+**JANGAN mulai layer owner-broker affinity, entity graph, atau ownership ingest.**
+Roadmap menggerbangi ketiganya di belakang eksperimen ini, dan eksperimen ini
+tidak lolos. Membangun graf entitas sekarang berarti menumpuk struktur rumit di
+atas sesuatu yang belum berdiri.
+
+### Kandidat langkah berikut, urut dari yang paling murah
+
+1. **§22 Level 3 — agregat berbobot, bukan satu kolom per broker.** Ini versi
+   berprinsip dari diagnostik C2: `weighted_buyer_alpha`-style, dihitung
+   strictly out-of-sample. Menjawab keluhan dimensionalitas tanpa memilih broker
+   sambil melihat jawaban.
+2. **Target klasifikasi (§19).** "+10% sebelum −5% dalam 10 hari" jauh lebih
+   dekat ke keputusan trading daripada `ret_10`, dan **peringkat** justru yang
+   dibutuhkannya — cocok dengan bentuk sinyal yang ditemukan di sini.
+3. **§38 gate 7 & 39.** Apakah IC harian C berasal dari 1–2 ticker saja? Apakah
+   SHAP-nya stabil antar-window? Dua pengecekan murah yang bisa membatalkan
+   satu-satunya kemenangan di atas.
+4. **§13 transfer matrix / §12 absorption.** Belum disentuh sama sekali, dan
+   secara konseptual lebih dekat ke tesis "barang berpindah dari retail ke
+   bandar" daripada net flow per broker.
+
+Menjalankannya: `py model_v2_ablation.py` (empat set pra-registrasi), atau
+`py model_v2_ablation.py --diagnose` (plus dua set diagnostik).
