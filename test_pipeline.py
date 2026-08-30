@@ -30,6 +30,9 @@ from ml_v2_experiment_1 import (
     _historical_net_lots, build_broker_identity_features,
     feature_sets_for_columns, make_walk_forward_splits,
 )
+from ml_v2_experiment_1_robustness import (
+    _bootstrap_statistics, paired_date_differences,
+)
 
 
 def test_broker_day_aggregates_basic():
@@ -234,6 +237,33 @@ def test_ml_v2_walk_forward_splits_are_strictly_chronological():
         assert set(split["eval"]).isdisjoint(split["test"])
         assert max(split["fit"]) < min(split["eval"]) < min(split["test"])
     print("test_ml_v2_walk_forward_splits_are_strictly_chronological passed")
+
+
+def test_ml_v2_robustness_pairs_predictions_within_date():
+    rows_b, rows_c = [], []
+    targets = [-0.04, -0.01, 0.01, 0.04]
+    for date in ("d1", "d2"):
+        for i, target in enumerate(targets):
+            base = {"ticker": f"T{i}", "date": date, "target": target, "cycle": 1}
+            rows_b.append({**base, "prediction": float(4 - i)})
+            rows_c.append({**base, "prediction": float(i)})
+    paired = paired_date_differences(pd.DataFrame(rows_b), pd.DataFrame(rows_c))
+    assert len(paired) == 2
+    assert (paired["top_hit_delta"] == 1.0).all()
+    assert (paired["return_edge_delta"] > 0).all()
+    assert (paired["daily_ic_delta"] > 1.9).all()
+    print("test_ml_v2_robustness_pairs_predictions_within_date passed")
+
+
+def test_ml_v2_bootstrap_is_date_level_and_deterministic():
+    values = pd.Series([1.0, -1.0, 2.0, -2.0, 0.5, -0.5])
+    first = _bootstrap_statistics(values, n_bootstrap=500, seed=99)
+    second = _bootstrap_statistics(values, n_bootstrap=500, seed=99)
+    weekly = _bootstrap_statistics(values, n_bootstrap=500, block_days=5, seed=99)
+    assert first == second
+    assert first["n"] == len(values) == weekly["n"]
+    assert first["mean_ci"][0] <= values.mean() <= first["mean_ci"][1]
+    print("test_ml_v2_bootstrap_is_date_level_and_deterministic passed")
 
 
 def test_trade_stats_has_no_annualisation():
@@ -840,6 +870,8 @@ if __name__ == "__main__":
     test_ml_v2_feature_sets_keep_the_same_price_controls()
     test_broker_identity_flows_and_observable_inventory_use_net_lots()
     test_ml_v2_walk_forward_splits_are_strictly_chronological()
+    test_ml_v2_robustness_pairs_predictions_within_date()
+    test_ml_v2_bootstrap_is_date_level_and_deterministic()
     test_trade_stats_has_no_annualisation()
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()
