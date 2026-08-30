@@ -107,7 +107,11 @@ def get_walk_forward_predictions(panel):
         model.fit(fit_df[FEATURES], fit_df["target"],
                   eval_set=[(eval_df[FEATURES], eval_df["target"])], verbose=False)
         test_df["pred"] = model.predict(test_df[FEATURES])
-        pred_rows.append(test_df[["ticker", "date", "pred"]])
+        # `target` rides along because score_all() needs it for the base rate
+        # every hit rate is read against. Dropping it here is what made
+        # run_ml_reports.py die with KeyError: 'target' every night from
+        # 2026-08-23 (the commit that started reporting base rates) onward.
+        pred_rows.append(test_df[["ticker", "date", "pred", "target"]])
     return pd.concat(pred_rows, ignore_index=True)
 
 

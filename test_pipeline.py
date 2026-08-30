@@ -15,8 +15,10 @@ import numpy as np
 
 from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target, signal_quality,
+    FEATURES,
 )
 from signal_metrics import spearman_ic, signal_stats, trade_stats
+from strategy_variants import get_walk_forward_predictions
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
@@ -383,6 +385,35 @@ def _inventory_payload(nlot, nval):
             "meta": {"symbol": "SINI"}}
 
 
+
+def test_predictions_carry_the_columns_the_scorer_reads():
+    # run_ml_reports.py died with KeyError: 'target' every night for a week
+    # (2026-08-23 onward). score_all() started computing the base rate from
+    # preds["target"], but get_walk_forward_predictions() returned only
+    # ticker/date/pred. Nothing caught it: check_ml_health imports the module
+    # and runs these tests, neither of which executed the report path.
+    rng = np.random.default_rng(0)
+    dates = [f"2026-{m:02d}-{d:02d}" for m in (1, 2) for d in range(1, 21)][:40]
+    rows = []
+    for d in dates:
+        for t in ("AAA", "BBB", "CCC"):
+            row = {"date": d, "ticker": t}
+            for f in FEATURES:
+                row[f] = float(rng.normal())
+            row["target"] = float(rng.normal(0, 0.02))
+            rows.append(row)
+    panel = pd.DataFrame(rows)
+
+    preds = get_walk_forward_predictions(panel)
+    assert len(preds), "the synthetic panel should span enough dates to produce folds"
+    for col in ("ticker", "date", "pred", "target"):
+        assert col in preds.columns, f"score_all() reads {col!r}; it must survive"
+    # The exact expression that used to raise.
+    base_rate = float((preds["target"] > 0).mean())
+    assert 0.0 <= base_rate <= 1.0
+    print("test_predictions_carry_the_columns_the_scorer_reads passed")
+
+
 def test_date_offset_only_holds_before_the_open():
     # The invariant every date join rests on (Appendix E) is "scrape date - 1 ==
     # data date", and it is true ONLY because the scheduled run beats the open.
@@ -521,6 +552,7 @@ def test_should_fail_run_catches_a_broken_scrape():
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
+    test_predictions_carry_the_columns_the_scorer_reads()
     test_date_offset_only_holds_before_the_open()
     test_quarantined_row_is_not_a_baseline_for_the_next_row()
     test_trusted_mask_leaves_real_contamination_detectable()
