@@ -1136,18 +1136,55 @@ Akibatnya `check_signal_integrity` gagal dengan **true positive**:
 yang rusak. 205 baris `market_summary_daily` untuk 08-27 dan
 `konglo_signal_watch` 08-27 (25 sinyal, dari yang seharusnya 12) ikut terpengaruh.
 
-**Belum diperbaiki.** Nilai yang benar masih ada persis di git (commit `8b454b0`,
-sebelum run manual), jadi pemulihannya exact — tapi menulis `neobdm.db` lewat PR
-bertabrakan dengan commit harian workflow, jadi harus dijalankan lokal (catatan
-yang sama seperti quarantine di Lampiran D).
+**SUDAH DIPERBAIKI — keduanya.**
 
-Dua hal yang perlu diputuskan:
+### 1. Data dipulihkan
 
-1. **Pulihkan** baris `market_summary_daily` + `konglo_signal_watch` tanggal
-   2026-08-27 dari `8b454b0`.
-2. **Pasang pagar** supaya ini tidak bisa terulang — `daily-scrape.yml` /
-   `neobdm_scraper.py` tidak punya apa pun yang menolak atau memperingatkan
-   ketika dijalankan di luar jendela pra-buka, padahal seluruh konvensi tanggal
-   bergantung padanya. Idealnya scraper mencatat tanggal data sebenarnya
-   (kolom `last_date` yang selama ini NULL) alih-alih menyandarkan semuanya pada
-   tanggal scrape.
+`repair_scrape_date.py` (baru) mengembalikan baris berkunci-tanggal-scrape dari
+DB yang masih benar. Nilai benarnya ada persis di git, di commit sebelum run
+buruk itu:
+
+```
+git show 8b454b0:neobdm.db > /tmp/good.db
+py repair_scrape_date.py 2026-08-27 /tmp/good.db --apply
+```
+
+```
+market_summary_daily: live 205 -> restored 204
+konglo_signal_watch:  live  25 -> restored  12
+```
+
+Idempoten (jalan kedua kali melaporkan "nothing to change"), dan menolak
+mengosongkan tabel kalau sumbernya kebetulan kosong. `price_history` dan
+`broker_flow` **sengaja tidak** disentuh: keduanya berkunci tanggal bursa asli
+dari API, bukan tanggal scrape — justru itu sebabnya ketidaksepakatan kedua
+jalur terdeteksi keras.
+
+Sesudahnya: `🟢 signal integrity OK — offset=1d n=113 agree=100%`, exit 0.
+
+### 2. Pagar dipasang
+
+`price_audit.date_offset_holds(now_local)` menjawab satu pertanyaan: apakah
+invarian `scrape date − 1 = tanggal data` berlaku untuk run yang dimulai
+sekarang? Hanya berlaku **sebelum pasar buka** — IDX buka 09:00 WIB (UTC+7) =
+10:00 di zona waktu UTC+8 yang dipakai penjadwalan repo ini.
+
+`neobdm_scraper._offset_safe()` memakainya untuk **melewati penulisan
+`market_summary_daily` dan `konglo_signal_watch`** ketika di luar jendela, dengan
+log yang menjelaskan persis kenapa. Override sadar: `NEOBDM_ALLOW_OFF_WINDOW=1`.
+
+Yang **tidak** diubah, dan ini disengaja: scrape-nya tetap jalan dan sinyal
+Telegram tetap terkirim. Angka yang ditampilkan benar jam berapa pun — yang
+berbahaya cuma **menyimpannya** di bawah tanggal yang dibaca pipeline sebagai
+sesi sebelumnya. Jadi `/scrape` on-demand tetap berguna; yang hilang hanya baris
+yang memang tidak boleh ditulis. Dikunci tes
+`test_date_offset_only_holds_before_the_open`, termasuk kasus 22:09 yang
+menyebabkan kerusakan ini.
+
+### Yang masih terbuka
+
+Perbaikan sebenarnya tetap yang ditulis Lampiran E: **scraper mencatat tanggal
+data sebenarnya** alih-alih menyimpulkannya dari tanggal scrape. Kolom
+`last_date` yang disediakan untuk itu NULL di semua baris. Pagar di atas
+mencegah penulisan yang salah, tapi tidak membuat run di luar jendela jadi
+berguna untuk panel — itu butuh tanggal data yang otoritatif.

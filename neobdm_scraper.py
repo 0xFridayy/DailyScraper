@@ -19,7 +19,7 @@ import pytz
 
 # Pure, playwright-free helper parked in price_audit so CI can test it — see the
 # note above bagholders_from_payload for why that placement is deliberate.
-from price_audit import bagholders_from_payload
+from price_audit import bagholders_from_payload, date_offset_holds
 
 
 # ─────────────────────────────────────────────
@@ -131,6 +131,32 @@ TELEGRAM_CHAT_ID   = _require_env("TELEGRAM_CHAT_ID")
 
 TIMEZONE  = "Asia/Kuala_Lumpur"
 SEND_TIME = "07:00"
+
+# Set to 1 to store date-keyed rows even when the run is outside the pre-open
+# window. Only do this if you know the offset is right for that particular run;
+# the default refuses, because a wrong-dated row is worse than a missing one.
+ALLOW_OFF_WINDOW = os.environ.get("NEOBDM_ALLOW_OFF_WINDOW") == "1"
+
+
+def _offset_safe(what):
+    """May we store rows keyed by TODAY's scrape date? Logs why not.
+
+    The scrape itself, and the Telegram message, are fine at any hour — the
+    numbers shown are real either way. What is NOT fine off-window is PERSISTING
+    them under a date the rest of the pipeline reads as meaning the previous
+    session (price_audit.date_offset_holds explains the invariant). So the run
+    continues and still reports; only the date-keyed writes are skipped.
+    """
+    if date_offset_holds(datetime.now(pytz.timezone(TIMEZONE))) or ALLOW_OFF_WINDOW:
+        return True
+    log.error(
+        f"SKIPPING {what}: this run started after IDX opened, so the screener "
+        f"serves TODAY's close, not the previous session's. Storing it under "
+        f"today's date would break the one-day offset every date join relies on "
+        f"(HANDOFF Appendix Q). The scrape and the Telegram signal are unaffected. "
+        f"Set NEOBDM_ALLOW_OFF_WINDOW=1 to override.")
+    return False
+
 
 # Retail-dominated brokers. Their combined net sell is the retail-distribution
 # signal we screen for. Note: YP/PD also appear in the bandar groups below —
@@ -569,8 +595,9 @@ def scrape_market_summary(page):
         return []
     top = screen_market_summary(rows)
     try:
-        date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-        save_market_summary_daily(date_str, columns, rows, keep_tickers=None)
+        if _offset_safe("market_summary_daily persistence"):
+            date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+            save_market_summary_daily(date_str, columns, rows, keep_tickers=None)
     except Exception as e:
         log.error(f"market_summary_daily persistence failed: {e}")
     return top
@@ -1144,12 +1171,13 @@ def run_all_jobs():
                 log.error(f"broker_flow persistence failed: {e}")
 
             try:
-                date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-                watch_conn = init_db()
-                try:
-                    record_konglo_signals(watch_conn, date_str, ms_data, dash_data, bs_data)
-                finally:
-                    watch_conn.close()
+                if _offset_safe("konglo_signal_watch tracking"):
+                    date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+                    watch_conn = init_db()
+                    try:
+                        record_konglo_signals(watch_conn, date_str, ms_data, dash_data, bs_data)
+                    finally:
+                        watch_conn.close()
             except Exception as e:
                 log.error(f"konglo signal tracking failed: {e}")
 
