@@ -19,7 +19,7 @@ import pytz
 
 # Pure, playwright-free helper parked in price_audit so CI can test it — see the
 # note above bagholders_from_payload for why that placement is deliberate.
-from price_audit import bagholders_from_payload, date_offset_holds
+from price_audit import bagholders_from_payload, date_offset_holds, resolve_broker_selector
 
 
 # ─────────────────────────────────────────────
@@ -752,20 +752,58 @@ INVENTORY_API = f"{API_BASE}/inventory"
 # explicitly instead of inheriting whatever the old page defaulted to.
 BAGHOLDER_WINDOW_DAYS = 90
 
-# Which brokers the endpoint resolves. This is the site's OWN request grammar and
-# the exact pair /inventory-chart/ sends, so it is guaranteed accepted — no risk
-# of a 400 burning a run. It resolves to the 5 largest net buyers + 5 largest net
-# sellers BY LOT over the last 20 candles, then returns their per-day flow across
-# the whole window. Caveat worth knowing: the SELECTION is recency-weighted (last
-# 20 candles), so a broker who accumulated hard two months ago and then stopped
-# can be missed. Widening to TOP_8_*_ALL is one edit here, but that spelling is
-# documented grammar we have not seen the site itself send — verify before using.
-BAGHOLDER_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
+# Which brokers the endpoint resolves, in the site's own request grammar
+# TOP_{n}_{tx}_{unit}_{period} — n∈{3,5,8}, tx∈{NB,NS,BUY,SELL},
+# unit∈{LOT,VAL}, period∈{C1,C3,C5,C10,C20,C50,ALL} (see backfill_inventory.py).
+#
+# WIDE is what this feature actually means. "Bag holder" is a claim about who has
+# been sitting on inventory for ~3 months, but _C20 SELECTS on the last 20
+# candles only: a broker who accumulated hard two months ago and then stopped is
+# simply not in the response, so no amount of summing brings them back. _ALL
+# selects over the whole requested window, which is the same ~3 months
+# BAGHOLDER_WINDOW_DAYS asks for, and 8 slots instead of 5 widens the net.
+#
+# VERIFIED is the exact pair /inventory-chart/ sends, so it cannot be rejected.
+# WIDE is grammatical but we have never observed the site itself send it, and
+# there are no NeoBDM credentials in a dev session to check with. Rather than
+# leave the coverage bug in place waiting for a verification that has no way to
+# happen, resolve it AT RUNTIME: probe WIDE once per run, fall back to VERIFIED
+# on rejection. Worst case costs one extra GET for the whole run, and the
+# fallback is logged rather than silent — the failure mode this whole feature
+# already suffered once was a broken path that rendered identically to a working
+# one (Appendix P).
+BAGHOLDER_BROKERS_WIDE = ["TOP_8_NB_LOT_ALL", "TOP_8_NS_LOT_ALL"]
+BAGHOLDER_BROKERS_VERIFIED = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
+
+# Resolved on the first lookup of a run and reused for the rest of it.
+_bagholder_brokers = None
+
+
+def reset_bagholder_broker_probe():
+    """Forget the resolved selector — for tests, and for a long-lived process."""
+    global _bagholder_brokers
+    _bagholder_brokers = None
 
 
 def _inventory_window(days=BAGHOLDER_WINDOW_DAYS):
     end = datetime.now(pytz.timezone(TIMEZONE)).date()
     return (end - timedelta(days=days)).isoformat(), end.isoformat()
+
+
+def _inventory_get(page, ticker, brokers):
+    """One authenticated GET. Returns the payload, or None if the API rejected
+    the request — a rejection is a normal outcome when probing WIDE, so it is
+    returned rather than raised, and the caller decides."""
+    start_date, end_date = _inventory_window()
+    query = [("symbol", ticker), ("start_date", start_date),
+             ("end_date", end_date), ("investor_type", "A")]
+    query += [("brokers", b) for b in brokers]
+
+    resp = page.context.request.get(f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
+    payload = _api_json(resp)
+    if not payload or not payload.get("success"):
+        return None
+    return payload
 
 
 def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
@@ -783,18 +821,34 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
     backfill_inventory.py was migrated to the /api/inventory JSON endpoint at the
     time and this caller was left as follow-up (Appendix N, item 2). This is that
     follow-up: one authenticated GET, no DOM, no render race.
-    """
-    start_date, end_date = _inventory_window()
-    query = [("symbol", ticker), ("start_date", start_date),
-             ("end_date", end_date), ("investor_type", "A")]
-    query += [("brokers", b) for b in BAGHOLDER_BROKERS]
 
-    resp = page.context.request.get(f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
-    payload = _api_json(resp)
-    if not payload or not payload.get("success"):
+    Which brokers get resolved is decided once per run — see
+    BAGHOLDER_BROKERS_WIDE. The probe doubles as this ticker's real fetch, so
+    the good case costs nothing extra and the bad case costs one GET.
+    """
+    global _bagholder_brokers
+
+    payload = None
+    if _bagholder_brokers is None:
+        _bagholder_brokers, payload = resolve_broker_selector(
+            lambda brokers: _inventory_get(page, ticker, brokers),
+            BAGHOLDER_BROKERS_WIDE, BAGHOLDER_BROKERS_VERIFIED)
+        if payload is None:
+            log.warning(
+                f"inventory API rejected {BAGHOLDER_BROKERS_WIDE} — falling back to "
+                f"{BAGHOLDER_BROKERS_VERIFIED} for this run. Bag holders are then "
+                f"selected on the last 20 candles, not the full "
+                f"{BAGHOLDER_WINDOW_DAYS}d window, so a broker who accumulated "
+                f"early and stopped will be missed.")
+        else:
+            log.info(f"inventory API accepted {BAGHOLDER_BROKERS_WIDE}")
+
+    if payload is None:
+        payload = _inventory_get(page, ticker, _bagholder_brokers)
+    if payload is None:
         raise RuntimeError(
-            f"{ticker}: inventory API status={resp.status} "
-            f"success={(payload or {}).get('success')}")
+            f"{ticker}: inventory API rejected the request "
+            f"(brokers={_bagholder_brokers})")
 
     # The endpoint is symbol-keyed, but never trust a payload whose meta disagrees
     # with what we asked for — the same gate backfill_inventory.py applies.

@@ -17,6 +17,24 @@ Pipeline riset trading IDX: scrape data broker/harga saban hari dari NeoBDM, sim
 > Konsekuensinya, kesimpulan lama "tesis broker flow gugur" **belum bisa ditarik** —
 > itu diukur di atas data rusak. `HANDOFF.md` memuat urutan kerja 5 tahap,
 > daftar yang jangan dikerjakan dulu, dan alasannya.
+>
+> **Update 2026-08-30 — tahap 1 & 3 selesai.** Semua panel model kini bersumber
+> dari `price_audit.clean_panel()`, bukan `price_history` mentah: target di luar
+> batas ARA/ARB **82 → 0**, rata-rata panel **+14,38% → +0,283%**, kurtosis
+> **12,1 → 3,9**. Angka berbasis rata-rata sudah bisa dibaca.
+>
+> Dan bacaan pertamanya **positif**, bukan nol. Walk-forward pooled 37 siklus
+> (n=8.900): **IC +0,066 | hit top-desil 51,9% vs base 42,3% (edge +9,6pp) |
+> return edge +1,72%**. Bandingkan bacaan di data kotor: IC −0,025, hit edge
+> +1,2pp. Jadi kontaminasi bukan cuma menggelembungkan rata-rata — ia juga
+> **menutupi** sinyal yang ada. Belum tervalidasi: 45 ticker itu sangat
+> berkorelasi, jadi n=8.900 jauh melebih-lebihkan jumlah observasi independen;
+> IC harian (bukan pooled) dan uji ablasi masih harus dijalankan.
+>
+> `SATISFACTION_SHARPE = 1.5` **dipensiunkan tanpa pengganti angka tunggal** —
+> metrik evaluasinya adalah IC, hit edge, return edge, dan perbandingan base
+> rate, dilaporkan sebagai satu set (lihat `signal_metrics.py`, bagian THE
+> EVALUATION BAR).
 
 ## Alur pipeline
 
@@ -44,8 +62,8 @@ Membangun panel fitur dari data mentah dan menguji apakah ada sinyal yang bisa d
 
 | File | Status | Fungsi |
 |---|---|---|
-| `walk_forward_backtest.py` | riset — inti | Backtest XGBoost walk-forward: bangun panel fitur (agregat broker_flow + momentum/volume harga), latih-uji bergulir per siklus. Modul referensi — `build_panel`, `FEATURES`, `DB_PATH` dipakai ulang oleh hampir semua file lain di repo ini. Hasil terkini: Sharpe pooled 0.81 (242 hari), hit-rate 42.8%. |
-| `feature_ablation.py` | riset | Membandingkan tiga set fitur (lengkap / broker-saja / harga-saja) di tiga horizon (1/3/5 hari) untuk menjawab: apakah data broker menambah sesuatu, atau sinyalnya cuma momentum harga? Hasil: fitur harga-saja justru skor Sharpe terbaik. |
+| `walk_forward_backtest.py` | riset — inti | Backtest XGBoost walk-forward: bangun panel fitur (agregat broker_flow + momentum/volume harga), latih-uji bergulir per siklus. Modul referensi — `build_panel`, `FEATURES`, `DB_PATH` dipakai ulang oleh hampir semua file lain di repo ini. Hasil terkini di panel bersih (254 hari, 45 ticker, 37 siklus, n=8.900): **IC +0,066 | hit top-desil 51,9% vs base 42,3% (edge +9,6pp) | return edge +1,72%**. ~~Sharpe pooled 0.81~~ VOID. |
+| `feature_ablation.py` | riset | Membandingkan tiga set fitur (lengkap / broker-saja / harga-saja) di tiga horizon (1/3/5 hari) untuk menjawab: apakah data broker menambah sesuatu, atau sinyalnya cuma momentum harga? Hasil lama (Sharpe, VOID): fitur harga-saja justru terbaik. Perlu dijalankan ulang di panel bersih dengan metrik IC/edge. |
 | `multiday_features.py` | riset | Menguji apakah pola broker multi-hari (rolling average, streak beli beruntun) menangkap sinyal yang tak terlihat di snapshot harian tunggal. Hasil: tidak ada perbaikan. |
 | `smart_money_divergence.py` | riset | Menguji tesis spesifik: broker "smart money" net-beli sementara broker ritel net-jual pada saham yang sama (absorpsi). Hasil: konsisten arahnya tapi tidak signifikan secara statistik (p=0.18). |
 | `shap_analysis.py` | riset | Interpretasi feature importance model lewat SHAP + gain importance XGBoost + korelasi mentah. Hasil: `broker_concentration` peringkat 7 dari 8 — `momentum_1d` mendominasi. |
@@ -57,10 +75,10 @@ Mengambil sinyal dari panel di atas dan menguji cara masuk/keluar posisi yang re
 
 | File | Status | Fungsi |
 |---|---|---|
-| `strategy_variants.py` | riset | Grid-search 11 varian exit (ambang entry, lama holding, take-profit/stop-loss) di atas sinyal model yang sama, dengan split search/holdout untuk menghindari overfitting. Hasil: varian terbaik Sharpe 6.95 di holdout — tapi belum memodelkan biaya transaksi & ARA/ARB. |
+| `strategy_variants.py` | riset | Grid-search 11 varian exit (ambang entry, lama holding, take-profit/stop-loss) di atas sinyal model yang sama, dengan split search/holdout untuk menghindari overfitting. ~~Sharpe 6.95~~ VOID. Sejak tahap 1, simulasinya memakai harga bersih dan **menolak window yang melompati baris terkarantina** — TP/SL tidak lagi diuji terhadap high/low yang tidak pernah terjadi. Tetap belum memodelkan biaya transaksi & ARA/ARB. |
 | `ara_arb_simulation.py` | riset | Mensimulasikan aturan Auto Rejection Atas/Bawah IDX terhadap strategi pemenang di atas — entry di hari ARA dibuang, exit yang macet di ARB digeser maju ke hari berikutnya yang tidak macet. |
 | `ddqn_entry_exit.py` | riset | Agen Double DQN yang belajar kapan masuk *dan* keluar posisi sekaligus (bukan model entry + aturan exit terpisah), dengan realisme ARA/ARB, biaya transaksi, dan reward shaping loss-aversion. |
-| `kelly_sizing.py` | dorman | Rumus ukuran posisi Kelly Criterion (dengan fraction cap / "half Kelly"). Formula sudah teruji tapi sengaja belum dipakai — nunggu sampai Layer 1 benar-benar punya edge tervalidasi (Sharpe > 1.5). |
+| `kelly_sizing.py` | dorman | Rumus ukuran posisi Kelly Criterion (dengan fraction cap / "half Kelly"). Formula sudah teruji tapi sengaja belum dipakai — nunggu sampai Layer 1 benar-benar punya edge tervalidasi. Barnya bukan lagi satu angka (`Sharpe > 1.5` pensiun): IC, hit edge, return edge, dan base rate dibaca sebagai satu set. |
 
 ### 4. Evaluasi, laporan & tes
 

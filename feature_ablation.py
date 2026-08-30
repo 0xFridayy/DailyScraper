@@ -35,6 +35,7 @@ import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH,
+    clean_price_features,
 )
 
 BROKER_FEATURES = ["broker_concentration", "net_flow_total", "n_brokers",
@@ -44,23 +45,22 @@ FULL_FEATURES = BROKER_FEATURES + PRICE_FEATURES
 
 
 def build_multi_horizon_panel(conn, horizons=(1, 3, 5)):
+    """Multi-horizon targets off the clean panel (HANDOFF stage 1).
+
+    The 3d and 5d targets were the worst offenders in the old raw-price
+    version: a 1-day shift only bridges one hole, a 5-day shift bridges any
+    hole inside a five-row window, so the longer the horizon the more targets
+    were fabricated. They are the horizons this file exists to compare.
+    """
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, close, volume FROM price_history", conn)
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
     agg = agg.merge(corr, on=["ticker", "date"], how="left")
 
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
-    px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
-    px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    for h in horizons:
-        px[f"target_{h}d"] = px.groupby("ticker")["close"].shift(-h) / px["close"] - 1
-
+    pxf = clean_price_features(conn, horizons=horizons)
     target_cols = [f"target_{h}d" for h in horizons]
-    return agg.merge(px[["ticker", "date", "momentum_1d", "volume_ratio"] + target_cols],
+    return agg.merge(pxf[["ticker", "date", "momentum_1d", "volume_ratio"] + target_cols],
                       on=["ticker", "date"], how="inner")
 
 

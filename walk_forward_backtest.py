@@ -129,6 +129,7 @@ import pandas as pd
 import shap
 from xgboost import XGBRegressor
 
+from price_audit import clean_panel
 from signal_metrics import signal_stats, trade_stats
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
@@ -175,25 +176,66 @@ def _broker_correlation_1d(bf):
     return pd.DataFrame(rows)
 
 
-def _price_features_and_target(px):
+def _price_features_and_target(px, horizons=(1,)):
+    """Momentum/volume features + forward targets from a clean_panel() frame.
+
+    This function no longer computes any return itself. `px` must already carry
+    price_audit.clean_panel()'s gap-guarded `lag_1` and `fwd_{h}` columns, and
+    they are simply renamed here. That is the whole of HANDOFF stage 1: the
+    version this replaced did
+
+        px["target"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
+
+    straight off raw price_history, which does two separate wrong things. It
+    reads quarantined closes (KIOS's price stored under MDIA's name), and —
+    even once those rows are filtered out — groupby().shift(-1) does not know a
+    row was removed, so it joins the last surviving close to the next surviving
+    one and manufactures a "next-day return" spanning a hole. 82 of this
+    panel's targets sat outside the IDX ARA/ARB band as a result, which is
+    arithmetically impossible on a real listing, and they dragged the panel
+    mean from +0.32% to +14.38% — the single reason every mean-based figure in
+    this repo's reports was unreadable.
+
+    volume_ratio is deliberately NOT gap-guarded. Its rolling mean over a hole
+    averages the last five SURVIVING days rather than the last five calendar
+    trading days, which is a mild distortion of a level, not a fabricated move:
+    unlike a return it cannot invent a +92% observation for a tree to split on.
+    Guarding it would cost real rows for no protection.
+    """
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
+    px["momentum_1d"] = px["lag_1"]
     px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["next_close"] = px.groupby("ticker")["close"].shift(-1)
-    px["target"] = (px["next_close"] - px["close"]) / px["close"]
-    return px[["ticker", "date", "momentum_1d", "volume_ratio", "target"]]
+
+    cols = ["ticker", "date", "momentum_1d", "volume_ratio"]
+    for h in horizons:
+        px[f"target_{h}d"] = px[f"fwd_{h}"]
+        cols.append(f"target_{h}d")
+    px["target"] = px[f"target_{horizons[0]}d"]
+    return px[cols + ["target"]]
 
 
-def build_panel(conn):
+def clean_price_features(conn, horizons=(1,)):
+    """The one place price features and targets are built for a panel.
+
+    Five modules used to carry a byte-identical copy of the block above
+    (walk_forward_backtest, feature_ablation, multiday_features,
+    smart_money_divergence, ddqn_entry_exit). Copy number six is how a fix
+    lands in one of them and silently misses the rest, which is exactly what
+    happened when horizon_scan.py was moved onto clean_panel() alone and every
+    other consumer kept reading price_history raw.
+    """
+    px = clean_panel(conn, horizons=horizons, lags=(1,))
+    return _price_features_and_target(px, horizons=horizons)
+
+
+def build_panel(conn, horizons=(1,)):
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, close, volume FROM price_history", conn)
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
     agg = agg.merge(corr, on=["ticker", "date"], how="left")
-    pxf = _price_features_and_target(px)
+    pxf = clean_price_features(conn, horizons=horizons)
 
     panel = agg.merge(pxf, on=["ticker", "date"], how="inner")
     panel = panel.dropna(subset=["target"]).sort_values("date").reset_index(drop=True)

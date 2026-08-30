@@ -22,14 +22,18 @@ or are one dependency bump away:
      Stage 3 removed every Sharpe (see signal_metrics.py); what this checks now
      is the honest replacement - whether the top-decile hit rate actually beats
      the universe base rate, and whether IC is distinguishable from zero.
+     NOTE: the model figures here are a 60-day SMOKE SLICE, labelled as such in
+     the output. They answer "did the model break", not "is the model good".
+     The project's numbers come from run_ml_reports.py's full walk-forward.
 
 KNOWN-DEFECT BUDGET
 -------------------
 Defects that are known and scheduled are pinned rather than failed on, because a
 check that is permanently red for a known condition trains everyone to skip it.
-The count fails only when it GROWS. SQRT252_BUDGET reached its target of 0 when
-stage 3 landed; IMPOSSIBLE_TARGET_BUDGET is still ratcheting down and should
-reach 0 once build_panel() sources price_audit.clean_panel().
+The count fails only when it GROWS. Both budgets have now reached 0 —
+SQRT252_BUDGET when stage 3 landed, IMPOSSIBLE_TARGET_BUDGET when stage 1 put
+build_panel() on price_audit.clean_panel(). At 0 they stop being budgets and
+become assertions: any impossible target is a regression, not a backlog.
 
 Run:  py check_ml_health.py            -> print status
       py check_ml_health.py --telegram -> also send it
@@ -75,18 +79,21 @@ LIMIT_TOLERANCE = 0.01
 #   2026-08-20  4   initial pin
 #   2026-08-23  0   stage 3 landed: all four sites replaced by signal_metrics.py
 SQRT252_BUDGET = 0
-# build_panel() still reads price_history directly, so contaminated rows reach
-# the panel and land outside the IDX limit band. Swapping it to
-# price_audit.clean_panel() (HANDOFF.md stage 1) takes this to 0. Pinned rather
-# than merely reported so that contamination getting WORSE still fails the
-# build, instead of hiding inside a number that was already red.
+# A target outside the IDX ARA/ARB band is arithmetically impossible on a real
+# listing, so any at all means bad prices reached the panel. This is now 0 and
+# must stay there: it is an assertion, not a backlog allowance. If it goes
+# non-zero, something began generating targets off raw price_history again.
 #
 # Ratchet log - lower this every time it can be lowered, never raise it:
 #   2026-08-20  88   initial pin
 #   2026-08-21  82   an unchanged rerun of backfill_inventory.py healed 899 of
 #                    1,400 contaminated rows overnight (CDIA and COIN went from
 #                    231 bad rows each to 0) and broke zero new ones
-IMPOSSIBLE_TARGET_BUDGET = 82
+#   2026-08-30   0   stage 1: build_panel() sources price_audit.clean_panel().
+#                    Measured on the same DB - panel mean +14.38% -> +0.283%,
+#                    target kurtosis 12.1 -> 3.9, min/max +34.88%/-15.00%,
+#                    i.e. exactly the ARA/ARB band and not a basis point past it.
+IMPOSSIBLE_TARGET_BUDGET = 0
 # SHARPE_IMPLAUSIBLE is gone with stage 3: no code path emits a Sharpe to
 # sanity-check any more. What replaces it is the hit-edge/IC check below.
 
@@ -188,15 +195,11 @@ def check_panel(problems, notes, stats):
         problems.append(
             f"{impossible} target(s) outside the IDX limit band, budget is "
             f"{IMPOSSIBLE_TARGET_BUDGET} (worst "
-            f"{', '.join(f'{v*100:+.0f}%' for v in worst)}) — contamination is "
-            f"GROWING. The scraper defect is writing new bad rows; see "
-            f"HANDOFF.md stage 2.")
-    elif impossible:
-        notes.append(
-            f"{impossible} target(s) outside the IDX limit band (within the "
-            f"pinned budget of {IMPOSSIBLE_TARGET_BUDGET}) — build_panel() still "
-            f"reads price_history directly. Swap it to price_audit.clean_panel() "
-            f"and this goes to 0; HANDOFF.md stage 1.")
+            f"{', '.join(f'{v*100:+.0f}%' for v in worst)}). Since stage 1 this "
+            f"should be 0: build_panel() sources price_audit.clean_panel(), so a "
+            f"non-zero count means either a target is being generated off raw "
+            f"price_history again, or the detectors stopped catching something "
+            f"they used to. Check both before touching this budget.")
 
     # Base rate belongs next to any hit_rate that gets quoted. Recorded here so
     # a model that merely reproduces it cannot look like a finding.
@@ -244,21 +247,32 @@ def check_model_runs(panel, problems, notes, stats):
         v = pooled.get(key)
         return None if v is None or (isinstance(v, float) and np.isnan(v)) else round(float(v), nd)
 
-    stats["pooled_ic"] = _r("ic")
-    stats["pooled_hit"] = _r("top_hit")
-    stats["pooled_hit_edge"] = _r("top_hit_edge")
-    stats["pooled_edge"] = _r("edge", 4)
+    # NAMED "smoke", not "pooled". These come from the last 60 dates only (5
+    # cycles), because this check exists to catch "the model stopped working",
+    # not to measure it. The full walk-forward is 37 cycles over n=8,900 and
+    # reads very differently - on 2026-08-30 the smoke slice said IC -0.029 /
+    # edge -3.4% while the full run said IC +0.066 / edge +1.72%. Printing a
+    # 60-day figure in the same shape as the headline is how it gets quoted as
+    # the headline, which is the failure this repo keeps rediscovering: a thing
+    # that is NOT the result rendering identically to the result.
+    stats["smoke_dates"] = len(dates)
+    stats["smoke_ic"] = _r("ic")
+    stats["smoke_hit"] = _r("top_hit")
+    stats["smoke_hit_edge"] = _r("top_hit_edge")
+    stats["smoke_edge"] = _r("edge", 4)
 
     # The number that actually answers "is the signal any good". A top-decile
     # hit rate means nothing next to a base rate it matches - this repo reported
     # 42.8% for months while the base rate was also 42.8%.
-    if stats["pooled_hit_edge"] is not None and abs(stats["pooled_hit_edge"]) < 0.005:
+    if stats["smoke_hit_edge"] is not None and abs(stats["smoke_hit_edge"]) < 0.005:
         notes.append(
-            f"top-decile hit {stats['pooled_hit']:.1%} matches the universe base "
-            f"rate {pooled.get('base_rate', float('nan')):.1%} to within 0.5pp — "
-            f"the model is adding no directional information.")
-    if stats["pooled_ic"] is not None and abs(stats["pooled_ic"]) < 0.02:
-        notes.append(f"IC {stats['pooled_ic']:+.3f} is indistinguishable from zero.")
+            f"[{len(dates)}d smoke slice] top-decile hit {stats['smoke_hit']:.1%} "
+            f"matches the base rate {pooled.get('base_rate', float('nan')):.1%} to "
+            f"within 0.5pp. Read run_ml_reports.py's full walk-forward before "
+            f"concluding anything from it.")
+    if stats["smoke_ic"] is not None and abs(stats["smoke_ic"]) < 0.02:
+        notes.append(f"[{len(dates)}d smoke slice] IC {stats['smoke_ic']:+.3f} is "
+                     f"indistinguishable from zero — 5 cycles, not a verdict.")
 
 
 def _sqrt252_sites():
@@ -331,13 +345,15 @@ def format_report(problems, notes, stats):
     if bits:
         lines.append(" | ".join(bits))
 
+    # Prefixed, not bare. See check_model_runs(): this is a 60-day slice, and an
+    # unlabelled number in the headline's shape gets quoted as the headline.
     m = []
-    if stats.get("pooled_ic") is not None:
-        m.append(f"IC {stats['pooled_ic']:+.3f}")
-    if stats.get("pooled_hit") is not None:
-        m.append(f"top-hit {stats['pooled_hit']:.1%}")
-    if stats.get("pooled_hit_edge") is not None:
-        m.append(f"edge {stats['pooled_hit_edge']:+.1%}")
+    if stats.get("smoke_ic") is not None:
+        m.append(f"[{stats.get('smoke_dates', '?')}d smoke] IC {stats['smoke_ic']:+.3f}")
+    if stats.get("smoke_hit") is not None:
+        m.append(f"top-hit {stats['smoke_hit']:.1%}")
+    if stats.get("smoke_hit_edge") is not None:
+        m.append(f"edge {stats['smoke_hit_edge']:+.1%}")
     if stats.get("base_rate") is not None:
         m.append(f"base {stats['base_rate']:.1%}")
     if "impossible_targets" in stats:

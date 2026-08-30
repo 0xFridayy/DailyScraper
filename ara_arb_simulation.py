@@ -1,4 +1,15 @@
 """
+================================================================================
+VOID — every Sharpe figure quoted below was produced by `mean/std * sqrt(252)`
+applied to per-trade, cross-sectionally overlapping returns. Both halves of that
+are wrong and they compound. The numbers are kept, not deleted, so nobody
+re-derives them and believes them a second time. See signal_metrics.py.
+
+The `Sharpe > 1.5` bar they were compared against is also retired, and is NOT
+replaced by another single number: the evaluation metrics are IC, hit edge,
+return edge and the base-rate comparison, read as a set (user decision
+2026-08-30; reasoning in signal_metrics.py under THE EVALUATION BAR).
+================================================================================
 Simulates IDX's Auto Rejection Atas/Bawah (ARA/ARB) daily price-limit rules
 against the winning strategy from strategy_variants.py ("entry threshold
 >2%, 1-day fixed exit, no TP/SL"), since a backtest that assumes every close
@@ -41,6 +52,7 @@ import numpy as np
 import pandas as pd
 from walk_forward_backtest import build_panel, DB_PATH
 from strategy_variants import get_walk_forward_predictions
+from price_audit import load_clean_ohlc
 from signal_metrics import trade_stats, format_trade_stats
 
 NEAR_LIMIT_TOLERANCE = 0.01  # within 1 percentage point of the theoretical limit counts as "stuck"
@@ -58,8 +70,21 @@ ARB_BOUND = -0.15
 
 
 def annotate_limits(px):
+    """at_ara / at_arb per row. `px` should carry `pos`
+    (price_audit.load_clean_ohlc); when it does, a previous close that sits
+    more than one position back is NOT used as the baseline.
+
+    An ARA/ARB flag is a statement about a ONE-DAY move. Measured across a
+    quarantined row it describes a multi-day move instead, and a multi-day move
+    routinely exceeds a one-day band — which is the same false positive that
+    made price_audit.detect() accuse a clean MDIA row (HANDOFF Appendix Q).
+    Here it would wrongly mark days as limit-locked and drop tradeable entries.
+    """
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
+    if "pos" in px.columns:
+        contig = (px["pos"] - px.groupby("ticker")["pos"].shift(1)) == 1
+        px["prev_close"] = px["prev_close"].where(contig)
     px["pct_chg"] = (px["close"] - px["prev_close"]) / px["prev_close"]
     px["ara_bound"] = px["prev_close"].apply(ara_bound)
     px["at_ara"] = px["pct_chg"] >= (px["ara_bound"] - NEAR_LIMIT_TOLERANCE)
@@ -77,12 +102,17 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
     i0 = idx_map[entry_date]
     if g.loc[i0, "at_ara"]:
         return None  # entry blocked: can't reliably buy into a locked limit-up
+    if i0 + 1 >= len(g) or g.loc[i0 + 1, "pos"] - g.loc[i0, "pos"] != 1:
+        # no next row, or the next surviving row is not the next trading day
+        return None
     if i0 + 1 >= len(g):
         return None
     entry_price = g.loc[i0, "close"]
 
     j = i0 + 1
     while j < len(g) and g.loc[j, "at_arb"] and j < i0 + 20:  # cap the roll-forward search
+        if j + 1 < len(g) and g.loc[j + 1, "pos"] - g.loc[j, "pos"] != 1:
+            return None  # the roll-forward would jump a removed row
         j += 1
     if j >= len(g):
         j = len(g) - 1
@@ -93,7 +123,7 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
 def run_ara_arb_check(threshold=0.020):
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = load_clean_ohlc(conn)
     conn.close()
 
     px = annotate_limits(px)

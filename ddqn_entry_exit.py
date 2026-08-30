@@ -1,4 +1,15 @@
 """
+================================================================================
+VOID — every Sharpe figure quoted below was produced by `mean/std * sqrt(252)`
+applied to per-trade, cross-sectionally overlapping returns. Both halves of that
+are wrong and they compound. The numbers are kept, not deleted, so nobody
+re-derives them and believes them a second time. See signal_metrics.py.
+
+The `Sharpe > 1.5` bar they were compared against is also retired, and is NOT
+replaced by another single number: the evaluation metrics are IC, hit edge,
+return edge and the base-rate comparison, read as a set (user decision
+2026-08-30; reasoning in signal_metrics.py under THE EVALUATION BAR).
+================================================================================
 Roadmap #5 (early look) - Double DQN, end-to-end entry AND exit in one policy.
 
 Everything before this file decomposed the problem into two stages: an
@@ -112,7 +123,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from walk_forward_backtest import FEATURES, DB_PATH, _broker_day_aggregates, _broker_correlation_1d
+from walk_forward_backtest import (
+    FEATURES, DB_PATH, _broker_day_aggregates, _broker_correlation_1d,
+    clean_price_features,
+)
+from price_audit import load_clean_ohlc
 from ara_arb_simulation import annotate_limits
 from signal_metrics import trade_stats, format_trade_stats
 
@@ -125,25 +140,39 @@ STATE_EXTRA = ["position", "days_in_position", "unrealized_return"]
 
 def build_episode_frame(conn):
     """Like walk_forward_backtest.build_panel(), but keeps daily_return and
-    ARA/ARB flags per ticker/date instead of collapsing to an aggregated
-    Sharpe - the DDQN environment needs to step through days in order."""
+    ARA/ARB flags per ticker/date instead of collapsing to a pooled statistic -
+    the DDQN environment needs to step through days in order.
+
+    Sources price_audit.load_clean_ohlc(), not raw price_history (HANDOFF stage
+    1). Two things follow from that and both matter here more than they do for
+    the panel models:
+
+    - `daily_return` is clean_panel()'s gap-guarded lag_1, so a return spanning
+      a quarantined row is NaN and its row is dropped rather than handed to the
+      agent as one day's move.
+    - `pos` rides along to make_envs(), which splits each ticker into
+      CONTIGUOUS runs. Dropping the row after a hole is not enough on its own:
+      the surviving sequence would still close up, and the agent would step
+      from one side of the hole to the other believing it held the position for
+      a single day. An RL agent trained on that learns exit timing against a
+      calendar that does not exist.
+    """
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close, volume FROM price_history", conn)
+    px = load_clean_ohlc(conn)
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
     agg = agg.merge(corr, on=["ticker", "date"], how="left")
 
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
-    px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
-    px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["daily_return"] = px["momentum_1d"]  # today's close-over-close return, same quantity walk_forward_backtest calls "target" one day earlier
+    pxf = clean_price_features(conn, horizons=(1,))
     px = annotate_limits(px)  # adds at_ara / at_arb, using the same tiered/flat bounds as ara_arb_simulation.py
+    px = px.merge(pxf, on=["ticker", "date"], how="inner")
+    # today's close-over-close return, the same quantity walk_forward_backtest
+    # calls "target" one day earlier - now gap-guarded at source
+    px["daily_return"] = px["momentum_1d"]
 
     panel = agg.merge(
-        px[["ticker", "date", "momentum_1d", "volume_ratio", "daily_return", "at_ara", "at_arb"]],
+        px[["ticker", "date", "pos", "momentum_1d", "volume_ratio", "daily_return", "at_ara", "at_arb"]],
         on=["ticker", "date"], how="inner",
     )
     panel = panel.dropna(subset=["daily_return"]).sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -237,18 +266,37 @@ class TickerEnv:
         return self._state(), reward, done, dict(realized_return=ret if filled_position else 0.0)
 
 
+MIN_EPISODE_DAYS = 10
+
+
 def make_envs(panel):
+    """One episode per CONTIGUOUS run of a ticker's dates, not per ticker.
+
+    `pos` is the row's index on the unfiltered price_history date axis
+    (price_audit.date_positions), so a run breaks wherever consecutive
+    surviving rows are more than one position apart - a quarantined row, a
+    suspension, or simply a day this ticker has no data for. Without the split
+    the frame closes up over the hole and the environment steps across it as if
+    it were one trading day, which silently corrupts every holding-period and
+    exit-timing decision the agent is being trained to make.
+
+    Runs shorter than MIN_EPISODE_DAYS are dropped, same as short tickers were
+    before.
+    """
     envs = []
     for ticker, g in panel.groupby("ticker"):
-        g = g.sort_values("date").reset_index(drop=True)
-        if len(g) < 10:
-            continue
-        feats = g[FEATURES].to_numpy(dtype=np.float32)
-        envs.append(TickerEnv(
-            feats, g["daily_return"].to_numpy(dtype=np.float32),
-            g["at_ara"].to_numpy(dtype=bool), g["at_arb"].to_numpy(dtype=bool),
-            ticker=ticker, dates=g["date"].to_numpy(),
-        ))
+        g = g.sort_values("pos").reset_index(drop=True)
+        run_id = (g["pos"].diff() != 1).cumsum()
+        for _, run in g.groupby(run_id):
+            run = run.reset_index(drop=True)
+            if len(run) < MIN_EPISODE_DAYS:
+                continue
+            envs.append(TickerEnv(
+                run[FEATURES].to_numpy(dtype=np.float32),
+                run["daily_return"].to_numpy(dtype=np.float32),
+                run["at_ara"].to_numpy(dtype=bool), run["at_arb"].to_numpy(dtype=bool),
+                ticker=ticker, dates=run["date"].to_numpy(),
+            ))
     return envs
 
 

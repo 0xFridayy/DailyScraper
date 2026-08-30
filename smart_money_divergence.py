@@ -33,7 +33,10 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from xgboost import XGBRegressor
-from walk_forward_backtest import _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH
+from walk_forward_backtest import (
+    _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH,
+    clean_price_features,
+)
 from neobdm_scraper import SMART_MONEY, RETAIL_BROKERS, BIG_PLAYER_ABSORBERS
 
 SMART_MONEY_SET = set(SMART_MONEY)
@@ -60,7 +63,6 @@ def _group_features(g):
 
 def build_panel_with_smart_money(conn):
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    px = pd.read_sql("SELECT date, ticker, close, volume FROM price_history", conn)
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
@@ -68,14 +70,8 @@ def build_panel_with_smart_money(conn):
     special = bf.groupby(["ticker", "date"]).apply(_group_features, include_groups=False).reset_index()
     agg = agg.merge(special, on=["ticker", "date"], how="left")
 
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = (px["close"] - px["prev_close"]) / px["prev_close"]
-    px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
-    px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["target"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
-
-    panel = agg.merge(px[["ticker", "date", "momentum_1d", "volume_ratio", "target"]],
+    pxf = clean_price_features(conn, horizons=(1,))  # HANDOFF stage 1
+    panel = agg.merge(pxf[["ticker", "date", "momentum_1d", "volume_ratio", "target"]],
                        on=["ticker", "date"], how="inner")
     return panel.dropna(subset=["target"])
 

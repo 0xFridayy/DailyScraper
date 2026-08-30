@@ -25,6 +25,30 @@ which needs no sizing assumption at all.
 
 So nothing here annualises anything, and nothing here is called Sharpe.
 
+THE EVALUATION BAR (user decision, 2026-08-30)
+---------------------------------------------
+`SATISFACTION_SHARPE = 1.5` is retired and is NOT being replaced by another
+single number. The decision, in the user's words, is to keep IC, hit edge,
+return edge and the base-rate comparison as the evaluation metrics — the SET is
+the bar.
+
+That is the right call and worth writing down so it does not drift back:
+
+  - A single scalar is what let this project run for months on "Sharpe 6.95".
+    One number invites a threshold, a threshold invites tuning toward it, and
+    nothing in the number itself says which of its inputs moved.
+  - The four disagree usefully. A signal can have a positive hit edge and a
+    negative return edge (right more often, wrong when it is expensive) — that
+    is a real and readable state, and any scalar collapsing them hides it. This
+    panel is in exactly that state right now.
+  - Nothing here is annualised or sized, so there is no scale on which to set
+    "good". The base rate supplies the only meaningful zero: the same universe,
+    same rows, no model.
+
+evaluation_scorecard() below renders all four together for that reason, the
+same way format_trade_stats() refuses to print a hit rate without its base
+rate. Report the four; do not derive a verdict from one.
+
 BASE RATE IS NOT OPTIONAL
 -------------------------
 A hit rate alone is unreadable. This repo recorded hit_rate 42.8% for months as
@@ -132,6 +156,19 @@ def trade_stats(returns, base_rate=None):
     )
 
 
+def evaluation_scorecard(ic, base_rate, hit_rate, top_mean, all_mean):
+    """The four evaluation metrics on one line, always together.
+
+    IC, hit edge (vs base rate), return edge (vs universe mean), and the base
+    rate itself. See THE EVALUATION BAR above: these are reported as a set
+    because no one of them is the verdict.
+    """
+    ic_s = "n/a" if ic is None or np.isnan(ic) else f"{ic:+.3f}"
+    return (f"IC {ic_s} | top-decile hit {hit_rate:.1%} vs base {base_rate:.1%} "
+            f"(edge {hit_rate - base_rate:+.1%}) | return {top_mean:+.2%} vs "
+            f"{all_mean:+.2%} (edge {top_mean - all_mean:+.2%})")
+
+
 def format_trade_stats(s, label=""):
     """One-line rendering, always showing the base rate next to the hit rate."""
     head = f"{label}: " if label else ""
@@ -149,8 +186,6 @@ def format_signal_stats(s, label=""):
     head = f"{label}: " if label else ""
     if not s["n"]:
         return f"{head}no rows"
-    ic = "n/a" if np.isnan(s["ic"]) else f"{s['ic']:+.3f}"
-    return (f"{head}n={s['n']} IC {ic} | top{int((1 - TOP_QUANTILE) * 100)}% "
-            f"n={s['n_top']} hit {s['hit_rate']:.1%} vs base {s['base_rate']:.1%} "
-            f"(edge {s['hit_edge']:+.1%}) | ret {s['top_mean']:+.2%} vs "
-            f"{s['all_mean']:+.2%} (edge {s['edge']:+.2%})")
+    return (f"{head}n={s['n']} top{int((1 - TOP_QUANTILE) * 100)}% n={s['n_top']} "
+            + evaluation_scorecard(s["ic"], s["base_rate"], s["hit_rate"],
+                                   s["top_mean"], s["all_mean"]))

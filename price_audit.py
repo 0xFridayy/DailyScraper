@@ -170,6 +170,31 @@ def ticker_from_title(title):
     return m.group(1) if m else None
 
 
+def resolve_broker_selector(fetch, wide, verified):
+    """Pick the widest broker selector the inventory API will actually accept.
+
+    `fetch(selector)` must return a payload, or None when the API rejected the
+    request. Returns `(selector, payload)`; payload is None when the fallback
+    was taken, meaning the caller still has to fetch with `verified`.
+
+    Lives here rather than in neobdm_scraper.py for the reason that module
+    already documents: there it could not be imported without playwright and
+    NeoBDM credentials, so CI — the only place a regression in this gets caught
+    — could not test it.
+
+    The point of probing at all: the site's own UI sends TOP_5_*_C20, which
+    SELECTS brokers on the last 20 candles. A bag holder is a ~3-month claim,
+    so that selector structurally cannot answer the question being asked of it.
+    TOP_8_*_ALL can, but it has never been observed leaving the site, and a
+    dev session has no credentials to check with. One probe answers it at
+    runtime instead of leaving the bug in place indefinitely.
+    """
+    payload = fetch(wide)
+    if payload is not None:
+        return wide, payload
+    return verified, None
+
+
 def bagholders_from_payload(payload, n=2):
     """Rank brokers by cumulative NET LOT in an /api/inventory response.
 
@@ -268,28 +293,49 @@ def should_fail_run(n_failed, n_total, max_failure_rate=0.30):
 #  guard below, limit violations in the target drop to zero.
 # ─────────────────────────────────────────────
 
-def load_clean(conn, strict=False):
-    """price_history with quarantined (date, ticker) rows dropped.
+def quarantine_keys(conn, strict=False):
+    """The (date, ticker) set to exclude: the stored snapshot UNION a fresh
+    detector run.
 
-    Prefers the price_quarantine table written by the `quarantine` command. If
-    that table is absent the detectors are run in-memory instead, so a caller
-    that forgot to quarantine still gets clean rows rather than silently
-    training on dirty ones. Pass strict=True to require the table instead.
+    The snapshot alone is not safe to trust. price_quarantine is written by the
+    `quarantine` command and is a SNAPSHOT, so it goes stale in two opposite
+    directions, and only one of them is harmless:
+
+      - rows that HEALED are still listed. Wasteful (a clean row is dropped),
+        never wrong.
+      - rows that broke AFTER the snapshot are missing. That one is dangerous,
+        and it was live: the snapshot in this repo dates from 2026-08-23 and
+        does not contain RAJA 2025-08-25, whose 5:1 stock split shows up as a
+        -80.3% close-to-close move. Preferring the table, as this used to, put
+        that -80.3% straight into the training target — a single row with more
+        weight than any hundred real ones.
+
+    The union removes the dangerous half and keeps the harmless half. Re-run
+    `py price_audit.py quarantine` to clear the wasteful half; that rewrites
+    the snapshot from the current detectors.
+
+    strict=True still requires the table to exist (the fresh run is added on
+    top either way).
     """
     px = load(conn)
     has_table = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
     ).fetchone()[0]
+    if strict and not has_table:
+        raise RuntimeError("price_quarantine missing — run: py price_audit.py quarantine")
 
+    d = detect(px)
+    keys = set(zip(d.loc[d["suspect"], "date"], d.loc[d["suspect"], "ticker"]))
     if has_table:
         q = pd.read_sql("SELECT date, ticker FROM price_quarantine", conn)
-    elif strict:
-        raise RuntimeError("price_quarantine missing — run: py price_audit.py quarantine")
-    else:
-        d = detect(px)
-        q = d.loc[d["suspect"], ["date", "ticker"]]
+        keys |= set(zip(q["date"], q["ticker"]))
+    return keys
 
-    bad = set(zip(q["date"], q["ticker"]))
+
+def load_clean(conn, strict=False):
+    """price_history with quarantined (date, ticker) rows dropped."""
+    px = load(conn)
+    bad = quarantine_keys(conn, strict=strict)
     keep = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
     return px[keep].reset_index(drop=True)
 
@@ -348,6 +394,46 @@ def add_lagged_returns(px, all_dates, lags=(1,)):
         px[f"lag_{k}"] = np.where(contig, px["close"] / g["close"].shift(k) - 1, np.nan)
 
     return px.drop(columns=["_pos"])
+
+
+def date_positions(conn):
+    """Position of every price_history date on the UNFILTERED panel axis.
+
+    Filtering the quarantine out renumbers rows. A simulator that walks
+    `i0 + 1, i0 + 2, ...` down a filtered frame therefore steps over a removed
+    row without noticing and calls it "the next day". These positions are what
+    make the hole visible: they are assigned before any filtering, so two
+    surviving rows are adjacent in real trading time only when their positions
+    differ by exactly one.
+    """
+    dates = sorted(
+        r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history").fetchall()
+    )
+    return {d: i for i, d in enumerate(dates)}
+
+
+def load_clean_ohlc(conn, strict=False):
+    """Clean OHLCV for the trade simulators, carrying a `pos` column.
+
+    add_forward_returns() already solves this for panel-shaped code. The
+    simulators (strategy_variants.simulate_trade,
+    ara_arb_simulation.simulate_trade_with_limits, the konglo watch window in
+    run_ml_reports) do not build a panel — they walk a ticker's rows forward
+    one index at a time, checking each day's high/low. Handing them a filtered
+    frame with no position column would silently move the hazard from the
+    target to the SIMULATION: a take-profit "hit on day 2" that was really
+    eleven days and one quarantined row later.
+
+    So they get `pos` and must compare it, not the row index:
+
+        g.loc[i0 + k, "pos"] - g.loc[i0, "pos"] == k
+
+    Same doctrine as everywhere else in this module — a window that spans a
+    removed row is dropped, never bridged.
+    """
+    px = load_clean(conn, strict=strict)
+    px["pos"] = px["date"].map(date_positions(conn))
+    return px.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False):

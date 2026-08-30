@@ -211,7 +211,7 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       berbagi OHLCV *beserta volume persis sampai lembar* di 134 tanggal, jadi
       bukan false positive detektor. Kalau tetap membandel setelah tahap 2,
       barulah pertimbangkan membuangnya.
-- [ ] **Jangan** pakai `LEFT JOIN price_quarantine ... WHERE IS NULL` sendirian.
+- [x] **Jangan** pakai `LEFT JOIN price_quarantine ... WHERE IS NULL` sendirian.
       Filter itu perlu tapi **tidak cukup**: `groupby.shift(-h)` tidak tahu ada
       baris yang dibuang, jadi ia menyambung baris bersih terakhir ke baris
       bersih berikutnya dan **mengarang return yang tidak pernah terjadi**
@@ -226,10 +226,16 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
       #    jendelanya melompati baris yang dibuang
       ```
 
-      Sudah dipasang di `horizon_scan.py`. Masih perlu dipasang di
-      `walk_forward_backtest.build_panel()` dan
-      `ddqn_entry_exit.build_episode_frame()`.
-      Regresi: 3 tes di `test_pipeline.py` mengunci perilaku ini.
+      **SELESAI 2026-08-30 — lihat Lampiran R.** Terpasang di **sembilan**
+      pemanggil, bukan dua: `walk_forward_backtest.build_panel()`,
+      `ddqn_entry_exit.build_episode_frame()`, `feature_ablation`,
+      `multiday_features`, `smart_money_divergence`, plus tiga simulator
+      (`strategy_variants`, `ara_arb_simulation`, watch konglo di
+      `run_ml_reports`) yang membaca harga mentah untuk mengecek high/low.
+      Hasil terukur: target di luar batas ARA/ARB **82 → 0**, rata-rata panel
+      **+14,38% → +0,283%**, kurtosis **12,1 → 3,9**, min/maks persis
+      −15,00%/+34,88%. `IMPOSSIBLE_TARGET_BUDGET` turun 82 → **0**.
+      Regresi: 7 tes di `test_pipeline.py` mengunci perilaku ini.
 - [ ] Pertimbangkan menjalankan `py backfill_inventory.py` beberapa kali
       **setelah tahap 2 selesai**. Karena `insert_ticker_data()` menulis
       `price_history` dengan `INSERT OR REPLACE` untuk seluruh rentang chart,
@@ -295,11 +301,27 @@ per-cluster kemungkinan jauh lebih informatif daripada agregat.
 - [x] Laporkan **base rate** di samping setiap hit_rate → `format_trade_stats()`
       dan `format_signal_stats()` menolak mencetak hit rate tanpanya.
 - [x] `SQRT252_BUDGET` diturunkan 4 → **0**.
-- [ ] **Tetapkan bar pengganti `SATISFACTION_SHARPE = 1.5`.** Sengaja tidak saya
-      putuskan: 1,5 adalah target yang *kamu* set untuk statistik yang benar,
-      jadi penggantinya keputusanmu. Laporan sekarang tidak menyatakan pemenang.
-- [ ] Tandai semua angka Sharpe di docstring repo sebagai **VOID** —
+- [x] ~~**Tetapkan bar pengganti `SATISFACTION_SHARPE = 1.5`.**~~
+      **DIPUTUSKAN 2026-08-30 — tidak ada pengganti angka tunggal.** Keputusan
+      user: hapus dependensinya, lalu pertahankan **IC, hit edge, return edge,
+      dan perbandingan base rate** sebagai metrik evaluasi — *set*-nya yang
+      jadi bar. Alasannya ditulis penuh di `signal_metrics.py` (bagian THE
+      EVALUATION BAR); intinya: satu skalar itu persis yang membuat repo ini
+      hidup berbulan-bulan di atas "Sharpe 6,95", dan keempat metrik itu bisa
+      **berbeda arah** — panel ini sekarang hit edge +0,8pp tapi return edge
+      −3,4%, dan skalar apa pun akan menyembunyikan kontradiksi itu.
+      `evaluation_scorecard()` mencetak keempatnya sekaligus, dengan disiplin
+      yang sama seperti `format_trade_stats()` yang menolak mencetak hit rate
+      tanpa base rate.
+- [x] Tandai semua angka Sharpe di docstring repo sebagai **VOID** —
       jangan dihapus, beri catatan kenapa (dua alasan di Temuan 1 & 2)
+      **SELESAI 2026-08-30.** Tiga file yang terlewat sebelumnya ikut ditandai:
+      `ddqn_entry_exit.py`, `kelly_sizing.py`, `ara_arb_simulation.py`.
+      `kelly_sizing.py` yang paling penting — docstring-nya masih menjadikan
+      "Layer 1 Sharpe > 1.5 sustained" sebagai syarat aktivasi modul, yaitu
+      dependensi hidup pada bar yang sudah pensiun. Sekarang syaratnya IC/hit
+      edge/return edge, dan modul ini tetap dorman karena **return edge −3,4%**
+      di panel bersih, bukan sekadar karena barnya hilang.
 
 ### 4. Uji ulang tesis broker flow
 
@@ -1188,3 +1210,134 @@ data sebenarnya** alih-alih menyimpulkannya dari tanggal scrape. Kolom
 `last_date` yang disediakan untuk itu NULL di semua baris. Pagar di atas
 mencegah penulisan yang salah, tapi tidak membuat run di luar jendela jadi
 berguna untuk panel — itu butuh tanggal data yang otoritatif.
+
+## Lampiran R — tahap 1 selesai: panel bersih sampai ke simulator (2026-08-30)
+
+Tahap 1 sudah lama tertulis sebagai "pasang `clean_panel()` di
+`build_panel()` dan `build_episode_frame()`". Setelah ditelusuri, pemanggil yang
+membaca `price_history` **mentah** ternyata ada **delapan**, dan tiga di
+antaranya bukan pembangun panel sama sekali.
+
+### Apa yang berubah, dan kenapa dua kelompok berbeda
+
+**Kelompok 1 — panel (target model).** `walk_forward_backtest.build_panel()`,
+`ddqn_entry_exit.build_episode_frame()`, `feature_ablation`,
+`multiday_features`, `smart_money_divergence`. Kelimanya membawa **salinan
+byte-identik** dari blok fitur harga yang sama. Itu sebabnya `horizon_scan.py`
+dipindah ke `clean_panel()` berbulan lalu dan tak satu pun ikut. Sekarang
+semuanya lewat satu fungsi, `walk_forward_backtest.clean_price_features()`.
+
+**Kelompok 2 — simulator (harga eksekusi).** Ini yang terlewat dari rencana
+awal, dan justru yang paling merusak angka rata-rata: `strategy_variants`,
+`ara_arb_simulation`, dan blok watch konglo di `run_ml_reports` **tidak**
+membangun panel — mereka menyusuri baris satu ticker maju satu indeks per hari
+sambil memeriksa high/low tiap hari. Membersihkan target tanpa menyentuh
+mereka hanya **memindahkan** bahayanya:
+
+> Menyaring baris terkarantina **menomori ulang** frame. `i0 + k` berarti "k
+> baris kemudian", bukan "k hari bursa kemudian". Take-profit yang tercatat
+> "kena di hari ke-2" bisa saja high dari sebelas hari dan satu baris buang
+> sesudah entry.
+
+Karena itu `price_audit.load_clean_ohlc()` membawa kolom **`pos`** — indeks
+baris pada sumbu tanggal **sebelum** penyaringan — dan tiap simulator wajib
+membandingkan `pos`, bukan indeks baris:
+
+```python
+g.loc[i0 + k, "pos"] - g.loc[i0, "pos"] == k
+```
+
+Window yang melompati lubang **dibuang**, tidak dijembatani. Arah konservatifnya
+disengaja: alternatifnya adalah memberi kredit pada varian atas exit yang tidak
+mungkin diambilnya.
+
+### Tiga temuan yang muncul saat mengerjakannya
+
+1. **Snapshot `price_quarantine` bisa basi ke arah yang berbahaya.**
+   `load_clean()` dulu **mengutamakan** tabel itu. Tabelnya bertanggal
+   2026-08-23 dan **tidak memuat RAJA 2025-08-25** — stock split 1:5 yang
+   terbaca −80,3% close-to-close. Jadi setelah semua pekerjaan di atas, masih
+   tersisa **1** target mustahil, dan itu satu baris dengan bobot lebih besar
+   daripada seratus baris nyata. Sekarang `quarantine_keys()` mengambil
+   **union** snapshot ∪ deteksi segar: basi ke arah "menahan baris yang sudah
+   sembuh" itu boros tapi aman, basi ke arah "melewatkan kerusakan baru" itu
+   berbahaya. Union menghapus yang berbahaya.
+2. **DDQN butuh lebih dari sekadar membuang baris.** Membuang baris setelah
+   lubang tidak cukup: urutannya **merapat**, dan agen melangkah dari satu sisi
+   lubang ke sisi lain sambil mengira ia menahan posisi satu hari. `make_envs()`
+   sekarang memecah tiap ticker menjadi **run kontigu**, satu episode per run.
+3. **`annotate_limits()` mengukur ARA/ARB melintasi lubang.** Gerak −30% dalam
+   empat hari terbaca sebagai limit-down satu hari — kesalahan yang sama persis
+   dengan Lampiran Q, hanya di sisi eksekusi: entry yang sebenarnya bisa diambil
+   malah dibuang. Guard-nya opt-in (aktif kalau ada kolom `pos`).
+
+### Hasil terukur, DB yang sama
+
+| | sebelum | sesudah |
+|---|---|---|
+| target di luar batas ARA/ARB | 82 | **0** |
+| rata-rata target panel | +14,38% | **+0,283%** |
+| kurtosis target | 12,1 | **3,9** |
+| min / maks target | −80,3% / +92% | **−15,00% / +34,88%** |
+| baris panel | 10.269 | 10.193 |
+| `IMPOSSIBLE_TARGET_BUDGET` | 82 | **0** |
+
+Min/maks sekarang persis batas ARB/ARA IDX dan tidak satu basis poin pun
+melewatinya. Harga baris panel yang hilang: **76 baris (0,7%)**.
+
+`IMPOSSIBLE_TARGET_BUDGET = 0` berhenti menjadi budget dan menjadi **asersi**:
+angka bukan-nol berarti ada yang membangkitkan target dari `price_history`
+mentah lagi.
+
+### Yang sekarang bisa dibaca — dan tidak enak dibaca
+
+Panel bersih, walk-forward XGBoost yang sama, 254 hari × 45 ticker, **37 siklus
+pooled, n=8.900**:
+
+```
+IC +0,066 | hit top-desil 51,9% vs base 42,3% (edge +9,6pp) | return edge +1,72%
+threshold rule: n=4.176 mean +0,53% hit 44,5% (edge +2,2pp)
+```
+
+Bandingkan bacaan di data kotor (Temuan/tahap 3, panel 249 hari):
+
+```
+IC −0,025 | hit top-desil 43,5% vs base 42,3% (edge +1,2pp)
+```
+
+Dua hal sekaligus, dan yang kedua tidak saya duga:
+
+1. Angka `+67,95%`, `+348,53%`, `return edge +80,15%` memang artefak — sekarang
+   terbukti, bukan dugaan. `mean/trade` strategy search turun dari +67,95% ke
+   **+2,94%** (holdout +2,64%, n=57); DDQN turun dari +348% ke **+7,44%**
+   search / **−0,58%** holdout.
+2. **Kontaminasi juga MENUTUPI sinyalnya.** Kesimpulan lama "model tidak
+   menambah informasi arah sama sekali" ternyata ikut jadi korban data kotor:
+   baris-baris mustahil itu masuk ke jendela training *dan* ke penilaian, dan
+   IC peringkat pun ikut rusak. Di data bersih hit edge naik ke **+9,6pp**.
+
+**Ini belum edge tervalidasi**, dan jangan diperlakukan begitu. n=8.900 itu 45
+ticker yang sangat berkorelasi (korelasi rata-rata harian +0,275 → ~3,4 seri
+independen efektif), jadi jumlah observasi independen jauh lebih kecil daripada
+yang disugestikan n. Yang wajib sebelum angka ini dipercaya: **IC
+cross-sectional harian + ICIR** (bukan pooled), uji ablasi price-only vs broker,
+dan purge/embargo. Semuanya ada di roadmap ML V2 §27–§30.
+
+### Jebakan yang hampir saya sebarkan sendiri
+
+`check_ml_health.check_model_runs()` mencetak baris yang **bentuknya identik**
+dengan headline di atas — `IC −0,029 | top-hit 43,7% | edge −3,4%` — padahal ia
+smoke test atas **60 hari terakhir saja** (5 siklus). Saya sempat menulis angka
+itu ke README dan lampiran ini sebagai hasil proyek. Bentuk yang sama, arti yang
+berbeda: pola kegagalan yang sama persis dengan `Bag holder: -` dan gerbang
+kontaminasi — sesuatu yang **bukan** hasil, tampil identik dengan hasil.
+Barisnya sekarang diberi label eksplisit sebagai smoke test 60 hari.
+
+### Regresi yang mengunci
+
+Tujuh tes di `test_pipeline.py`, empat di antaranya baru:
+`test_simulate_trade_refuses_a_window_that_spans_a_removed_row`,
+`test_annotate_limits_does_not_measure_across_a_gap`,
+`test_stale_quarantine_snapshot_cannot_hide_new_damage`,
+`test_ddqn_episodes_split_where_days_are_missing`. Total 37 tes hijau,
+`check_ml_health` hijau dengan `impossible targets 0`.

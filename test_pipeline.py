@@ -22,7 +22,8 @@ from strategy_variants import get_walk_forward_predictions
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
-                         detect, bagholders_from_payload, date_offset_holds)
+                         detect, bagholders_from_payload, date_offset_holds,
+                         resolve_broker_selector)
 
 
 def test_broker_day_aggregates_basic():
@@ -72,7 +73,14 @@ def test_price_features_no_leakage():
         "close": [100, 101, 99, 105, 98, 110, 90, 120, 80, 130],
         "volume": [1000] * 10,
     })
-    out = _price_features_and_target(px)
+    # Since stage 1 the returns come from price_audit's gap-guarded helpers, so
+    # feed them through the same way clean_price_features() does rather than
+    # letting the test build the columns itself - a test that computed lag_1
+    # its own way would stop testing the real path.
+    all_dates = sorted(px["date"])
+    out = _price_features_and_target(
+        add_lagged_returns(add_forward_returns(px, all_dates, horizons=(1,)), all_dates, lags=(1,))
+    )
 
     # momentum_1d on day d must equal (close[d]-close[d-1])/close[d-1], using
     # ONLY past+current-close info (both known as of day d's close) — not
@@ -549,13 +557,168 @@ def test_should_fail_run_catches_a_broken_scrape():
     print("test_should_fail_run_catches_a_broken_scrape passed")
 
 
+# ─── HANDOFF stage 1: the clean panel must reach the SIMULATORS too ──────────
+#
+# Sourcing clean_panel() in build_panel() fixes the targets. It does nothing for
+# the code that walks a ticker's rows forward checking each day's high/low,
+# because filtering renumbers the frame: "two rows later" stops meaning "two
+# trading days later" the moment a row is removed. These lock that down.
+
+def test_simulate_trade_refuses_a_window_that_spans_a_removed_row():
+    from strategy_variants import _index_price_history, simulate_trade
+
+    # 2026-01-03 is missing (quarantined). Its neighbours survive, so rows 2 and
+    # 3 of the frame are adjacent by index but two trading days apart.
+    px = pd.DataFrame([
+        {"date": "2026-01-01", "ticker": "AAA", "pos": 0, "open": 100, "high": 100, "low": 100, "close": 100},
+        {"date": "2026-01-02", "ticker": "AAA", "pos": 1, "open": 100, "high": 101, "low": 99, "close": 100},
+        {"date": "2026-01-04", "ticker": "AAA", "pos": 3, "open": 100, "high": 200, "low": 100, "close": 190},
+    ])
+    by_ticker, idx = _index_price_history(px)
+
+    # Entering on 01-02 and holding one day lands on 01-04, two days later. The
+    # +90% close and the take-profit-triggering high both belong to a day the
+    # trade could not have reached. Both must be refused, not banked.
+    assert simulate_trade(by_ticker, idx, "AAA", "2026-01-02", 1, None, None) is None
+    assert simulate_trade(by_ticker, idx, "AAA", "2026-01-02", 1, 0.05, 0.05) is None
+
+    # The contiguous entry one day earlier still trades normally.
+    assert simulate_trade(by_ticker, idx, "AAA", "2026-01-01", 1, None, None) == 0.0
+    print("test_simulate_trade_refuses_a_window_that_spans_a_removed_row passed")
+
+
+def test_annotate_limits_does_not_measure_across_a_gap():
+    from ara_arb_simulation import annotate_limits
+
+    px = pd.DataFrame([
+        {"date": "2026-01-01", "ticker": "AAA", "pos": 0, "close": 1000.0},
+        {"date": "2026-01-05", "ticker": "AAA", "pos": 4, "close": 700.0},
+    ])
+    out = annotate_limits(px).sort_values("date").reset_index(drop=True)
+
+    # -30% over four days is an ordinary decline. Measured as if it were one
+    # day it reads as a limit-down lock, and simulate_trade_with_limits() would
+    # roll the exit forward waiting for an ARB that never happened.
+    assert not bool(out.loc[1, "at_arb"]), "a multi-day move was judged against a one-day band"
+    assert pd.isna(out.loc[1, "pct_chg"])
+
+    # Without pos (older callers) behaviour is unchanged - the guard is opt-in.
+    plain = annotate_limits(px.drop(columns=["pos"])).sort_values("date").reset_index(drop=True)
+    assert bool(plain.loc[1, "at_arb"])
+    print("test_annotate_limits_does_not_measure_across_a_gap passed")
+
+
+def test_stale_quarantine_snapshot_cannot_hide_new_damage():
+    """The stored snapshot is a snapshot, so it goes stale in both directions.
+
+    Modelled on the real row this caught: RAJA 2025-08-25, a 5:1 stock split
+    that reads as -80.3% close-to-close. The 2026-08-23 snapshot predates it
+    being flagged, and preferring the table (as load_clean used to) put that
+    -80.3% straight into the training target.
+    """
+    import sqlite3
+    from price_audit import quarantine_keys
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE price_history (date TEXT, ticker TEXT, open REAL, "
+                 "high REAL, low REAL, close REAL, volume REAL)")
+    rows = [("2026-01-01", "AAA", 1000, 1000, 1000, 1000.0, 10),
+            ("2026-01-02", "AAA", 200, 200, 200, 200.0, 10),   # -80%: impossible
+            ("2026-01-01", "BBB", 500, 500, 500, 500.0, 10),
+            ("2026-01-02", "BBB", 505, 505, 505, 505.0, 10)]
+    conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", rows)
+    # A snapshot written before that row existed: it lists something else.
+    conn.execute("CREATE TABLE price_quarantine (date TEXT, ticker TEXT, open REAL, "
+                 "high REAL, low REAL, close REAL, volume REAL, reasons TEXT)")
+    conn.execute("INSERT INTO price_quarantine VALUES "
+                 "('2026-01-01','BBB',500,500,500,500,10,'limit_violation')")
+    conn.commit()
+
+    keys = quarantine_keys(conn)
+    assert ("2026-01-02", "AAA") in keys, "fresh detection was skipped because a table existed"
+    assert ("2026-01-01", "BBB") in keys, "the stored snapshot was discarded"
+    conn.close()
+    print("test_stale_quarantine_snapshot_cannot_hide_new_damage passed")
+
+
+def test_ddqn_episodes_split_where_days_are_missing():
+    """Dropping the row after a hole is not enough: the sequence closes up and
+    the agent steps across the gap believing it held for one day."""
+    try:
+        from ddqn_entry_exit import make_envs, MIN_EPISODE_DAYS
+    except ImportError:
+        print("test_ddqn_episodes_split_where_days_are_missing skipped (no torch)")
+        return
+
+    n = MIN_EPISODE_DAYS
+    # Two runs of n contiguous days each, separated by one missing position.
+    pos = list(range(n)) + list(range(n + 1, 2 * n + 1))
+    panel = pd.DataFrame({
+        "ticker": ["AAA"] * (2 * n),
+        "date": [f"d{p:03d}" for p in pos],
+        "pos": pos,
+        "daily_return": [0.01] * (2 * n),
+        "at_ara": [False] * (2 * n),
+        "at_arb": [False] * (2 * n),
+        **{f: [0.0] * (2 * n) for f in FEATURES},
+    })
+    envs = make_envs(panel)
+    assert len(envs) == 2, f"expected the gap to split one ticker into 2 episodes, got {len(envs)}"
+    assert all(e.T == n for e in envs)
+
+    # No gap -> one episode, so the split is caused by the hole, not by the code
+    # fragmenting everything it touches.
+    contiguous = panel.copy()
+    contiguous["pos"] = range(2 * n)
+    assert len(make_envs(contiguous)) == 1
+    print("test_ddqn_episodes_split_where_days_are_missing passed")
+
+
+
+def test_wide_broker_selector_is_used_when_the_api_accepts_it():
+    """HANDOFF Appendix P. TOP_5_*_C20 selects on the last 20 candles, so it
+    cannot answer a 3-month bag-holder question at all — a broker who
+    accumulated early and stopped is absent from the response, not merely
+    small in it."""
+    seen = []
+
+    def accepts_anything(brokers):
+        seen.append(brokers)
+        return {"success": True, "data": {}}
+
+    sel, payload = resolve_broker_selector(accepts_anything, ["WIDE"], ["VERIFIED"])
+    assert sel == ["WIDE"]
+    assert payload is not None, "the probe's own response must be reused, not re-fetched"
+    assert seen == [["WIDE"]], "the verified selector was requested needlessly"
+    print("test_wide_broker_selector_is_used_when_the_api_accepts_it passed")
+
+
+def test_broker_selector_falls_back_instead_of_burning_the_run():
+    """An unverified spelling must never cost the daily signal. A rejection
+    returns the verified pair and no payload, so the caller re-fetches once."""
+    def rejects_wide(brokers):
+        return None if brokers == ["WIDE"] else {"success": True}
+
+    sel, payload = resolve_broker_selector(rejects_wide, ["WIDE"], ["VERIFIED"])
+    assert sel == ["VERIFIED"]
+    assert payload is None, "a caller told the fallback succeeded would skip its own fetch"
+    print("test_broker_selector_falls_back_instead_of_burning_the_run passed")
+
+
+
 if __name__ == "__main__":
+    test_simulate_trade_refuses_a_window_that_spans_a_removed_row()
+    test_annotate_limits_does_not_measure_across_a_gap()
+    test_stale_quarantine_snapshot_cannot_hide_new_damage()
+    test_ddqn_episodes_split_where_days_are_missing()
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
     test_predictions_carry_the_columns_the_scorer_reads()
     test_date_offset_only_holds_before_the_open()
     test_quarantined_row_is_not_a_baseline_for_the_next_row()
     test_trusted_mask_leaves_real_contamination_detectable()
+    test_wide_broker_selector_is_used_when_the_api_accepts_it()
+    test_broker_selector_falls_back_instead_of_burning_the_run()
     test_bagholders_sum_per_day_lots_not_last_value()
     test_bagholders_exclude_net_sellers()
     test_bagholders_survive_a_malformed_payload()

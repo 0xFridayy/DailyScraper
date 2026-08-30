@@ -65,6 +65,7 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+from price_audit import load_clean_ohlc
 from signal_metrics import trade_stats
 
 MAX_HOLD_DAYS = 7  # explicit user ceiling
@@ -116,6 +117,8 @@ def get_walk_forward_predictions(panel):
 
 
 def _index_price_history(px):
+    """px must come from price_audit.load_clean_ohlc(): quarantined rows gone,
+    `pos` present. simulate_trade() below compares `pos`, not row index."""
     px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
     date_idx_by_ticker = {t: {d: i for i, d in enumerate(g["date"])} for t, g in px_by_ticker.items()}
     return px_by_ticker, date_idx_by_ticker
@@ -124,7 +127,17 @@ def _index_price_history(px):
 def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_days, tp_pct, sl_pct):
     """Enter at entry_date's close. Each subsequent day, check that day's
     high/low for a TP/SL hit BEFORE checking the timed exit - a trade that
-    hits both TP and SL on the same day is treated as SL (conservative)."""
+    hits both TP and SL on the same day is treated as SL (conservative).
+
+    The window must be CONTIGUOUS. Filtering quarantined rows out renumbers the
+    frame, so `i0 + k` is "k rows later", not "k trading days later"; without
+    the `pos` check below, a stop-loss "hit on day 2" could be a low from
+    eleven days and one removed row after entry. That is the gap-guard
+    doctrine of price_audit.add_forward_returns() applied at the simulation
+    end: a window spanning a hole is dropped, never bridged. Dropping is the
+    conservative direction here — the alternative silently credits the variant
+    with an exit it could not have taken.
+    """
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -133,11 +146,14 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     if i0 + 1 >= len(g):
         return None
     entry_price = g.loc[i0, "close"]
+    pos0 = g.loc[i0, "pos"]
 
     for k in range(1, hold_days + 1):
         if i0 + k >= len(g):
             break
         day = g.loc[i0 + k]
+        if day["pos"] - pos0 != k:
+            return None
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct
         if tp_pct is not None and day["high"] >= entry_price * (1 + tp_pct):
@@ -203,7 +219,7 @@ def run_strategy_search(panel, px, search_frac=0.7):
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = load_clean_ohlc(conn)
     conn.close()
 
     result = run_strategy_search(panel, px)

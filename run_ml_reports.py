@@ -12,10 +12,11 @@ This report no longer computes a Sharpe. The one this repo used was wrong twice
 over - per-trade returns annualised with the daily sqrt(252) factor, and 45
 cross-sectionally correlated tickers counted as 45 independent draws - so both
 the numbers and the SATISFACTION_SHARPE = 1.5 bar they were compared against are
-VOID. The bar was the user's target for a CORRECT statistic, so choosing its
-replacement is their call; this script reports what was measured (IC,
-top-decile hit rate against the universe base rate, return edge) and declares no
-winner. See signal_metrics.py. Only strategy_variants
+VOID. That bar is retired and is NOT replaced by another single number: the
+evaluation metrics are IC, hit edge, return edge and the base-rate comparison,
+reported as a set (user decision 2026-08-30, reasoning in signal_metrics.py
+under THE EVALUATION BAR). This script therefore reports the scorecard and
+draws no verdict from any one of its four numbers. Only strategy_variants
 .py's EXISTING 11 variants are searched here (per explicit instruction:
 wire in the existing grid first, compare against a bigger one later) - do
 not silently expand VARIANTS without that being a deliberate, separate
@@ -32,9 +33,11 @@ login credentials, neither of which this report needs.
 import os
 import sqlite3
 
+import numpy as np
 import pandas as pd
 import requests
 
+from price_audit import load_clean_ohlc
 from walk_forward_backtest import build_panel, run_walk_forward, DB_PATH
 from strategy_variants import run_strategy_search
 from ddqn_entry_exit import (
@@ -42,16 +45,14 @@ from ddqn_entry_exit import (
     normalize_features, make_envs, train_ddqn, evaluate_policy,
     evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
 )
-from signal_metrics import trade_stats, format_trade_stats
+from signal_metrics import trade_stats, format_trade_stats, evaluation_scorecard
 
 RECENT_TRADES_SHOWN = 15
 
-# SATISFACTION_SHARPE = 1.5 used to gate this report. It is gone, not moved:
-# nothing here computes a Sharpe any more, because the one this repo computed was
-# wrong twice over (see signal_metrics.py). The 1.5 bar was the USER's stated
-# target, so replacing it with some other number is the user's call, not this
-# script's. Until they set one, the report states what was measured and refuses
-# to declare a winner.
+# SATISFACTION_SHARPE = 1.5 used to gate this report. It is gone and nothing
+# replaces it - see signal_metrics.evaluation_scorecard() and the reasoning
+# above it. There is deliberately no threshold constant here to compare against,
+# because a threshold is what turns a report into a target.
 KONGLO_TRACK_DAYS = 3  # per explicit instruction: track flagged konglo tickers 1-3 trading days
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -84,7 +85,7 @@ def run_xgboost_report(conn):
 
 def run_strategy_variants_report(conn):
     panel = build_panel(conn)
-    px = pd.read_sql("SELECT date, ticker, open, high, low, close FROM price_history", conn)
+    px = load_clean_ohlc(conn)  # HANDOFF stage 1 — TP/SL must not be tested against quarantined highs/lows
     result = run_strategy_search(panel, px)
     return dict(
         winner_label=result["winner_label"],
@@ -132,10 +133,10 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     drawdown % (using intraday low) - exactly as requested, not a
     close-to-close approximation. A signal with days_elapsed < max_days is
     still "active"; once it reaches max_days it's "resolved" and its final
-    (day-max_days close) return feeds a pooled Sharpe across all resolved
-    signals - a single signal's own Sharpe isn't statistically meaningful
-    (n=1), same caveat as every other Sharpe in this repo, so this only
-    reports one once there's more than a handful of resolved signals."""
+    (day-max_days close) return joins the pooled trade_stats across all
+    resolved signals. Nothing here is annualised (the repo's Sharpe is gone -
+    see signal_metrics.py), and the pooled line is withheld until more than a
+    handful have resolved, because a mean over three trades is not a result."""
     try:
         watch = pd.read_sql("SELECT flag_date, ticker, sources FROM konglo_signal_watch", conn)
     except pd.errors.DatabaseError:
@@ -143,7 +144,7 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     if watch.empty:
         return dict(signals=[], resolved=trade_stats([]))
 
-    px = pd.read_sql("SELECT date, ticker, high, low, close FROM price_history", conn)
+    px = load_clean_ohlc(conn)
     px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
 
     signals = []
@@ -157,6 +158,13 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
             continue  # price_history hasn't caught up to the flag day yet
         i0 = idx[0]
         window = g.iloc[i0 + 1: i0 + 1 + max_days]
+        # Truncate at the first non-contiguous day. A "3-day" high/drawdown
+        # measured across a quarantined row is not a 3-day figure, and this
+        # block is what the Telegram konglo-radar percentages are read off.
+        if not window.empty:
+            steps = window["pos"].to_numpy() - g.loc[i0, "pos"]
+            keep = int((steps == np.arange(1, len(window) + 1)).cumprod().sum())
+            window = window.iloc[:keep]
         if window.empty:
             continue
         entry_close = g.loc[i0, "close"]
@@ -178,21 +186,18 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
 
 
 def format_telegram_message(xgb, strat, ddqn, konglo):
-    # No pass/fail line any more. The old one compared a Sharpe that was wrong
-    # twice over against a bar the user set for a correct one; keeping the shape
-    # while changing the metric underneath would be worse than dropping it.
-    # The number that answers "is the signal any good" is hit_edge: the
-    # top-decile hit rate MINUS the universe base rate. Zero means no
-    # directional information, whatever the raw hit rate looks like.
+    # No pass/fail line, by decision rather than by omission. The old one
+    # compared a Sharpe that was wrong twice over against a bar set for a
+    # correct one; the bar is retired and is not being replaced by another
+    # scalar. What ships instead is the four-metric scorecard, and it is
+    # repeated at the end because that is the line worth reading if you read
+    # nothing else - IC and hit edge say whether there is any directional
+    # information, return edge says whether it is worth anything.
     p = xgb["pooled"]
-    edge_line = (
-        f"Signal edge: top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
-        f"= {p['top_hit_edge']:+.1%}, IC {p['ic']:+.3f}"
-    )
     bar_line = (
-        edge_line + "\n"
-        "No Sharpe target line: Sharpe is no longer computed (see signal_metrics.py). "
-        "A replacement bar needs your call."
+        "Scorecard (no single-number bar, by design - signal_metrics.py):\n"
+        + evaluation_scorecard(p["ic"], p["base_rate"], p["top_hit"],
+                               p["top_mean"], p["all_mean"])
     )
 
     active = [s for s in konglo["signals"] if not s["resolved"]]
@@ -214,8 +219,8 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         f"📈 Daily ML report\n\n"
         f"XGBoost walk-forward ({xgb['n_dates']}d, {xgb['n_tickers']} tickers, "
         f"{xgb['date_min']} to {xgb['date_max']}):\n"
-        f"  IC {p['ic']:+.3f} | top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
-        f"({p['top_hit_edge']:+.1%}) | return edge {p['edge']:+.2%}\n"
+        f"  " + evaluation_scorecard(p["ic"], p["base_rate"], p["top_hit"],
+                                       p["top_mean"], p["all_mean"]) + "\n"
         f"  threshold rule: n={p['n_trades']} mean {p['trade_mean']:+.2%} "
         f"hit {p['trade_hit']:.1%} ({p['trade_hit_edge']:+.1%})\n\n"
         f"Strategy search ({len(strat['search_results'])} entry/exit variants), winner: {strat['winner_label']}\n"
@@ -255,10 +260,13 @@ def write_step_summary(xgb, strat, ddqn, konglo):
                 "|---|---|---|---|---|---|\n")
         f.write(f"| {p['ic']:+.3f} | {p['top_hit']:.1%} | {p['base_rate']:.1%} | "
                 f"{p['top_hit_edge']:+.1%} | {p['edge']:+.2%} | {p['n']} |\n\n")
-        f.write("**Hit edge is the number that matters.** A top-decile hit rate only means "
-                "something next to the base rate of the same rows; this repo reported 42.8% "
-                "for months while the base rate was also 42.8%, i.e. no directional "
-                "information at all. See `signal_metrics.py`.\n\n")
+        f.write("**Read all four together.** There is deliberately no single-number bar: "
+                "IC and hit edge say whether there is directional information, return edge "
+                "says whether it is worth anything, and the base rate is the only meaningful "
+                "zero (same universe, same rows, no model). A top-decile hit rate alone is "
+                "unreadable - this repo reported 42.8% for months while the base rate was "
+                "also 42.8%. The four can disagree, and that disagreement is information, "
+                "not noise. See `signal_metrics.py` under THE EVALUATION BAR.\n\n")
         f.write(f"Threshold rule (>{0.5}% pred): n={p['n_trades']}, mean {p['trade_mean']:+.2%}, "
                 f"hit {p['trade_hit']:.1%} ({p['trade_hit_edge']:+.1%} vs base)\n\n")
 
@@ -292,7 +300,8 @@ def write_step_summary(xgb, strat, ddqn, konglo):
             "No Sharpe and no target line: the Sharpe this repo used was wrong twice over "
             "(per-trade returns annualised as if daily, and cross-sectionally overlapping "
             "observations counted as independent), and the 1.5 bar was set for a correct one. "
-            "A replacement bar is the user's call. See `signal_metrics.py`, and "
+            "That bar is retired with nothing put in its place, by decision: the scorecard "
+            "above is the evaluation. See `signal_metrics.py`, and "
             "`walk_forward_backtest.py` / `strategy_variants.py` / `ddqn_entry_exit.py` docstrings "
             "for full caveats (small sample, backfilled-vs-live data, DDQN overfitting) before "
             "reading any of these numbers as a real edge.\n\n"
@@ -304,8 +313,8 @@ def write_step_summary(xgb, strat, ddqn, konglo):
             "Dashboard presets, or Broker Stalker), it gets tracked here for the next "
             f"{KONGLO_TRACK_DAYS} trading days. Highest % and drawdown % use intraday high/low "
             "(not just close), same as strategy_variants.py's TP/SL checks. A signal only feeds "
-            f"the pooled Sharpe once it resolves ({KONGLO_TRACK_DAYS} days elapsed) - a single "
-            "signal's own Sharpe isn't statistically meaningful.\n\n"
+            f"the pooled stats once it resolves ({KONGLO_TRACK_DAYS} days elapsed), and even "
+            "then a handful of them says very little.\n\n"
         )
         if not konglo["signals"]:
             f.write("No konglo tickers have appeared in the daily radar yet.\n\n")

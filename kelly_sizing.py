@@ -1,4 +1,15 @@
 """
+================================================================================
+VOID — every Sharpe figure quoted below was produced by `mean/std * sqrt(252)`
+applied to per-trade, cross-sectionally overlapping returns. Both halves of that
+are wrong and they compound. The numbers are kept, not deleted, so nobody
+re-derives them and believes them a second time. See signal_metrics.py.
+
+The `Sharpe > 1.5` bar they were compared against is also retired, and is NOT
+replaced by another single number: the evaluation metrics are IC, hit edge,
+return edge and the base-rate comparison, read as a set (user decision
+2026-08-30; reasoning in signal_metrics.py under THE EVALUATION BAR).
+================================================================================
 Roadmap #4 — Kelly criterion position sizing.
 
 DORMANT: not wired into anything yet. Feed kelly_fraction a negative or zero
@@ -23,8 +34,11 @@ this module is still inert; see the __main__ block below for why a positive
 number out of the formula doesn't change that.
 
 This module exists so the formula is ready and tested for whenever a real
-edge shows up (Layer 1 Sharpe > 1.5 sustained, per SYSTEM.md), not because
-it's safe to use today.
+edge shows up, not because it's safe to use today. What "a real edge" means is
+no longer a Sharpe threshold: it is a sustained, positive reading across IC,
+hit edge and return edge against the universe base rate. On the clean panel
+(2026-08-30) the return edge is -3.4%, so this stays dormant on the honest
+metrics too — not merely for want of a bar to compare against.
 """
 
 def kelly_fraction(win_rate, avg_win, avg_loss, fraction_cap=0.5):
