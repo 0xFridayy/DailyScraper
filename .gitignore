@@ -19,3 +19,15 @@ price_audit_suspects.csv
 idx-research-agent.jsx
 modern_ta_checklist.tsx
 phase1_tf.md
+
+# Phase 2A ownership artifacts — private runtime data, never commit
+# Raw authenticated capture cache (pane text + chart JSON, one subdir per run_id)
+ownership_raw/
+# SQLite DB written by ownership_capture.py / ownership_schema.py
+neobdm_ownership.db
+# Discovery scratch files written during capture probing sessions
+scratch_ownership_panes*.json
+# Any other raw HTML pages or session snapshots (ownership_capture.py
+# explicitly avoids writing full HTML, but belt-and-suspenders)
+*_raw*.html
+*_page*.html
