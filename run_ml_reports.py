@@ -322,7 +322,10 @@ def write_step_summary(xgb, strat, ddqn, konglo):
                 f.write(f"Across {konglo['resolved']['n_trades']} resolved signals: "
                         + format_trade_stats(konglo["resolved"]) + f"{note}.\n\n")
 
-        f.write(f"## XGBoost: {len(xgb['recent_trades'])} most recent trades (of {xgb['n_trades']} total)\n\n")
+        # n_trades lives in the pooled stats dict, not at the top level of xgb -
+        # run_xgboost_report() returns pooled=... alongside recent_trades=...
+        f.write(f"## XGBoost: {len(xgb['recent_trades'])} most recent trades "
+                f"(of {p['n_trades']} total)\n\n")
         f.write("Top 3 features by SHAP contribution behind each prediction - not a raw feature "
                 "value, but how much that feature pushed the prediction up (+) or down (-).\n\n")
         f.write("| Date | Ticker | Pred | Actual | Top SHAP features |\n|---|---|---|---|---|\n")
