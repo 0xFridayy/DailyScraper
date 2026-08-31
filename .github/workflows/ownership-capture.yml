@@ -1,0 +1,118 @@
+name: NeoBDM Ownership Capture
+
+# Phase 2B: scheduled point-in-time ownership archival. Runs ownership_capture.py
+# for the full tracked universe and commits neobdm_ownership.db back into git,
+# following the exact commit-back pattern daily-scrape.yml / price-history-topup.yml
+# already use for neobdm.db — but as its OWN file, never merged into neobdm.db.
+# SQLite is single-writer; this repo already had to hand-tune cron offsets once
+# (see price-history-topup.yml) to stop two jobs racing to commit the same file.
+# A separate file means this workflow can never contend with those two for a
+# write lock even if a schedule drifts, so it doesn't need that same defense —
+# but it still must not run WHILE either of them is scraping neobdm.tech, since
+# ownership_capture.py logs in via the same shared neobdm_scraper.login() and
+# NEOBDM_USERNAME/PASSWORD account, and a concurrent second session under one
+# account is the risk worth avoiding, not a git conflict on this file.
+#
+# available_at falls back to captured_at (see ownership_schema.py) — daily
+# capture is what turns that into real point-in-time history, one calendar day
+# of resolution at a time. Nothing here backdates captured_at: ownership_capture.py
+# stamps it from actual wall-clock time at capture, and --run-id only names the
+# resumable same-day raw-cache directory, never the row timestamps themselves.
+# INSERT OR IGNORE on natural keys (ownership_ingest.py) already gives first-
+# write-wins semantics for free on every rerun, scheduled or manual.
+#
+# Cron slot chosen as 02:30 UTC, after inspecting every existing schedule:
+#   23:00 UTC  daily-scrape.yml         (writes neobdm.db, scrapes neobdm.tech, 35-min timeout -> done by 23:35)
+#   00:30 UTC  price-history-topup.yml  (writes neobdm.db, scrapes neobdm.tech, 20-min timeout -> done by 00:50)
+#   01:15 UTC  capture-health.yml       (read-only, 10-min timeout -> done by 01:25)
+#   01:45 UTC  signal-integrity.yml     (read-only, 15-min timeout -> done by 02:00)
+#   02:00 UTC  signal-eval.yml          (Sundays only, read-only, 15-min timeout -> done by 02:15)
+#   12:30 UTC  ml-health.yml            (read-only, unrelated ML stack)
+#   13:00 UTC  ml-daily-report.yml      (read-only, unrelated ML stack)
+# 02:30 UTC clears the LAST scheduled job of the overnight cluster (signal-eval.yml's
+# Sunday-only 02:00-02:15 window) with a 15-minute margin, and clears both
+# neobdm.tech-scraping writers (daily-scrape.yml, price-history-topup.yml) by well
+# over an hour in either direction on every day of the week — no schedule overlap,
+# no concurrent-login risk, no git-push race, and it stays in the same overnight
+# IDX-data-refresh cluster as the workflows it's thematically closest to, well
+# clear of the unrelated 12:30/13:00 UTC ML cluster.
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A second trigger (e.g. a manual workflow_dispatch) while a scheduled run is
+# still capturing must wait, not run alongside it or cancel it mid-ticker —
+# ownership_capture.py's per-ticker SAVEPOINT already makes a kill safe, but
+# queuing is strictly better than either overlapping writers on
+# neobdm_ownership.db or discarding an in-progress capture for no reason.
+concurrency:
+  group: ownership-capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    # Full universe measured at ~12.8 minutes for the capture loop alone (45/45
+    # ok, zero retries). Same generous-headroom philosophy as this repo's other
+    # Playwright-based jobs (see price-history-topup.yml): a slow green beats a
+    # kill mid-run that leaves progress logs truncated.
+    timeout-minutes: 40
+    env:
+      # Without this, Python block-buffers stdout when it is not a TTY and a
+      # killed run loses ALL progress output between per-ticker log lines.
+      PYTHONUNBUFFERED: "1"
+      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
+      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium (+ system deps)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Capture ownership data (full tracked universe)
+        run: python ownership_capture.py --run-id "$(date -u +%Y-%m-%d)"
+
+      # Debug screenshots taken strictly BEFORE authentication succeeds (see
+      # neobdm_scraper.py login(): login_page.png is captured immediately after
+      # navigating to the login URL, before any credential is filled;
+      # debug_login_fail.png is captured only when the username field was never
+      # found, i.e. login never proceeded). Named explicitly, not globbed --
+      # after_login.png (captured AFTER authentication, showing real NeoBDM
+      # session content) and any *.html page dump are deliberately excluded.
+      # If login()'s screenshot ordering ever changes, this allowlist must be
+      # re-checked before trusting it again. Ephemeral (7-day), debug-only --
+      # the authoritative persisted artifact is neobdm_ownership.db, committed
+      # below; nothing here is ever treated as the source of truth.
+      - name: Upload pre-login debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ownership-capture-debug-${{ github.run_id }}
+          path: |
+            login_page.png
+            debug_login_fail.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit updated neobdm_ownership.db
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add neobdm_ownership.db
+          git diff --staged --quiet || git commit -m "Update neobdm_ownership.db ($(date -u +%Y-%m-%d))"
+          git pull --rebase
+          git push
