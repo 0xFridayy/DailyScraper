@@ -351,6 +351,41 @@ def test_normalize_entity_name_does_not_overreach():
         op.normalize_entity_name("ZHAOCAI PRIME HILL FUND")
 
 
+def test_alias_candidate_order_independence_regression():
+    """Verify that alias candidates SCG CHEMICALS PUBLIC and SCG CHEMICALS PUBLIC COMPANY
+    are flagged during the first clean ingestion, regardless of source-table processing order,
+    and verify that their dq_suspected_entity_name_variant columns are set to 1."""
+    conn = make_conn()
+    # KDA 1% contains SCG CHEMICALS PUBLIC
+    kda1 = "Data per 31 jul 2026 XLSX\nTotal Kepemilikan: 79.3%\nInvestor\tKepemilikan\tScrip\tScripless\n\nSCG CHEMICALS PUBLIC\nCorporate F\n\t15.7%\t136M lot\t-"
+    # PKDA 5% contains SCG CHEMICALS PUBLIC COMPANY
+    pkda5 = "Tanggal\nInvestor\nPerubahan\n2026-06-05\nSCG CHEMICALS PUBLIC COMPANY\n\nF\n\nYU 23M lot"
+
+    capture = make_capture(kda1=kda1, pkda5=pkda5)
+    counts = ing.ingest_capture(conn, "TPIA", capture, "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    # Assert that it is flagged in the first run!
+    assert counts["entity_alias_candidate"] == 1
+
+    # Verify both names exist in tables
+    names_snapshot = [r[0] for r in conn.execute("SELECT investor_name_raw FROM ownership_snapshot WHERE ticker='TPIA'")]
+    names_change = [r[0] for r in conn.execute("SELECT investor_name_raw FROM ownership_change WHERE ticker='TPIA'")]
+    assert "SCG CHEMICALS PUBLIC" in names_snapshot
+    assert "SCG CHEMICALS PUBLIC COMPANY" in names_change
+
+    # Verify dq_suspected_entity_name_variant is updated to 1 for both
+    dq_snapshot = conn.execute("SELECT dq_suspected_entity_name_variant FROM ownership_snapshot WHERE investor_name_raw='SCG CHEMICALS PUBLIC'").fetchone()[0]
+    dq_change = conn.execute("SELECT dq_suspected_entity_name_variant FROM ownership_change WHERE investor_name_raw='SCG CHEMICALS PUBLIC COMPANY'").fetchone()[0]
+    assert dq_snapshot == 1
+    assert dq_change == 1
+
+    # Verify rerun inserts exactly 0 rows across all tables
+    counts_rerun = ing.ingest_capture(conn, "TPIA", capture, "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    assert sum(counts_rerun.values()) == 0
+
+    conn.close()
+
+
 # --- 7. dry-run transaction: ingest then rollback leaves DB unchanged ----------
 
 def test_dry_run_rollback_leaves_db_unchanged():

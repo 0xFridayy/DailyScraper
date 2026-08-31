@@ -79,37 +79,71 @@ def _upsert_custody_participant(conn, label, ticker, source_family, captured_at)
     return 1 if cur.rowcount > 0 else 0
 
 
-def _check_alias_candidates(conn, ticker, source_table, name_raw, captured_at):
-    """Compare name_raw's normalized form against other distinct raw names
-    already seen for this ticker (across all three name-bearing tables).
-    Only ever INSERTs into entity_alias_candidate -- never touches the
-    fact tables themselves."""
-    key = op.normalize_entity_name(name_raw)
-    if not key:
-        return False
-    seen = set()
-    for tbl in ("ownership_snapshot", "ownership_change", "custody_breakdown_snapshot"):
-        for (other,) in conn.execute(
-            f"SELECT DISTINCT investor_name_raw FROM {tbl} WHERE ticker = ?", (ticker,)
-        ):
-            seen.add(other)
-    matched = False
+def _detect_and_insert_alias_candidates(conn, ticker, captured_at):
+    """Compare normalized forms of all distinct investor names for the current
+    ticker across the complete ticker state and flag candidate variants in
+    entity_alias_candidate, updating dq_suspected_entity_name_variant to 1
+    for those names."""
+    # 1. Fetch all distinct raw investor names from the three name-bearing tables
+    names_snapshot = {r[0] for r in conn.execute(
+        "SELECT DISTINCT investor_name_raw FROM ownership_snapshot WHERE ticker = ?", (ticker,)
+    )}
+    names_change = {r[0] for r in conn.execute(
+        "SELECT DISTINCT investor_name_raw FROM ownership_change WHERE ticker = ?", (ticker,)
+    )}
+    names_custody = {r[0] for r in conn.execute(
+        "SELECT DISTINCT investor_name_raw FROM custody_breakdown_snapshot WHERE ticker = ?", (ticker,)
+    )}
+
+    all_names = names_snapshot | names_change | names_custody
+
+    # 2. Group by normalized key
+    groups = {}
+    for name in all_names:
+        key = op.normalize_entity_name(name)
+        if key:
+            groups.setdefault(key, set()).add(name)
+
+    # 3. Process each group with size > 1
     inserted = 0
-    for other in seen:
-        if other == name_raw:
-            continue
-        if op.normalize_entity_name(other) == key:
-            matched = True
-            a, b = sorted([name_raw, other])
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO entity_alias_candidate
-                   (ticker, source_table, name_a, name_b, normalized_key, captured_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (ticker, source_table, a, b, key, captured_at),
-            )
-            if cur.rowcount > 0:
-                inserted += 1
-    return matched, inserted
+    for key, raw_names in groups.items():
+        if len(raw_names) > 1:
+            raw_names_list = sorted(list(raw_names))
+            # Generate all unique pairs
+            for i in range(len(raw_names_list)):
+                for j in range(i + 1, len(raw_names_list)):
+                    a = raw_names_list[i]
+                    b = raw_names_list[j]
+
+                    # Determine source table prioritizing snapshot -> change -> custody
+                    if a in names_snapshot:
+                        src_tbl = "ownership_snapshot"
+                    elif a in names_change:
+                        src_tbl = "ownership_change"
+                    else:
+                        src_tbl = "custody_breakdown_snapshot"
+
+                    cur = conn.execute(
+                        """INSERT OR IGNORE INTO entity_alias_candidate
+                           (ticker, source_table, name_a, name_b, normalized_key, captured_at)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (ticker, src_tbl, a, b, key, captured_at),
+                    )
+                    if cur.rowcount > 0:
+                        inserted += 1
+
+            # 4. Set dq_suspected_entity_name_variant = 1 for the variants in snapshot and change tables
+            for name in raw_names:
+                conn.execute(
+                    "UPDATE ownership_snapshot SET dq_suspected_entity_name_variant = 1 WHERE ticker = ? AND investor_name_raw = ?",
+                    (ticker, name)
+                )
+                conn.execute(
+                    "UPDATE ownership_change SET dq_suspected_entity_name_variant = 1 WHERE ticker = ? AND investor_name_raw = ?",
+                    (ticker, name)
+                )
+
+    return inserted
 
 
 def ingest_capture(conn, ticker, capture, captured_at, source_url,
@@ -140,9 +174,6 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
         snap_date = parsed["snapshot_date"]
         src_family = "stock_detail_kda1_current"
         for row in parsed["rows"]:
-            alias_matched, alias_inserted = _check_alias_candidates(
-                conn, ticker, "ownership_snapshot", row["investor_name_raw"], captured_at)
-            counts["entity_alias_candidate"] += alias_inserted
             raw_hash = sha256_hex(f"{ticker}|{snap_date}|{row['investor_name_raw']}|{kda1_text[:200]}")
             cur = conn.execute(
                 """INSERT OR IGNORE INTO ownership_snapshot
@@ -153,7 +184,7 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
                     published_at, captured_at, available_at,
                     source_url, source_family, extraction_version, raw_hash,
                     dq_unknown_publication_time, dq_suspected_entity_name_variant)
-                   VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)""",
                 (ticker, "1pct", snap_date, row["investor_name_raw"],
                  row["investor_category"], int(row["is_foreign"]),
                  row["ownership_pct_raw"], row["ownership_pct"],
@@ -161,7 +192,7 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
                  row["scripless_lot"], row["scripless_pct"], row["scripless_raw"],
                  xlsx_url, published_at, captured_at, available_at,
                  source_url, src_family, EXTRACTION_VERSION, raw_hash,
-                 dq_unknown_pub, int(alias_matched)),
+                 dq_unknown_pub),
             )
             counts["ownership_snapshot"] += cur.rowcount if cur.rowcount > 0 else 0
 
@@ -207,9 +238,6 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
         snap_date = parsed["snapshot_date"]
         src_family = "stock_detail_kda5_current"
         for holder in parsed["holders"]:
-            alias_matched, alias_inserted = _check_alias_candidates(
-                conn, ticker, "ownership_snapshot", holder["investor_name_raw"], captured_at)
-            counts["entity_alias_candidate"] += alias_inserted
             raw_hash = sha256_hex(f"{ticker}|{snap_date}|{holder['investor_name_raw']}|{kda5_text[:200]}")
             cur = conn.execute(
                 """INSERT OR IGNORE INTO ownership_snapshot
@@ -221,14 +249,14 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
                     source_url, source_family, extraction_version, raw_hash,
                     dq_unknown_publication_time, dq_suspected_entity_name_variant)
                    VALUES (?,?,?,?,NULL,NULL,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-                           ?,?,?,?,?,?,?,?,?)""",
+                           ?,?,?,?,?,?,?,?,0)""",
                 (ticker, "5pct", snap_date, holder["investor_name_raw"],
                  int(holder["is_foreign"]),
                  f"{holder['total_pct']}%" if holder["total_pct"] is not None else None,
                  holder["total_pct"],
                  published_at, captured_at, available_at,
                  source_url, src_family, EXTRACTION_VERSION, raw_hash,
-                 dq_unknown_pub, int(alias_matched)),
+                 dq_unknown_pub),
             )
             counts["ownership_snapshot"] += cur.rowcount if cur.rowcount > 0 else 0
 
@@ -350,6 +378,9 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
                  dq_unknown_pub),
             )
             counts["float_holder_snapshot"] += cur.rowcount if cur.rowcount > 0 else 0
+
+    # Execute alias candidate detection once across the complete ticker state
+    counts["entity_alias_candidate"] = _detect_and_insert_alias_candidates(conn, ticker, captured_at)
 
     # Deliberately no conn.commit() here.
     # Commit/rollback semantics belong to the caller:
