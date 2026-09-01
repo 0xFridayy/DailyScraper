@@ -68,6 +68,14 @@ jobs:
       PYTHONUNBUFFERED: "1"
       NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
       NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+      # This job never sends a Telegram message, but neobdm_scraper.py resolves
+      # TELEGRAM_BOT_TOKEN/CHAT_ID via _require_env() at MODULE IMPORT time, and
+      # ownership_capture.py imports login()/TRACKED_TICKERS from it. Without
+      # these the import raises before capture starts -- exactly how the first
+      # scheduled run (33484395904) failed. Every other workflow in this repo
+      # passes both for the same reason, including read-only ones.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v5
 
