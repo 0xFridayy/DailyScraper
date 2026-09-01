@@ -11,6 +11,25 @@ The only authorized next step is **Experiment #1**. Ownership, controller,
 custodian, beneficial-owner, and owner-broker-affinity work is explicitly
 blocked until Experiment #1 has been reviewed.
 
+> **Status update (2026-09-01): Experiment #1 has been run and reviewed.**
+> Results and the review decision are recorded in
+> [[ML_V2_EXPERIMENT_1_RESULTS.md]] (prediction digest `147d734749c71e2d`,
+> split `14cae7f9fc9ec403`, seed 17). Summary of the decision:
+> `broker_identity` is **retained as a research feature only** — directional
+> incremental OOS information, but not approved for production promotion
+> because bootstrap intervals cross zero and leave-one-broker-out can reverse
+> the sign. `observable_inventory` is **rejected** from the active feature set.
+> That rejection is **not** evidence that real shareholder-ownership data lacks
+> predictive value; the two encode different economic information.
+>
+> The stop condition below is lifted for **entity canonicalization of the
+> ownership dataset only**. Owner/controller mapping, ownership attribution,
+> custodian mapping, owner-broker affinity, and ownership-derived ML features
+> all remain blocked pending their own separate review.
+>
+> Everything below this note is the original pre-experiment specification and is
+> retained unaltered as the historical record.
+
 ## Experiment #1 question
 
 Does retaining broker identity add out-of-sample next-session ranking
