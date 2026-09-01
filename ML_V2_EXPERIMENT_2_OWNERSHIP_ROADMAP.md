@@ -119,32 +119,108 @@ ownership-change history (Groups O2/O3) available, not just level features.
 
 ## Minimum history requirement
 
-Experiment #2 is not allowed to run until:
+Experiment #2 is not allowed to run until ALL of the following are satisfied.
+The 60-day clock is necessary but not sufficient; the signal-rate gates below
+are the binding constraints based on what the data actually contains.
 
-1. **At least 60 consecutive trading days of ownership captures** have been
-   ingested into `neobdm_ownership.db` via the daily ownership-capture workflow.
-   This provides:
-   - ~40 trading days where O2/O3 features are available with full depth
-   - A training window where ownership-change and persistence signals have
-     enough history to differentiate from noise
-   - At least 30-session minimum training depth with O2/O3 features on ≥20 of
-     those sessions
+### Gate 1: 60 trading days of capture history
 
-2. **The 60-day window must include no gaps exceeding 3 consecutive trading
-   days.** The ownership-capture workflow runs daily; brief gaps from workflow
-   failures are expected and tolerable, but a >3-day gap means a missing
-   observation that breaks the change/persistence feature chain. Short gaps
-   are handled by forward-filling the last known snapshot; long gaps require
-   investigation.
+**At least 60 consecutive trading days of ownership captures** must be
+ingested into `neobdm_ownership.db` via the daily ownership-capture workflow.
+This provides:
+- ~40 trading days where O2/O3 features are available with full depth
+- A training window where ownership-change and persistence signals have
+  enough history to differentiate from noise
+- At least 30-session minimum training depth with O2/O3 features on ≥20 of
+  those sessions
 
-3. **Entity canonicalization must be re-run** on the accumulated data after
-   the 60-day threshold is reached, to capture any new aliases or entities
-   that emerged in the ownership history.
+The 60-day window must include no gaps exceeding 3 consecutive trading
+days. The ownership-capture workflow runs daily; brief gaps from workflow
+failures are expected and tolerable, but a >3-day gap means a missing
+observation that breaks the change/persistence feature chain. Short gaps
+are handled by forward-filling the last known snapshot; long gaps require
+investigation.
 
-With daily captures starting 2026-09-01, the earliest feasible Experiment #2
-run date is approximately **2026-11-30** (60 calendar days of captures at
+Entity canonicalization must be re-run on the accumulated data after the
+60-day threshold is reached, to capture any new aliases or entities that
+emerged in the ownership history.
+
+With daily captures starting 2026-09-01, the earliest feasible date for
+Gate 1 is approximately **2026-11-30** (60 calendar days of captures at
 ~20 trading days/month). This date will be refined based on actual capture
 completeness.
+
+### Gate 2: Effective-sample signal-rate requirement
+
+The 60-day clock only tells us when history is *available*. It does not tell
+us whether that history contains *enough real signal* for the experiment to
+distinguish a real effect from noise. As of 2026-09-01, the current data
+illustrates the problem:
+
+- 975 PKDA-5% rows total, of which only 62 (6.4%) are actual
+  `is_custodian_move=1` events. The other 913 are threshold adjustments
+  and registration artifacts — the `own_net_lot_change_1d` and
+  `own_flow_magnitude_1d` features are mostly zero or near-zero.
+- 221 distinct change_dates but only 34 tickers with PKDA-5% data, meaning
+  ~1.8 custodian moves per ticker per date on average across the whole
+  history. 7 tickers have only one PKDA-5% row, and 5 tickers have 50+,
+  so the signal is highly concentrated in a few names.
+- 3 distinct snapshot dates across all tickers. O1 (level) and O3
+  (persistence) features are technically computable but have
+  near-zero historical depth.
+
+These patterns are likely to persist (or grow slightly) with 60 days of
+daily captures, because the underlying NeoBDM disclosure cadence is
+monthly for the 1% pane and event-driven for the 5% pane. The
+60-day clock alone would not produce a materially better training set than
+what the data already shows.
+
+**Gate 2 — all of the following must hold in the 60-day window:**
+
+| Sub-gate | Requirement | Why |
+|---|---|---|
+| 2a. Custodian-move rate | At least **5 custodian-move events per ticker** on average across tickers with PKDA-5% history. | Below this, `own_net_lot_change_1d` and `own_flow_magnitude_1d` are too sparse for XGBoost to learn a split. Targets the bottom of the distribution: at least 29 of 34 tickers (the 85th percentile) must clear this. |
+| 2b. Active-ticker coverage | At least **30 tickers** have ≥1 PKDA-5% row in the 60-day window. | Matches the current 34; if new tickers appear, that's fine. If coverage shrinks, the universe has changed and the experiment should not run. |
+| 2c. Snapshot depth | At least **20 distinct snapshot dates** in `ownership_snapshot` across the window. | O1 and O3 features require snapshot history. With only 3 distinct snapshot dates currently, this is the binding gate — daily captures alone will not produce 20 snapshot dates because the snapshot pane is monthly, not daily. The 60-day window will yield ~3 monthly snapshots at most. This gate is **almost certainly not satisfiable** with the current capture cadence. |
+| 2d. New-entry / exit sample | At least **50 new-entry events** and **50 exit events** (O2's `own_new_entries_5d` / `own_exits_5d`) across the window. | Entry/exit features need a baseline rate of ~1 per trading day; 50 events is a minimum for the model to learn the split. |
+| 2e. Persistent-holder sample | At least **100 ticker-dates** where the persistent-holder feature is computable (i.e. ≥3 distinct snapshot dates are available for that ticker). | O3 features require lookback; below this, the feature is mostly NaN. |
+
+**Gate 3: Snapshot cadence**
+
+Sub-gate 2c almost certainly blocks Experiment #2 with the current
+ownership-capture cadence. The snapshot pane is monthly, so 60 days
+of daily captures yields at most 2–3 snapshot dates per ticker. The
+ownership-capture workflow should be modified to capture KDA 1% and
+KDA 5% snapshots at the daily frequency NeoBDM makes available, not
+just when a new month closes. Until then, the experiment is blocked
+on Gate 3, regardless of Gate 1 and Gate 2.
+
+This is a separate, earlier piece of work: modify the capture pipeline
+to snapshot on a more frequent cadence, run for 60 days, then evaluate
+Gate 1 and Gate 2.
+
+### What this changes about the roadmap
+
+The "60 trading days" threshold is now a **necessary but not sufficient**
+condition. The binding constraint is **Gate 3** (snapshot cadence) followed
+by **Gate 2c** (20 distinct snapshot dates). With the current monthly
+cadence, neither is achievable in 60 days.
+
+The corrected sequencing is:
+
+1. **First** (separate task, blocked until approved): modify
+   ownership_capture.py to capture snapshots on NeoBDM's available
+   frequency, not just at month-close. Run the new cadence for
+   60 trading days.
+2. **Then** (this experiment): evaluate Gate 1 and Gate 2. If both pass,
+   Experiment #2 is allowed to run. If Gate 2 fails on any sub-gate,
+   the experiment does not run and the data is re-assessed in 30
+   days.
+3. **Implementation is still blocked** until Gate 1, Gate 2, and Gate 3
+   are all satisfied. The estimated earliest feasible date with the
+   current cadence is **never** (Gate 2c unachievable). With a
+   higher-frequency capture pipeline in place, the earliest feasible
+   date is approximately 60 trading days after that pipeline change.
 
 ## Walk-forward protocol
 
