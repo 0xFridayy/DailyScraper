@@ -228,6 +228,62 @@ CREATE TABLE IF NOT EXISTS entity_alias_candidate (
     captured_at     TEXT NOT NULL,
     UNIQUE (ticker, source_table, name_a, name_b)
 );
+
+-- Canonical ownership entity identity. GLOBAL (deliberately NOT scoped by
+-- ticker, unlike entity_alias_candidate above): the same holder appears under
+-- several tickers -- TIRTA ORISA YASA under four, ELANG MAHKOTA TEKNOLOGI
+-- under three -- and a per-ticker identity would issue that one holder several
+-- unrelated IDs.
+--
+-- entity_id is DERIVED, not assigned: 'ENT-' + sha256(canonical_key)[:16].
+-- It is a pure function of canonical_key, so it is stable across reruns,
+-- machines and insertion order, and a newly captured alias joining a group
+-- never renumbers the group. canonical_key is the fully-reduced ordered token
+-- sequence (see ownership_entity.py); ORDERED, so 'ALPHA BETA' and
+-- 'BETA ALPHA' are different entities.
+--
+-- canonical_name is a representative RAW name chosen from the members. It is a
+-- display label only. No source row is ever rewritten to it, and
+-- investor_name_raw everywhere remains exactly the captured bytes.
+CREATE TABLE IF NOT EXISTS entity_canonical (
+    entity_id       TEXT PRIMARY KEY,
+    canonical_key   TEXT NOT NULL UNIQUE,
+    canonical_name  TEXT NOT NULL,
+    member_count    INTEGER NOT NULL,
+    needs_review    INTEGER NOT NULL DEFAULT 0,
+    rule_version    TEXT NOT NULL,
+    first_seen_at   TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- One row per DISTINCT raw investor name ever captured, mapping it to its
+-- global entity_id, with the deterministic rule that produced the mapping.
+--
+--   R0  raw name needed no transformation at all
+--   R1  case / punctuation / whitespace only, token ORDER preserved
+--   R2  R1 plus removal of the PT and TBK entity-form tokens only
+--   R3  R1/R2 plus an explicitly curated spacing substitution (HONGKONG)
+--   R4  refused -- a candidate pair proposed this name as an alias of another
+--       name and the rules above did not confirm it, so it KEEPS ITS OWN
+--       global entity_id and is flagged for a human. Ambiguity never merges.
+--
+-- match_status='review' marks any name a human still has to adjudicate. That
+-- includes every R4 name and also any confidently-merged name that separately
+-- has an unconfirmed candidate partner outstanding.
+CREATE TABLE IF NOT EXISTS entity_alias (
+    name_raw      TEXT PRIMARY KEY,
+    entity_id     TEXT NOT NULL REFERENCES entity_canonical(entity_id),
+    match_rule    TEXT NOT NULL CHECK (match_rule IN ('R0','R1','R2','R3','R4')),
+    match_status  TEXT NOT NULL CHECK (match_status IN ('auto','review')),
+    confidence    TEXT NOT NULL CHECK (confidence IN ('exact','high','confirmed','unresolved')),
+    evidence      TEXT NOT NULL,
+    rule_version  TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_alias_entity ON entity_alias (entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_alias_status ON entity_alias (match_status);
 """
 
 
