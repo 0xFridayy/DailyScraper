@@ -33,3 +33,32 @@ scratch_ownership_panes*.json
 # explicitly avoids writing full HTML, but belt-and-suspenders)
 *_raw*.html
 *_page*.html
+
+# ---------------------------------------------------------------------------
+# Local research artifacts — generated / reproducible, never commit
+# ---------------------------------------------------------------------------
+
+# Inventory harvest cache + derived parquet tables
+# (regenerate: harvest_inventory.py -> build_inventory_db.py)
+inventory_raw/
+*.parquet
+
+# Local research DB, intentionally separate from neobdm.db so the nightly CI
+# commit of neobdm.db never collides with it (see txchart_history_pull.py)
+txchart_history.db
+
+# Backtest / experiment output
+backtest_out/
+*_results.csv
+patterns_detected.csv
+pattern_trades.csv
+regime_validation_daily.csv
+harvest.log
+
+# Harvested market data (re-pullable)
+jci_daily.csv
+idx_foreign_daily.csv
+
+# Raw API response dumps
+inventory_*_sample.json
+get_choices.json
