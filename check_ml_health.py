@@ -255,12 +255,22 @@ def check_model_runs(panel, problems, notes, stats):
 
 
 def _sqrt252_sites():
-    """Real sqrt(252) CALLS, found via the AST.
+    """Real annualisation CALLS, found via the AST.
 
     A plain text search does not work here: this repo discusses the defect in
     prose extensively, so docstrings in walk_forward_backtest.py, horizon_scan.py
     and this file all mention it. Parsing means only executable code counts, and
     the description of a bug never registers as the bug.
+
+    Matches any sqrt(...) whose argument contains the literal 252 anywhere in
+    its expression tree -- so sqrt(252), sqrt(252 / hold_days) and
+    sqrt(n * 252) all count. Rescaling the constant repairs only the
+    dimensional half of HANDOFF.md TEMUAN 2 and leaves the independence half
+    untouched, so a "repaired" site is still a site. Kept narrow: only a
+    sqrt() argument is examined, and only the constant 252, so sqrt(5) /
+    sqrt(10) normalisations and a bare 252 elsewhere never register.
+
+    Must stay in step with test_pipeline.py::_sqrt_252_call_sites.
     """
     listed = subprocess.run(
         ["git", "ls-files", "--", "*.py"], cwd=HERE,
@@ -282,9 +292,13 @@ def _sqrt252_sites():
                 continue
             fname = (node.func.attr if isinstance(node.func, ast.Attribute)
                      else getattr(node.func, "id", None))
-            arg = node.args[0]
-            if fname == "sqrt" and isinstance(arg, ast.Constant) and arg.value == 252:
-                hits.append(f"{fn}:{node.lineno}")
+            if fname != "sqrt":
+                continue
+            for sub in ast.walk(node.args[0]):
+                if (isinstance(sub, ast.Constant) and not isinstance(sub.value, bool)
+                        and sub.value == 252):
+                    hits.append(f"{fn}:{node.lineno}")
+                    break
     return hits
 
 

@@ -305,10 +305,70 @@ def test_signal_quality_scores_every_row_not_just_triggered():
     print("test_signal_quality_scores_every_row_not_just_triggered passed")
 
 
+def _sqrt_252_call_sites(source, filename):
+    """Annualisation sites in one source string: any sqrt(...) whose argument
+    contains the literal 252 ANYWHERE in its expression tree.
+
+    Widened deliberately. The original matcher required the argument to be
+    exactly Constant(252), so the "repaired" forms sqrt(252 / hold_days) and
+    sqrt(n_per_year * 252) passed silently -- and those are the forms a
+    well-meaning fix produces. HANDOFF.md TEMUAN 2 names TWO errors: the
+    dimensional one (per-trade returns scaled as daily) and the independence
+    one (concurrent cross-ticker trades counted as independent draws).
+    Rescaling the constant addresses only the first while making the second
+    invisible to this guard, which is worse than leaving it alone.
+
+    Kept narrow on purpose:
+      - only the argument of a call named `sqrt` is examined, so 252 appearing
+        anywhere else in the file is not flagged;
+      - the constant must be 252, so sqrt(5) / sqrt(10) z-score normalisations
+        and sqrt(variance) are untouched;
+      - AST-based, so prose about the defect in a docstring never registers as
+        the defect.
+    """
+    import ast as _ast
+    hits = []
+    for node in _ast.walk(_ast.parse(source)):
+        if not isinstance(node, _ast.Call) or len(node.args) != 1:
+            continue
+        fname = (getattr(node.func, "attr", None) or getattr(node.func, "id", None))
+        if fname != "sqrt":
+            continue
+        for sub in _ast.walk(node.args[0]):
+            if (isinstance(sub, _ast.Constant) and not isinstance(sub.value, bool)
+                    and sub.value == 252):
+                hits.append(f"{filename}:{node.lineno}")
+                break
+    return hits
+
+def test_sqrt_252_matcher_catches_repaired_forms():
+    # The matcher itself, checked against the forms a naive fix produces.
+    caught = [
+        "s = r.mean() / r.std() * np.sqrt(252)",
+        "s = r.mean() / r.std() * np.sqrt(252 / hold_days)",
+        "s = r.mean() / r.std() * np.sqrt(hold_days / 252)",
+        "s = r.mean() / r.std() * np.sqrt(n * 252)",
+        "s = r.mean() / r.std() * math.sqrt(252.0)",
+        "s = sqrt(252 * periods_per_day / overlap)",
+    ]
+    for src in caught:
+        assert _sqrt_252_call_sites(src, "x.py"), f"matcher missed: {src}"
+    ignored = [
+        "z = f.rolling(5).sum() / (std20 * np.sqrt(5))",       # z-score normalisation
+        "z = f.rolling(10).sum() / (std20 * np.sqrt(10))",
+        "se = np.sqrt(on.var() / len(on) + off.var() / len(off))",
+        "TRADING_DAYS = 252",                                   # bare constant, no sqrt
+        "ann = (1 + r).prod() ** (252 / len(r)) - 1",           # CAGR, not a sqrt
+        "d = np.sqrt(variance)",
+    ]
+    for src in ignored:
+        assert not _sqrt_252_call_sites(src, "x.py"), f"matcher over-fired on: {src}"
+    print("test_sqrt_252_matcher_catches_repaired_forms passed")
+
 def test_no_sqrt_252_anywhere():
     # The defect this whole change removes. AST-based so prose about it in
     # docstrings does not count as a reoccurrence.
-    import ast as _ast, os as _os, subprocess as _subprocess
+    import os as _os, subprocess as _subprocess
     here = _os.path.dirname(_os.path.abspath(__file__))
     listed = _subprocess.run(
         ["git", "ls-files", "--", "*.py"], cwd=here,
@@ -322,15 +382,11 @@ def test_no_sqrt_252_anywhere():
         if fn == "check_ml_health.py":      # its own budget guard mentions it
             continue
         try:
-            tree = _ast.parse(open(_os.path.join(here, fn), encoding="utf-8").read())
+            src = open(_os.path.join(here, fn), encoding="utf-8").read()
+            hits += _sqrt_252_call_sites(src, fn)
         except (OSError, SyntaxError):
             continue
-        for node in _ast.walk(tree):
-            if (isinstance(node, _ast.Call) and len(node.args) == 1
-                    and (getattr(node.func, "attr", None) or getattr(node.func, "id", None)) == "sqrt"
-                    and isinstance(node.args[0], _ast.Constant) and node.args[0].value == 252):
-                hits.append(f"{fn}:{node.lineno}")
-    assert not hits, f"sqrt(252) is back at {hits}"
+    assert not hits, f"sqrt(252) annualisation is back at {hits}"
     print("test_no_sqrt_252_anywhere passed")
 
 
@@ -875,6 +931,7 @@ if __name__ == "__main__":
     test_trade_stats_has_no_annualisation()
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()
+    test_sqrt_252_matcher_catches_repaired_forms()
     test_no_sqrt_252_anywhere()
     test_kelly_fraction_known_example()
     test_kelly_fraction_negative_edge_returns_zero()
