@@ -57,7 +57,8 @@ CORE_MODULES = ["price_audit", "walk_forward_backtest", "strategy_variants",
                 "feature_ablation", "multiday_features", "smart_money_divergence",
                 "shap_analysis", "kelly_sizing", "ara_arb_simulation",
                 "horizon_scan", "evaluate_signals", "ml_v2_experiment_1",
-                "ml_v2_experiment_1_robustness", "pattern_type_backtest"]
+                "ml_v2_experiment_1_robustness", "pattern_type_backtest",
+                "foreign_flow_signal_backtest"]
 OPTIONAL_MODULES = ["ddqn_entry_exit"]
 
 # Panel shape. Wide bands - this catches "the panel collapsed", not drift.

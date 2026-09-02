@@ -34,6 +34,10 @@ from ml_v2_experiment_1_robustness import (
     _bootstrap_statistics, paired_date_differences,
 )
 from pattern_type_backtest import date_balanced_hit_edge, trade_level_stats
+from foreign_flow_signal_backtest import (
+    date_balanced_hit_edge as foreign_date_balanced_hit_edge,
+    trade_stats as foreign_trade_stats,
+)
 
 
 def test_broker_day_aggregates_basic():
@@ -330,6 +334,31 @@ def test_pattern_type_stats_use_same_date_baseline_and_balance_dates():
     assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
     assert balanced["positive_edge_days"] == 0.5
     print("test_pattern_type_stats_use_same_date_baseline_and_balance_dates passed")
+
+
+def test_foreign_flow_stats_use_same_date_baseline_and_balance_dates():
+    universe = [
+        {"entry_date": "d1", "gross_return": r}
+        for r in (0.10, 0.08, -0.10, -0.08)
+    ] + [
+        {"entry_date": "d2", "gross_return": r}
+        for r in (0.10, -0.08, -0.09, -0.10)
+    ]
+    signals = [
+        {"entry_date": "d1", "gross_return": 0.10},
+        {"entry_date": "d1", "gross_return": 0.08},
+        {"entry_date": "d2", "gross_return": -0.08},
+    ]
+
+    pooled = foreign_trade_stats(signals, universe, preset="moderate")
+    balanced = foreign_date_balanced_hit_edge(signals, universe, preset="moderate")
+
+    assert abs(pooled["base_rate"] - 0.375) < 1e-12
+    assert abs(pooled["hit_edge"] - ((2 / 3) - (3 / 8))) < 1e-12
+    assert balanced["n_signal_days"] == 2
+    assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
+    assert balanced["positive_edge_days"] == 0.5
+    print("test_foreign_flow_stats_use_same_date_baseline_and_balance_dates passed")
 
 
 def _sqrt_252_call_sites(source, filename):
@@ -959,6 +988,7 @@ if __name__ == "__main__":
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()
     test_pattern_type_stats_use_same_date_baseline_and_balance_dates()
+    test_foreign_flow_stats_use_same_date_baseline_and_balance_dates()
     test_sqrt_252_matcher_catches_repaired_forms()
     test_no_sqrt_252_anywhere()
     test_kelly_fraction_known_example()
