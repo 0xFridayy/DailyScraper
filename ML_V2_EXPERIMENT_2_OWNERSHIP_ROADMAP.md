@@ -334,3 +334,130 @@ gate.
 5. **Minimum history target:** 60 trading days is the floor. Should the spec
    recommend running at 90 days (~2027-01-01) instead, to give O2/O3 features
    deeper lookback in the first training windows?
+
+---
+
+## Experiment #2A0: frozen exploratory event study
+
+**Approval status:** approved with final corrections on 2026-09-02. This is a
+separate exploratory event study. Experiment #2A ML remains **FAILED** for
+insufficient breadth/effective sample. No #2A0 result can revive #2A, authorize
+ML training, or promote an ownership feature to production.
+
+### Frozen source population and unit of analysis
+
+The source filter is immutable:
+
+```sql
+threshold = '5pct'
+AND is_custodian_move = 1
+AND lot_change IS NOT NULL
+AND lot_change != 0
+```
+
+The confirmed source population is 45 rows (18 positive, 27 negative), 36
+unique `(ticker, change_date)` primary events, 39 canonical holder-events, and
+11 tickers. The earlier 62-row count is not the source population because it
+includes rows that fail the non-null/non-zero economic-event requirement.
+Multiple rows or holders on one ticker-date collapse to one equal-weighted
+primary event; no sign or magnitude weighting is allowed.
+
+Concentration is frozen as BREN = 13/36 (36.1%) and the top five tickers
+(BREN, BRMS, EMTK, FAST, SCMA) = 28/36 (77.8%). Every outcome must be reported
+for the full sample (36 events/11 tickers), ex-BREN (23/10), all 11
+leave-one-ticker-out samples (23--35 events/10 tickers), and ex-top-five as a
+stress test (8/6).
+
+### Mandatory observability gate
+
+This gate must pass before any price or return analysis. Verify what
+`ownership_change.change_date` represents and when each underlying fact became
+observable to market participants. Strict-next-session alignment may use
+`change_date` only if it is independently established as an observable-date
+proxy. If publication/availability is later, use the earliest defensible
+observable date instead. Historical facts first discovered in a backfill must
+not be backdated. If event-level observability cannot be established, stop and
+report the failure; do not compute returns, placebos, or inference.
+
+**Current status (2026-09-02): BLOCKED.** The stored provenance does not
+establish historical event-level publication times. A publication-timestamp
+recovery audit was started against official BEI/KSEI/OJK records, then stopped
+before all 36 primary events could be adjudicated. Recovery is therefore
+**INCOMPLETE**: no candidate match is accepted as verified, no observability
+manifest has been approved, and the event study must not run.
+
+### Timing and outcomes
+
+For an event that passes the observability gate, `t0` is the first ticker
+session strictly after the defensible observable date with a valid positive
+close. The entry/base price is the close at `t0`. Frozen horizons are 1, 5, 10,
+and 20 ticker trading sessions after `t0`:
+
+```text
+R(i,h) = P(i,t0+h) / P(i,t0) - 1,  h in {1, 5, 10, 20}
+AR(i,h) = R(i,h) - R(IHSG,t0 to t0+h)
+```
+
+The IHSG return uses the identical calendar endpoints. No transaction costs
+apply. Coverage is horizon-specific: an event missing an endpoint remains in
+the frozen manifest but is missing only for that horizon, with no imputation,
+replacement, or shorter substitute horizon.
+
+For raw and IHSG-adjusted returns at every horizon and required concentration
+sample, report the equal-weighted mean (primary estimator), median, percentage
+above zero, N events, N tickers, minimum, and maximum.
+
+### Sign restriction
+
+`is_custodian_move=1` is an inclusion flag only. Positive/negative
+`lot_change` must not be interpreted as bullish/bearish,
+accumulation/distribution, or inflow/outflow until both fields' economic
+semantics are independently verified. Mixed-sign events are not netted. Any
+signed, magnitude-weighted, or long/short study requires a separately approved
+preregistration.
+
+### Same-ticker placebo
+
+Use 10,000 Monte Carlo repetitions with seed `20260200`. For each real event
+and each horizon separately, sample an eligible pseudo-date for the same ticker
+within the same calendar month. If insufficient unused eligible dates remain
+there to preserve the without-replacement per-ticker event count, use the
+predefined +/-40 IDX-session window around the real event. Always exclude every
+actual event date for that ticker. Sampling is without replacement within a
+repetition and preserves each included ticker's exact event count.
+
+Eligibility is horizon-specific and must mirror the real sample: 1d pseudo
+tests require valid 1d forward coverage, 5d require 5d, 10d require 10d, and
+20d require 20d. Shorter-horizon pseudo-events must not be required to have 20d
+coverage. Apply the identical observable-date alignment and outcome rules.
+Report the observed mean's placebo percentile and two-sided empirical p-value:
+
+```text
+p = (1 + count(abs(placebo mean) >= abs(observed mean))) / 10001
+```
+
+Run this for full, ex-BREN, all leave-one-ticker-out, and ex-top-five samples.
+
+### Uncertainty, multiplicity, and frozen interpretation
+
+Do not headline IID event-level standard errors. Report separate 95% percentile
+intervals from (a) a whole-ticker cluster bootstrap, 10,000 repetitions, seed
+`20260201`, and (b) a bootstrap of non-overlapping 20-IDX-session date blocks
+assigned by `t0`, 10,000 repetitions, seed `20260202`. Never select whichever
+interval is narrower.
+
+For every outcome/horizon, the leave-one-ticker-out table must include all 11
+estimates, its minimum/maximum, sign stability, and the omission producing the
+largest absolute change from the full-sample estimate. Report nominal placebo
+p-values and Holm-adjusted p-values across the eight full-sample tests (two
+outcomes x four horizons); sensitivity samples are secondary.
+
+The following interpretations are frozen:
+
+- A nominal full-sample result that becomes non-significant or reverses sign
+  ex-BREN is concentration-driven.
+- The eight-event ex-top-five result cannot independently establish a signal.
+- Single-horizon significance is exploratory only.
+- Leave-one-ticker-out sign instability is ticker dependence.
+- No result is causal, establishes economic direction/tradability, promotes a
+  feature, authorizes ML, or changes Experiment #2A's failed status.
