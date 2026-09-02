@@ -10,7 +10,7 @@ value plus clean OHLCV:
     data = {date:[...], blot:{BROKER:[...]}, bval:{...}, slot:{...}, sval:{...},
             nlot:{...}, nval:{...}, ohlc:[{date,open,high,low,close,volume,...}]}
 
-This is the same data the /inventory/ Plotly chart draws, so the cumulative
+This is the same data the /inventory-chart/ Plotly chart draws, so the
 "inventory curve" per broker is just a cumsum of nlot. It is strictly better
 than the old broker_flow capture: real buy/sell split (so cost basis is
 computable), 101 broker codes instead of 29, and no cross-ticker cloning.
@@ -36,7 +36,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from neobdm_scraper import API_BASE, NEOBDM_INVENTORY_URL, login, log  # noqa: E402
+from neobdm_scraper import API_BASE, INVENTORY_CHART_URL, login, log  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +111,7 @@ def main():
         ctx = b.new_context(viewport={"width": 1400, "height": 900})
         page = ctx.new_page()
         login(page)
-        page.goto(NEOBDM_INVENTORY_URL, wait_until="domcontentloaded", timeout=60000)
+        page.goto(INVENTORY_CHART_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
         req = ctx.request
 
