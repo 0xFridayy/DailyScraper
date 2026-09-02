@@ -33,6 +33,7 @@ from ml_v2_experiment_1 import (
 from ml_v2_experiment_1_robustness import (
     _bootstrap_statistics, paired_date_differences,
 )
+from pattern_type_backtest import date_balanced_hit_edge, trade_level_stats
 
 
 def test_broker_day_aggregates_basic():
@@ -303,6 +304,32 @@ def test_signal_quality_scores_every_row_not_just_triggered():
     assert abs(q["trade_hit"] - (2 / 3)) < 1e-12
     assert "sharpe" not in q, "Sharpe must be gone, not renamed"
     print("test_signal_quality_scores_every_row_not_just_triggered passed")
+
+
+def test_pattern_type_stats_use_same_date_baseline_and_balance_dates():
+    # d1 has two signals while d2 has one. The headline date-balanced edge must
+    # give the two dates equal weight rather than letting d1 vote twice.
+    universe = pd.DataFrame({
+        "signal_date": ["d1"] * 4 + ["d2"] * 4,
+        "gross_ret": [0.10, 0.08, -0.10, -0.08,
+                      0.10, -0.08, -0.09, -0.10],
+    })
+    signals = pd.DataFrame({
+        "signal_date": ["d1", "d1", "d2"],
+        "gross_ret": [0.10, 0.08, -0.08],
+    })
+
+    pooled = trade_level_stats(signals, universe, preset="moderate")
+    balanced = date_balanced_hit_edge(signals, universe, preset="moderate")
+
+    # Pooled: signal 2/3 versus universe 3/8.
+    assert abs(pooled["base_rate"] - 0.375) < 1e-12
+    assert abs(pooled["hit_edge"] - round((2 / 3) - (3 / 8), 4)) < 1e-12
+    # Per date: d1 edge 1 - 1/2 = +1/2; d2 edge 0 - 1/4 = -1/4.
+    assert balanced["n_signal_days"] == 2
+    assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
+    assert balanced["positive_edge_days"] == 0.5
+    print("test_pattern_type_stats_use_same_date_baseline_and_balance_dates passed")
 
 
 def _sqrt_252_call_sites(source, filename):
@@ -931,6 +958,7 @@ if __name__ == "__main__":
     test_trade_stats_has_no_annualisation()
     test_trade_stats_edges()
     test_signal_quality_scores_every_row_not_just_triggered()
+    test_pattern_type_stats_use_same_date_baseline_and_balance_dates()
     test_sqrt_252_matcher_catches_repaired_forms()
     test_no_sqrt_252_anywhere()
     test_kelly_fraction_known_example()
