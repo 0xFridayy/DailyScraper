@@ -16,6 +16,7 @@ threshold = '5pct'
 AND is_custodian_move = 1
 AND lot_change IS NOT NULL
 AND lot_change != 0
+AND captured_at < '2026-09-02'   -- as-of the freeze; see below
 ```
 
 Population verification passed:
@@ -29,6 +30,34 @@ Population verification passed:
 | Tickers | 11 |
 | BREN concentration | 13/36 (36.1%) |
 | Top-five concentration | 28/36 (77.8%) |
+
+## Cohort reproducibility -- fixed 2026-09-03
+
+The pre-run audit above was reproducible only for as long as no new ownership
+capture ran. The frozen filter carried no upper bound in time, so the
+2026-09-03 capture -- ordinary, correct data collection -- added one newly
+disclosed PKDA 5% custodian move (`SINI` / `change_date` 2026-09-01, first
+captured 2026-09-03T07:32:14Z) and took the standing query to 46 rows, 37
+primary events, and 12 tickers. The drift guard then failed on every run,
+reporting normal capture as a breach of the freeze.
+
+The cohort is now bounded at first-capture time: the frozen population is the
+matching rows with `captured_at < 2026-09-02`, the day the audit was confirmed.
+That bound reproduces the frozen numbers exactly -- 45 rows, 18/27, 36 events,
+39 holder-events, 11 tickers, BREN 13/36, top-five 28/36 -- and changes no
+event, filter term, horizon, or outcome rule. Rows captured on or after the
+boundary are printed as post-freeze accretion and never enter the study.
+
+Two guards now stand behind the freeze:
+
+| Guard | Catches |
+|---|---|
+| Count audit (unchanged) | A change in the shape of the cohort |
+| SHA-256 cohort digest `aec1358174f98b1bc89530f60e1abff6542b6140e466ca62af89ed07f0cb44a6` | A re-parse that rewrites a value in place while the counts still match |
+
+The 2026-09-03 run reports: population audit 45/36/11 with the pinned digest,
+post-freeze accretion of 1 row / 1 event / 1 ticker (`SINI/2026-09-01`), and
+the observability gate still failing closed. Nothing below changed.
 
 ## Event-date observability gate -- FAILED
 
@@ -89,9 +118,19 @@ captured first-availability observations with sufficient forward horizons.
 The frozen implementation is `experiment_2a0_event_study.py`. Its cohort and
 observability checks ran on 2026-09-02: the cohort audit passed, the
 observability gate returned failure, no price file was loaded, and no result
-artifact was created. Eight focused implementation tests passed, including a
-synthetic end-to-end study, strict-next-session alignment, and
-horizon-specific placebo eligibility.
+artifact was created. Eleven focused implementation tests pass, including a
+synthetic end-to-end study, strict-next-session alignment, horizon-specific
+placebo eligibility, and the three cohort-boundary tests added on 2026-09-03.
+
+### Note on prospectively captured moves
+
+`SINI/2026-09-01` is outside the frozen cohort and is not studied here, but it
+differs in kind from the 45 backfilled rows: it was first observed by a capture
+two days after its `change_date`, rather than in a single backfill spanning a
+year of history. Bounding first availability that way is what the historical
+rows cannot support. This is an observation about the accretion, not a
+prospective cohort -- none is defined, and defining one would need its own
+approved preregistration.
 
 Experiment #2A0 remains **BLOCKED at observability**. Experiment #2A ML
 remains **FAILED**. Experiment #2B has not been started.
