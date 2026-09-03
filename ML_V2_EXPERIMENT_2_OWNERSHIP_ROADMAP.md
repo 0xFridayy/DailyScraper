@@ -362,6 +362,18 @@ includes rows that fail the non-null/non-zero economic-event requirement.
 Multiple rows or holders on one ticker-date collapse to one equal-weighted
 primary event; no sign or magnitude weighting is allowed.
 
+The filter is evaluated **as of the freeze**, not as a standing query. The
+frozen population is the set of matching rows first captured strictly before
+`2026-09-02`, the day the 45/36/11 audit was confirmed. Without that bound the
+filter has no upper bound in time and each subsequent daily ownership capture
+would enlarge the cohort the spec calls immutable — as happened on 2026-09-03,
+when a newly disclosed SINI move took the unbounded query to 46 rows / 37
+events / 12 tickers. Rows matching the filter but first captured on or after
+the boundary are post-freeze accretion: they are reported alongside the audit,
+they never enter this study, and their arrival is not cohort drift. Drift now
+means what it was meant to mean — the frozen 45 rows themselves changed — and
+is detected by both the counts above and a content digest over those rows.
+
 Concentration is frozen as BREN = 13/36 (36.1%) and the top five tickers
 (BREN, BRMS, EMTK, FAST, SCMA) = 28/36 (77.8%). Every outcome must be reported
 for the full sample (36 events/11 tickers), ex-BREN (23/10), all 11

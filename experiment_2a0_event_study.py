@@ -23,8 +23,32 @@ FILTER_SQL = (
     "threshold='5pct' AND is_custodian_move=1 "
     "AND lot_change IS NOT NULL AND lot_change != 0"
 )
+
+# The frozen cohort is an AS-OF population, not a standing query.
+#
+# The spec freezes the source population at 45 rows / 36 primary events / 11
+# tickers, confirmed on 2026-09-02.  FILTER_SQL alone does not reproduce that:
+# it has no upper bound in time, so every subsequent daily ownership capture
+# silently changes the "frozen" cohort.  It already did -- the 2026-09-03
+# capture added SINI/2026-09-01, taking the standing query to 46 rows / 37
+# events / 12 tickers and making the drift guard fail on ordinary data
+# collection rather than on a real breach.
+#
+# Bounding the cohort by first-capture time restores the frozen numbers
+# exactly and keeps them reproducible for as long as captures continue.  It is
+# not a re-freeze: it selects the same 45 rows the 2026-09-02 audit confirmed,
+# and it changes no event, no filter term, and no outcome rule.  Rows captured
+# on or after the boundary are reported separately as post-freeze accretion and
+# are never part of the study.
+FREEZE_CAPTURED_BEFORE = "2026-09-02"
 EXPECTED = {"rows": 45, "positive": 18, "negative": 27,
             "events": 36, "holders": 39, "tickers": 11}
+# SHA-256 over the frozen rows' identity and economic fields.  Counts alone
+# would pass if a re-parse changed a lot_change in place while leaving the
+# shape of the cohort intact; this would not.
+EXPECTED_COHORT_DIGEST = (
+    "aec1358174f98b1bc89530f60e1abff6542b6140e466ca62af89ed07f0cb44a6"
+)
 HORIZONS = (1, 5, 10, 20)
 TOP_FIVE = ("BREN", "BRMS", "EMTK", "FAST", "SCMA")
 N_RESAMPLES = 10_000
@@ -52,20 +76,59 @@ def readonly_sqlite(path: Path) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
 
 
-def load_source_rows(path: Path) -> pd.DataFrame:
-    sql = f"""
-        SELECT oc.ticker, oc.change_date, oc.investor_name_raw,
-               COALESCE(ea.entity_id, oc.investor_name_raw) AS holder_id,
-               oc.lot_change, oc.published_at, oc.captured_at, oc.available_at,
-               oc.dq_unknown_publication_time, oc.source_url
-        FROM ownership_change oc
-        LEFT JOIN entity_alias ea ON ea.name_raw = oc.investor_name_raw
-        WHERE oc.threshold='5pct' AND oc.is_custodian_move=1
-          AND oc.lot_change IS NOT NULL AND oc.lot_change != 0
-        ORDER BY oc.ticker, oc.change_date, oc.id
+_SOURCE_SQL = """
+    SELECT oc.ticker, oc.change_date, oc.investor_name_raw,
+           COALESCE(ea.entity_id, oc.investor_name_raw) AS holder_id,
+           oc.lot_change, oc.published_at, oc.captured_at, oc.available_at,
+           oc.dq_unknown_publication_time, oc.source_url
+    FROM ownership_change oc
+    LEFT JOIN entity_alias ea ON ea.name_raw = oc.investor_name_raw
+    WHERE oc.threshold='5pct' AND oc.is_custodian_move=1
+      AND oc.lot_change IS NOT NULL AND oc.lot_change != 0
+      AND {bound}
+    ORDER BY oc.ticker, oc.change_date, oc.id
+"""
+
+
+def load_source_rows(
+    path: Path, captured_before: str | None = FREEZE_CAPTURED_BEFORE
+) -> pd.DataFrame:
+    """Rows of the frozen cohort: the filter, bounded at first-capture time.
+
+    `captured_before=None` returns the unbounded standing query, which is what
+    `load_post_freeze_rows` differences against.  It is not the study cohort.
     """
+    if captured_before is None:
+        sql, params = _SOURCE_SQL.format(bound="1=1"), ()
+    else:
+        sql, params = _SOURCE_SQL.format(bound="oc.captured_at < ?"), (captured_before,)
     with readonly_sqlite(path) as conn:
-        return pd.read_sql_query(sql, conn)
+        return pd.read_sql_query(sql, conn, params=params)
+
+
+def load_post_freeze_rows(
+    path: Path, captured_before: str = FREEZE_CAPTURED_BEFORE
+) -> pd.DataFrame:
+    """Rows the filter matches that were first captured after the freeze.
+
+    These are reported, never studied.  Ordinary capture is expected to grow
+    this set; that growth is not cohort drift, and hiding it would be the same
+    mistake as absorbing it.
+    """
+    sql = _SOURCE_SQL.format(bound="oc.captured_at >= ?")
+    with readonly_sqlite(path) as conn:
+        return pd.read_sql_query(sql, conn, params=(captured_before,))
+
+
+def cohort_digest(rows: pd.DataFrame) -> str:
+    """Order-independent content hash of the frozen rows."""
+    fields = ["ticker", "change_date", "investor_name_raw", "holder_id",
+              "lot_change", "captured_at"]
+    lines = sorted(
+        "|".join(repr(value) for value in record)
+        for record in rows[fields].itertuples(index=False, name=None)
+    )
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def audit_population(rows: pd.DataFrame) -> dict:
@@ -86,6 +149,13 @@ def audit_population(rows: pd.DataFrame) -> dict:
         raise FrozenSpecError("frozen BREN concentration drift")
     if int(per_ticker.reindex(TOP_FIVE).sum()) != 28:
         raise FrozenSpecError("frozen top-five concentration drift")
+    digest = cohort_digest(rows)
+    if digest != EXPECTED_COHORT_DIGEST:
+        raise FrozenSpecError(
+            "frozen cohort content drift: the 45 rows still have the frozen "
+            f"shape but their values changed (digest {digest}, expected "
+            f"{EXPECTED_COHORT_DIGEST})")
+    audit["digest"] = digest
     return audit
 
 
@@ -509,8 +579,22 @@ def main() -> int:
     args = parser.parse_args()
 
     rows = load_source_rows(args.ownership_db)
-    audit = audit_population(rows)
+    try:
+        audit = audit_population(rows)
+    except FrozenSpecError as exc:
+        print(str(exc))
+        return 3
     print("population audit:", json.dumps(audit, sort_keys=True))
+
+    accretion = load_post_freeze_rows(args.ownership_db)
+    if len(accretion):
+        later = accretion[["ticker", "change_date"]].drop_duplicates()
+        print(
+            f"post-freeze accretion (NOT in the study): {len(accretion)} row(s), "
+            f"{len(later)} event(s), {later['ticker'].nunique()} ticker(s) first "
+            f"captured on or after {FREEZE_CAPTURED_BEFORE}: "
+            + ", ".join(f"{t}/{d}" for t, d in later.to_numpy())
+        )
     try:
         events = establish_observability(rows, args.observability_manifest)
     except ObservabilityGateError as exc:
