@@ -40,6 +40,7 @@ from foreign_flow_signal_backtest import (
     date_balanced_hit_edge as foreign_date_balanced_hit_edge,
     trade_stats as foreign_trade_stats,
 )
+from regime_gated_momentum import select_threshold
 
 
 def test_broker_day_aggregates_basic():
@@ -361,6 +362,27 @@ def test_foreign_flow_stats_use_same_date_baseline_and_balance_dates():
     assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
     assert balanced["positive_edge_days"] == 0.5
     print("test_foreign_flow_stats_use_same_date_baseline_and_balance_dates passed")
+
+
+def test_regime_threshold_selection_uses_daily_edge_and_minimum_dates():
+    search = pd.DataFrame([
+        # Best point estimate is deliberately too sparse to be eligible.
+        {"thresh": 0.01, "daily_hit_edge": 0.20, "hit_edge": 0.25,
+         "n_signal_days": 5},
+        # Of the supported variants, daily edge wins even though pooled edge loses.
+        {"thresh": 0.02, "daily_hit_edge": 0.04, "hit_edge": 0.01,
+         "n_signal_days": 25},
+        {"thresh": 0.03, "daily_hit_edge": 0.03, "hit_edge": 0.50,
+         "n_signal_days": 30},
+    ])
+    winner, reliable = select_threshold(search, min_signal_days=20)
+    assert winner["thresh"] == 0.02
+    assert reliable is True
+
+    low_n_winner, reliable = select_threshold(search.iloc[[0]], min_signal_days=20)
+    assert low_n_winner["thresh"] == 0.01
+    assert reliable is False
+    print("test_regime_threshold_selection_uses_daily_edge_and_minimum_dates passed")
 
 
 def _sqrt_252_call_sites(source, filename):
@@ -1040,6 +1062,7 @@ if __name__ == "__main__":
     test_signal_quality_scores_every_row_not_just_triggered()
     test_pattern_type_stats_use_same_date_baseline_and_balance_dates()
     test_foreign_flow_stats_use_same_date_baseline_and_balance_dates()
+    test_regime_threshold_selection_uses_daily_edge_and_minimum_dates()
     test_sqrt_252_matcher_catches_repaired_forms()
     test_no_sqrt_252_anywhere()
     test_kelly_fraction_known_example()
