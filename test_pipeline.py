@@ -24,7 +24,9 @@ from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
                          detect, bagholders_from_payload, bagholders_from_payloads,
-                         inventory_date_blocks, date_offset_holds)
+                         inventory_date_blocks, date_offset_holds,
+                         authoritative_duplicate_deletions, cmd_quarantine,
+                         OHLCV)
 from ml_v2_experiment_1 import (
     EXPERIMENT_XGB_PARAMS, FLOW_WINDOWS, PRICE_FEATURES,
     _historical_net_lots, build_broker_identity_features,
@@ -833,6 +835,53 @@ def test_quarantined_row_is_not_a_baseline_for_the_next_row():
     print("test_quarantined_row_is_not_a_baseline_for_the_next_row passed")
 
 
+def test_authoritative_panel_identifies_only_the_cloned_duplicate():
+    px = pd.DataFrame([
+        {"rid": 1, "date": "2026-01-02", "ticker": "AAA",
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1234},
+        {"rid": 2, "date": "2026-01-02", "ticker": "BBB",
+         "open": 100, "high": 110, "low": 95, "close": 105, "volume": 1234},
+    ])
+    source = px.loc[px["ticker"] == "AAA", ["date", "ticker", *OHLCV]].copy()
+    targets = authoritative_duplicate_deletions(px, source)
+    assert targets[["date", "ticker"]].to_dict("records") == [
+        {"date": "2026-01-02", "ticker": "BBB"}
+    ]
+
+    # If the source cannot uniquely identify the legitimate member, no partial
+    # deletion is allowed.
+    try:
+        authoritative_duplicate_deletions(px, source.iloc[0:0])
+    except RuntimeError as exc:
+        assert "exactly one authoritative member" in str(exc)
+    else:
+        raise AssertionError("ambiguous collision group was not rejected")
+    print("test_authoritative_panel_identifies_only_the_cloned_duplicate passed")
+
+
+def test_quarantine_refresh_removes_healed_rows():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE price_history (
+        date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL,
+        volume REAL, PRIMARY KEY(date,ticker))""")
+    duplicate = ("2026-01-02", 100, 110, 95, 105, 1234)
+    conn.executemany(
+        "INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+        [(duplicate[0], "AAA", *duplicate[1:]),
+         (duplicate[0], "BBB", *duplicate[1:])],
+    )
+    cmd_quarantine(conn)
+    assert conn.execute("SELECT COUNT(*) FROM price_quarantine").fetchone()[0] == 2
+
+    conn.execute(
+        "UPDATE price_history SET close=101, volume=4321 WHERE ticker='BBB'"
+    )
+    cmd_quarantine(conn)
+    assert conn.execute("SELECT COUNT(*) FROM price_quarantine").fetchone()[0] == 0
+    conn.close()
+    print("test_quarantine_refresh_removes_healed_rows passed")
+
+
 def test_trusted_mask_leaves_real_contamination_detectable():
     # The mask must only relax the limit_violation BASELINE. cross_ticker_dup is
     # what actually proves the scraper regressed, and it must survive untouched —
@@ -951,6 +1000,8 @@ if __name__ == "__main__":
     test_predictions_carry_the_columns_the_scorer_reads()
     test_date_offset_only_holds_before_the_open()
     test_quarantined_row_is_not_a_baseline_for_the_next_row()
+    test_authoritative_panel_identifies_only_the_cloned_duplicate()
+    test_quarantine_refresh_removes_healed_rows()
     test_trusted_mask_leaves_real_contamination_detectable()
     test_bagholders_sum_per_day_lots_not_last_value()
     test_bagholders_exclude_net_sellers()

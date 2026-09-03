@@ -23,7 +23,7 @@ The replacement UI, /inventory-chart/, is backed by a clean JSON endpoint:
         &brokers=TOP_5_NS_LOT_C20
 
     -> { success, data: {
-             date:  ["2025-08-25", ...],            # trading days, parallel to ohlc
+             date:  ["2026-08-04", ...],            # currently capped at 20 sessions
              blot/slot/nlot: { "AK": [...], ... },  # buy/sell/NET LOT per broker
              bval/sval/nval: { "AK": [...], ... },  # buy/sell/net VALUE in full Rp
              ohlc:  [ {date, open, high, low, close, volume, volume_sma20}, ... ]
@@ -52,7 +52,9 @@ deliberate on two counts:
      JSON `nval` here is actually full-precision and would be usable, but see (2).
 
   2. It matches the unit of the rows already stored by the old backfill, so a
-     re-fetch HEALS existing rows in place rather than mixing two conventions.
+     recent-window re-fetch heals existing rows in place rather than mixing two
+     conventions. Older contamination is reconciled from the archived full-
+     market parquet; the live endpoint no longer serves enough history.
      bval/sval/bavg/savg are left NULL for the same reason — the live path
      (neobdm_scraper.save_broker_flow) stores those in a different, page-derived
      unit, and reconciling the two conventions is a separate task, not this one.
@@ -87,21 +89,19 @@ BACKFILL_END = "2026-07-04"  # never overwrite live-scraped broker_flow rows fro
 MAX_FAILURE_RATE = 0.30
 FAILURE_SNAPSHOT = "topup-failure.json"   # raw first-failure response, a CI artifact
 
-# 1Y is the window the /inventory-chart/ UI itself caps at, and it is exactly the
-# horizon within which the quarantined bad price_history rows are still healable.
+# Ask for the longest window the endpoint historically allowed. As of 2026-09-03
+# the live service caps every tested request shape to 20 sessions despite these
+# dates; this remains useful for nightly top-ups but cannot heal older history.
 WINDOW_DAYS = 365
 INVESTOR_TYPE = "A"   # A = All (foreign + domestic); matches the site default
 
-# Which brokers the endpoint resolves and returns. This is the SITE'S OWN request
-# grammar — TOP_{n}_{tx}_{unit}_{period}, with n∈{3,5,8}, tx∈{NB,NS,BUY,SELL},
-# unit∈{LOT,VAL}, period∈{C1,C3,C5,C10,C20,C50,ALL} — and this exact pair is what
-# /inventory-chart/ sends, so it is guaranteed accepted (no guessing, no risk of a
-# 400 that burns a run). It resolves to the 5 largest net-buyers + 5 largest
-# net-sellers BY LOT over the last 20 candles, then returns their per-day flow
-# across the whole window. That is the day's dominant flow, which overlaps most of
-# BROKER_FLOW_CODES for an actively-traded name; rows are filtered to
-# BROKER_FLOW_CODES below and the returned-vs-kept coverage is logged each run, so
-# if the overlap turns out too thin the selector (e.g. TOP_8_*_ALL) is one edit.
+# The site's own selector grammar. Live verification on 2026-09-03 established
+# that both these selectors AND 30/101 repeated explicit broker codes now return
+# only 10 brokers and 20 sessions. Keep the dashboard selectors here because they
+# at least choose the current dominant buyers/sellers for top-ups. Historical
+# cleanup uses the previously harvested authoritative ohlc.parquet through
+# price_audit.py reconcile-cross-dups instead of pretending this endpoint can
+# still re-fetch a year.
 INVENTORY_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
 
 
@@ -121,7 +121,7 @@ def _json_or_none(resp):
 
 
 def _date_window(window_days=WINDOW_DAYS):
-    """(start_date, end_date) as YYYY-MM-DD, the full 1Y the UI allows."""
+    """Requested date bounds; the service may return a shorter capped window."""
     end = date.today()
     return (end - timedelta(days=window_days)).isoformat(), end.isoformat()
 
