@@ -50,6 +50,9 @@ USAGE
     py price_audit.py count cross_ticker_dup # one detector only (the CI gate)
     py price_audit.py quarantine             # mark bad rows, write audit table
     py price_audit.py repair corrected.csv   # apply fixes + rescale netval
+    py price_audit.py reconcile-cross-dups ohlc.parquet [--apply]
+                                             # remove proven cloned wrong bars;
+                                             # dry-run unless --apply is present
 
 corrected.csv columns: date,ticker,open,high,low,close,volume
 Get it from any reliable OHLCV source for the flagged (date, ticker) pairs.
@@ -59,6 +62,7 @@ import os
 import re
 import sys
 import sqlite3
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
@@ -519,14 +523,18 @@ def cmd_quarantine(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS price_quarantine (
         date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL,
         volume REAL, reasons TEXT, PRIMARY KEY (date, ticker))""")
+    previous = conn.execute("SELECT COUNT(*) FROM price_quarantine").fetchone()[0]
+    # This table is a snapshot, not an append-only history. Without clearing it,
+    # repaired rows stay quarantined forever even after a fresh audit clears them.
+    conn.execute("DELETE FROM price_quarantine")
     conn.executemany(
         "INSERT OR REPLACE INTO price_quarantine VALUES (?,?,?,?,?,?,?,?)",
         bad[["date", "ticker", "open", "high", "low", "close", "volume", "reasons"]]
         .itertuples(index=False, name=None),
     )
     conn.commit()
-    print(f"quarantined {len(bad)} rows into price_quarantine (originals left intact "
-          "in price_history - nothing deleted).")
+    print(f"refreshed price_quarantine: {previous} previous rows -> {len(bad)} current "
+          "suspects (originals left intact in price_history).")
     print("Backtests should exclude these until repaired, e.g.:")
     print("  LEFT JOIN price_quarantine q USING (date, ticker) WHERE q.date IS NULL")
 
@@ -571,6 +579,126 @@ def cmd_repair(conn, csv_path):
     print("\nRe-run: py price_audit.py audit   to confirm the suspect count dropped.")
 
 
+def authoritative_duplicate_deletions(px, authoritative):
+    """Return cloned rows that are not the authoritative member of a collision.
+
+    Safety invariant: each identical-OHLCV collision group must contain exactly
+    one row whose (date, ticker, OHLCV) agrees with the authoritative panel. If
+    any group has zero or multiple confirmed members, refuse the entire repair;
+    guessing which ticker is real would be worse than leaving it quarantined.
+    """
+    needed = {"date", "ticker", *OHLCV}
+    missing = needed - set(authoritative.columns)
+    if missing:
+        raise ValueError(f"authoritative panel missing columns: {sorted(missing)}")
+
+    source = authoritative[list(needed)].copy()
+    source["date"] = source["date"].astype(str)
+    source["ticker"] = source["ticker"].astype(str).str.upper()
+    if source.duplicated(["date", "ticker"]).any():
+        raise ValueError("authoritative panel has duplicate (date, ticker) keys")
+
+    audited = detect(px)
+    dup = audited[audited["cross_ticker_dup"]][
+        ["rid", "date", "ticker", *OHLCV]
+    ].copy()
+    if dup.empty:
+        return dup
+    dup["date"] = dup["date"].astype(str)
+    dup["ticker"] = dup["ticker"].astype(str).str.upper()
+
+    source = source.rename(columns={c: f"{c}_source" for c in OHLCV})
+    source["_source_present"] = True
+    checked = dup.merge(source, on=["date", "ticker"], how="left")
+    same = checked["_source_present"].fillna(False).to_numpy(dtype=bool)
+    for col in OHLCV:
+        left = pd.to_numeric(checked[col], errors="coerce").to_numpy(dtype=float)
+        right = pd.to_numeric(checked[f"{col}_source"], errors="coerce").to_numpy(dtype=float)
+        same &= np.isclose(left, right, rtol=0, atol=1e-9, equal_nan=False)
+    checked["_confirmed"] = same
+    checked["_collision"] = checked.groupby(
+        ["date", *OHLCV], dropna=False, sort=False
+    ).ngroup()
+    confirmed_per_group = checked.groupby("_collision")["_confirmed"].transform("sum")
+    unresolved = checked[confirmed_per_group != 1]
+    if not unresolved.empty:
+        n_groups = unresolved["_collision"].nunique()
+        raise RuntimeError(
+            f"refusing reconciliation: {n_groups} collision group(s) do not have "
+            "exactly one authoritative member"
+        )
+    return checked.loc[~checked["_confirmed"], ["rid", "date", "ticker", *OHLCV]]
+
+
+def cmd_reconcile_cross_dups(conn, parquet_path, apply=False):
+    """Reconcile duplicate OHLCV groups against an authoritative parquet panel."""
+    source = pd.read_parquet(parquet_path)
+    targets = authoritative_duplicate_deletions(load(conn), source)
+    before = int(detect(load(conn))["cross_ticker_dup"].sum())
+    print(f"cross_ticker_dup rows before: {before}")
+    print(f"proven cloned wrong rows: {len(targets)}")
+    if len(targets):
+        print(targets.groupby("ticker").size().sort_values(ascending=False).to_string())
+    if not apply:
+        print("DRY RUN — pass --apply to archive and remove these rows.")
+        return
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS price_repair_archive (
+        date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL,
+        volume REAL, reason TEXT, archived_at TEXT,
+        PRIMARY KEY (date, ticker)
+    )""")
+    conn.execute("DROP TABLE IF EXISTS temp.reconcile_targets")
+    conn.execute("CREATE TEMP TABLE reconcile_targets (date TEXT, ticker TEXT, PRIMARY KEY(date,ticker))")
+    conn.executemany(
+        "INSERT INTO reconcile_targets VALUES (?,?)",
+        targets[["date", "ticker"]].itertuples(index=False, name=None),
+    )
+
+    live_rows = conn.execute("""
+        SELECT COUNT(*) FROM broker_flow b
+        JOIN reconcile_targets t USING (date, ticker)
+        WHERE b.bval IS NOT NULL
+    """).fetchone()[0]
+
+    stamp = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        INSERT OR REPLACE INTO price_repair_archive
+        SELECT p.date, p.ticker, p.open, p.high, p.low, p.close, p.volume,
+               'cross_ticker_dup_not_authoritative_member', ?
+        FROM price_history p JOIN reconcile_targets t USING (date, ticker)
+    """, (stamp,))
+    broker_rows = conn.execute("""
+        SELECT COUNT(*) FROM broker_flow b
+        JOIN reconcile_targets t USING (date, ticker)
+        WHERE b.bval IS NULL
+    """).fetchone()[0]
+    conn.execute("""
+        DELETE FROM broker_flow
+        WHERE bval IS NULL AND EXISTS (
+            SELECT 1 FROM reconcile_targets t
+            WHERE t.date=broker_flow.date AND t.ticker=broker_flow.ticker
+        )
+    """)
+    conn.execute("""
+        DELETE FROM price_history
+        WHERE EXISTS (
+            SELECT 1 FROM reconcile_targets t
+            WHERE t.date=price_history.date AND t.ticker=price_history.ticker
+        )
+    """)
+    after = int(detect(load(conn))["cross_ticker_dup"].sum())
+    if after:
+        conn.rollback()
+        raise RuntimeError(
+            f"reconciliation would leave {after} cross_ticker_dup rows; rolled back"
+        )
+    conn.commit()
+    print(f"archived and removed {len(targets)} price rows and {broker_rows} derived "
+          f"backfill broker rows; preserved {live_rows} independently scraped live "
+          f"broker rows; cross_ticker_dup rows after: {after}")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "audit"
     conn = sqlite3.connect(DB_PATH)
@@ -582,6 +710,10 @@ if __name__ == "__main__":
         cmd_quarantine(conn)
     elif cmd == "repair":
         cmd_repair(conn, sys.argv[2])
+    elif cmd == "reconcile-cross-dups":
+        cmd_reconcile_cross_dups(
+            conn, sys.argv[2], apply="--apply" in sys.argv[3:]
+        )
     else:
         raise SystemExit(__doc__)
     conn.close()
