@@ -6,6 +6,7 @@ no network access, no Playwright, no live NeoBDM session required.
 
     py -3 -m pytest test_ownership_ingest.py -v
 """
+import json
 import sqlite3
 import sys
 import os
@@ -90,6 +91,20 @@ def make_conn():
     conn = sqlite3.connect(":memory:")
     create_schema(conn)
     return conn
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def redirect_fragment_storage(tmp_path, monkeypatch):
+    """store_pane_fragment() writes raw pane fragments to a path derived from
+    ownership_ingest.HERE, since production capture always wants them beside
+    the real DB. Tests use an in-memory DB but that module-level HERE is not
+    otherwise redirected, so without this fixture every test that exercises a
+    non-empty pane silently writes real .txt.gz files into the actual repo
+    working tree. Point HERE at a throwaway tmp_path for every test instead."""
+    monkeypatch.setattr(ing, "HERE", str(tmp_path))
 
 
 def make_capture(kda1=None, kda5=None, pkda1=None, pkda5=None, badge=None, traces=None):
@@ -549,6 +564,332 @@ def test_per_ticker_savepoint_atomicity_and_recovery():
     n_a = conn.execute("SELECT COUNT(*) FROM ownership_snapshot WHERE ticker = 'TICKER_A'").fetchone()[0]
     assert n_a == 0
 
+    conn.close()
+
+
+# =============================================================================
+# Bitemporal layer: capture_run / ownership_observation / observation_state /
+# capture_payload. The invariant under test throughout: exact replay is
+# idempotent; factual revision is append-only and detectable. Contrast with
+# the legacy INSERT OR IGNORE tests above, which prove the OPPOSITE property
+# is deliberately preserved on the eight original tables.
+# =============================================================================
+
+def test_payload_hash_detects_every_relevant_field_change():
+    """The regression test for the original defect: legacy raw_hash covers a
+    row key plus a 200-byte PANE PREFIX, not the row's own payload, so most
+    fields could change without the hash moving. payload_hash_hex() must
+    react to every field in the payload, not just whichever happen to appear
+    early in the source pane."""
+    base = {"investor_category": "Corporate", "is_foreign": 0,
+            "ownership_pct_raw": "34.6%", "ownership_pct": 34.6,
+            "scrip_lot": 181000000.0, "scrip_pct": 21.0, "scrip_raw": "181M lot 21.0%",
+            "scripless_lot": 118000000.0, "scripless_pct": 13.7,
+            "scripless_raw": "118M lot 13.7%"}
+    base_hash = ing.payload_hash_hex(ing.canonical_json(base))
+    for field, new_value in [
+        ("investor_category", "Individual"), ("is_foreign", 1),
+        ("ownership_pct", 40.0), ("scrip_lot", 999.0), ("scrip_pct", 1.0),
+        ("scripless_lot", 1.0), ("scripless_pct", 1.0),
+    ]:
+        mutated = dict(base)
+        mutated[field] = new_value
+        mutated_hash = ing.payload_hash_hex(ing.canonical_json(mutated))
+        assert mutated_hash != base_hash, \
+            f"payload_hash_hex did not react to a change in '{field}'"
+
+
+def test_exact_replay_is_idempotent_at_observation_layer():
+    conn = make_conn()
+    capture = make_capture(kda1=TPIA_KDA1)
+    c1 = ing.ingest_capture(conn, "TPIA", capture, "2026-08-30T10:00:00Z",
+                             "https://neobdm.tech/stock_detail/TPIA/")
+    assert c1["ownership_observation"] > 0
+    assert c1["ownership_revision"] == 0
+    n_obs = conn.execute("SELECT COUNT(*) FROM ownership_observation").fetchone()[0]
+
+    c2 = ing.ingest_capture(conn, "TPIA", capture, "2026-08-31T10:00:00Z",
+                             "https://neobdm.tech/stock_detail/TPIA/")
+    assert c2["ownership_observation"] == 0, "identical replay must add no new observation rows"
+    assert c2["ownership_revision"] == 0
+    n_obs2 = conn.execute("SELECT COUNT(*) FROM ownership_observation").fetchone()[0]
+    assert n_obs == n_obs2
+
+    state = conn.execute(
+        "SELECT first_seen_at, last_seen_at, times_seen FROM observation_state"
+    ).fetchall()
+    assert all(row[2] == 2 for row in state), "times_seen must advance on an unchanged replay"
+    assert all(row[0] == "2026-08-30T10:00:00Z" for row in state), "first_seen_at must not move"
+    assert all(row[1] == "2026-08-31T10:00:00Z" for row in state), "last_seen_at must advance"
+    conn.close()
+
+
+def test_revision_is_preserved_not_dropped():
+    """The core defect this layer exists to fix: under the legacy tables, a
+    same-key different-payload re-observation is silently discarded by
+    INSERT OR IGNORE with cur.rowcount thrown away. Here it must become a
+    retrievable, numbered revision."""
+    conn = make_conn()
+    c1 = ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                             "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    assert c1["ownership_revision"] == 0
+
+    revised = TPIA_KDA1.replace("34.6%\t181M lot 21.0%", "40.0%\t210M lot 24.3%")
+    c2 = ing.ingest_capture(conn, "TPIA", make_capture(kda1=revised),
+                             "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    assert c2["ownership_observation"] == 1
+    assert c2["ownership_revision"] == 1, "a changed payload at the same key must be a detected revision"
+
+    rows = conn.execute(
+        "SELECT revision_number, observed_at, payload_hash FROM ownership_observation "
+        "WHERE business_key LIKE '%BARITO PACIFIC%' ORDER BY revision_number"
+    ).fetchall()
+    assert [r[0] for r in rows] == [0, 1]
+    assert rows[0][2] != rows[1][2], "both revisions must be independently retrievable"
+
+    # The legacy table, meanwhile, kept only the first-seen value (34.6%) --
+    # this is the existing, deliberately-preserved contract, not a bug.
+    legacy_pct = conn.execute(
+        "SELECT ownership_pct FROM ownership_snapshot WHERE investor_name_raw='BARITO PACIFIC'"
+    ).fetchone()[0]
+    assert legacy_pct == 34.6
+
+    state = conn.execute(
+        "SELECT current_payload_hash, revision_count FROM observation_state "
+        "WHERE business_key LIKE '%BARITO PACIFIC%'"
+    ).fetchone()
+    assert state[1] == 1
+    assert state[0] == rows[1][2], "observation_state must point at the LATEST revision"
+    conn.close()
+
+
+def test_no_business_key_is_ever_silently_dropped():
+    """Counterpart of the legacy tables' discarded cur.rowcount: every
+    re-presented business key must resolve to exactly one outcome
+    (new/unchanged/revised), never vanish without a trace."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    keys_after_1 = {r[0] for r in conn.execute("SELECT business_key FROM observation_state")}
+
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    keys_after_2 = {r[0] for r in conn.execute("SELECT business_key FROM observation_state")}
+    assert keys_after_1 == keys_after_2, "a re-presented key must never disappear from observation_state"
+    conn.close()
+
+
+def test_absence_vs_capture_failure_are_distinguishable():
+    """status='ok' with a key absent means genuine disappearance. Any other
+    status means unknown -- absence must not be inferred from it."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    ok_row = conn.execute(
+        "SELECT status, row_count FROM capture_run WHERE ticker='TPIA' AND pane='insider-current'"
+    ).fetchone()
+    assert ok_row == ("ok", 3)  # TPIA_KDA1 fixture has 3 investor rows
+
+    # A capture where the pane failed to load entirely (None, not empty text)
+    conn2 = make_conn()
+    failed_capture = make_capture(kda1=None)
+    ing.ingest_capture(conn2, "XYZQ", failed_capture,
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/XYZQ/")
+    fail_row = conn2.execute(
+        "SELECT status, row_count, error_detail FROM capture_run "
+        "WHERE ticker='XYZQ' AND pane='insider-current'"
+    ).fetchone()
+    assert fail_row[0] != "ok"
+    assert fail_row[2] is not None, "a non-ok status must carry an explanation"
+    # No observation_state row exists for XYZQ's insider-current -- correctly
+    # UNKNOWN, not incorrectly inferred as "holder never existed".
+    n = conn2.execute(
+        "SELECT COUNT(*) FROM observation_state WHERE ticker='XYZQ'"
+    ).fetchone()[0]
+    assert n == 0
+    conn.close(); conn2.close()
+
+
+def test_row_count_zero_is_not_row_count_null():
+    """A pane that rendered with zero rows and a pane that was never parsed
+    are different facts and must stay distinguishable."""
+    conn = make_conn()
+    empty_but_present = "Data per 31 jul 2026 XLSX\nTotal Kepemilikan: 0.0%\n"
+    ing.ingest_capture(conn, "EMPT", make_capture(kda1=empty_but_present),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/EMPT/")
+    row = conn.execute(
+        "SELECT status, row_count FROM capture_run WHERE ticker='EMPT' AND pane='insider-current'"
+    ).fetchone()
+    assert row == ("ok", 0)
+
+    ing.ingest_capture(conn, "MISS", make_capture(kda1=None),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/MISS/")
+    row2 = conn.execute(
+        "SELECT status, row_count FROM capture_run WHERE ticker='MISS' AND pane='insider-current'"
+    ).fetchone()
+    assert row2[0] != "ok"
+    assert row2[1] is None
+    conn.close()
+
+
+def test_first_and_last_seen_derivation_across_runs():
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    # unchanged middle run
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    revised = TPIA_KDA1.replace("34.6%\t181M lot 21.0%", "36.0%\t190M lot 22.0%")
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=revised),
+                       "2026-09-01T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    row = conn.execute(
+        "SELECT first_seen_at, last_seen_at, times_seen, revision_count FROM observation_state "
+        "WHERE business_key LIKE '%BARITO PACIFIC%'"
+    ).fetchone()
+    assert row == ("2026-08-30T10:00:00Z", "2026-09-01T10:00:00Z", 3, 1)
+    conn.close()
+
+
+def test_observation_state_first_seen_and_current_state_are_exactly_rebuildable():
+    """first_seen_at, current_payload_hash and revision_count always match
+    the log exactly -- unlike last_seen_at (see the next test), these never
+    depend on capture_run reconfirmation."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    revised = TPIA_KDA1.replace("34.6%\t181M lot 21.0%", "36.0%\t190M lot 22.0%")
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=revised),
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    before = sorted(conn.execute(
+        "SELECT business_key, first_seen_at, current_payload_hash, revision_count "
+        "FROM observation_state"
+    ).fetchall())
+    ing.rebuild_observation_state(conn)
+    after = sorted(conn.execute(
+        "SELECT business_key, first_seen_at, current_payload_hash, revision_count "
+        "FROM observation_state"
+    ).fetchall())
+    assert before == after
+    conn.close()
+
+
+def test_observation_state_last_seen_rebuild_is_exact_when_whole_pane_unchanged():
+    """When nothing else in the pane changes between two captures, rebuilt
+    last_seen_at exactly matches the incrementally-tracked value (this is the
+    common production case: most panes are unchanged on most days)."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),  # byte-identical pane
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    before = sorted(conn.execute(
+        "SELECT business_key, last_seen_at FROM observation_state"
+    ).fetchall())
+    ing.rebuild_observation_state(conn)
+    after = sorted(conn.execute(
+        "SELECT business_key, last_seen_at FROM observation_state"
+    ).fetchall())
+    assert before == after
+    assert all(v == "2026-08-31T10:00:00Z" for _, v in after)
+    conn.close()
+
+
+def test_observation_state_last_seen_rebuild_never_overstates_when_pane_partially_changes():
+    """When ONE row in a pane changes, rebuild cannot recover the fact that
+    an UNCHANGED sibling row was reconfirmed the same day (pane_hash is
+    whole-pane, so the sibling's reconfirming run no longer hash-matches).
+    The rebuilt value must therefore be <= the true incrementally-tracked
+    value -- it may understate freshness, it must never overstate it."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    revised = TPIA_KDA1.replace("34.6%\t181M lot 21.0%", "36.0%\t190M lot 22.0%")
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=revised),  # only BARITO PACIFIC changed
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    true_last_seen = dict(conn.execute(
+        "SELECT business_key, last_seen_at FROM observation_state"
+    ).fetchall())
+    ing.rebuild_observation_state(conn)
+    rebuilt_last_seen = dict(conn.execute(
+        "SELECT business_key, last_seen_at FROM observation_state"
+    ).fetchall())
+
+    for key in true_last_seen:
+        assert rebuilt_last_seen[key] <= true_last_seen[key], \
+            f"rebuild overstated freshness for {key}"
+
+    prajogo_key = next(k for k in true_last_seen if "PRAJOGO" in k)
+    assert true_last_seen[prajogo_key] == "2026-08-31T10:00:00Z", \
+        "incremental tracking correctly reconfirms the unchanged row"
+    assert rebuilt_last_seen[prajogo_key] == "2026-08-30T10:00:00Z", \
+        "rebuild cannot see that reconfirmation once the whole pane's hash moved -- documented limitation"
+    conn.close()
+
+
+def test_legacy_isolation_strict_clock_starts_at_zero():
+    """LEGACY_PARTIAL runs must never count toward the strict capture clock."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/",
+                       run_id="2026-08-30", evidence_class="LEGACY_PARTIAL")
+    strict_days = conn.execute(
+        "SELECT COUNT(DISTINCT run_id) FROM capture_run WHERE evidence_class='STRICT' AND status='ok'"
+    ).fetchone()[0]
+    assert strict_days == 0
+
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-09-05T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/",
+                       run_id="2026-09-05", evidence_class="STRICT")
+    strict_days2 = conn.execute(
+        "SELECT COUNT(DISTINCT run_id) FROM capture_run WHERE evidence_class='STRICT' AND status='ok'"
+    ).fetchone()[0]
+    assert strict_days2 == 1
+    conn.close()
+
+
+def test_legacy_table_equals_revision_zero_projection():
+    """The eight original tables must always equal the FIRST-observed
+    (revision_number=0) slice of the log for shared keys -- this is the
+    invariant that lets both layers coexist without diverging."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    revised = TPIA_KDA1.replace("34.6%\t181M lot 21.0%", "36.0%\t190M lot 22.0%")
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=revised),
+                       "2026-08-31T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+
+    legacy_pct = conn.execute(
+        "SELECT ownership_pct FROM ownership_snapshot WHERE investor_name_raw='BARITO PACIFIC'"
+    ).fetchone()[0]
+    rev0_payload = conn.execute(
+        "SELECT payload_json FROM ownership_observation "
+        "WHERE business_key LIKE '%BARITO PACIFIC%' AND revision_number = 0"
+    ).fetchone()[0]
+    assert json.loads(rev0_payload)["ownership_pct"] == legacy_pct
+    conn.close()
+
+
+def test_fragment_replay_fidelity():
+    """A stored gzipped fragment must re-parse to exactly the same rows
+    recorded at ingest time."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "TPIA", make_capture(kda1=TPIA_KDA1),
+                       "2026-08-30T10:00:00Z", "https://neobdm.tech/stock_detail/TPIA/")
+    frag = conn.execute(
+        "SELECT fragment_path, byte_len FROM capture_payload"
+    ).fetchone()
+    assert frag is not None
+    fragment_path, byte_len = frag
+    abs_path = os.path.join(ing.HERE, *fragment_path.split("/"))
+    import gzip
+    with gzip.open(abs_path, "rb") as f:
+        replayed_text = f.read().decode("utf-8")
+    assert len(replayed_text.encode("utf-8")) == byte_len
+    assert op.parse_kda1_current(replayed_text) == op.parse_kda1_current(TPIA_KDA1)
     conn.close()
 
 

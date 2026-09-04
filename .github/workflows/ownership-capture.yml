@@ -21,6 +21,15 @@ name: NeoBDM Ownership Capture
 # INSERT OR IGNORE on natural keys (ownership_ingest.py) already gives first-
 # write-wins semantics for free on every rerun, scheduled or manual.
 #
+# Bitemporal capture-durability remediation: ownership_ingest.py now also
+# writes capture_run / ownership_observation / observation_state into
+# neobdm_ownership.db (still committed exactly as before) AND immutable,
+# content-addressed pane fragments under ownership_raw_fragments/ via
+# store_pane_fragment(). Those fragments are the durable raw evidence a
+# revision can be re-verified against; ownership_raw/ (gitignored) remains a
+# same-day resumable cache only. See the commit step below for how both get
+# persisted together.
+#
 # Cron slot chosen as 02:30 UTC, after inspecting every existing schedule:
 #   23:00 UTC  daily-scrape.yml         (writes neobdm.db, scrapes neobdm.tech, 35-min timeout -> done by 23:35)
 #   00:30 UTC  price-history-topup.yml  (writes neobdm.db, scrapes neobdm.tech, 20-min timeout -> done by 00:50)
@@ -116,11 +125,32 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Commit updated neobdm_ownership.db
+      - name: Commit updated neobdm_ownership.db and new raw fragments
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Only these two paths -- deliberately never `git add .` / `git add -A`.
+          # This repo accumulates untracked scratch/discovery files elsewhere
+          # (probe scripts, one-off JSON dumps, etc.) that an automated commit
+          # must never sweep in.
+          #
+          # ownership_raw_fragments/ is content-addressed and write-once (see
+          # ownership_ingest.store_pane_fragment(): `if not os.path.exists(...)`
+          # before writing, keyed by the pane's own hash). A pane byte-identical
+          # to one already committed hashes to a path that already exists on
+          # disk and in git, so re-adding it here stages nothing -- no duplicate
+          # file, no duplicate commit content. Nothing in this pipeline ever
+          # deletes a fragment, so this step can never stage a deletion either.
+          #
+          # The directory may not exist on a run where every pane happened to
+          # be empty or every ticker failed before any fragment was written
+          # (the ordinary case, once this has run once, is that it already
+          # exists from a prior commit) -- guard the add so a missing directory
+          # can't fail this step under Actions' default `set -e` shell.
           git add neobdm_ownership.db
-          git diff --staged --quiet || git commit -m "Update neobdm_ownership.db ($(date -u +%Y-%m-%d))"
+          if [ -d ownership_raw_fragments ]; then
+            git add ownership_raw_fragments/
+          fi
+          git diff --staged --quiet || git commit -m "Update neobdm_ownership.db + raw fragments ($(date -u +%Y-%m-%d))"
           git pull --rebase
           git push

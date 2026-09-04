@@ -20,6 +20,15 @@ float_holder_snapshot), plus:
 available_at = published_at when independently verifiable, else captured_at.
 Nothing here backdates: a row's available_at is fixed at first insert and
 never moved earlier or later by re-ingestion (see ownership_ingest.py).
+
+Plus a FOUR-TABLE BITEMPORAL LAYER added alongside (capture_run,
+capture_payload, ownership_observation, observation_state). The eight tables
+above record only the state as FIRST observed -- a natural key seen again with
+a different payload is discarded by INSERT OR IGNORE, so revisions, last_seen_at
+and the difference between "holder gone" and "pane failed" are all unavailable
+from them. The new layer records that history additively: no existing table's
+DDL, key, semantics or rows change, which is what keeps Experiment #2A0's
+frozen ownership_change cohort byte-for-byte intact.
 """
 
 SCHEMA_SQL = """
@@ -284,6 +293,136 @@ CREATE TABLE IF NOT EXISTS entity_alias (
 
 CREATE INDEX IF NOT EXISTS idx_entity_alias_entity ON entity_alias (entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_alias_status ON entity_alias (match_status);
+
+-- ---------------------------------------------------------------------------
+-- BITEMPORAL LAYER (added after the capture-durability review).
+--
+-- The eight tables above are first-write-wins: a natural key seen again with a
+-- DIFFERENT payload is silently discarded by INSERT OR IGNORE, and captured_at
+-- never moves. That makes them a faithful record of "the state as FIRST
+-- observed" and nothing else -- no last_seen_at, no revisions, and no way to
+-- tell a holder that genuinely disappeared from a pane that failed to load.
+--
+-- These four tables add that missing history ALONGSIDE the originals. Nothing
+-- above changes: same DDL, same keys, same semantics, same rows. Experiment
+-- #2A0's frozen cohort queries ownership_change and must keep returning
+-- exactly what it returns today, which is why this layer is additive rather
+-- than a widening of the existing keys.
+-- ---------------------------------------------------------------------------
+
+-- Append-only capture manifest: one row per run x ticker x pane, written
+-- whether the pane succeeded or not. This is the table that separates
+-- "the holder is gone" from "we never saw the pane".
+--
+--   status='ok' AND the key absent from that run's observations -> genuine
+--     disappearance.
+--   any other status -> UNKNOWN. No exit may be inferred, ever.
+--
+-- row_count=0 (pane rendered, contained no rows) and row_count IS NULL (pane
+-- never parsed) are deliberately different values, not interchangeable nulls.
+--
+-- evidence_class='STRICT' marks a run captured under this bitemporal ingest.
+-- 'LEGACY_PARTIAL' marks the three pre-remediation runs (2026-08-31/09-01/
+-- 09-03), whose revision history was already lost and cannot be reconstructed.
+-- The strict capture clock counts STRICT runs only.
+CREATE TABLE IF NOT EXISTS capture_run (
+    run_id              TEXT NOT NULL,
+    ticker              TEXT NOT NULL,
+    pane                TEXT NOT NULL,
+    captured_at         TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN (
+                            'ok', 'empty_pane', 'parse_error', 'fetch_error',
+                            'skipped', 'legacy_reconstructed')),
+    snapshot_date_seen  TEXT,
+    row_count           INTEGER,
+    pane_hash           TEXT,
+    error_detail        TEXT,
+    extraction_version  TEXT NOT NULL,
+    evidence_class      TEXT NOT NULL CHECK (evidence_class IN ('STRICT', 'LEGACY_PARTIAL')),
+    PRIMARY KEY (run_id, ticker, pane)
+);
+
+CREATE INDEX IF NOT EXISTS idx_capture_run_evidence ON capture_run (evidence_class, status);
+CREATE INDEX IF NOT EXISTS idx_capture_run_hash ON capture_run (pane_hash);
+
+-- Content-addressed index of retained raw pane fragments. Keyed by content,
+-- so a pane that did not change between runs is recorded once and referenced
+-- by every later capture_run row -- an unchanged pane costs no extra storage.
+--
+-- The BYTES live on disk as write-once gzipped files, NOT in this DB. The DB
+-- is committed on every capture run, and a mutating SQLite file costs roughly
+-- its full size per commit in new git objects (page shifts defeat delta
+-- compression); .git is already ~475 MB with neobdm.db committed 91 times.
+-- Immutable per-run files add only their own bytes, once. fragment_path is
+-- relative to the repo root.
+CREATE TABLE IF NOT EXISTS capture_payload (
+    pane_hash      TEXT PRIMARY KEY,
+    fragment_path  TEXT NOT NULL,
+    byte_len       INTEGER NOT NULL,
+    gz_byte_len    INTEGER,
+    first_run_id   TEXT NOT NULL,
+    first_seen_at  TEXT NOT NULL
+);
+
+-- Append-on-change canonical observations. The bitemporal record.
+--
+--   no prior observation for business_key  -> append, revision_number = 0
+--   payload_hash == latest payload_hash    -> append NOTHING (exact replay is
+--                                             idempotent); bump observation_state
+--   payload_hash differs                   -> append, revision_number = prev + 1
+--
+-- payload_hash is a FULL-WIDTH sha256 over a canonical serialisation of every
+-- economically relevant field for that source family. It is emphatically not
+-- the legacy raw_hash, which hashes the row key plus a 200-byte prefix of the
+-- surrounding pane and therefore cannot detect a change in the value it is
+-- attached to (a 3.1% -> 9.9% ownership revision produces a byte-identical
+-- legacy raw_hash).
+--
+-- business_key is the canonical serialisation of the SAME natural key the
+-- corresponding legacy table uses, so the two layers stay joinable.
+CREATE TABLE IF NOT EXISTS ownership_observation (
+    obs_id             INTEGER PRIMARY KEY,
+    run_id             TEXT NOT NULL,
+    ticker             TEXT NOT NULL,
+    source_family      TEXT NOT NULL,
+    business_key       TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    payload_hash       TEXT NOT NULL,
+    observed_at        TEXT NOT NULL,
+    revision_number    INTEGER NOT NULL,
+    evidence_class     TEXT NOT NULL CHECK (evidence_class IN ('STRICT', 'LEGACY_PARTIAL')),
+    extraction_version TEXT NOT NULL,
+    UNIQUE (business_key, payload_hash, run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_obs_key_time ON ownership_observation (business_key, observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_run ON ownership_observation (run_id);
+
+-- Derived projection over ownership_observation + capture_run. The ONLY
+-- mutable table in this layer, and the only place last_seen_at lives.
+--
+-- Maintained incrementally for query speed, but never the sole copy of the
+-- truth for first_seen_at / current state: those are exactly rebuildable
+-- from ownership_observation alone. last_seen_at is rebuildable from
+-- ownership_observation + capture_run as a conservative lower bound (never
+-- an overstatement, exact whenever nothing else in the same pane changed
+-- meanwhile) -- pane_hash is whole-pane, so it cannot alone reconfirm one
+-- unchanged row inside a pane where a sibling row changed. See
+-- ownership_ingest.rebuild_observation_state() for the exact contract.
+CREATE TABLE IF NOT EXISTS observation_state (
+    business_key         TEXT PRIMARY KEY,
+    ticker               TEXT NOT NULL,
+    source_family        TEXT NOT NULL,
+    first_seen_at        TEXT NOT NULL,
+    last_seen_at         TEXT NOT NULL,
+    times_seen           INTEGER NOT NULL,
+    current_payload_hash TEXT NOT NULL,
+    current_obs_id       INTEGER NOT NULL REFERENCES ownership_observation(obs_id),
+    revision_count       INTEGER NOT NULL,
+    evidence_class       TEXT NOT NULL CHECK (evidence_class IN ('STRICT', 'LEGACY_PARTIAL'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_obs_state_ticker ON observation_state (ticker, source_family);
 """
 
 
