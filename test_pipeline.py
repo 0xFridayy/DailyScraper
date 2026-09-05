@@ -82,31 +82,42 @@ def test_broker_correlation_first_day_is_nan():
 
 
 def test_price_features_no_leakage():
-    # construct a price series where today's close is a dead giveaway of a "cheat"
-    # value, and confirm neither momentum_1d nor volume_ratio for day d can see it
+    """Features as of close(T); target under the EXECUTABLE contract.
+
+    This test used to assert that entry at close(T) was CORRECT. It was not:
+    a decision taken at EOD(T) consumes that same close and the post-session
+    broker summary, so it cannot transact at that close. The target is now
+    open(T+1) -> open(T+2). Features are unchanged and still as-of close(T).
+    """
     px = pd.DataFrame({
         "date": [f"2026-01-{d:02d}" for d in range(1, 11)],
         "ticker": ["AAA"] * 10,
+        "open":  [100, 102, 98, 106, 97, 111, 91, 121, 81, 131],
+        "high":  [101, 103, 100, 107, 99, 112, 92, 122, 82, 132],
+        "low":   [99, 100, 97, 104, 96, 109, 89, 119, 79, 129],
         "close": [100, 101, 99, 105, 98, 110, 90, 120, 80, 130],
         "volume": [1000] * 10,
     })
     out = _price_features_and_target(px)
-
-    # momentum_1d on day d must equal (close[d]-close[d-1])/close[d-1], using
-    # ONLY past+current-close info (both known as of day d's close) — not
-    # tomorrow's close, which is what `target` (not momentum_1d) should hold
-    expected_mom = (101 - 100) / 100
     row = out[out["date"] == "2026-01-02"].iloc[0]
-    assert abs(row["momentum_1d"] - expected_mom) < 1e-9
 
-    # target on day d must be tomorrow's return, not today's
-    expected_target = (99 - 101) / 101
-    assert abs(row["target"] - expected_target) < 1e-9
+    # momentum_1d on day d still uses ONLY past+current close, both known as of
+    # day d's close.
+    assert abs(row["momentum_1d"] - (101 - 100) / 100) < 1e-9
 
-    # volume_ratio must use a rolling mean that EXCLUDES today (shift(1) before
-    # rolling) — with constant volume=1000 this is trivially 1.0 everywhere it's
-    # defined, but the point is it must be defined starting only once 5 PRIOR
-    # days exist, not 5 total days including today
+    # target for a decision on day 2 must be open(day3) -> open(day4): the
+    # earliest anchor the decision could actually reach.
+    assert abs(row["target"] - (106 / 98 - 1)) < 1e-9, (
+        "target must be open(T+1)->open(T+2); if this equals a close-based "
+        "return the unexecutable contract has come back"
+    )
+    # and it must NOT equal the old close(T)->close(T+1) value
+    assert abs(row["target"] - ((99 - 101) / 101)) > 1e-6
+
+    # the close-anchored value survives only as a labelled diagnostic
+    assert abs(row["target_cc"] - ((99 - 101) / 101)) < 1e-9
+
+    # volume_ratio must use a trailing mean that EXCLUDES today.
     defined = out.dropna(subset=["volume_ratio"])
     assert defined["date"].min() == "2026-01-06", (
         "volume_ratio should first be defined on day 6, using days 1-5 as the "
@@ -115,6 +126,194 @@ def test_price_features_no_leakage():
         "leaking into its own trailing average"
     )
     print("test_price_features_no_leakage passed")
+
+
+def _oa_frame(rows):
+    """Small OHLC frame for open-anchored label tests."""
+    return pd.DataFrame(rows)
+
+
+def test_open_anchored_labels_match_hand_computed_values():
+    import price_audit as pa
+    dates = [f"2026-01-{d:02d}" for d in range(1, 6)]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 5,
+        "open":  [100.0, 102.0, 104.0, 106.0, 108.0],
+        "high":  [110.0, 112.0, 114.0, 116.0, 118.0],
+        "low":   [95.0, 97.0, 99.0, 101.0, 103.0],
+        "close": [101.0, 103.0, 105.0, 107.0, 109.0],
+        "volume": [1000] * 5,
+    })
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    r0 = out.iloc[0]
+    # decision day 1: enter open(day2)=102, exit open(day3)=104
+    assert abs(r0["fwd_oo_1"] - (104 / 102 - 1)) < 1e-12
+    # open(day2)=102 -> close(day2)=103
+    assert abs(r0["fwd_oc_1"] - (103 / 102 - 1)) < 1e-12
+    # close(day1)=101 -> open(day2)=102
+    assert abs(r0["gap_1"] - (102 / 101 - 1)) < 1e-12
+    # unchanged close-anchored label
+    assert abs(r0["fwd_1"] - (103 / 101 - 1)) < 1e-12
+    print("test_open_anchored_labels_match_hand_computed_values passed")
+
+
+def test_multiplicative_composition_not_additive():
+    """1 + fwd_1 == (1+gap_1)*(1+fwd_oc_1). The ADDITIVE form is wrong and is
+    asserted wrong here so the distinction is pinned by test, not comment."""
+    import price_audit as pa
+    dates = [f"2026-01-{d:02d}" for d in range(1, 6)]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 5,
+        "open":  [100.0, 108.0, 104.0, 106.0, 108.0],
+        "high":  [115.0, 118.0, 114.0, 116.0, 118.0],
+        "low":   [95.0, 97.0, 99.0, 101.0, 103.0],
+        "close": [101.0, 103.0, 105.0, 107.0, 109.0],
+        "volume": [1000] * 5,
+    })
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    d = out.dropna(subset=["fwd_1", "gap_1", "fwd_oc_1"])
+    assert len(d) > 0
+    lhs = 1 + d["fwd_1"]
+    rhs = (1 + d["gap_1"]) * (1 + d["fwd_oc_1"])
+    assert (lhs - rhs).abs().max() < 1e-12, "multiplicative identity must hold"
+    additive = d["gap_1"] + d["fwd_oc_1"]
+    assert (additive - d["fwd_1"]).abs().max() > 1e-9, (
+        "the additive form must NOT hold — if it does the fixture is degenerate "
+        "and the test proves nothing"
+    )
+    print("test_multiplicative_composition_not_additive passed")
+
+
+def test_invalid_open_anchor_yields_nan_even_when_close_passes():
+    """The FAST 2025-10-14 case: prev_close 580, open 870 (+50%), close 720.
+
+    Close-to-close is +24.1%, inside the 25% band, so _step_valid PASSES — yet
+    an entry anchored on 870 is fabricated. Every target anchored on that open
+    must be NaN, while the ROW itself is kept (never deleted).
+    """
+    import price_audit as pa
+    dates = [f"2026-01-{d:02d}" for d in range(1, 5)]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 4,
+        "open":  [575.0, 870.0, 725.0, 730.0],   # day2 open is +50% on prev close
+        "high":  [585.0, 880.0, 735.0, 740.0],
+        "low":   [570.0, 715.0, 715.0, 720.0],
+        "close": [580.0, 720.0, 730.0, 735.0],   # 580 -> 720 = +24.1%, in band
+        "volume": [1000] * 4,
+    })
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    day1 = out.iloc[0]
+    assert pd.notna(day1["fwd_1"]), "close-anchored label passes the band, as measured"
+    assert pd.isna(day1["fwd_oo_1"]), "entry anchored on an out-of-band open must be NaN"
+    assert pd.isna(day1["fwd_oc_1"])
+    assert pd.isna(day1["gap_1"])
+    assert len(out) == 4, "rows are kept, never deleted"
+    print("test_invalid_open_anchor_yields_nan_even_when_close_passes passed")
+
+
+def test_open_outside_high_low_or_nonpositive_is_invalid():
+    import price_audit as pa
+    dates = [f"2026-01-{d:02d}" for d in range(1, 4)]
+    for label, opens in [("open>high", [100.0, 130.0, 104.0]),
+                          ("open<=0", [100.0, 0.0, 104.0])]:
+        px = _oa_frame({
+            "date": dates, "ticker": ["AAA"] * 3,
+            "open": opens,
+            "high": [110.0, 112.0, 114.0],
+            "low": [95.0, 97.0, 99.0],
+            "close": [101.0, 103.0, 105.0],
+            "volume": [1000] * 3,
+        })
+        out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+        assert pd.isna(out.iloc[0]["fwd_oc_1"]), f"{label} must invalidate the anchor"
+        assert pd.isna(out.iloc[0]["gap_1"]), f"{label} must invalidate the anchor"
+    print("test_open_outside_high_low_or_nonpositive_is_invalid passed")
+
+
+def test_both_realization_purges_hold_on_timestamps():
+    """decision at EOD(i); label enters OPEN(i+1) and realizes OPEN(i+1+h).
+
+    Ordering is on TIMESTAMPS, not dates: OPEN(k) precedes EOD(k) within one
+    session, which is exactly why purge=h (not h+1) is correct.
+    """
+    from walk_forward_backtest import make_walk_forward_splits
+    dates = list(range(258))
+    realized_at = lambda i, h: (i + 1 + h) + 0.0   # OPEN
+    decision_at = lambda i: i + 0.5                # EOD
+
+    for h in (1, 5, 10, 20):
+        splits, report = make_walk_forward_splits(dates, horizon=h)
+        assert splits, f"h={h} produced no scored folds"
+        for sp in splits:
+            train = list(sp["fit"]) + list(sp["eval"])
+            assert max(realized_at(i, h) for i in train) < min(decision_at(k) for k in sp["test"]), \
+                f"outer purge violated at h={h}"
+            assert max(realized_at(i, h) for i in sp["fit"]) < min(decision_at(k) for k in sp["eval"]), \
+                f"internal fit->eval purge violated at h={h}"
+            assert not (set(sp["fit"]) & set(sp["eval"])), "fit/eval must be date-disjoint"
+        assert report["n_folds_scored"] == len(splits)
+
+    # the guard has teeth: with no purge at all the outer invariant fails
+    violations = sum(
+        1 for te in range(30, 258 - 6 + 1, 6)
+        if not max(realized_at(i, 1) for i in range(te)) < min(decision_at(k) for k in range(te, te + 6))
+    )
+    assert violations > 0, "counter-check failed: unpurged folds should violate"
+    print("test_both_realization_purges_hold_on_timestamps passed")
+
+
+def test_thin_and_infeasible_folds_are_skipped_and_counted():
+    from walk_forward_backtest import make_walk_forward_splits
+    dates = list(range(258))
+    _, r20 = make_walk_forward_splits(dates, horizon=20)
+    assert r20["n_infeasible"] == 3, (
+        "at h=20 on a 258-date panel three folds are arithmetically impossible "
+        "(fit block <= 0 after both purges) and must be counted, not scored"
+    )
+    assert r20["n_folds_scored"] + r20["n_infeasible"] + r20["n_too_thin"] == r20["n_folds_nominal"]
+    # every scored fold actually clears the stated minimums
+    for h in (1, 5, 10, 20):
+        splits, rep = make_walk_forward_splits(dates, horizon=h)
+        for sp in splits:
+            assert len(sp["fit"]) >= rep["min_fit_days"]
+            assert len(sp["eval"]) >= rep["min_eval_days"]
+    print("test_thin_and_infeasible_folds_are_skipped_and_counted passed")
+
+
+def test_legacy_experiment1_digest_is_frozen():
+    """The close-contract result is historical provenance, not a value to
+    re-pin. #1E gets its own identity instead."""
+    import ml_v2_experiment_1_robustness as rob
+    assert rob.LEGACY_CLOSE_CONTRACT_DIGEST == "147d734749c71e2d", (
+        "legacy Experiment #1 provenance must not be overwritten — the "
+        "executable re-audit belongs under EXECUTABLE_V1_PREDICTION_DIGEST"
+    )
+    assert hasattr(rob, "EXECUTABLE_V1_PREDICTION_DIGEST")
+    assert rob.EXECUTABLE_V1_PREDICTION_DIGEST != rob.LEGACY_CLOSE_CONTRACT_DIGEST, (
+        "the executable contract cannot reproduce the close contract's digest "
+        "by construction; reusing it would be a false provenance claim"
+    )
+    print("test_legacy_experiment1_digest_is_frozen passed")
+
+
+def test_target_refuses_to_silently_use_the_close_contract():
+    """No `open` and no fwd_oo_1 must RAISE, never quietly fall back.
+
+    A silent fallback to close(T)->close(T+1) is precisely how an unexecutable
+    target would creep back in unnoticed.
+    """
+    px = pd.DataFrame({
+        "date": [f"2026-01-{d:02d}" for d in range(1, 6)],
+        "ticker": ["AAA"] * 5,
+        "close": [100, 101, 99, 105, 98],
+        "volume": [1000] * 5,
+    })
+    try:
+        _price_features_and_target(px)
+        assert False, "must refuse to fall back to the close-anchored target"
+    except ValueError as e:
+        assert "close" in str(e).lower()
+    print("test_target_refuses_to_silently_use_the_close_contract passed")
 
 
 def test_spearman_ic_direction():
@@ -237,8 +436,17 @@ def test_broker_identity_flows_and_observable_inventory_use_net_lots():
 
 def test_ml_v2_walk_forward_splits_are_strictly_chronological():
     panel = pd.DataFrame({"date": [f"d{i:03d}" for i in range(50)]})
-    splits = make_walk_forward_splits(panel, train_min=30, test_window=6)
-    assert len(splits) == 3
+    splits, report = make_walk_forward_splits(
+        panel, train_min=30, test_window=6, return_report=True
+    )
+    # Was 3 before the executable contract. The first candidate fold now has a
+    # 22-date fit block after both realization purges and is correctly rejected
+    # as too thin (MIN_FIT_DAYS=24) — skipped and COUNTED, never silently
+    # scored. The chronology assertions below are the real point of this test.
+    assert len(splits) == 2
+    assert report["n_too_thin"] == 1
+    assert report["n_folds_scored"] + report["n_too_thin"] + report["n_infeasible"] \
+        == report["n_folds_nominal"]
     for split in splits:
         assert set(split["fit"]).isdisjoint(split["eval"])
         assert set(split["fit"]).isdisjoint(split["test"])
@@ -787,7 +995,12 @@ def test_predictions_carry_the_columns_the_scorer_reads():
     # ticker/date/pred. Nothing caught it: check_ml_health imports the module
     # and runs these tests, neither of which executed the report path.
     rng = np.random.default_rng(0)
-    dates = [f"2026-{m:02d}-{d:02d}" for m in (1, 2) for d in range(1, 21)][:40]
+    # 60 dates, not 40: under the executable contract a fold must clear TWO
+    # realization purges plus MIN_FIT_DAYS, so a 40-date panel yields exactly
+    # one candidate fold and it is (correctly) rejected as too thin. The test
+    # is about which COLUMNS survive, so give it a panel long enough to
+    # actually produce folds rather than loosening the split guard for it.
+    dates = [f"2026-{m:02d}-{d:02d}" for m in (1, 2, 3) for d in range(1, 21)][:60]
     rows = []
     for d in dates:
         for t in ("AAA", "BBB", "CCC"):

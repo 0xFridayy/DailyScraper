@@ -179,6 +179,18 @@ def _broker_correlation_1d(bf):
 
 
 def _price_features_and_target(px):
+    """Features as of close(T); target under the EXECUTABLE contract.
+
+    The features are unchanged and all genuinely known by EOD(T). The TARGET
+    is not what it used to be: it is now open(T+1) -> open(T+2), because a
+    decision taken at EOD(T) cannot transact at close(T) — that same close and
+    the post-session broker summary are both inputs to the decision. The old
+    close(T) -> close(T+1) value rides along as `target_cc` for diagnosis only.
+
+    Measured on this panel, the pre-entry close(T)->open(T+1) gap carries
+    +0.5463%/day while the reachable intraday window is -0.1945%/day, so the
+    old target was crediting a window the signal could never have traded.
+    """
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
     px["momentum_1d"] = px["lag_1"] if "lag_1" in px else (
@@ -188,16 +200,33 @@ def _price_features_and_target(px):
     if "lag_5" in px:
         px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    if "fwd_1" in px:
-        px["target"] = px["fwd_1"]
+
+    if "fwd_oo_1" in px:
+        px["target"] = px["fwd_oo_1"]
+    elif "open" in px:
+        # Unguarded fallback for fixtures that carry OHLC but were not built
+        # through clean_panel(open_anchored=True). Never falls back to the
+        # close-anchored value: silently reverting the contract is exactly the
+        # failure this change exists to remove.
+        nxt_open = px.groupby("ticker")["open"].shift(-1)
+        px["target"] = px.groupby("ticker")["open"].shift(-2) / nxt_open - 1
     else:
-        px["next_close"] = px.groupby("ticker")["close"].shift(-1)
-        px["target"] = (px["next_close"] - px["close"]) / px["close"]
-    return px[["ticker", "date", "momentum_1d", "volume_ratio", "target"]]
+        raise ValueError(
+            "executable target needs fwd_oo_1 (clean_panel(open_anchored=True)) "
+            "or an `open` column; refusing to silently fall back to the "
+            "unexecutable close(T)->close(T+1) target"
+        )
+
+    if "fwd_1" in px:
+        px["target_cc"] = px["fwd_1"]
+    else:
+        px["target_cc"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
+
+    return px[["ticker", "date", "momentum_1d", "volume_ratio", "target", "target_cc"]]
 
 
 def build_panel(conn):
-    px = clean_panel(conn, horizons=(1,), lags=(1, 5))
+    px = clean_panel(conn, horizons=(1,), lags=(1, 5), open_anchored=True)
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
     # Backfilled netval was derived from the same close that was contaminated.
     # Dropping bad price keys from y but retaining their broker rows in X would
@@ -219,6 +248,87 @@ def build_panel(conn):
 
 
 TRADE_THRESHOLD = 0.005
+
+#: Minimum FIT block, measured AFTER both realization purges. 24 is not a
+#: round number picked for comfort: the pre-contract protocol's fit block was
+#: 0.8 * train_min = 0.8 * 30 = 24 dates at h=1 with no purges, so requiring 24
+#: preserves exactly the training depth every published Experiment #1 result
+#: was actually computed at, instead of quietly training on thinner and thinner
+#: data as the horizon grows.
+MIN_FIT_DAYS = 24
+#: n_eval can otherwise collapse to 1-2 dates, which makes XGBoost's early
+#: stopping a coin flip rather than a criterion.
+MIN_EVAL_DAYS = 3
+
+
+def make_walk_forward_splits(dates, horizon=1, train_min=30, test_window=6,
+                             eval_fraction=0.20, embargo=0,
+                             min_fit_days=MIN_FIT_DAYS,
+                             min_eval_days=MIN_EVAL_DAYS):
+    """Date-level expanding-window folds with TWO mandatory realization purges.
+
+        [ FIT ] - purge h - [ EVAL ] - purge h (+embargo) - [ TEST ]
+
+    Under the executable contract a label decided at EOD(T) enters at OPEN(T+1)
+    and realizes at OPEN(T+1+h). Both purges are `horizon` and both are
+    mandatory for correctness, not stylistic:
+
+      - OUTER (train -> test): without it the last training rows' labels
+        realize inside the test window.
+      - INTERNAL (fit -> eval): the one a date-level 80/20 cut alone misses.
+        Labels from the tail of FIT realize inside EVAL, so the fitted model
+        has already seen outcomes belonging to its own early-stopping
+        validation period.
+
+    Why `purge = h` and not `h + 1`: with p = h the last training label
+    realizes at OPEN(train_end), while the first test decision is EOD(train_end).
+    OPEN precedes EOD within the same session, so that label was already public
+    before the decision. The invariant is a TIMESTAMP ordering
+    (max realized_at < min decision_at), not a date comparison — a date-only
+    `<` would demand h+1 and discard a whole session for no informational
+    reason.
+
+    EMBARGO is a different thing and is deliberately not conflated with purge.
+    Serial correlation (+0.275 mean pairwise ticker correlation on this panel)
+    is dependence/inference optimism, not leakage, so embargo defaults to 0 and
+    is applied at the outer boundary only — the test block is the measurement
+    of record. embargo=5 is a robustness variant, never the headline.
+
+    Returns (splits, report). Folds whose FIT block is empty (arithmetically
+    impossible at long horizons on a short panel) or thinner than the minimums
+    are SKIPPED and counted in `report` — never silently scored.
+    """
+    dates = tuple(dates)
+    splits, n_infeasible, n_thin = [], 0, 0
+    train_end = train_min
+    while train_end + test_window <= len(dates):
+        train_block = dates[: train_end - horizon - embargo]
+        n_eval = max(1, int(np.ceil(len(train_block) * eval_fraction))) if train_block else 0
+        n_fit = len(train_block) - n_eval - horizon
+
+        if n_fit <= 0 or n_eval == 0:
+            n_infeasible += 1
+        elif n_fit < min_fit_days or n_eval < min_eval_days:
+            n_thin += 1
+        else:
+            splits.append({
+                "fit": train_block[:n_fit],
+                "eval": train_block[len(train_block) - n_eval:],
+                "test": dates[train_end:train_end + test_window],
+            })
+        train_end += test_window
+
+    report = {
+        "n_folds_nominal": len(splits) + n_infeasible + n_thin,
+        "n_folds_scored": len(splits),
+        "n_infeasible": n_infeasible,
+        "n_too_thin": n_thin,
+        "horizon": horizon,
+        "embargo": embargo,
+        "min_fit_days": min_fit_days,
+        "min_eval_days": min_eval_days,
+    }
+    return splits, report
 
 
 def signal_quality(pred, actual, dates=None):
@@ -256,31 +366,37 @@ def signal_quality(pred, actual, dates=None):
     )
 
 
-def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
+def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3,
+                     horizon=1, embargo=0, min_fit_days=MIN_FIT_DAYS,
+                     min_eval_days=MIN_EVAL_DAYS):
     """Returns (cycle_results, pooled_stats, trade_log). trade_log is built
     from the SAME model fit that produced each cycle's out-of-sample
     predictions (not a separate fit) - one row per triggered trade
     (pred > TRADE_THRESHOLD), with the top_k_features SHAP-driving features
-    for that specific prediction, so you can see WHY that trade fired, not
-    just the pooled Sharpe. shap.TreeExplainer is fast for XGBoost, so this
-    adds negligible cost per cycle."""
-    dates = sorted(panel["date"].unique())
-    n = len(dates)
-    cycles = []
-    train_end = train_min
-    while train_end + test_window <= n:
-        cycles.append((dates[:train_end], dates[train_end:train_end + test_window]))
-        train_end += test_window
+    for that specific prediction, so you can see WHY that trade fired.
+    shap.TreeExplainer is fast for XGBoost, so this adds negligible cost.
+
+    `horizon` must match the target's horizon: it sets both realization purges
+    (see make_walk_forward_splits). pooled_stats carries a `split_report` with
+    the skipped/infeasible fold counts — at h=20 on a ~258-date panel some
+    folds are arithmetically impossible, and that is reported, not hidden."""
+    splits, split_report = make_walk_forward_splits(
+        sorted(panel["date"].unique()), horizon=horizon, train_min=train_min,
+        test_window=test_window, embargo=embargo,
+        min_fit_days=min_fit_days, min_eval_days=min_eval_days,
+    )
 
     results = []
     all_preds, all_actuals, all_test_dates = [], [], []
     trade_rows = []
-    for i, (train_dates, test_dates) in enumerate(cycles, 1):
-        train_df = panel[panel["date"].isin(train_dates)]
+    for i, sp in enumerate(splits, 1):
+        train_dates, test_dates = sp["fit"] + sp["eval"], sp["test"]
+        # Cut on DATES, never .iloc: a positional 80/20 split lands mid-date and
+        # puts the same trading day on both sides of the early-stopping
+        # boundary, contaminating the stopping criterion cross-sectionally.
+        fit_df = panel[panel["date"].isin(sp["fit"])]
+        eval_df = panel[panel["date"].isin(sp["eval"])]
         test_df = panel[panel["date"].isin(test_dates)].copy()
-
-        split = int(len(train_df) * 0.8)
-        fit_df, eval_df = train_df.iloc[:split], train_df.iloc[split:]
 
         model = XGBRegressor(**XGB_PARAMS)
         model.fit(
@@ -320,6 +436,7 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3):
     pooled_stats = signal_quality(
         np.concatenate(all_preds), np.concatenate(all_actuals), np.concatenate(all_test_dates)
     )
+    pooled_stats["split_report"] = split_report
     trade_log = pd.DataFrame(trade_rows).sort_values("date").reset_index(drop=True) if trade_rows else pd.DataFrame(
         columns=["cycle", "ticker", "date", "pred", "actual", "top_features"]
     )

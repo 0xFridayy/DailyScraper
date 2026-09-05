@@ -64,7 +64,9 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
-from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+from walk_forward_backtest import (
+    build_panel, FEATURES, XGB_PARAMS, DB_PATH, make_walk_forward_splits,
+)
 from price_audit import clean_panel
 from signal_metrics import trade_stats
 
@@ -86,24 +88,24 @@ VARIANTS = [
 assert all(1 <= v[2] <= MAX_HOLD_DAYS for v in VARIANTS), "a variant's hold_days is outside the 1-7 day requirement"
 
 
-def get_walk_forward_predictions(panel):
+def get_walk_forward_predictions(panel, horizon=1, embargo=0):
     """Same expanding-window CV as walk_forward_backtest.py, but keeps
     ticker/date on every test-set prediction instead of just aggregating
-    Sharpe, so different exit mechanics can be simulated on the same
+    stats, so different exit mechanics can be simulated on the same
     entry signal."""
-    dates = sorted(panel["date"].unique())
-    train_min, test_window = 30, 6
-    cycles, train_end = [], train_min
-    while train_end + test_window <= len(dates):
-        cycles.append((dates[:train_end], dates[train_end:train_end + test_window]))
-        train_end += test_window
+    # One shared split helper, not a fourth divergent copy. This file used to
+    # re-implement walk_forward_backtest's expanding window and 0.8 positional
+    # split independently, so a fix in one never reached the other.
+    splits, _ = make_walk_forward_splits(
+        sorted(panel["date"].unique()), horizon=horizon, embargo=embargo,
+    )
 
     pred_rows = []
-    for train_dates, test_dates in cycles:
-        train_df = panel[panel["date"].isin(train_dates)]
+    for sp in splits:
+        test_dates = sp["test"]
+        fit_df = panel[panel["date"].isin(sp["fit"])]
+        eval_df = panel[panel["date"].isin(sp["eval"])]
         test_df = panel[panel["date"].isin(test_dates)].copy()
-        split = int(len(train_df) * 0.8)
-        fit_df, eval_df = train_df.iloc[:split], train_df.iloc[split:]
         model = XGBRegressor(**XGB_PARAMS)
         model.fit(fit_df[FEATURES], fit_df["target"],
                   eval_set=[(eval_df[FEATURES], eval_df["target"])], verbose=False)
@@ -123,9 +125,17 @@ def _index_price_history(px):
 
 
 def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_days, tp_pct, sl_pct):
-    """Enter at entry_date's close. Each subsequent day, check that day's
-    high/low for a TP/SL hit BEFORE checking the timed exit - a trade that
-    hits both TP and SL on the same day is treated as SL (conservative)."""
+    """Decision at EOD(entry_date); enter at the NEXT session's OPEN.
+
+    Entry used to be entry_date's close, which is not executable: the decision
+    consumes that same close and the post-session broker summary. The anchor is
+    now open(T+1). That is a PRICE ANCHOR, not a guaranteed fill — a locked
+    ARA/ARB open or a thin name may not absorb the order at that price; see
+    ara_arb_simulation.annotate_limits(). Fillability is a separate execution-
+    quality layer and is deliberately not modelled here.
+
+    TP/SL are checked from the entry session onward against that session's own
+    high/low; a day hitting both is treated as SL (conservative)."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -133,7 +143,11 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     i0 = idx_map[entry_date]
     if i0 + 1 >= len(g):
         return None
-    entry_price = g.loc[i0, "close"]
+    # i0 is the DECISION session; the position opens at i0+1's open.
+    entry_price = g.loc[i0 + 1, "open"]
+    if not (entry_price > 0):
+        return None
+    i0 = i0 + 1
 
     for k in range(1, hold_days + 1):
         if i0 + k >= len(g):

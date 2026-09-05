@@ -23,6 +23,7 @@ from signal_metrics import signal_stats
 from walk_forward_backtest import (
     DB_PATH, RANDOM_SEED, XGB_PARAMS, _broker_correlation_1d,
     _broker_day_aggregates, _price_features_and_target,
+    make_walk_forward_splits as _shared_splits,
 )
 
 
@@ -140,8 +141,15 @@ def feature_sets_for_columns(identity_columns, inventory_columns):
 
 
 def build_experiment_panel(conn):
-    """Build one common clean panel and all four feature definitions."""
-    px = clean_panel(conn, horizons=(1,), lags=(1, 3, 5, 10, 20))
+    """Build one common clean panel and all four feature definitions.
+
+    open_anchored=True is mandatory: without it px still carries a raw `open`
+    column (load() always selects the full price_history row), so
+    _price_features_and_target's unguarded fallback would silently compute an
+    un-gap-guarded, un-ARA/ARB-validated open-to-open target instead of the
+    properly validated fwd_oo_1 that price_audit.add_forward_returns builds.
+    """
+    px = clean_panel(conn, horizons=(1,), lags=(1, 3, 5, 10, 20), open_anchored=True)
     bf = pd.read_sql(
         "SELECT date, ticker, broker_code, bval, sval, netval, bavg, savg "
         "FROM broker_flow",
@@ -168,21 +176,23 @@ def build_experiment_panel(conn):
     return panel, feature_sets
 
 
-def make_walk_forward_splits(panel, train_min=30, test_window=6, eval_fraction=0.20):
-    """Precompute date-level fit/eval/test folds once for every feature set."""
-    dates = tuple(sorted(panel["date"].unique()))
-    splits = []
-    train_end = train_min
-    while train_end + test_window <= len(dates):
-        train_dates = dates[:train_end]
-        n_eval = max(1, int(np.ceil(len(train_dates) * eval_fraction)))
-        splits.append({
-            "fit": train_dates[:-n_eval],
-            "eval": train_dates[-n_eval:],
-            "test": dates[train_end:train_end + test_window],
-        })
-        train_end += test_window
-    return splits
+def make_walk_forward_splits(panel, train_min=30, test_window=6, eval_fraction=0.20,
+                              horizon=1, embargo=0, return_report=False):
+    """Precompute date-level fit/eval/test folds once for every feature set.
+
+    Delegates to walk_forward_backtest.make_walk_forward_splits so there is ONE
+    implementation of the split rules. That helper adds the two mandatory
+    realization purges this file previously lacked: the outer train->test purge
+    AND the internal fit->eval purge, without which labels from the tail of FIT
+    realize inside EVAL and the fitted model has already seen outcomes from its
+    own early-stopping validation period.
+    """
+    splits, report = _shared_splits(
+        tuple(sorted(panel["date"].unique())),
+        horizon=horizon, train_min=train_min, test_window=test_window,
+        eval_fraction=eval_fraction, embargo=embargo,
+    )
+    return (splits, report) if return_report else splits
 
 
 def split_digest(splits):
@@ -296,15 +306,31 @@ def main():
         "--determinism-check", action="store_true",
         help="repeat the full experiment and require identical prediction hashes",
     )
+    parser.add_argument(
+        "--embargo", type=int, default=0,
+        help="extra dates purged at the outer train->test boundary beyond the "
+             "mandatory horizon purge (dependence/inference-optimism control, "
+             "not leakage). 0 is the headline run; 5 is the robustness variant.",
+    )
     args = parser.parse_args()
 
     with sqlite3.connect(DB_PATH) as conn:
         panel, feature_sets = build_experiment_panel(conn)
-    splits = make_walk_forward_splits(panel)
+    splits, split_report = make_walk_forward_splits(
+        panel, embargo=args.embargo, return_report=True,
+    )
     print(
         f"Clean common panel: {len(panel)} rows, {panel['date'].nunique()} dates, "
-        f"{panel['ticker'].nunique()} tickers | {len(splits)} identical folds | "
-        f"split {split_digest(splits)} | seed {RANDOM_SEED}"
+        f"{panel['ticker'].nunique()} tickers | {len(splits)} identical folds "
+        f"(embargo={args.embargo}) | split {split_digest(splits)} | seed {RANDOM_SEED}"
+    )
+    print(
+        f"Fold report: scored={split_report['n_folds_scored']} "
+        f"skipped_too_thin={split_report['n_too_thin']} "
+        f"infeasible={split_report['n_infeasible']} "
+        f"nominal={split_report['n_folds_nominal']} "
+        f"min_fit_days={split_report['min_fit_days']} "
+        f"min_eval_days={split_report['min_eval_days']}"
     )
     print("Feature counts: " + ", ".join(f"{name}={len(cols)}" for name, cols in feature_sets.items()))
     table, predictions = run_experiment(panel, feature_sets, splits)

@@ -67,11 +67,38 @@ MIN_PANEL_DATES = 150
 MIN_PANEL_TICKERS = 30
 MAX_FEATURE_NAN = 0.15
 
-# IDX daily limits. A target outside this band is arithmetically impossible on a
-# real listing, so its presence means bad prices reached the panel.
+# IDX daily limits. ara_bound() in price_audit.py is price-tiered (0.20/0.25/
+# 0.35); ARA_MAX pins the widest tier so a single global ceiling can be used
+# here without joining back to the price that set each row's own tier.
 ARA_MAX = 0.35
 ARB_MIN = -0.15
 LIMIT_TOLERANCE = 0.01
+
+# walk_forward_backtest.build_panel() sources the executable contract:
+# clean_panel(horizons=(1,), open_anchored=True) -> panel["target"] = fwd_oo_1
+# = open(T+1) -> open(T+2). That is NOT a single-session return, so the plain
+# [ARB_MIN, ARA_MAX] band is the wrong test for it. price_audit's oo_valid mask
+# chains THREE ARA/ARB-bounded transitions to build fwd_oo_1:
+#   entry  open(T+1)  vs close(T)
+#   step   close(T+1) vs close(T)
+#   exit   open(T+2)  vs close(T+1)
+# A legitimate value can legally exceed the single-session band (e.g. entry
+# pinned at ARB_MIN off close(T), exit pinned at ARA_MAX twice-compounded off
+# close(T) via close(T+1)) — that is not contamination. The bound below is
+# DERIVED by composing the same ARA_MAX/ARB_MIN primitives across
+# TARGET_HORIZON + 1 chained transitions; it is not a separately chosen,
+# arbitrary widened constant. See price_audit.add_forward_returns()'s oo_valid
+# construction and test_pipeline.py::test_open_anchored_labels_match_hand_computed_values.
+TARGET_HORIZON = 1  # must track build_panel()'s clean_panel(horizons=(1,), ...)
+
+
+def _executable_target_bounds(horizon=TARGET_HORIZON):
+    """Max/min feasible fwd_oo_{horizon}, derived by chaining ARA_MAX/ARB_MIN
+    across `horizon + 1` transitions (entry, `horizon` closes, exit — each an
+    independent extremal draw off the same close(T) origin)."""
+    hi = (1 + ARA_MAX) ** (horizon + 1) / (1 + ARB_MIN) - 1
+    lo = (1 + ARB_MIN) ** (horizon + 1) / (1 + ARA_MAX) - 1
+    return lo, hi
 
 # See KNOWN-DEFECT BUDGET above. Both ratchet down, never up.
 #   2026-08-20  4   initial pin
@@ -177,13 +204,16 @@ def check_panel(problems, notes, stats):
         problems.append("panel target is entirely NaN")
         return panel
 
-    impossible = ((t > ARA_MAX + LIMIT_TOLERANCE) | (t < ARB_MIN - LIMIT_TOLERANCE)).sum()
+    lo, hi = _executable_target_bounds()
+    impossible = ((t > hi + LIMIT_TOLERANCE) | (t < lo - LIMIT_TOLERANCE)).sum()
     stats["impossible_targets"] = int(impossible)
     stats["target_kurtosis"] = round(float(t.kurt()), 1)
     if impossible > IMPOSSIBLE_TARGET_BUDGET:
         worst = t.abs().nlargest(3).tolist()
         problems.append(
-            f"{impossible} target(s) outside the IDX limit band, budget is "
+            f"{impossible} target(s) outside the fwd_oo_{TARGET_HORIZON} feasible "
+            f"band [{lo:+.1%}, {hi:+.1%}] (derived by chaining ARA/ARB across "
+            f"{TARGET_HORIZON + 1} transitions), budget is "
             f"{IMPOSSIBLE_TARGET_BUDGET} (worst "
             f"{', '.join(f'{v*100:+.0f}%' for v in worst)}) — contamination is "
             f"GROWING. The scraper defect is writing new bad rows; see "

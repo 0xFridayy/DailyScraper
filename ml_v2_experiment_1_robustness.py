@@ -22,7 +22,31 @@ from ml_v2_experiment_1 import (
 )
 
 
-ACCEPTED_PREDICTION_DIGEST = "147d734749c71e2d"
+#: Experiment #1 (LEGACY, close(T) -> close(T+1) contract). FROZEN PROVENANCE:
+#: never re-pin this in place. That contract is invalid as a tradable-return
+#: claim — the entire drift sat in the pre-entry close->open gap the signal
+#: could not reach — but it remains a real, reproducible RANKING result under a
+#: stated contract, and HEAD must never imply the original experiment used
+#: next-open execution.
+LEGACY_CLOSE_CONTRACT_DIGEST = "147d734749c71e2d"
+
+#: Experiment #1E (EXECUTABLE, open(T+1) -> open(T+2) contract). A separate
+#: contract version with its own identity, not an overwrite of the above.
+#: Pinned 2026-09-05 after determinism was proven two ways: (a) two fully
+#: independent OS-process invocations of `py ml_v2_experiment_1.py --embargo 0`
+#: produced byte-identical stdout (panel shape, split digest, full result
+#: table, and this digest), and (b) an in-process harness rebuilt the panel,
+#: splits, and predictions from two independent sqlite connections and asserted
+#: exact pandas .equals() on the panel, the fold list, every feature set's
+#: prediction rows, and the summary table. See
+#: ML_V2_EXPERIMENT_1E_RESULTS.md for the accepted (negative/weak) finding —
+#: this pin records reproducibility, not a claim that the result is strong.
+EXECUTABLE_V1_PREDICTION_DIGEST = "4dac8d153b33f7aa"
+
+#: What the current run is checked against. Points at the executable contract
+#: once #1E is pinned; until then there is nothing to enforce, and the legacy
+#: digest is deliberately NOT reused as a stand-in for it.
+ACCEPTED_PREDICTION_DIGEST = EXECUTABLE_V1_PREDICTION_DIGEST
 BOOTSTRAP_SEED = 1701
 N_BOOTSTRAP = 20_000
 WEEKLY_BLOCK_DAYS = 5
@@ -209,24 +233,49 @@ def _print_concentration_summary(table, id_column, full_delta):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--jci", default=os.path.join(os.path.dirname(__file__), "jci_daily.csv"))
+    parser.add_argument(
+        "--embargo", type=int, default=0,
+        help="same meaning as ml_v2_experiment_1.py --embargo; 0 is headline, "
+             "5 is the robustness variant.",
+    )
     args = parser.parse_args()
 
     with sqlite3.connect(DB_PATH) as conn:
         panel, feature_sets = build_experiment_panel(conn)
-    splits = make_walk_forward_splits(panel)
+    splits, split_report = make_walk_forward_splits(
+        panel, embargo=args.embargo, return_report=True,
+    )
     print(
         f"Common panel {len(panel)} rows / {panel['date'].nunique()} dates | "
-        f"{len(splits)} folds | split {split_digest(splits)}",
+        f"{len(splits)} folds (embargo={args.embargo}) | split {split_digest(splits)}",
+        flush=True,
+    )
+    print(
+        f"Fold report: scored={split_report['n_folds_scored']} "
+        f"skipped_too_thin={split_report['n_too_thin']} "
+        f"infeasible={split_report['n_infeasible']} "
+        f"nominal={split_report['n_folds_nominal']}",
         flush=True,
     )
     table, predictions = run_experiment(panel, feature_sets, splits)
     digest = prediction_digest(predictions)
-    if digest != ACCEPTED_PREDICTION_DIGEST:
+    if ACCEPTED_PREDICTION_DIGEST is None:
+        # Experiment #1E has not been pinned yet. Report the digest so it can be
+        # reviewed and pinned deliberately; do NOT fall back to comparing against
+        # LEGACY_CLOSE_CONTRACT_DIGEST, which belongs to a different contract and
+        # cannot be reproduced under next-open execution by construction.
+        print(
+            f"Experiment #1E digest (executable contract, UNPINNED): {digest}\n"
+            f"  legacy close-contract digest, frozen: {LEGACY_CLOSE_CONTRACT_DIGEST}",
+            flush=True,
+        )
+    elif digest != ACCEPTED_PREDICTION_DIGEST:
         raise AssertionError(
             f"accepted predictions were not reproduced: {digest} != "
             f"{ACCEPTED_PREDICTION_DIGEST}"
         )
-    print(f"Accepted prediction digest reproduced: {digest}", flush=True)
+    else:
+        print(f"Accepted prediction digest reproduced: {digest}", flush=True)
 
     pred_b = predictions["existing_broker_aggregate"]
     pred_c = predictions["broker_identity"]
