@@ -50,6 +50,50 @@ All four originally-flagged Tier B files are now disposed of:
 
 ---
 
+## Gate 3 feasibility audit (read-only, 2026-09-03)
+
+A read-only audit of the KDA 1%/5% source (`ownership_capture.py`, `ownership_parse.py`,
+`neobdm_ownership.db`, `STOCK_DETAIL_OWNERSHIP_DISCOVERY.md`) found the roadmap's Gate 3
+"monthly, almost certainly not satisfiable" verdict does not hold uniformly across both
+KDA panes:
+
+- **KDA 1% current snapshot (`insider-current`, threshold='1pct') cadence is monthly.**
+  Confirmed live: only one `snapshot_date` transition across 3 captures
+  (`2026-07-31` -> `2026-08-31`).
+- **KDA 5% current snapshot (`insider5p-current`, threshold='5pct') cadence is
+  near-daily**, based on observed source-provided `snapshot_date`. Confirmed live: 3
+  distinct `snapshot_date` values across 3 captures spanning
+  `2026-08-28` -> `2026-08-31` -> `2026-09-01`, tracking consecutive trading days.
+- **`snapshot_date` is parsed directly from NeoBDM's "Data per ..." label**
+  (`ownership_parse.parse_data_per_date`) — source-provided, not inferred or defaulted
+  from `captured_at`.
+- **Daily ownership capture can therefore accumulate genuine KDA5 point-in-time
+  snapshots.** Running the collector more often is not merely re-observing one frozen
+  monthly value for the 5% pane (it is for the 1% pane, where repeat captures dedupe to
+  nothing via `ownership_snapshot`'s `UNIQUE (ticker, threshold, snapshot_date,
+  investor_name_raw)`).
+- **Gate 3 status: WAITING / ACCUMULATING, not structurally impossible.** Only 3 capture
+  runs exist total (`captured_at` 2026-08-31, 2026-09-01, 2026-09-03) — far too few to
+  certify Gate 2c (>=20 distinct snapshot dates), but the earlier "never" conclusion was
+  based on treating both panes as monolithically monthly, which the live data contradicts
+  for the 5% pane.
+- **Gate 2c must not pool 1pct and 5pct snapshot dates as interchangeable history.** The
+  two panes' dates must be reported and evaluated separately
+  (`STOCK_DETAIL_OWNERSHIP_DISCOVERY.md` — "cannot be joined on date"); a passing count
+  must come predominantly from `threshold='5pct'` depth, not a pooled total that hides the
+  1pct pane still being near-static.
+- **Do not relax Gate 2c, start Experiment #2, or change ownership features yet.** This
+  finding changes the diagnosis of why Gate 2c currently fails and the outlook, not the
+  bar itself.
+- **Re-evaluate after ~15–20 trading days of sustained daily capture, then again at 60
+  trading days**, once enough `insider5p-current` observations exist to confirm the
+  near-daily cadence holds without long stalls.
+
+No files, DB rows, roadmap text, workflows, or schedules were modified by this audit —
+read-only queries against `neobdm_ownership.db` only.
+
+---
+
 ## Future architecture note (not implemented)
 
 Preserved for reference only — do not build this yet:
