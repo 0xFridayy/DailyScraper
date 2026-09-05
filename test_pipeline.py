@@ -1008,12 +1008,17 @@ def test_build_panel_cannot_recreate_impossible_target_returns():
 
 
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
+    # d2->d4's gap_1 is NaN for the same reason its fwd_1 is: d3 is missing,
+    # so decision-at-d2 -> (positionally-next-but-calendar-discontiguous) d4
+    # is not a valid transition. simulate_trade() now reads gap_1 (not
+    # fwd_1) for the decision->entry step, so this fixture supplies both.
     px = pd.DataFrame({
         "ticker": ["AAA", "AAA", "AAA"],
         "date": ["d1", "d2", "d4"],
         "open": [100.0, 110.0, 500.0], "high": [100.0, 110.0, 500.0],
         "low": [100.0, 110.0, 500.0], "close": [100.0, 110.0, 500.0],
         "fwd_1": [0.10, np.nan, np.nan],
+        "gap_1": [0.10, np.nan, np.nan],
     })
     by_ticker, by_date = _index_price_history(px)
     ret = simulate_trade(by_ticker, by_date, "AAA", "d2", 1, None, None)
@@ -1029,16 +1034,26 @@ def _off_by_one_regression_fixture():
     difference is deliberate: it is what makes a regression to the old
     off-by-one (which evaluated TP/SL against T+2 instead of T+1) fail loudly
     instead of silently passing for an unrelated reason.
+
+    Routed through the real price_audit.add_forward_returns(open_anchored=True)
+    pipeline (not hand-set) so `gap_1` is genuinely computed and valid at d1 —
+    simulate_trade() now requires that certificate for the decision->entry
+    step. fwd_1 comes out identical to the values this fixture used to
+    hard-code (verified by inspection: every step here is comfortably inside
+    the ARA/ARB band), so none of the downstream assertions change.
     """
+    import price_audit as pa
+    dates = ["d1", "d2", "d3", "d4"]
     px = pd.DataFrame({
         "ticker": ["AAA"] * 4,
-        "date": ["d1", "d2", "d3", "d4"],
+        "date": dates,
         "open":  [100.0, 105.0, 110.0, 130.0],
         "high":  [101.0, 120.0, 115.0, 140.0],
         "low":   [99.0, 90.0, 108.0, 125.0],
         "close": [100.0, 110.0, 130.0, 135.0],
-        "fwd_1": [(110 - 100) / 100, (130 - 110) / 110, (135 - 130) / 130, np.nan],
+        "volume": [1000] * 4,
     })
+    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
     return _index_price_history(px)
 
 
@@ -1106,6 +1121,82 @@ def test_hold_days_two_expires_at_close_t_plus_2():
         f"hold_days=2 must exit at T+2's close (expected {expected:+.6f}, got {ret})"
     )
     print("test_hold_days_two_expires_at_close_t_plus_2 passed")
+
+
+def test_simulator_refuses_fabricated_open_even_when_close_step_passes():
+    """PR #36 review: the FAST 2025-10-14 case, at the strategy-simulator
+    level. prev_close(T)=580, open(T+1)=870 (+50%), close(T+1)=720.
+    close(T)->close(T+1) is +24.1%, comfortably inside the 25% band an
+    earlier version of simulate_trade checked via `fwd_1` alone — but
+    open(T+1)=870 is not a real anchor. gap_1 must be NaN and the simulator
+    must refuse the trade entirely, regardless of hold_days/tp/sl.
+    """
+    import price_audit as pa
+    dates = ["d1", "d2"]
+    px = pd.DataFrame({
+        "ticker": ["AAA"] * 2,
+        "date": dates,
+        "open":  [575.0, 870.0],
+        "high":  [585.0, 880.0],
+        "low":   [570.0, 715.0],
+        "close": [580.0, 720.0],
+        "volume": [1000] * 2,
+    })
+    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    by_ticker, by_date = _index_price_history(px)
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    assert ret is None, (
+        "a fabricated open(T+1) must block the trade even though the "
+        "close(T)->close(T+1) step alone would pass"
+    )
+    print("test_simulator_refuses_fabricated_open_even_when_close_step_passes passed")
+
+
+def test_simulator_trades_normally_on_a_valid_next_open():
+    """Minimal pair with the test above: identical close(T)->close(T+1) step
+    (580->720, +24.1%), but open(T+1)=590 is a real anchor this time. The
+    simulator must trade normally, proving the guard above is about open
+    validity specifically, not an overzealous rejection of this close path."""
+    import price_audit as pa
+    dates = ["d1", "d2"]
+    px = pd.DataFrame({
+        "ticker": ["AAA"] * 2,
+        "date": dates,
+        "open":  [575.0, 590.0],
+        "high":  [585.0, 730.0],
+        "low":   [570.0, 585.0],
+        "close": [580.0, 720.0],
+        "volume": [1000] * 2,
+    })
+    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    by_ticker, by_date = _index_price_history(px)
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    expected = (720.0 - 590.0) / 590.0
+    assert ret is not None and abs(ret - expected) < 1e-9, (
+        f"a valid open(T+1) anchor must trade normally (expected {expected:+.6f}, got {ret})"
+    )
+    print("test_simulator_trades_normally_on_a_valid_next_open passed")
+
+
+def test_simulator_raises_when_gap_1_is_missing_entirely():
+    """PR #36 review: a price frame built WITHOUT open_anchored=True (no
+    `gap_1` column at all) must raise, never silently fall back to reading
+    the raw `open` column with no validity guard behind it."""
+    px = pd.DataFrame({
+        "ticker": ["AAA"] * 2,
+        "date": ["d1", "d2"],
+        "open":  [575.0, 870.0],
+        "high":  [585.0, 880.0],
+        "low":   [570.0, 715.0],
+        "close": [580.0, 720.0],
+    })
+    by_ticker, by_date = _index_price_history(px)
+    try:
+        simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+        assert False, "must refuse to silently use raw open without a gap_1 certificate"
+    except ValueError as e:
+        assert "gap_1" in str(e) and "open_anchored" in str(e)
+    print("test_simulator_raises_when_gap_1_is_missing_entirely passed")
 
 
 def test_all_tracked_model_price_consumers_use_clean_panel():
@@ -1507,6 +1598,9 @@ if __name__ == "__main__":
     test_tp_and_sl_hit_on_entry_session_are_detected()
     test_one_day_hold_never_touches_t_plus_2()
     test_hold_days_two_expires_at_close_t_plus_2()
+    test_simulator_refuses_fabricated_open_even_when_close_step_passes()
+    test_simulator_trades_normally_on_a_valid_next_open()
+    test_simulator_raises_when_gap_1_is_missing_entirely()
     test_all_tracked_model_price_consumers_use_clean_panel()
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()

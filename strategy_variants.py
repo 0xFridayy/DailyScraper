@@ -142,7 +142,23 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     hold loop, so hold_days=1 evaluated T+2 instead of T+1 — one session too
     long. TP/SL are checked from the entry session onward against each held
     session's own high/low; a day hitting both is treated as SL
-    (conservative)."""
+    (conservative).
+
+    The decision(T)->entry(T+1) transition is certified by `gap_1`
+    (price_audit.add_forward_returns(open_anchored=True)): gap_1 is NaN
+    unless BOTH the close(T)->close(T+1) step is valid AND open(T+1) passes
+    _open_anchor_valid (>0, within [low, high], within the ARA/ARB band off
+    close(T)). An earlier version of this function checked `fwd_1` alone for
+    this transition, which validates only the close step and says nothing
+    about the open — a close that legitimately passes its own band check can
+    still sit behind a fabricated open (the documented FAST 2025-10-14 case:
+    prev_close 580, open 870 (+50%), close 720 — close-to-close is +24.1%,
+    inside the 25% band, while the open is not). That let the simulator
+    transact on an open the executable-contract guard exists specifically to
+    reject. The caller MUST build its price frame with
+    clean_panel(..., open_anchored=True) so `gap_1` exists as a column —
+    its absence is a caller error (raises); `gap_1` being NaN for a specific
+    decision row is a legitimate per-row invalidity (skip that trade)."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -150,14 +166,18 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     i0 = idx_map[entry_date]
     if i0 + 1 >= len(g):
         return None
-    # The decision(T)->entry(T+1) step is itself a transition that can bridge
-    # a quarantine/suspension gap now that entry no longer coincides with the
-    # decision session (open(i0+1) may not really be the very next trading
-    # day if a row was dropped), so it needs the same guard every held
-    # transition below gets.
-    if "fwd_1" in g and pd.isna(g.loc[i0, "fwd_1"]):
-        return None
-    # i0 is the DECISION session; the position opens at i0+1's open.
+    if "gap_1" not in g:
+        raise ValueError(
+            "simulate_trade requires gap_1 -- build the price frame with "
+            "clean_panel(conn, horizons=(1,), open_anchored=True). Without "
+            "it, entry_price would read a raw open with no open-anchor "
+            "validity, ARA/ARB band, or gap guard applied at all -- exactly "
+            "the failure this contract exists to prevent."
+        )
+    if pd.isna(g.loc[i0, "gap_1"]):
+        return None  # decision->entry transition invalid: bad close step, or a fabricated open(T+1)
+    # i0 is the DECISION session; the position opens at i0+1's open, now
+    # certified valid by the gap_1 check above.
     entry_price = g.loc[i0 + 1, "open"]
     if not (entry_price > 0):
         return None
@@ -234,7 +254,10 @@ def run_strategy_search(panel, px, search_frac=0.7):
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = clean_panel(conn, horizons=(1,), lags=(1,))
+    # open_anchored=True is mandatory: simulate_trade() now requires the
+    # gap_1 certificate to validate the decision->entry open, not just a
+    # raw `open` column with no ARA/ARB or contiguity guard behind it.
+    px = clean_panel(conn, horizons=(1,), lags=(1,), open_anchored=True)
     conn.close()
 
     result = run_strategy_search(panel, px)
