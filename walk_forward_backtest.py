@@ -199,9 +199,26 @@ def _price_features_and_target(px):
     the post-session broker summary are both inputs to the decision. The old
     close(T) -> close(T+1) value rides along as `target_cc` for diagnosis only.
 
-    Measured on this panel, the pre-entry close(T)->open(T+1) gap carries
-    +0.5463%/day while the reachable intraday window is -0.1945%/day, so the
-    old target was crediting a window the signal could never have traded.
+    Measured on this panel, the pre-entry close(T)->open(T+1) gap carried
+    +0.5463%/day while the reachable intraday window carried -0.1945%/day —
+    the legacy edge largely disappeared once that unreachable gap was removed,
+    consistent with the model having loaded materially on it. That is not a
+    full causal decomposition of the legacy edge; no such decomposition was
+    measured.
+
+    `target` ONLY ever comes from `fwd_oo_1` — there is no raw-OHLC fallback.
+    An earlier version of this function accepted a bare `open` column and
+    reconstructed open(T+1)->open(T+2) directly, unguarded by open-anchor
+    validity, the ARA/ARB band, or the quarantine/contiguity checks that
+    `price_audit.add_forward_returns(..., open_anchored=True)` applies. That
+    fallback ran silently and produced a target that LOOKED correct — it is
+    the exact same failure class as `ml_v2_experiment_1.build_experiment_panel`
+    once forgetting `open_anchored=True` and silently scoring an unvalidated
+    target instead of erroring. The fix there was to pass the flag; the fix
+    here is to remove the fallback so forgetting it can no longer be silent
+    regardless of caller. Build prices through
+    `clean_panel(conn, horizons=(1,), open_anchored=True)` and pass the
+    result in; there is no other supported path to a `target` column.
     """
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
@@ -213,21 +230,17 @@ def _price_features_and_target(px):
         px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
     px["volume_ratio"] = px["volume"] / px["vol_ma5"]
 
-    if "fwd_oo_1" in px:
-        px["target"] = px["fwd_oo_1"]
-    elif "open" in px:
-        # Unguarded fallback for fixtures that carry OHLC but were not built
-        # through clean_panel(open_anchored=True). Never falls back to the
-        # close-anchored value: silently reverting the contract is exactly the
-        # failure this change exists to remove.
-        nxt_open = px.groupby("ticker")["open"].shift(-1)
-        px["target"] = px.groupby("ticker")["open"].shift(-2) / nxt_open - 1
-    else:
+    if "fwd_oo_1" not in px:
         raise ValueError(
-            "executable target needs fwd_oo_1 (clean_panel(open_anchored=True)) "
-            "or an `open` column; refusing to silently fall back to the "
-            "unexecutable close(T)->close(T+1) target"
+            "executable target needs fwd_oo_1 — build prices through "
+            "clean_panel(conn, horizons=(1,), open_anchored=True) and pass "
+            "the result in. There is no raw-OHLC fallback: reconstructing "
+            "open(T+1)->open(T+2) here would bypass open-anchor validity, "
+            "the ARA/ARB band, and the quarantine/contiguity guards that "
+            "add_forward_returns() applies, silently recreating an "
+            "unvalidated target that looks correct."
         )
+    px["target"] = px["fwd_oo_1"]
 
     if "fwd_1" in px:
         px["target_cc"] = px["fwd_1"]

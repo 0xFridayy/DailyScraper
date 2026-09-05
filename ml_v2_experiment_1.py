@@ -143,11 +143,15 @@ def feature_sets_for_columns(identity_columns, inventory_columns):
 def build_experiment_panel(conn):
     """Build one common clean panel and all four feature definitions.
 
-    open_anchored=True is mandatory: without it px still carries a raw `open`
-    column (load() always selects the full price_history row), so
-    _price_features_and_target's unguarded fallback would silently compute an
-    un-gap-guarded, un-ARA/ARB-validated open-to-open target instead of the
-    properly validated fwd_oo_1 that price_audit.add_forward_returns builds.
+    open_anchored=True is mandatory: without it px lacks `fwd_oo_1`, and
+    _price_features_and_target() now raises ValueError rather than deriving
+    anything from the raw `open` column it would otherwise still carry
+    (load() always selects the full price_history row). An earlier version
+    of that function had an unguarded raw-open fallback that silently
+    computed an un-gap-guarded, un-ARA/ARB-validated open-to-open target
+    instead of the properly validated fwd_oo_1 that
+    price_audit.add_forward_returns builds; it was removed for exactly the
+    silent-failure risk this docstring used to warn about.
     """
     px = clean_panel(conn, horizons=(1,), lags=(1, 3, 5, 10, 20), open_anchored=True)
     bf = pd.read_sql(

@@ -88,9 +88,19 @@ def test_price_features_no_leakage():
     a decision taken at EOD(T) consumes that same close and the post-session
     broker summary, so it cannot transact at that close. The target is now
     open(T+1) -> open(T+2). Features are unchanged and still as-of close(T).
+
+    _price_features_and_target() no longer accepts a bare `open` column and
+    reconstructs a target from it (PR #36 hardening: that fallback bypassed
+    open-anchor validity, the ARA/ARB band, and the quarantine/contiguity
+    guards entirely). So this fixture is routed through the real
+    add_forward_returns() validity pipeline first, exactly as production
+    does via clean_panel(open_anchored=True), rather than handing
+    _price_features_and_target raw OHLC and letting it derive anything.
     """
+    import price_audit as pa
+    dates = [f"2026-01-{d:02d}" for d in range(1, 11)]
     px = pd.DataFrame({
-        "date": [f"2026-01-{d:02d}" for d in range(1, 11)],
+        "date": dates,
         "ticker": ["AAA"] * 10,
         "open":  [100, 102, 98, 106, 97, 111, 91, 121, 81, 131],
         "high":  [101, 103, 100, 107, 99, 112, 92, 122, 82, 132],
@@ -98,6 +108,7 @@ def test_price_features_no_leakage():
         "close": [100, 101, 99, 105, 98, 110, 90, 120, 80, 130],
         "volume": [1000] * 10,
     })
+    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
     out = _price_features_and_target(px)
     row = out[out["date"] == "2026-01-02"].iloc[0]
 
@@ -423,22 +434,45 @@ def test_legacy_experiment1_digest_is_frozen():
 
 
 def test_target_refuses_to_silently_use_the_close_contract():
-    """No `open` and no fwd_oo_1 must RAISE, never quietly fall back.
+    """fwd_oo_1 absent must RAISE, never quietly fall back to anything else —
+    regardless of which raw OHLC columns happen to be present.
 
-    A silent fallback to close(T)->close(T+1) is precisely how an unexecutable
-    target would creep back in unnoticed.
+    PR #36 hardening removed the raw-`open` fallback entirely: an earlier
+    version accepted a bare `open` column and reconstructed
+    open(T+1)->open(T+2) directly, unguarded by open-anchor validity, the
+    ARA/ARB band, or the quarantine/contiguity checks that
+    add_forward_returns(open_anchored=True) applies — the same silent-failure
+    class as build_experiment_panel() once forgetting open_anchored=True.
+    fwd_oo_1 is now the ONLY accepted source of `target`, so both a frame
+    missing `open` entirely AND a frame carrying full raw OHLC but no
+    fwd_oo_1 must raise identically.
     """
-    px = pd.DataFrame({
+    no_open_no_fwd_oo_1 = pd.DataFrame({
         "date": [f"2026-01-{d:02d}" for d in range(1, 6)],
         "ticker": ["AAA"] * 5,
         "close": [100, 101, 99, 105, 98],
         "volume": [1000] * 5,
     })
-    try:
-        _price_features_and_target(px)
-        assert False, "must refuse to fall back to the close-anchored target"
-    except ValueError as e:
-        assert "close" in str(e).lower()
+    raw_ohlc_but_no_fwd_oo_1 = pd.DataFrame({
+        "date": [f"2026-01-{d:02d}" for d in range(1, 6)],
+        "ticker": ["AAA"] * 5,
+        "open":  [100, 102, 98, 106, 97],
+        "high":  [101, 103, 100, 107, 99],
+        "low":   [99, 100, 97, 104, 96],
+        "close": [100, 101, 99, 105, 98],
+        "volume": [1000] * 5,
+    })
+    for label, px in (
+        ("no open, no fwd_oo_1", no_open_no_fwd_oo_1),
+        ("full raw OHLC present, but no fwd_oo_1", raw_ohlc_but_no_fwd_oo_1),
+    ):
+        try:
+            _price_features_and_target(px)
+            assert False, f"{label}: must refuse, never derive target from raw OHLC"
+        except ValueError as e:
+            assert "fwd_oo_1" in str(e), (
+                f"{label}: error must name fwd_oo_1 as the only accepted source"
+            )
     print("test_target_refuses_to_silently_use_the_close_contract passed")
 
 

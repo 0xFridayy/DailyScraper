@@ -37,6 +37,23 @@ Every table, delta, and conclusion below is unchanged and still applies. This
 is reported, not assumed: the two independent-run and in-process
 determinism proofs were both rerun after the fix, not just before it.
 
+## Post-review fallback removal (2026-09-05)
+
+A second PR review pass found `walk_forward_backtest._price_features_and_target()`
+still contained a raw-`open` fallback for frames lacking `fwd_oo_1`: it
+reconstructed open(T+1)->open(T+2) directly from `open.shift()`, bypassing
+open-anchor validity, the ARA/ARB band, and the quarantine/contiguity guards
+entirely — the same silent-failure class as `build_experiment_panel()` once
+forgetting `open_anchored=True` (see the first audit above). The fallback is
+now removed: `fwd_oo_1` is the only accepted source of `target`, and its
+absence raises `ValueError` unconditionally, regardless of what raw OHLC
+columns happen to be present. Both production callers
+(`walk_forward_backtest.build_panel()`, `ml_v2_experiment_1.build_experiment_panel()`)
+already passed `open_anchored=True`, so only test fixtures exercised the
+removed path. Rebuilt, rerun, and reconfirmed: panel (9,861 rows), split
+digest (`1856490d23c5a5c0`), and prediction digest (`4dac8d153b33f7aa`) are
+all unchanged.
+
 ## Why the contract changed
 
 The legacy Experiment #1 target was `fwd_1`, the clean close(T)→close(T+1)
@@ -47,8 +64,11 @@ decision could actually transact at is **open(T+1)**, not close(T). As
 measured on this panel and recorded in `walk_forward_backtest.py`'s
 `_price_features_and_target` docstring, the pre-entry close(T)→open(T+1) gap
 carried +0.5463%/day while the reachable open(T+1)→close(T+1) window carried
-−0.1945%/day — the entire legacy edge sat in a window the signal could never
-have traded.
+−0.1945%/day. The legacy edge largely disappeared once that unreachable gap
+was removed — consistent with the model having loaded materially on it — but
+this is not a full causal decomposition of the legacy edge; no such
+decomposition was measured, and the weaker statement is the one the evidence
+supports.
 
 - **Decision timing:** EOD(T). All features (price and broker-flow) are as of
   close(T) and are unchanged from Experiment #1.
