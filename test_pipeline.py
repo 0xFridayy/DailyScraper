@@ -861,6 +861,93 @@ def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
     print("test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap passed")
 
 
+def _off_by_one_regression_fixture():
+    """decision=d1(T), entry=d2(T+1), d3=T+2, d4=T+3.
+
+    d2's high/low (120/90) breach a 10%-TP / 5%-SL threshold off entry_price
+    105; d3's high/low (115/108) do NOT breach those same thresholds. That
+    difference is deliberate: it is what makes a regression to the old
+    off-by-one (which evaluated TP/SL against T+2 instead of T+1) fail loudly
+    instead of silently passing for an unrelated reason.
+    """
+    px = pd.DataFrame({
+        "ticker": ["AAA"] * 4,
+        "date": ["d1", "d2", "d3", "d4"],
+        "open":  [100.0, 105.0, 110.0, 130.0],
+        "high":  [101.0, 120.0, 115.0, 140.0],
+        "low":   [99.0, 90.0, 108.0, 125.0],
+        "close": [100.0, 110.0, 130.0, 135.0],
+        "fwd_1": [(110 - 100) / 100, (130 - 110) / 110, (135 - 130) / 130, np.nan],
+    })
+    return _index_price_history(px)
+
+
+def test_hold_days_one_uses_entry_session_high_low_and_close():
+    """Requirement 1: hold_days=1 with no TP/SL must exit at T+1's own close,
+    computed off entry_price = open(T+1) = 105."""
+    by_ticker, by_date = _off_by_one_regression_fixture()
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    expected = (110.0 - 105.0) / 105.0  # close(T+1) vs open(T+1)
+    assert ret is not None and abs(ret - expected) < 1e-9, (
+        f"hold_days=1 must exit at T+1's close (expected {expected:+.6f}, got {ret}); "
+        "the old off-by-one would evaluate T+2's close (130) instead"
+    )
+    print("test_hold_days_one_uses_entry_session_high_low_and_close passed")
+
+
+def test_tp_and_sl_hit_on_entry_session_are_detected():
+    """Requirement 2: a TP or SL breach on T+1 itself must fire immediately.
+
+    T+1's high=120 clears a 10% TP off entry_price=105 (threshold 115.5); T+2's
+    high=115 does NOT clear that same threshold. If the old off-by-one bug
+    (checking T+2 instead of T+1) were reintroduced, this TP would silently
+    fail to trigger and the trade would fall through to a timed exit instead.
+    """
+    by_ticker, by_date = _off_by_one_regression_fixture()
+    tp_ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, 0.10, None)
+    assert tp_ret == 0.10, (
+        f"TP must fire off T+1's high=120 (>= 115.5 threshold), got {tp_ret}"
+    )
+
+    # T+1's low=90 clears a 5% SL off entry_price=105 (threshold 99.75); T+2's
+    # low=108 does NOT.
+    sl_ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, 0.05)
+    assert sl_ret == -0.05, (
+        f"SL must fire off T+1's low=90 (<= 99.75 threshold), got {sl_ret}"
+    )
+    print("test_tp_and_sl_hit_on_entry_session_are_detected passed")
+
+
+def test_one_day_hold_never_touches_t_plus_2():
+    """Requirement 3: for hold_days=1, T+2 (d3) must never be read at all.
+
+    d3's close (130) and OHLC are deliberately far from d2's, so any
+    contamination from reading d3 instead of d2 is impossible to miss.
+    """
+    by_ticker, by_date = _off_by_one_regression_fixture()
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    t_plus_2_based = (130.0 - 105.0) / 105.0
+    assert abs(ret - t_plus_2_based) > 1e-6, (
+        "hold_days=1 result matches a T+2-close calculation — T+2 is being "
+        "read for a one-day hold"
+    )
+    print("test_one_day_hold_never_touches_t_plus_2 passed")
+
+
+def test_hold_days_two_expires_at_close_t_plus_2():
+    """Requirement 4: hold_days=2 with no TP/SL must run through T+1 AND T+2,
+    timed-exiting at T+2's close — not T+1's (one session too short) and not
+    forced by running out of data (d4/T+3 exists precisely so the exit is a
+    genuine k==hold_days-1 timed exit, not an end-of-panel fallback)."""
+    by_ticker, by_date = _off_by_one_regression_fixture()
+    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 2, None, None)
+    expected = (130.0 - 105.0) / 105.0  # close(T+2) vs open(T+1)
+    assert ret is not None and abs(ret - expected) < 1e-9, (
+        f"hold_days=2 must exit at T+2's close (expected {expected:+.6f}, got {ret})"
+    )
+    print("test_hold_days_two_expires_at_close_t_plus_2 passed")
+
+
 def test_all_tracked_model_price_consumers_use_clean_panel():
     # The low-level audit/check/scrape modules may inspect raw storage, but a
     # model, strategy, or report must not source its target/simulation from it.
@@ -1256,6 +1343,10 @@ if __name__ == "__main__":
     test_multi_day_windows_cannot_cross_a_corporate_action()
     test_build_panel_cannot_recreate_impossible_target_returns()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
+    test_hold_days_one_uses_entry_session_high_low_and_close()
+    test_tp_and_sl_hit_on_entry_session_are_detected()
+    test_one_day_hold_never_touches_t_plus_2()
+    test_hold_days_two_expires_at_close_t_plus_2()
     test_all_tracked_model_price_consumers_use_clean_panel()
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()

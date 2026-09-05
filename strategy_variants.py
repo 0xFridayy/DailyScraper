@@ -134,8 +134,15 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     ara_arb_simulation.annotate_limits(). Fillability is a separate execution-
     quality layer and is deliberately not modelled here.
 
-    TP/SL are checked from the entry session onward against that session's own
-    high/low; a day hitting both is treated as SL (conservative)."""
+    hold_days counts SESSIONS FROM ENTRY, not sessions after entry:
+    hold_days=1 means the position opens AND is timed-exited within session
+    T+1 itself (TP/SL checked against T+1's own high/low, timed exit at T+1's
+    close); hold_days=2 extends that through T+2, etc. An earlier version of
+    this function incremented past the entry session before starting the
+    hold loop, so hold_days=1 evaluated T+2 instead of T+1 — one session too
+    long. TP/SL are checked from the entry session onward against each held
+    session's own high/low; a day hitting both is treated as SL
+    (conservative)."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -143,23 +150,30 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     i0 = idx_map[entry_date]
     if i0 + 1 >= len(g):
         return None
+    # The decision(T)->entry(T+1) step is itself a transition that can bridge
+    # a quarantine/suspension gap now that entry no longer coincides with the
+    # decision session (open(i0+1) may not really be the very next trading
+    # day if a row was dropped), so it needs the same guard every held
+    # transition below gets.
+    if "fwd_1" in g and pd.isna(g.loc[i0, "fwd_1"]):
+        return None
     # i0 is the DECISION session; the position opens at i0+1's open.
     entry_price = g.loc[i0 + 1, "open"]
     if not (entry_price > 0):
         return None
-    i0 = i0 + 1
+    i0 = i0 + 1  # i0 is now the ENTRY session (T+1) itself.
 
-    for k in range(1, hold_days + 1):
+    for k in range(hold_days):
         if i0 + k >= len(g):
             break
-        if "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
+        if k > 0 and "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
             return None  # quarantine/suspension gap: never bridge it as a hold day
         day = g.loc[i0 + k]
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct
         if tp_pct is not None and day["high"] >= entry_price * (1 + tp_pct):
             return tp_pct
-        if k == hold_days or i0 + k == len(g) - 1:
+        if k == hold_days - 1 or i0 + k == len(g) - 1:
             return (day["close"] - entry_price) / entry_price
     return None
 
