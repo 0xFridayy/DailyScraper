@@ -64,7 +64,9 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
-from walk_forward_backtest import build_panel, FEATURES, XGB_PARAMS, DB_PATH
+from walk_forward_backtest import (
+    build_panel, FEATURES, XGB_PARAMS, DB_PATH, make_walk_forward_splits,
+)
 from price_audit import clean_panel
 from signal_metrics import trade_stats
 
@@ -86,24 +88,24 @@ VARIANTS = [
 assert all(1 <= v[2] <= MAX_HOLD_DAYS for v in VARIANTS), "a variant's hold_days is outside the 1-7 day requirement"
 
 
-def get_walk_forward_predictions(panel):
+def get_walk_forward_predictions(panel, horizon=1, embargo=0):
     """Same expanding-window CV as walk_forward_backtest.py, but keeps
     ticker/date on every test-set prediction instead of just aggregating
-    Sharpe, so different exit mechanics can be simulated on the same
+    stats, so different exit mechanics can be simulated on the same
     entry signal."""
-    dates = sorted(panel["date"].unique())
-    train_min, test_window = 30, 6
-    cycles, train_end = [], train_min
-    while train_end + test_window <= len(dates):
-        cycles.append((dates[:train_end], dates[train_end:train_end + test_window]))
-        train_end += test_window
+    # One shared split helper, not a fourth divergent copy. This file used to
+    # re-implement walk_forward_backtest's expanding window and 0.8 positional
+    # split independently, so a fix in one never reached the other.
+    splits, _ = make_walk_forward_splits(
+        sorted(panel["date"].unique()), horizon=horizon, embargo=embargo,
+    )
 
     pred_rows = []
-    for train_dates, test_dates in cycles:
-        train_df = panel[panel["date"].isin(train_dates)]
+    for sp in splits:
+        test_dates = sp["test"]
+        fit_df = panel[panel["date"].isin(sp["fit"])]
+        eval_df = panel[panel["date"].isin(sp["eval"])]
         test_df = panel[panel["date"].isin(test_dates)].copy()
-        split = int(len(train_df) * 0.8)
-        fit_df, eval_df = train_df.iloc[:split], train_df.iloc[split:]
         model = XGBRegressor(**XGB_PARAMS)
         model.fit(fit_df[FEATURES], fit_df["target"],
                   eval_set=[(eval_df[FEATURES], eval_df["target"])], verbose=False)
@@ -123,9 +125,40 @@ def _index_price_history(px):
 
 
 def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_days, tp_pct, sl_pct):
-    """Enter at entry_date's close. Each subsequent day, check that day's
-    high/low for a TP/SL hit BEFORE checking the timed exit - a trade that
-    hits both TP and SL on the same day is treated as SL (conservative)."""
+    """Decision at EOD(entry_date); enter at the NEXT session's OPEN.
+
+    Entry used to be entry_date's close, which is not executable: the decision
+    consumes that same close and the post-session broker summary. The anchor is
+    now open(T+1). That is a PRICE ANCHOR, not a guaranteed fill — a locked
+    ARA/ARB open or a thin name may not absorb the order at that price; see
+    ara_arb_simulation.annotate_limits(). Fillability is a separate execution-
+    quality layer and is deliberately not modelled here.
+
+    hold_days counts SESSIONS FROM ENTRY, not sessions after entry:
+    hold_days=1 means the position opens AND is timed-exited within session
+    T+1 itself (TP/SL checked against T+1's own high/low, timed exit at T+1's
+    close); hold_days=2 extends that through T+2, etc. An earlier version of
+    this function incremented past the entry session before starting the
+    hold loop, so hold_days=1 evaluated T+2 instead of T+1 — one session too
+    long. TP/SL are checked from the entry session onward against each held
+    session's own high/low; a day hitting both is treated as SL
+    (conservative).
+
+    The decision(T)->entry(T+1) transition is certified by `gap_1`
+    (price_audit.add_forward_returns(open_anchored=True)): gap_1 is NaN
+    unless BOTH the close(T)->close(T+1) step is valid AND open(T+1) passes
+    _open_anchor_valid (>0, within [low, high], within the ARA/ARB band off
+    close(T)). An earlier version of this function checked `fwd_1` alone for
+    this transition, which validates only the close step and says nothing
+    about the open — a close that legitimately passes its own band check can
+    still sit behind a fabricated open (the documented FAST 2025-10-14 case:
+    prev_close 580, open 870 (+50%), close 720 — close-to-close is +24.1%,
+    inside the 25% band, while the open is not). That let the simulator
+    transact on an open the executable-contract guard exists specifically to
+    reject. The caller MUST build its price frame with
+    clean_panel(..., open_anchored=True) so `gap_1` exists as a column —
+    its absence is a caller error (raises); `gap_1` being NaN for a specific
+    decision row is a legitimate per-row invalidity (skip that trade)."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -133,19 +166,34 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     i0 = idx_map[entry_date]
     if i0 + 1 >= len(g):
         return None
-    entry_price = g.loc[i0, "close"]
+    if "gap_1" not in g:
+        raise ValueError(
+            "simulate_trade requires gap_1 -- build the price frame with "
+            "clean_panel(conn, horizons=(1,), open_anchored=True). Without "
+            "it, entry_price would read a raw open with no open-anchor "
+            "validity, ARA/ARB band, or gap guard applied at all -- exactly "
+            "the failure this contract exists to prevent."
+        )
+    if pd.isna(g.loc[i0, "gap_1"]):
+        return None  # decision->entry transition invalid: bad close step, or a fabricated open(T+1)
+    # i0 is the DECISION session; the position opens at i0+1's open, now
+    # certified valid by the gap_1 check above.
+    entry_price = g.loc[i0 + 1, "open"]
+    if not (entry_price > 0):
+        return None
+    i0 = i0 + 1  # i0 is now the ENTRY session (T+1) itself.
 
-    for k in range(1, hold_days + 1):
+    for k in range(hold_days):
         if i0 + k >= len(g):
             break
-        if "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
+        if k > 0 and "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
             return None  # quarantine/suspension gap: never bridge it as a hold day
         day = g.loc[i0 + k]
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct
         if tp_pct is not None and day["high"] >= entry_price * (1 + tp_pct):
             return tp_pct
-        if k == hold_days or i0 + k == len(g) - 1:
+        if k == hold_days - 1 or i0 + k == len(g) - 1:
             return (day["close"] - entry_price) / entry_price
     return None
 
@@ -206,7 +254,10 @@ def run_strategy_search(panel, px, search_frac=0.7):
 if __name__ == "__main__":
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel(conn)
-    px = clean_panel(conn, horizons=(1,), lags=(1,))
+    # open_anchored=True is mandatory: simulate_trade() now requires the
+    # gap_1 certificate to validate the decision->entry open, not just a
+    # raw `open` column with no ARA/ARB or contiguity guard behind it.
+    px = clean_panel(conn, horizons=(1,), lags=(1,), open_anchored=True)
     conn.close()
 
     result = run_strategy_search(panel, px)

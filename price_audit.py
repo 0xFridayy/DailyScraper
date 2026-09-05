@@ -336,7 +336,45 @@ def load_clean(conn, strict=False):
     return px[keep].reset_index(drop=True)
 
 
-def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
+def _open_anchor_valid(px, g):
+    """Rows whose OPEN is usable as a trade anchor.
+
+    detect() and _step_valid both validate `close` and nothing else:
+    limit_violation is close-vs-prev_close, series_break is close-vs-rolling-
+    median, and cross_ticker_dup only touches `open` incidentally via the
+    all-five-identical test. NOTHING validates `open` on its own, so a corrupt
+    open can hide behind a perfectly ordinary close. Audited on the cleaned
+    panel: 0 rows have open <= 0, 0 have open outside [low, high], but 11 have
+    an open outside the ARA/ARB band against the previous close — and some
+    defeat the close-based guard outright:
+
+        FAST 2025-10-14   prev_close 580  open 870 (+50%)  close 720
+
+    close-to-close there is +24.1%, inside the 25% band, so _step_valid PASSES
+    while an entry anchored on 870 is fabricated. That is why an open-anchored
+    target needs its own mask rather than inheriting the close-to-close one.
+
+    Same philosophy as _step_valid: never delete the row, just refuse to
+    produce a target anchored on it. A corporate action (RAJA 2025-08-25,
+    2710 -> 546 on a split) fails the band and the target goes NaN rather than
+    being silently "repaired".
+
+    A row with no previous close cannot be judged and is invalid here, exactly
+    as it already is for _step_valid — .between() is False against NaN.
+    """
+    prev_close = g["close"].shift(1)
+    open_chg = px["open"] / prev_close - 1
+    upper = prev_close.apply(ara_bound) + TOL
+    return (
+        (px["open"] > 0)
+        & (px["low"] <= px["open"])
+        & (px["open"] <= px["high"])
+        & open_chg.between(ARB_BOUND - TOL, upper)
+    )
+
+
+def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
+                        open_anchored=False):
     """Attach gap-guarded forward returns to a filtered price frame.
 
     all_dates: every date in the UNFILTERED panel, in order. Positions on this
@@ -351,6 +389,23 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
 
     A ticker suspended for a day is treated the same as a quarantined row:
     the window is dropped rather than bridged.
+
+    open_anchored=True additionally emits the EXECUTABLE-contract labels. A
+    decision taken at EOD(T) cannot transact at close(T) — the day's own
+    closing auction and the post-session broker summary are both inputs to it —
+    so the earliest anchor is open(T+1):
+
+        fwd_oo_{h}   open(T+1) -> open(T+1+h)    headline; the T+1->T+2 gap is
+                                                 captured legitimately because
+                                                 it happens AFTER entry
+        fwd_oc_{h}   open(T+1) -> close(T+h)     secondary (intraday at h=1)
+        gap_1        close(T)  -> open(T+1)      the pre-entry, UNREACHABLE
+                                                 component, for diagnosis only
+
+    These compose multiplicatively, never additively:
+        1 + fwd_1 == (1 + gap_1) * (1 + fwd_oc_1)
+
+    `fwd_{h}` is left exactly as it was; this is purely additive.
     """
     pos = {d: i for i, d in enumerate(all_dates)}
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -362,6 +417,20 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
     one_upper = px["close"].apply(ara_bound) + TOL
     px["_step_valid"] = one_contig & one_return.between(ARB_BOUND - TOL, one_upper)
     g = px.groupby("ticker")
+
+    if open_anchored:
+        missing = [c for c in ("open", "high", "low") if c not in px.columns]
+        if missing:
+            raise ValueError(
+                f"open_anchored=True needs {missing} — the executable contract "
+                "anchors entry on open(T+1), so an OHLC frame is required"
+            )
+        px["_open_valid"] = _open_anchor_valid(px, g)
+        g = px.groupby("ticker")
+        # The entry anchor is the same open(T+1) for every horizon and every
+        # open-anchored label, so resolve it once.
+        entry_open = g["open"].shift(-1)
+        entry_ok = g["_open_valid"].shift(-1).fillna(False).astype(bool)
 
     for h in horizons:
         contig = (g["_pos"].shift(-h) - px["_pos"]) == h
@@ -382,7 +451,55 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False):
             px[f"max_{h}"] = np.where(valid, hi / px["close"] - 1, np.nan)
             px[f"mdd_{h}"] = np.where(valid, lo / px["close"] - 1, np.nan)
 
-    return px.drop(columns=["_pos", "_step_valid"])
+        if open_anchored:
+            # fwd_oc_h: open(T+1) -> close(T+h). The EXIT anchor is
+            # close(T+h) — exactly the endpoint `valid` (above) already
+            # certifies for fwd_h: the h-step close(T)->...->close(T+h) chain,
+            # contiguity included. Reusing it, rather than re-deriving a
+            # second, differently-windowed close-step mask, is what fixes the
+            # bug where a corrupt close(T+1) at h=1 was never checked at all
+            # (the old h==1 branch hardcoded a step mask of True
+            # unconditionally). The only additional requirement is that the
+            # ENTRY anchor open(T+1) itself be valid.
+            oc_valid = valid & entry_ok
+            px[f"fwd_oc_{h}"] = np.where(
+                oc_valid, g["close"].shift(-h) / entry_open - 1, np.nan
+            )
+
+            # fwd_oo_h: open(T+1) -> open(T+1+h). The reference close backing
+            # the EXIT anchor open(T+1+h) is close(T+h) — again exactly the
+            # endpoint `step_window` already certifies via the
+            # close(T)->...->close(T+h) chain. The previous implementation
+            # instead re-derived a rolling window shifted one session later
+            # (checking close(T+1)->...->close(T+1+h)), which validates
+            # close(T+1+h) — information from AFTER the open(T+1+h) exit —
+            # while never checking close(T)->close(T+1), the very step that
+            # backs open(T+1+h)'s own previous-close reference two hops back.
+            # A corrupt close(T+1) could then pass entirely undetected as
+            # long as the *next* close happened to look locally sane. Full
+            # contiguity is extended one more session, to the exit session
+            # T+1+h, rather than reusing `contig`'s T->T+h span; the single
+            # equality below still proves every intermediate step was
+            # contiguous, exactly as the module docstring argues for `contig`
+            # (and it strictly implies `contig`, so `valid` need not be
+            # ANDed in separately).
+            oo_contig = (g["_pos"].shift(-(1 + h)) - px["_pos"]) == (1 + h)
+            exit_ok = g["_open_valid"].shift(-(1 + h)).fillna(False).astype(bool)
+            oo_valid = oo_contig & step_window & entry_ok & exit_ok
+            px[f"fwd_oo_{h}"] = np.where(
+                oo_valid, g["open"].shift(-(1 + h)) / entry_open - 1, np.nan
+            )
+
+    if open_anchored:
+        # gap_1: close(T) -> open(T+1). The pre-entry window an EOD(T) decision
+        # cannot reach. Needs the T->T+1 transition itself to be sane, which is
+        # exactly what _step_valid at T already asserts.
+        px["gap_1"] = np.where(
+            px["_step_valid"] & entry_ok, entry_open / px["close"] - 1, np.nan
+        )
+
+    drop = ["_pos", "_step_valid"] + (["_open_valid"] if open_anchored else [])
+    return px.drop(columns=drop)
 
 
 def add_lagged_returns(px, all_dates, lags=(1,)):
@@ -419,13 +536,19 @@ def add_lagged_returns(px, all_dates, lags=(1,)):
     return px.drop(columns=["_pos", "_step_valid"])
 
 
-def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False):
-    """load_clean() + add_forward_returns() — the one call worth importing."""
+def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False,
+                open_anchored=False):
+    """load_clean() + add_forward_returns() — the one call worth importing.
+
+    open_anchored=True additionally returns the executable-contract labels
+    (fwd_oo_{h} / fwd_oc_{h} / gap_1) — see add_forward_returns().
+    """
     all_dates = sorted(
         r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history").fetchall()
     )
     px = add_forward_returns(
-        load_clean(conn, strict=strict), all_dates, horizons=horizons, extremes=extremes
+        load_clean(conn, strict=strict), all_dates, horizons=horizons,
+        extremes=extremes, open_anchored=open_anchored,
     )
     if lags:
         px = add_lagged_returns(px, all_dates, lags=lags)
