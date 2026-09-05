@@ -181,8 +181,20 @@ def _broker_correlation_1d(bf):
 def _price_features_and_target(px):
     """Features as of close(T); target under the EXECUTABLE contract.
 
-    The features are unchanged and all genuinely known by EOD(T). The TARGET
-    is not what it used to be: it is now open(T+1) -> open(T+2), because a
+    The features themselves are unchanged. `momentum_1d`/`volume_ratio` are
+    pure price features and are genuinely known by EOD(T) by construction —
+    they are functions of that session's own OHLCV, computed here. The
+    broader "decision at EOD(T)" premise this module's docstrings invoke
+    elsewhere, when broker-flow-derived features are joined in later
+    (`build_panel`, `ml_v2_experiment_1.py`), carries an availability
+    requirement that is NOT independently verified: per HANDOFF.md, ~95% of
+    `broker_flow` rows are backfilled from `netval` only, and the historical
+    CAPTURE TIME of those rows relative to EOD(T) is unverified — only the
+    ~5% of rows carrying live bval/sval/bavg/savg (starting ~2026-07-05) have
+    confirmed same-session provenance. This caveat is independent of, and
+    predates, the target-contract fix below.
+
+    The TARGET is not what it used to be: it is now open(T+1) -> open(T+2), because a
     decision taken at EOD(T) cannot transact at close(T) — that same close and
     the post-session broker summary are both inputs to the decision. The old
     close(T) -> close(T+1) value rides along as `target_cc` for diagnosis only.

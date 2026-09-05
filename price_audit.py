@@ -452,34 +452,42 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
             px[f"mdd_{h}"] = np.where(valid, lo / px["close"] - 1, np.nan)
 
         if open_anchored:
-            # fwd_oo_h: open(T+1) -> open(T+1+h). BOTH anchors are opens, so
-            # both need _open_valid. The h close-to-close steps run from T+1,
-            # one day later than the fwd_{h} window — hence shift(-h) here
-            # versus shift(-(h-1)) above.
-            oo_contig = (g["_pos"].shift(-(1 + h)) - px["_pos"]) == (1 + h)
-            oo_steps = g["_step_valid"].transform(
-                lambda s: s.rolling(h, min_periods=h).sum().shift(-h).eq(h)
-            )
-            exit_ok = g["_open_valid"].shift(-(1 + h)).fillna(False).astype(bool)
-            oo_valid = oo_contig & oo_steps & entry_ok & exit_ok
-            px[f"fwd_oo_{h}"] = np.where(
-                oo_valid, g["open"].shift(-(1 + h)) / entry_open - 1, np.nan
-            )
-
-            # fwd_oc_h: open(T+1) -> close(T+h). Exit is a close, so only the
-            # entry anchor needs _open_valid. h-1 steps run from T+1 — none at
-            # all at h=1, which is a pure intraday hold inside session T+1.
-            oc_contig = (g["_pos"].shift(-h) - px["_pos"]) == h
-            if h > 1:
-                oc_steps = g["_step_valid"].transform(
-                    lambda s: s.rolling(h - 1, min_periods=h - 1)
-                                .sum().shift(-(h - 1)).eq(h - 1)
-                )
-            else:
-                oc_steps = pd.Series(True, index=px.index)
-            oc_valid = oc_contig & oc_steps & entry_ok
+            # fwd_oc_h: open(T+1) -> close(T+h). The EXIT anchor is
+            # close(T+h) — exactly the endpoint `valid` (above) already
+            # certifies for fwd_h: the h-step close(T)->...->close(T+h) chain,
+            # contiguity included. Reusing it, rather than re-deriving a
+            # second, differently-windowed close-step mask, is what fixes the
+            # bug where a corrupt close(T+1) at h=1 was never checked at all
+            # (the old h==1 branch hardcoded a step mask of True
+            # unconditionally). The only additional requirement is that the
+            # ENTRY anchor open(T+1) itself be valid.
+            oc_valid = valid & entry_ok
             px[f"fwd_oc_{h}"] = np.where(
                 oc_valid, g["close"].shift(-h) / entry_open - 1, np.nan
+            )
+
+            # fwd_oo_h: open(T+1) -> open(T+1+h). The reference close backing
+            # the EXIT anchor open(T+1+h) is close(T+h) — again exactly the
+            # endpoint `step_window` already certifies via the
+            # close(T)->...->close(T+h) chain. The previous implementation
+            # instead re-derived a rolling window shifted one session later
+            # (checking close(T+1)->...->close(T+1+h)), which validates
+            # close(T+1+h) — information from AFTER the open(T+1+h) exit —
+            # while never checking close(T)->close(T+1), the very step that
+            # backs open(T+1+h)'s own previous-close reference two hops back.
+            # A corrupt close(T+1) could then pass entirely undetected as
+            # long as the *next* close happened to look locally sane. Full
+            # contiguity is extended one more session, to the exit session
+            # T+1+h, rather than reusing `contig`'s T->T+h span; the single
+            # equality below still proves every intermediate step was
+            # contiguous, exactly as the module docstring argues for `contig`
+            # (and it strictly implies `contig`, so `valid` need not be
+            # ANDed in separately).
+            oo_contig = (g["_pos"].shift(-(1 + h)) - px["_pos"]) == (1 + h)
+            exit_ok = g["_open_valid"].shift(-(1 + h)).fillna(False).astype(bool)
+            oo_valid = oo_contig & step_window & entry_ok & exit_ok
+            px[f"fwd_oo_{h}"] = np.where(
+                oo_valid, g["open"].shift(-(1 + h)) / entry_open - 1, np.nan
             )
 
     if open_anchored:

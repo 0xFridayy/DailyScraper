@@ -230,6 +230,132 @@ def test_open_outside_high_low_or_nonpositive_is_invalid():
     print("test_open_outside_high_low_or_nonpositive_is_invalid passed")
 
 
+def test_corrupt_close_t_plus_1_invalidates_fwd_oc_1():
+    """PR #36 review: a corrupt close(T+1) must invalidate fwd_oc_1.
+
+    The old h==1 branch hardcoded its close-step mask to True unconditionally
+    (no window at all was checked), so a fabricated close(T+1) used directly
+    as the fwd_oc_1 exit price passed straight through. close(T+1)=180 is
+    +80% on close(T)=100 -- outside the ARA band -- so `_step_valid` at T is
+    False and must now propagate into fwd_oc_1.
+    """
+    import price_audit as pa
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 3,
+        "open":  [100.0, 101.0, 182.0],
+        "high":  [101.0, 182.0, 186.0],
+        "low":   [99.0, 100.0, 181.0],
+        "close": [100.0, 180.0, 183.0],  # close(T+1)=180 is +80% vs close(T)=100
+        "volume": [1000] * 3,
+    })
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    assert pd.isna(out.iloc[0]["fwd_oc_1"]), (
+        "fwd_oc_1 must be invalidated by a corrupt close(T+1) exit price"
+    )
+    print("test_corrupt_close_t_plus_1_invalidates_fwd_oc_1 passed")
+
+
+def test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass():
+    """PR #36 review: a corrupt close(T+1) must invalidate fwd_oo_1 even when
+    BOTH individual opens pass their own local previous-close check.
+
+    open(T+1)=101 is fine against close(T)=100 (+1%). open(T+2)=182 is ALSO
+    individually fine against close(T+1)=180 (+1.1%) -- but 180 itself is
+    +80% off close(T)=100, which neither open-vs-immediate-prior-close check
+    can see. The old code checked close(T+1)->close(T+2) (180->183, which
+    looks locally sane) instead of close(T)->close(T+1) (100->180, which does
+    not), so this corruption slipped through undetected.
+    """
+    import price_audit as pa
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 3,
+        "open":  [100.0, 101.0, 182.0],
+        "high":  [101.0, 182.0, 186.0],
+        "low":   [99.0, 100.0, 181.0],
+        "close": [100.0, 180.0, 183.0],
+        "volume": [1000] * 3,
+    })
+    open_valid = pa._open_anchor_valid(px, px.groupby("ticker"))
+    assert bool(open_valid.iloc[1]), "open(T+1) must pass its own local check"
+    assert bool(open_valid.iloc[2]), "open(T+2) must ALSO pass its own local check (vs the corrupt close(T+1))"
+
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    assert pd.isna(out.iloc[0]["fwd_oo_1"]), (
+        "fwd_oo_1 must be invalidated by corrupt close(T+1) even though both "
+        "individual opens independently pass"
+    )
+    print("test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass passed")
+
+
+def test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1():
+    """PR #36 review: a corrupt close(T+2) — which occurs AFTER fwd_oo_1's
+    open(T+2) exit and is never the reference for any open in this window —
+    must NOT invalidate fwd_oo_1. Exit validity depends on open(T+2) against
+    close(T+1), never on close(T+2) itself."""
+    import price_audit as pa
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+    px = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 3,
+        "open":  [100.0, 101.0, 106.0],
+        "high":  [101.0, 107.0, 999.0],
+        "low":   [99.0, 100.0, 106.0],
+        "close": [100.0, 105.0, 999.0],  # close(T+2)=999 is wildly corrupt
+        "volume": [1000] * 3,
+    })
+    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    row0 = out.iloc[0]
+    assert pd.notna(row0["fwd_oo_1"]), (
+        "a corrupt close strictly after the open(T+1+h) exit must not "
+        "invalidate fwd_oo_1"
+    )
+    expected = 106.0 / 101.0 - 1
+    assert abs(row0["fwd_oo_1"] - expected) < 1e-9
+    print("test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1 passed")
+
+
+def test_close_window_validity_fix_holds_for_h_greater_than_1():
+    """PR #36 review requirement 4: the same two properties hold at h=2 —
+    corrupt close(T+1) invalidates fwd_oo_2/fwd_oc_2, but corrupt close(T+3)
+    (the exit session's own close, strictly after open(T+3)'s exit) does not.
+    """
+    import price_audit as pa
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+
+    corrupt_entry_leg = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 4,
+        "open":  [100.0, 101.0, 182.0, 186.0],
+        "high":  [101.0, 182.0, 187.0, 191.0],
+        "low":   [99.0, 100.0, 181.0, 184.0],
+        "close": [100.0, 180.0, 185.0, 188.0],  # close(T+1)=180 is +80% vs close(T)=100
+        "volume": [1000] * 4,
+    })
+    out_a = pa.add_forward_returns(corrupt_entry_leg, dates, horizons=(2,), open_anchored=True)
+    row_a = out_a.iloc[0]
+    assert pd.isna(row_a["fwd_oo_2"]), "corrupt close(T+1) must invalidate fwd_oo_2"
+    assert pd.isna(row_a["fwd_oc_2"]), "corrupt close(T+1) must invalidate fwd_oc_2"
+
+    corrupt_after_exit = _oa_frame({
+        "date": dates, "ticker": ["AAA"] * 4,
+        "open":  [100.0, 101.0, 106.0, 111.0],
+        "high":  [101.0, 107.0, 112.0, 999.0],
+        "low":   [99.0, 100.0, 105.0, 111.0],
+        "close": [100.0, 105.0, 110.0, 999.0],  # close(T+3)=999: the exit session's own close
+        "volume": [1000] * 4,
+    })
+    out_b = pa.add_forward_returns(corrupt_after_exit, dates, horizons=(2,), open_anchored=True)
+    row_b = out_b.iloc[0]
+    assert pd.notna(row_b["fwd_oo_2"]), (
+        "corrupt close(T+3), the exit session's own close, must not "
+        "invalidate fwd_oo_2 (exit validity depends on open(T+3) vs "
+        "close(T+2), never on close(T+3) itself)"
+    )
+    expected = 111.0 / 101.0 - 1
+    assert abs(row_b["fwd_oo_2"] - expected) < 1e-9
+    print("test_close_window_validity_fix_holds_for_h_greater_than_1 passed")
+
+
 def test_both_realization_purges_hold_on_timestamps():
     """decision at EOD(i); label enters OPEN(i+1) and realizes OPEN(i+1+h).
 
@@ -1351,6 +1477,23 @@ if __name__ == "__main__":
     test_broker_day_aggregates_basic()
     test_broker_correlation_first_day_is_nan()
     test_price_features_no_leakage()
+    # These 8 were defined but never wired into this runner -- found while
+    # adding the PR #36 corrupt-close regression tests below and fixed
+    # alongside them; test_pipeline.py's "all tests pass" never actually
+    # exercised the open-anchor contract, the realization purges, the
+    # thin/infeasible fold gate, or the frozen legacy digest until now.
+    test_open_anchored_labels_match_hand_computed_values()
+    test_multiplicative_composition_not_additive()
+    test_invalid_open_anchor_yields_nan_even_when_close_passes()
+    test_open_outside_high_low_or_nonpositive_is_invalid()
+    test_corrupt_close_t_plus_1_invalidates_fwd_oc_1()
+    test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass()
+    test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1()
+    test_close_window_validity_fix_holds_for_h_greater_than_1()
+    test_both_realization_purges_hold_on_timestamps()
+    test_thin_and_infeasible_folds_are_skipped_and_counted()
+    test_legacy_experiment1_digest_is_frozen()
+    test_target_refuses_to_silently_use_the_close_contract()
     test_spearman_ic_direction()
     test_signal_stats_detects_a_useless_signal()
     test_signal_stats_reports_a_negative_edge_as_negative()

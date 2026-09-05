@@ -12,6 +12,31 @@ Produced by `ml_v2_experiment_1.py` (embargo=0 headline and embargo=5
 robustness runs) and `ml_v2_experiment_1_robustness.py` (digest gate), run on
 2026-09-05.
 
+## Post-review validity-window audit (2026-09-05)
+
+PR review of the executable contract found the `fwd_oo_1`/`fwd_oc_1` close-step
+validity mask in `price_audit.add_forward_returns()` was checking the wrong
+window: for `fwd_oo_1 = open(T+1) -> open(T+2)`, the code validated
+`close(T+1) -> close(T+2)` (information from *after* the `open(T+2)` exit)
+instead of `close(T) -> close(T+1)` (the step that actually backs
+`open(T+2)`'s own previous-close reference). `fwd_oc_1` performed no close-step
+check at all. Both were fixed to reuse the same close(T)→...→close(T+h) chain
+already computed for the legacy `fwd_h`, per four new regression tests in
+`test_pipeline.py` using deliberately corrupt closes (a corrupt close(T+1)
+that individually-valid opens on both sides could previously mask). The fixed
+panel was rebuilt and the full headline (embargo=0) and robustness (embargo=5)
+runs were repeated, with determinism re-proven the same two ways as before.
+
+**Result: byte-identical.** Panel rows (9,861), fold reports, both split
+digests, and both prediction digests (`4dac8d153b33f7aa` headline,
+`ee420553c5991f66` embargo=5) are unchanged. On this specific dataset,
+`load_clean()`'s existing quarantine detectors already remove any row corrupt
+enough to trigger the bug before `add_forward_returns()` runs, so the defect
+— real, and now closed by test — had zero effect on this panel's actual rows.
+Every table, delta, and conclusion below is unchanged and still applies. This
+is reported, not assumed: the two independent-run and in-process
+determinism proofs were both rerun after the fix, not just before it.
+
 ## Why the contract changed
 
 The legacy Experiment #1 target was `fwd_1`, the clean close(T)→close(T+1)
