@@ -1,0 +1,322 @@
+{
+  "basis_min_deviation": 0.001,
+  "note": "Measured basis ratios. No corporate-action metadata exists in the source, so no event attribution is claimed.",
+  "reconstruction_min_rate": 0.999,
+  "regimes": [
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 27,
+      "days_outside_regime": 212,
+      "evidence": {
+        "estimator_relative_gap": 0.0007639532366099377,
+        "estimator_volume_based": 0.9532098371127435,
+        "estimator_volume_free": 0.9539380448529743,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": false,
+        "ratio_like_correlation": 0.965084334907939,
+        "reconstruction_integral_rate": 0.037037037037037035,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 0.9532098371127435,
+      "factor_exact": "5969/6262",
+      "regime_first_date": "2025-09-26",
+      "regime_last_date": "2025-11-07",
+      "ticker": "ASRM"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 189,
+      "days_outside_regime": 41,
+      "evidence": {
+        "estimator_relative_gap": 0.0021397036916659395,
+        "estimator_volume_based": 1.191,
+        "estimator_volume_free": 1.1935483870967742,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.8268881735801085,
+        "reconstruction_integral_rate": 0.015873015873015872,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 1.191,
+      "factor_exact": "1191/1000",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-06-24",
+      "ticker": "BNBR"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 42,
+      "days_outside_regime": 197,
+      "evidence": {
+        "estimator_relative_gap": 0.0011794427189695256,
+        "estimator_volume_based": 0.5,
+        "estimator_volume_free": 0.49941027864051524,
+        "estimators_disagree": false,
+        "exactly_constant": true,
+        "prefix_block": true,
+        "ratio_like_correlation": 1.0,
+        "reconstruction_integral_rate": 0.5,
+        "reconstruction_on_grid_rate": 0.5
+      },
+      "factor": 0.5,
+      "factor_exact": "1/2",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2025-10-21",
+      "ticker": "BUAH"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 33,
+      "days_outside_regime": 206,
+      "evidence": {
+        "estimator_relative_gap": 0.0022096234196820053,
+        "estimator_volume_based": 2.709000010018936,
+        "estimator_volume_free": 2.7149858798849924,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 1.0,
+        "reconstruction_integral_rate": 0.0,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 2.709000010018936,
+      "factor_exact": "270388/99811",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2025-10-08",
+      "ticker": "COCO"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 86,
+      "days_outside_regime": 148,
+      "evidence": {
+        "estimator_relative_gap": 0.007249700255513636,
+        "estimator_volume_based": 1.628,
+        "estimator_volume_free": 1.639802512015976,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.9999999999999999,
+        "reconstruction_integral_rate": 0.0,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 1.628,
+      "factor_exact": "407/250",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-01-02",
+      "ticker": "INET"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 84,
+      "days_outside_regime": 155,
+      "evidence": {
+        "estimator_relative_gap": 0.0008399390623345937,
+        "estimator_volume_based": 0.5,
+        "estimator_volume_free": 0.5004199695311673,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": false,
+        "ratio_like_correlation": 0.9991966259296554,
+        "reconstruction_integral_rate": 0.9880952380952381,
+        "reconstruction_on_grid_rate": 0.8244047619047619
+      },
+      "factor": 0.5,
+      "factor_exact": "1/2",
+      "regime_first_date": "2025-08-25",
+      "regime_last_date": "2026-04-09",
+      "ticker": "MEGA"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 126,
+      "days_outside_regime": 83,
+      "evidence": {
+        "estimator_relative_gap": 2.254015378788665e-06,
+        "estimator_volume_based": 0.8571387233057468,
+        "estimator_volume_free": 0.8571406553096108,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.9999999996508115,
+        "reconstruction_integral_rate": 0.15674603174603174,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 0.8571387233057468,
+      "factor_exact": "29621/34558",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-04-16",
+      "ticker": "MEJA"
+    },
+    {
+      "classification": "RECONSTRUCTIBLE",
+      "days_in_regime": 205,
+      "days_outside_regime": 23,
+      "evidence": {
+        "estimator_relative_gap": 0.004178157749586298,
+        "estimator_volume_based": 25.0,
+        "estimator_volume_free": 25.10445394373966,
+        "estimators_disagree": false,
+        "exactly_constant": true,
+        "prefix_block": true,
+        "ratio_like_correlation": 1.0,
+        "reconstruction_integral_rate": 1.0,
+        "reconstruction_on_grid_rate": 1.0
+      },
+      "factor": 25.0,
+      "factor_exact": "25/1",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-07-20",
+      "ticker": "MLPT"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 96,
+      "days_outside_regime": 143,
+      "evidence": {
+        "estimator_relative_gap": 0.0015441064387464731,
+        "estimator_volume_based": 13.194,
+        "estimator_volume_free": 13.21437294035282,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.9999999999999998,
+        "reconstruction_integral_rate": 0.0390625,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 13.194,
+      "factor_exact": "6597/500",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-01-09",
+      "ticker": "PACK"
+    },
+    {
+      "classification": "RECONSTRUCTIBLE",
+      "days_in_regime": 212,
+      "days_outside_regime": 26,
+      "evidence": {
+        "estimator_relative_gap": 0.008489705466077302,
+        "estimator_volume_based": 5.0,
+        "estimator_volume_free": 5.042448527330387,
+        "estimators_disagree": false,
+        "exactly_constant": true,
+        "prefix_block": true,
+        "ratio_like_correlation": 1.0,
+        "reconstruction_integral_rate": 1.0,
+        "reconstruction_on_grid_rate": 1.0
+      },
+      "factor": 5.0,
+      "factor_exact": "5/1",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-07-15",
+      "ticker": "RAJA"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 87,
+      "days_outside_regime": 143,
+      "evidence": {
+        "estimator_relative_gap": 0.00043507151300570257,
+        "estimator_volume_based": 0.6763063110090306,
+        "estimator_volume_free": 0.6760120693990446,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": false,
+        "ratio_like_correlation": 0.6497696707086097,
+        "reconstruction_integral_rate": 0.09482758620689655,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 0.6763063110090306,
+      "factor_exact": "12956/19157",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-01-19",
+      "ticker": "RISE"
+    },
+    {
+      "classification": "RECONSTRUCTIBLE",
+      "days_in_regime": 201,
+      "days_outside_regime": 25,
+      "evidence": {
+        "estimator_relative_gap": 0.002172129027293801,
+        "estimator_volume_based": 5.0,
+        "estimator_volume_free": 4.989139354863531,
+        "estimators_disagree": false,
+        "exactly_constant": true,
+        "prefix_block": true,
+        "ratio_like_correlation": 1.0,
+        "reconstruction_integral_rate": 1.0,
+        "reconstruction_on_grid_rate": 1.0
+      },
+      "factor": 5.0,
+      "factor_exact": "5/1",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-07-16",
+      "ticker": "RMKE"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 55,
+      "days_outside_regime": 184,
+      "evidence": {
+        "estimator_relative_gap": 0.000685989200020054,
+        "estimator_volume_based": 0.7697536108751062,
+        "estimator_volume_free": 0.7692255682113694,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.980578219364409,
+        "reconstruction_integral_rate": 0.0,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 0.7697536108751062,
+      "factor_exact": "906/1177",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2025-11-07",
+      "ticker": "SPMA"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 147,
+      "days_outside_regime": 92,
+      "evidence": {
+        "estimator_relative_gap": 0.004229579872547573,
+        "estimator_volume_based": 0.5,
+        "estimator_volume_free": 0.4978852100637262,
+        "estimators_disagree": false,
+        "exactly_constant": true,
+        "prefix_block": true,
+        "ratio_like_correlation": 0.9999999999999998,
+        "reconstruction_integral_rate": 0.9642857142857143,
+        "reconstruction_on_grid_rate": 0.9642857142857143
+      },
+      "factor": 0.5,
+      "factor_exact": "1/2",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-04-02",
+      "ticker": "WGSH"
+    },
+    {
+      "classification": "QUARANTINE",
+      "days_in_regime": 169,
+      "days_outside_regime": 70,
+      "evidence": {
+        "estimator_relative_gap": 0.0004314220715531114,
+        "estimator_volume_based": 0.9864130434782609,
+        "estimator_volume_free": 0.9859874831196365,
+        "estimators_disagree": false,
+        "exactly_constant": false,
+        "prefix_block": false,
+        "ratio_like_correlation": 0.9434238467805218,
+        "reconstruction_integral_rate": 0.042899408284023666,
+        "reconstruction_on_grid_rate": 0.0
+      },
+      "factor": 0.9864130434782609,
+      "factor_exact": "363/368",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2026-05-25",
+      "ticker": "WINS"
+    }
+  ]
+}

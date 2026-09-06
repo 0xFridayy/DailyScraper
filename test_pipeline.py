@@ -10,9 +10,14 @@ exception. Run after touching build_panel(), signal_quality(), or
 kelly_fraction() — before trusting a new backtest run's results.
 """
 
+import os
 import pandas as pd
 import numpy as np
 import sqlite3
+
+import build_inventory_db as bidb
+import normalize_market_data as nm
+import experiment_1f_universe_gate as gate
 
 from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target,
@@ -1836,6 +1841,584 @@ def test_should_fail_run_catches_a_broken_scrape():
     print("test_should_fail_run_catches_a_broken_scrape passed")
 
 
+# ---------------------------------------------------------------------------
+# Experiment #1F Phase 2 -- lossless ingest + the normalized market-data layer
+# ---------------------------------------------------------------------------
+
+def _regime_payload(factor=5, regime_days=25, clean_days=10, adjusted_close=920,
+                    as_traded_close=4600, lots=1000, vwap_override=None, jitter=None):
+    """A raw-cache-shaped payload carrying a known observed_basis_factor regime.
+
+    Mirrors the real vendor shape: OHLC price and volume on one basis, broker
+    lots and values as-traded. So volume == factor * sum(blot) * SHARES_PER_LOT
+    inside the regime and volume == sum(blot) * SHARES_PER_LOT outside it.
+    """
+    dates, ohlc = [], []
+    blot, slot, nlot, bval, sval, nval = [], [], [], [], [], []
+    for i in range(regime_days + clean_days):
+        day = "2026-01-%02d" % (i + 1)
+        dates.append(day)
+        in_regime = i < regime_days
+        r = factor if in_regime else 1
+        close = adjusted_close if in_regime else as_traded_close // factor
+        traded = as_traded_close if in_regime else close
+        volume = r * lots * nm.SHARES_PER_LOT
+        if jitter is not None and in_regime and i % 3 == 0:
+            volume += jitter
+        ohlc.append({"date": day, "open": close, "high": close, "low": close,
+                     "close": close, "volume": volume})
+        blot.append(lots)
+        slot.append(lots)
+        nlot.append(0)
+        price = vwap_override if (vwap_override is not None and in_regime) else traded
+        value = float(lots * nm.SHARES_PER_LOT * price)
+        bval.append(value)
+        sval.append(value)
+        nval.append(0.0)
+    return {"date": dates, "ohlc": ohlc,
+            "blot": {"AK": blot}, "slot": {"AK": slot}, "nlot": {"AK": nlot},
+            "bval": {"AK": bval}, "sval": {"AK": sval}, "nval": {"AK": nval}}
+
+
+def _wrap_payload(lots=48530640, days=3, wrap_on=1):
+    """A payload whose OHLC volume has lost exactly one unsigned 32-bit modulus."""
+    dates, ohlc = [], []
+    blot, slot, nlot = [], [], []
+    for i in range(days):
+        day = "2026-02-%02d" % (i + 1)
+        dates.append(day)
+        true_volume = lots * nm.SHARES_PER_LOT
+        volume = true_volume - nm.MODULUS if i == wrap_on else true_volume
+        ohlc.append({"date": day, "open": 100, "high": 100, "low": 100,
+                     "close": 100, "volume": volume})
+        blot.append(lots)
+        slot.append(lots)
+        nlot.append(0)
+    zeros = [0.0] * days
+    return {"date": dates, "ohlc": ohlc,
+            "blot": {"AK": blot}, "slot": {"AK": slot}, "nlot": {"AK": nlot},
+            "bval": {"AK": list(zeros)}, "sval": {"AK": list(zeros)},
+            "nval": {"AK": list(zeros)}}
+
+
+def test_lot_storage_keeps_values_above_the_float32_exact_range():
+    """int64 lot columns survive the parquet round-trip exactly; float32 does not.
+
+    The vendor reports lots as exact integers up to 80,883,692. float32 is lossy
+    well below its own 2**24 exact-integer ceiling once a consumer computes
+    blot * SHARES_PER_LOT, because that product is then evaluated in float32.
+    """
+    import tempfile
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    values = np.array([0, 1, 2 ** 24 - 1, 2 ** 24, 2 ** 24 + 1,
+                       16777217, 33554433, 80883692, -32589075], dtype=np.int64)
+    frame = pd.DataFrame({
+        "date": ["2026-01-%02d" % (i + 1) for i in range(len(values))],
+        "ticker": "TEST", "broker": "AK",
+        "nlot": values, "nval": values.astype(np.float64),
+        "blot": values, "bval": values.astype(np.float64),
+        "slot": values, "sval": values.astype(np.float64),
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "lots.parquet")
+        table = pa.Table.from_pandas(frame, schema=bidb.BRK_SCHEMA, preserve_index=False)
+        pq.write_table(table, path, compression="zstd")
+        back = pd.read_parquet(path)
+
+    assert back["blot"].dtype == np.int64, "lot column came back as %s" % back["blot"].dtype
+    assert np.array_equal(back["blot"].to_numpy(), values), "int64 blot round-trip was not exact"
+    assert np.array_equal(back["nlot"].to_numpy(), values), "int64 nlot round-trip was not exact"
+
+    lossy = values.astype(np.float32).astype(np.int64)
+    assert not np.array_equal(lossy, values), \
+        "fixture no longer exercises the float32 defect it was written for"
+    assert float(np.float32(671089) * np.float32(100.0)) != 671089 * 100, \
+        "fixture no longer demonstrates float32 corruption of blot * SHARES_PER_LOT"
+    assert int(values[-2]) * nm.SHARES_PER_LOT == 80883692 * 100, \
+        "the int64 product must stay exact"
+    print("test_lot_storage_keeps_values_above_the_float32_exact_range passed")
+
+
+def test_lot_cast_refuses_non_integral_and_non_finite_lots():
+    """A lot is a counting quantity; rounding one silently would hide a contract change."""
+    ok = bidb.exact_lots(np.array([0.0, 5.0, 80883692.0]), "TEST", "blot")
+    assert ok.dtype == np.int64 and list(ok) == [0, 5, 80883692], \
+        "exact_lots must pass exact integers through as int64"
+
+    for bad, label in ((np.array([1.5]), "fractional"),
+                       (np.array([np.nan]), "NaN"),
+                       (np.array([np.inf]), "infinite")):
+        try:
+            bidb.exact_lots(bad, "TEST", "blot")
+        except ValueError:
+            continue
+        raise AssertionError("exact_lots silently accepted a %s lot value" % label)
+    print("test_lot_cast_refuses_non_integral_and_non_finite_lots passed")
+
+
+def test_row_level_nlot_identity_is_checked_in_exact_integer_space():
+    """nlot == blot - slot must hold exactly above 2**24, and a break must be caught."""
+    good = {"date": ["2026-01-01", "2026-01-02"],
+            "blot": {"AK": [16777217, 5]}, "slot": {"AK": [16777216, 2]},
+            "nlot": {"AK": [1, 3]}}
+    failures, rows = nm.row_identity_failures(good)
+    assert rows == 2, "expected 2 live rows, got %d" % rows
+    assert failures == 0, \
+        "identity must hold exactly above 2**24 in integer space, got %d failures" % failures
+
+    broken = {"date": ["2026-01-01"], "blot": {"AK": [10]},
+              "slot": {"AK": [4]}, "nlot": {"AK": [5]}}
+    failures, _ = nm.row_identity_failures(broken)
+    assert failures == 1, "a broken nlot identity must be reported"
+    print("test_row_level_nlot_identity_is_checked_in_exact_integer_space passed")
+
+
+def test_uint32_volume_wrap_requires_every_guard_to_hold():
+    """The detector fires on an exact single-modulus wrap and on nothing else."""
+    hits = nm.detect_volume_wraps("TEST", nm.daily_totals(_wrap_payload()))
+    assert len(hits) == 1, "expected exactly one wrap, got %d" % len(hits)
+    hit = hits[0]
+    assert hit["delta"] == nm.MODULUS, "shortfall must be exactly one modulus"
+    assert hit["wrap_count"] == 1, "a single wrap must be reported as k=1"
+    assert hit["normalized_volume"] == 48530640 * nm.SHARES_PER_LOT, \
+        "repaired volume must equal sum(blot) * SHARES_PER_LOT exactly"
+
+    broken_sides = _wrap_payload()
+    broken_sides["slot"]["AK"][1] -= 1
+    assert nm.detect_volume_wraps("TEST", nm.daily_totals(broken_sides)) == [], \
+        "detector must not fire when the buy and sell sides disagree"
+
+    off_residue = _wrap_payload()
+    off_residue["ohlc"][1]["volume"] += 1
+    assert nm.detect_volume_wraps("TEST", nm.daily_totals(off_residue)) == [], \
+        "detector must not fire when the residue is inconsistent with a whole lot count"
+
+    near_miss = _wrap_payload()
+    near_miss["ohlc"][1]["volume"] += nm.SHARES_PER_LOT
+    assert nm.detect_volume_wraps("TEST", nm.daily_totals(near_miss)) == [], \
+        "detector must use exact modulus equality, with no tolerance"
+
+    assert nm.detect_volume_wraps("TEST", nm.daily_totals(_wrap_payload(wrap_on=-1))) == [], \
+        "detector must not fire on a clean ticker"
+    print("test_uint32_volume_wrap_requires_every_guard_to_hold passed")
+
+
+def test_authorised_volume_repair_carries_full_provenance():
+    """Every authorised repair records what changed, on what evidence, from which file."""
+    hit = nm.detect_volume_wraps("TEST", nm.daily_totals(_wrap_payload()))[0]
+    for field in ("ticker", "date", "rule", "raw_volume", "normalized_volume",
+                  "delta", "wrap_count", "evidence"):
+        assert field in hit, "repair ledger entry is missing %s" % field
+    assert hit["evidence"]["equals_sum_blot_shares"], "buy-side evidence must be recorded"
+    assert hit["evidence"]["equals_sum_slot_shares"], \
+        "sell-side evidence is an independent field and must be recorded"
+    assert hit["normalized_volume"] - hit["raw_volume"] == hit["delta"], \
+        "delta must reconcile raw and normalized volume"
+
+    if os.path.exists(nm.raw_path("BUMI")):
+        built = nm.build_artifacts(["BUMI"], universe={"BUMI"})
+        repairs = built["volume_repair_ledger"]["authorised_repairs"]
+        assert len(repairs) == 4, "expected BUMI's 4 known wraps, got %d" % len(repairs)
+        for entry in repairs:
+            assert entry["source_fingerprint"], "each repair must name its source file"
+            assert entry["ticker"] == "BUMI", "repairs must stay bound to their ticker"
+    else:
+        print("  (raw cache absent -- skipped the real-data provenance assertions)")
+    print("test_authorised_volume_repair_carries_full_provenance passed")
+
+
+def test_observed_basis_factor_algebra_preserves_nominal_rupiah():
+    """adjusted_price = as_traded/r, adjusted_volume = as_traded*r, value invariant."""
+    r, as_traded_price, as_traded_volume = 5.0, 4600.0, 46141200.0
+    adjusted_price = as_traded_price / r
+    adjusted_volume = as_traded_volume * r
+    assert adjusted_price == 920.0, "price must divide by the factor"
+    assert adjusted_volume == 230706000.0, "volume must multiply by the factor"
+    assert abs(adjusted_price * adjusted_volume
+               - as_traded_price * as_traded_volume) < 1e-6, \
+        "nominal rupiah must be invariant across the basis change"
+
+    as_traded_lots = as_traded_volume / nm.SHARES_PER_LOT
+    adjusted_lots = as_traded_lots * r
+    assert adjusted_lots * nm.SHARES_PER_LOT == adjusted_volume, \
+        "scaling lots by r is what reconciles them with the already-adjusted volume"
+    assert float(adjusted_lots).is_integer(), "an integer factor must keep lots integral"
+    print("test_observed_basis_factor_algebra_preserves_nominal_rupiah passed")
+
+
+def test_basis_factor_requires_exact_piecewise_constancy():
+    """A clean, exactly-constant, on-grid prefix regime certifies as reconstructible."""
+    totals = nm.daily_totals(_regime_payload())
+    regime = nm.observed_basis_factor("TEST", totals, totals["volume"])
+    assert regime is not None, "a 25-day regime must be detected"
+    assert regime["factor"] == 5.0, "expected factor 5, got %s" % regime["factor"]
+    assert regime["evidence"]["exactly_constant"], "regime must be exactly constant"
+    assert regime["evidence"]["prefix_block"], "regime must be a contiguous prefix"
+    assert regime["evidence"]["reconstruction_integral_rate"] == 1.0, \
+        "price * r must be integral for a reconstructible regime"
+    assert regime["evidence"]["reconstruction_on_grid_rate"] == 1.0, \
+        "price * r must land on the IDX tick grid"
+    assert regime["classification"] == "RECONSTRUCTIBLE", \
+        "clean regime was classified %s" % regime["classification"]
+    print("test_basis_factor_requires_exact_piecewise_constancy passed")
+
+
+def test_dual_estimator_disagreement_vetoes_reconstruction():
+    """The volume-free estimator cannot certify a factor, but it can refute one.
+
+    Here the broker VWAP says the price basis never changed while the volume ratio
+    says it changed 5x. That contradiction must block reconstruction even though
+    every other criterion passes.
+    """
+    totals = nm.daily_totals(_regime_payload(vwap_override=920))
+    regime = nm.observed_basis_factor("TEST", totals, totals["volume"])
+    assert regime is not None, "the regime must still be detected"
+    assert regime["evidence"]["exactly_constant"], \
+        "fixture must keep constancy so the veto is what does the work"
+    assert regime["evidence"]["estimators_disagree"], \
+        "a 5x contradiction between the two estimators must be flagged"
+    assert regime["classification"] == "QUARANTINE", \
+        "contradictory estimators must force quarantine"
+    print("test_dual_estimator_disagreement_vetoes_reconstruction passed")
+
+
+def test_noisy_nonconstant_factor_is_quarantined():
+    """A factor that is not exactly constant is never corrected."""
+    totals = nm.daily_totals(_regime_payload(jitter=100))
+    regime = nm.observed_basis_factor("TEST", totals, totals["volume"])
+    assert regime is not None, "the regime must still be detected"
+    assert not regime["evidence"]["exactly_constant"], \
+        "fixture must produce a non-constant factor"
+    assert regime["classification"] == "QUARANTINE", \
+        "a noisy factor must be quarantined, not corrected"
+    print("test_noisy_nonconstant_factor_is_quarantined passed")
+
+
+def test_wrap_hidden_behind_a_basis_factor_is_never_silently_repaired():
+    """Stage B finds masked wraps, but must never authorise a repair from one."""
+    payload = _regime_payload(regime_days=25, clean_days=5, lots=1000)
+    totals = nm.daily_totals(payload)
+    idx = 2
+    shares = totals["blot"][idx] * nm.SHARES_PER_LOT
+    payload["blot"]["AK"][idx] = (shares + nm.MODULUS) // nm.SHARES_PER_LOT
+    payload["slot"]["AK"][idx] = payload["blot"]["AK"][idx]
+    payload["ohlc"][idx]["volume"] = int(5 * shares)
+    totals = nm.daily_totals(payload)
+
+    assert nm.detect_volume_wraps("TEST", totals) == [], \
+        "a wrap behind a basis factor must NOT reach the authorised repair path"
+
+    for entry in nm.detect_masked_wraps("TEST", totals, 5.0):
+        assert entry["authorised_repair"] is False, \
+            "stage B entries must be explicitly marked as not authorised"
+        assert entry["rule"].endswith("diagnostic"), \
+            "the stage B rule id must declare itself diagnostic"
+    print("test_wrap_hidden_behind_a_basis_factor_is_never_silently_repaired passed")
+
+
+def test_normalization_never_bleeds_across_ticker_boundaries():
+    """One ticker's wrap or basis regime must not contaminate another's."""
+    wrapped = nm.daily_totals(_wrap_payload())
+    clean = nm.daily_totals(_wrap_payload(wrap_on=-1))
+
+    hits_a = nm.detect_volume_wraps("AAAA", wrapped)
+    assert [h["ticker"] for h in hits_a] == ["AAAA"], "hits must carry their own ticker"
+    assert nm.detect_volume_wraps("BBBB", clean) == [], \
+        "a clean ticker must stay clean beside a wrapped one sharing its dates"
+    assert hits_a[0]["date"] in wrapped["dates"], "a hit date must come from its own ticker"
+
+    regime_totals = nm.daily_totals(_regime_payload())
+    regime = nm.observed_basis_factor("CCCC", regime_totals, regime_totals["volume"])
+    assert regime["ticker"] == "CCCC", "a regime must carry its own ticker"
+    flat = nm.daily_totals(_regime_payload(factor=1))
+    assert nm.observed_basis_factor("DDDD", flat, flat["volume"]) is None, \
+        "a ticker with no basis regime must not inherit one from a neighbour"
+    print("test_normalization_never_bleeds_across_ticker_boundaries passed")
+
+
+def _gate_frames():
+    """A tiny harvest + broker pair: one clean ticker, one on a 5x basis.
+
+    Internally coherent by construction: every broker value equals
+    lots * SHARES_PER_LOT * price, so a broker's implied VWAP lands inside the
+    session range. BBBB's in-regime rows carry the AS-TRADED price (4600) against
+    an ADJUSTED quoted range (~920) -- the real shape of the basis mismatch.
+    """
+    lots = 1000.0
+    rows, brk = [], []
+    for i in range(6):
+        day = "2026-01-%02d" % (i + 1)
+        rows.append({"date": day, "ticker": "AAAA", "open": 100.0, "high": 101.0,
+                     "low": 99.0, "close": 100.0, "volume": 100000.0})
+        value = lots * 100.0 * 100.0
+        brk.append({"date": day, "ticker": "AAAA", "broker_code": "AK",
+                    "blot": lots, "slot": lots, "nlot": 0.0,
+                    "bval": value, "sval": value, "nval": 0.0})
+
+        in_regime = i < 3
+        rows.append({"date": day, "ticker": "BBBB", "open": 920.0, "high": 940.0,
+                     "low": 900.0, "close": 920.0,
+                     "volume": 500000.0 if in_regime else 100000.0})
+        traded = 4600.0 if in_regime else 920.0
+        value = lots * 100.0 * traded
+        brk.append({"date": day, "ticker": "BBBB", "broker_code": "AK",
+                    "blot": lots, "slot": lots, "nlot": 0.0,
+                    "bval": value, "sval": value, "nval": 0.0})
+    return pd.DataFrame(rows), pd.DataFrame(brk)
+
+
+def _gate_artifacts(classification="RECONSTRUCTIBLE"):
+    return {
+        "authorised_repairs": {},
+        "diagnostic_only": [],
+        "regimes": {"BBBB": {"ticker": "BBBB", "factor": 5.0,
+                             "regime_last_date": "2026-01-03",
+                             "classification": classification}},
+        "ledger_digest": "test", "factor_digest": "test",
+    }
+
+
+def test_gate_refuses_to_run_without_the_normalized_artifacts():
+    """Absence of the ledger must stop the gate, never default to 'no repairs'."""
+    try:
+        gate.load_normalized_artifacts(ledger_path="does_not_exist.json",
+                                       factors_path="also_missing.json")
+    except gate.GateFailure as exc:
+        assert "normalize_market_data" in str(exc), \
+            "the failure must say how to produce the missing artifacts"
+    else:
+        raise AssertionError("a missing repair ledger must fail the gate")
+
+    if os.path.exists(gate.VOLUME_REPAIR_LEDGER_JSON):
+        loaded = gate.load_normalized_artifacts()
+        assert loaded["ledger_digest"] and loaded["factor_digest"], \
+            "real artifacts must produce stable digests"
+    print("test_gate_refuses_to_run_without_the_normalized_artifacts passed")
+
+
+def test_gate_applies_only_ledger_authorised_volume_repairs():
+    """The ledger authorises; the detector alone never does."""
+    ohlc, _ = _gate_frames()
+    raw = float(ohlc.loc[0, "volume"])
+    artifacts = _gate_artifacts()
+    artifacts["authorised_repairs"] = {
+        ("AAAA", "2026-01-01"): {"ticker": "AAAA", "date": "2026-01-01",
+                                 "raw_volume": raw,
+                                 "normalized_volume": raw + gate.VOLUME_WRAP_MODULUS},
+    }
+    repaired, report = gate.apply_volume_repairs(ohlc, artifacts)
+    assert report["applied"] == 1, "the single authorised repair must be applied"
+    assert float(repaired.loc[0, "volume"]) == raw + gate.VOLUME_WRAP_MODULUS, \
+        "the repaired row must carry the ledger's normalized volume"
+    untouched = repaired[(repaired.ticker == "AAAA") & (repaired.date != "2026-01-01")]
+    assert (untouched["volume"] == raw).all(), "no other row may be altered"
+
+    # a ledger that disagrees with the harvest is a stop, not a silent overwrite
+    artifacts["authorised_repairs"][("AAAA", "2026-01-01")]["raw_volume"] = raw + 1
+    try:
+        gate.apply_volume_repairs(ohlc, artifacts)
+    except gate.GateFailure:
+        pass
+    else:
+        raise AssertionError("a ledger/harvest source disagreement must fail the gate")
+    print("test_gate_applies_only_ledger_authorised_volume_repairs passed")
+
+
+def test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover():
+    """A new wrap must fail review rather than be silently corrected."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    # bury a wrap in a ticker the ledger says nothing about
+    mask = (ohlc.ticker == "AAAA") & (ohlc.date == "2026-01-02")
+    ohlc.loc[mask, "volume"] = 100000.0 - gate.VOLUME_WRAP_MODULUS
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["unrepaired_volume_wraps"] >= 1, "the wrap must be detected"
+    try:
+        gate.assert_cross_source_integrity(report)
+    except gate.GateFailure as exc:
+        assert "repair ledger" in str(exc), "the failure must name the ledger"
+    else:
+        raise AssertionError("an unrepaired wrap must fail the gate")
+    print("test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover passed")
+
+
+def test_gate_harmonises_a_certified_basis_and_keeps_lots_integral():
+    """Lots scale onto the price/volume basis; rupiah values never move."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    assert set(recon) == {"BBBB"} and not quar, "BBBB must be the certified regime"
+
+    before = brk[(brk.ticker == "BBBB") & (brk.date <= "2026-01-03")]
+    scaled, report = gate.harmonise_broker_basis(brk, recon)
+    after = scaled[(scaled.ticker == "BBBB") & (scaled.date <= "2026-01-03")]
+    assert report["rows_scaled"] == len(before), "every in-regime row must be scaled"
+    assert (after["blot"].to_numpy() == before["blot"].to_numpy() * 5).all(), \
+        "lots must be multiplied by the factor"
+    assert (after["bval"].to_numpy() == before["bval"].to_numpy()).all(), \
+        "rupiah values are basis-invariant and must not be touched"
+    assert np.allclose(after["blot"].to_numpy(), np.rint(after["blot"].to_numpy())), \
+        "an integer factor must leave lots integral"
+
+    outside = scaled[(scaled.ticker == "BBBB") & (scaled.date > "2026-01-03")]
+    assert (outside["blot"].to_numpy() == 1000.0).all(), \
+        "rows outside the regime must not be scaled"
+    untouched = scaled[scaled.ticker == "AAAA"]
+    assert (untouched["blot"].to_numpy() == 1000.0).all(), \
+        "a ticker with no regime must not be scaled"
+
+    # and after harmonisation the cross-source identity holds
+    report = gate.cross_source_invariants(ohlc, scaled, artifacts)
+    assert report["i1_basis_scale_breaks"] == 0, \
+        "harmonisation must clear the basis-scale break it was applied for"
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_harmonises_a_certified_basis_and_keeps_lots_integral passed")
+
+
+def test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker():
+    """The verifiably clean tail survives; the mismatched prefix does not."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts(classification="QUARANTINE")
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    assert not recon and set(quar) == {"BBBB"}, "BBBB must be quarantined"
+
+    kept, report = gate.quarantine_basis_regimes(ohlc, quar)
+    assert report["rows_dropped"] == 3, "only the 3 in-regime sessions may be dropped"
+    assert (kept.ticker == "BBBB").sum() == 3, "the clean tail must be retained"
+    assert (kept.ticker == "AAAA").sum() == 6, "the other ticker must be untouched"
+
+    kept_brk, _ = gate.quarantine_basis_regimes(brk, quar)
+    surviving = gate.cross_source_invariants(kept, kept_brk, artifacts)
+    assert surviving["i1_basis_scale_breaks"] == 0, \
+        "no mismatched-basis ticker-day may survive quarantine"
+    gate.assert_cross_source_integrity(surviving)
+    print("test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker passed")
+
+
+def test_gate_treats_lot_coverage_deficits_as_reported_not_fatal():
+    """Lot conservation is not source-guaranteed, so it must never stop the gate."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    # Realistic magnitudes: real coverage deficits are 2-23 lots against MILLIONS
+    # of lots (BRPT loses 23 of 1,413,470, i.e. 1.6e-5). At fixture scale a 2-lot
+    # gap on 1,000 lots would be 2e-3 and would correctly read as a basis break.
+    scale = (brk.ticker == "AAAA")
+    brk.loc[scale, "blot"] = 10000.0
+    brk.loc[scale, "slot"] = 10000.0
+    brk.loc[scale, "bval"] = 10000.0 * 100.0 * 100.0
+    brk.loc[scale, "sval"] = 10000.0 * 100.0 * 100.0
+    ohlc.loc[ohlc.ticker == "AAAA", "volume"] = 1000000.0
+    mask = scale & (brk.date == "2026-01-02")
+    brk.loc[mask, "blot"] = 9998.0
+    brk.loc[mask, "slot"] = 9998.0
+
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["i1_buy_vs_volume"] >= 1, "the deficit must still be measured"
+    assert gate.LOT_COVERAGE_DEFICIT_IS_FATAL is False, \
+        "lot conservation must be declared non-fatal"
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_treats_lot_coverage_deficits_as_reported_not_fatal passed")
+
+
+def test_gate_fails_when_value_conservation_breaks():
+    """Value conservation is the control that proves lots are the broken field."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    brk.loc[(brk.ticker == "AAAA") & (brk.date == "2026-01-02"), "sval"] = 5e7
+
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["i4_value_conservation"] >= 1, "the break must be measured"
+    try:
+        gate.assert_cross_source_integrity(report)
+    except gate.GateFailure as exc:
+        assert "value conservation" in str(exc), "the failure must name the invariant"
+    else:
+        raise AssertionError("a value-conservation break must fail the gate")
+    print("test_gate_fails_when_value_conservation_breaks passed")
+
+
+def test_gate_implied_price_confirms_the_basis_correction():
+    """I6 is a volume-free, row-level confirmation that harmonisation worked.
+
+    Before harmonisation the broker's implied VWAP sits far outside the session
+    range because the two sides are on different bases. After scaling lots by the
+    factor it falls inside. Because it never touches volume, it cannot be
+    satisfied by the same error that would satisfy the I1 ratio check.
+    """
+    ohlc, brk = _gate_frames()
+    # BBBB's in-regime rows already carry an as-traded 4600 against a 900-940 range
+    before = gate.implied_price_containment(ohlc, brk)
+    assert before["violations"] > 0, \
+        "an implied price of 4600 against a 900-940 range must be flagged"
+    assert any(w.startswith("BBBB") for w in before["worst_tickers"]), \
+        "the offending ticker must be named"
+
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    harmonised, _ = gate.harmonise_broker_basis(brk, recon)
+    after = gate.implied_price_containment(ohlc, harmonised)
+    assert after["violations"] == 0, \
+        "harmonisation must bring the implied price back inside the session range"
+    assert after["rows_checked"] == before["rows_checked"], \
+        "harmonisation must not change how many rows are checkable"
+
+    # and it stays REPORTED, not FATAL: a residual must not stop the gate
+    report = gate.cross_source_invariants(ohlc, harmonised, artifacts)
+    assert "i6_implied_price_outside_range" in report, "I6 must appear in the report"
+    report["i6_implied_price_outside_range"] = 4713
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_implied_price_confirms_the_basis_correction passed")
+
+
+def test_gate_does_not_call_a_thin_stock_deficit_a_basis_break():
+    """A few lots missing on a thinly traded name is coverage, not a basis error.
+
+    MTDL loses 3-8 lots on 14 scattered sessions while trading only 1,003-6,087
+    lots a day, which reads as |r-1| up to 4.8e-3. A ratio-only rule calls that a
+    basis break and fails the gate; requiring an absolute lot gap as well keeps
+    the two phenomena apart. Real basis regimes move at least 343 lots.
+    """
+    ohlc, brk = _gate_frames()
+    thin = ohlc.ticker == "AAAA"
+    ohlc.loc[thin, "volume"] = 200000.0           # 2,000 lots: a thin session
+    brk_thin = brk.ticker == "AAAA"
+    brk.loc[brk_thin, "blot"] = 2000.0
+    brk.loc[brk_thin, "slot"] = 2000.0
+    brk.loc[brk_thin, "bval"] = 2000.0 * 100.0 * 100.0
+    brk.loc[brk_thin, "sval"] = 2000.0 * 100.0 * 100.0
+    day = brk_thin & (brk.date == "2026-01-02")
+    brk.loc[day, "blot"] = 1994.0                 # 6 lots short: 3e-3 by ratio
+    brk.loc[day, "slot"] = 1994.0
+
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    harmonised, _ = gate.harmonise_broker_basis(brk, recon)
+    report = gate.cross_source_invariants(ohlc, harmonised, artifacts)
+
+    assert report["i1_buy_vs_volume"] >= 1, "the deficit must still be measured"
+    assert report["i1_basis_scale_breaks"] == 0,         "a 6-lot gap must never be classified as a basis break"
+    assert report["i1_rounding_deficits"] >= 1,         "it must be counted as a rounding deficit instead"
+    gate.assert_cross_source_integrity(report)
+
+    # and the absolute rule must not blind the check to a real basis break
+    big = brk.copy()
+    big_day = (big.ticker == "AAAA") & (big.date == "2026-01-03")
+    big.loc[big_day, "blot"] = 400.0              # 1,600 lots short on 2,000
+    big.loc[big_day, "slot"] = 400.0
+    harmonised_big, _ = gate.harmonise_broker_basis(big, recon)
+    broken = gate.cross_source_invariants(ohlc, harmonised_big, artifacts)
+    assert broken["i1_basis_scale_breaks"] >= 1,         "a genuine large-scale break must still be caught"
+    print("test_gate_does_not_call_a_thin_stock_deficit_a_basis_break passed")
+
+
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
@@ -1919,4 +2502,24 @@ if __name__ == "__main__":
     test_kelly_fraction_known_example()
     test_kelly_fraction_negative_edge_returns_zero()
     test_kelly_from_trades_matches_manual_calc()
+    test_lot_storage_keeps_values_above_the_float32_exact_range()
+    test_lot_cast_refuses_non_integral_and_non_finite_lots()
+    test_row_level_nlot_identity_is_checked_in_exact_integer_space()
+    test_uint32_volume_wrap_requires_every_guard_to_hold()
+    test_authorised_volume_repair_carries_full_provenance()
+    test_observed_basis_factor_algebra_preserves_nominal_rupiah()
+    test_basis_factor_requires_exact_piecewise_constancy()
+    test_dual_estimator_disagreement_vetoes_reconstruction()
+    test_noisy_nonconstant_factor_is_quarantined()
+    test_wrap_hidden_behind_a_basis_factor_is_never_silently_repaired()
+    test_normalization_never_bleeds_across_ticker_boundaries()
+    test_gate_refuses_to_run_without_the_normalized_artifacts()
+    test_gate_applies_only_ledger_authorised_volume_repairs()
+    test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover()
+    test_gate_harmonises_a_certified_basis_and_keeps_lots_integral()
+    test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker()
+    test_gate_treats_lot_coverage_deficits_as_reported_not_fatal()
+    test_gate_fails_when_value_conservation_breaks()
+    test_gate_implied_price_confirms_the_basis_correction()
+    test_gate_does_not_call_a_thin_stock_deficit_a_basis_break()
     print("\nAll tests passed.")

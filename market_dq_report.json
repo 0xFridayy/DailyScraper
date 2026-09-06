@@ -1,0 +1,12 @@
+{
+  "i1_buy_vs_volume": 3902,
+  "i2_sell_vs_volume": 3898,
+  "i3_row_nlot_identity": 0,
+  "i3_rows_checked": 2689054,
+  "i3b_sum_nlot_nonzero": 2460,
+  "i4_value_conservation": 0,
+  "i5_sum_nval_nonzero": 0,
+  "non_integer_lot_values": 0,
+  "ticker_days": 67954,
+  "tickers": 298
+}

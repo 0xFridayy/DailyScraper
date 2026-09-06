@@ -67,6 +67,21 @@ MODULUS = 2 ** 32                 # unsigned 32-bit wrap observed in vendor volu
 # |r-1| is >= 1.35e-2 for every basis regime and <= 8.5e-4 for every coverage
 # deficit, a 15.9x gap, and they separate again on the ratio correlation below.
 BASIS_MIN_DEVIATION = 1e-3
+
+#: ...and a ratio alone is not enough, because it punishes thin stocks. Nine
+#: tickers (KOIN, BBLD, FMII, CCSI, MDKI, SKBM, PDPP, INCI, UFOE) lose only 1-8
+#: lots a day but trade so little that this reads as |r-1| up to 9.2e-3. Detected
+#: on ratio alone they become "regimes" and get quarantined for what is ordinary
+#: source rounding.
+#:
+#: The populations separate on ABSOLUTE size, cleanly and market-wide: no ticker
+#: without a real basis regime has a median gap above 23 lots, while every real
+#: regime moves at least 343 lots and typically hundreds of thousands. A regime
+#: day must therefore clear both bars. This is the same conjunction Gate A
+#: applies, and the two must agree or the gate would quarantine tickers whose
+#: days it would never flag.
+BASIS_MIN_LOT_GAP = 100.0
+
 RATIO_CORRELATION_MIN = 0.90
 MIN_REGIME_DAYS = 20
 
@@ -76,6 +91,15 @@ MIN_REGIME_DAYS = 20
 # tickers spans [0.873, 1.196] at the 99.8% level and so cannot resolve a factor
 # closer than ~16% to 1.
 RECONSTRUCTION_MIN_RATE = 0.999
+
+# The volume-free estimator is used as a one-sided VETO, never as a certificate.
+# On clean (r == 1) tickers its own ratio spans [0.873, 1.196] at the 99.8% level
+# (sd 0.024, n=22,727 ticker-days), because a broker VWAP is not a close. So it
+# cannot confirm a factor -- it agrees with every regime we measured, including
+# ones that are demonstrably not reconstructible. It can still refute one: a
+# disagreement wider than that measured noise band means the price series and the
+# volume series disagree about the basis, and the regime is not trustworthy.
+DUAL_ESTIMATOR_MAX_DISAGREEMENT = 0.20
 
 # IDX fraksi harga (tick size) by price band.
 TICK_BANDS = ((200, 1.0), (500, 2.0), (2000, 5.0), (5000, 10.0))
@@ -284,7 +308,10 @@ def observed_basis_factor(ticker, totals, repaired_volume):
     for i in usable:
         ratios[i] = Fraction(int(repaired_volume[i]),
                              SHARES_PER_LOT * totals["blot"][i])
-    off = [i for i in usable if abs(float(ratios[i]) - 1.0) > BASIS_MIN_DEVIATION]
+    off = [i for i in usable
+           if abs(float(ratios[i]) - 1.0) > BASIS_MIN_DEVIATION
+           and abs(int(repaired_volume[i]) - SHARES_PER_LOT * totals["blot"][i])
+           / SHARES_PER_LOT > BASIS_MIN_LOT_GAP]
     if len(off) < MIN_REGIME_DAYS:
         return None
 
@@ -325,12 +352,21 @@ def observed_basis_factor(ticker, totals, repaired_volume):
         rate_integral = float(np.isclose(rebuilt, np.round(rebuilt)).mean())
         rate_on_grid = float(on_tick_grid(np.round(rebuilt, 6)).mean())
 
+    # One-sided veto: agreement proves nothing, but gross disagreement refutes.
+    if np.isnan(estimator_volume_free) or float(representative) == 0:
+        estimators_disagree = False
+        estimator_gap = float("nan")
+    else:
+        estimator_gap = abs(estimator_volume_free / float(representative) - 1.0)
+        estimators_disagree = estimator_gap > DUAL_ESTIMATOR_MAX_DISAGREEMENT
+
     reconstructible = bool(
         exactly_constant
         and prefix_block
         and (np.isnan(correlation) or correlation >= RATIO_CORRELATION_MIN)
         and rate_integral >= RECONSTRUCTION_MIN_RATE
         and rate_on_grid >= RECONSTRUCTION_MIN_RATE
+        and not estimators_disagree
     )
     return {
         "ticker": ticker,
@@ -346,6 +382,8 @@ def observed_basis_factor(ticker, totals, repaired_volume):
             "ratio_like_correlation": correlation,
             "estimator_volume_based": float(representative),
             "estimator_volume_free": estimator_volume_free,
+            "estimator_relative_gap": estimator_gap,
+            "estimators_disagree": estimators_disagree,
             "reconstruction_integral_rate": rate_integral,
             "reconstruction_on_grid_rate": rate_on_grid,
         },
