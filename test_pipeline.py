@@ -537,6 +537,77 @@ def test_1f_broker_source_audit_catches_incoherent_rows():
     print("test_1f_broker_source_audit_catches_incoherent_rows passed")
 
 
+def _gate_price_frame(close=1_100.0, dates=("2026-01-01", "2026-01-02")):
+    return pd.DataFrame({
+        "date": list(dates),
+        "ticker": ["AAAA"] * len(dates),
+        "open": [close] * len(dates),
+        "high": [close] * len(dates),
+        "low": [close] * len(dates),
+        "close": [close] * len(dates),
+        "volume": [1_000_000.0] * len(dates),
+    })
+
+
+def _value_without_lots(bval):
+    """Row 2 carries buy VALUE with zero buy LOTS; nval is kept consistent."""
+    frame = _gate_broker_frame()
+    frame["bval"] = [1_000_000.0, bval]
+    frame["nval"] = [600_000.0, bval - 500_000.0]
+    return frame
+
+
+def test_1f_one_lot_rounding_is_tolerated_but_a_real_defect_is_not():
+    """The bound must separate a one-lot vendor artifact from a genuine defect.
+
+    The frozen harvest carries 765 rows with rupiah value and zero lots, all on
+    CTRA/BRPT/TINS, whose implied quantity clusters on exactly one lot. Failing the
+    gate on those rejects the market's smallest possible trade; tolerating the shape
+    unconditionally would wave through a row that lost a large quantity. So the
+    discriminator is the implied quantity, and it must cut between the two.
+    """
+    import experiment_1f_universe_gate as gate
+
+    prices = _gate_price_frame(close=1_100.0)
+
+    # 110,000 rupiah at 1,100 = 100 shares = exactly one lot -> tolerated.
+    report = gate.audit_broker_source(_value_without_lots(110_000.0), prices)
+    assert report["passed"], "a one-lot rounding artifact must not fail the gate"
+    verdict = report["value_without_lots"]
+    assert (verdict["rows"], verdict["tolerated"], verdict["fatal"]) == (1, 1, 0)
+
+    # 1,100,000 rupiah at 1,100 = 1,000 shares = ten lots -> far too big to be rounding.
+    report = gate.audit_broker_source(_value_without_lots(1_100_000.0), prices)
+    assert not report["passed"], "ten lots of value with zero lots must stay fatal"
+    assert report["value_without_lots"]["fatal"] == 1
+
+    # Straddling the bound: just under tolerated, at the bound fatal. No silent gap.
+    under = gate.audit_broker_source(
+        _value_without_lots(1_100.0 * (gate.SUBLOT_MAX_SHARES - 1)), prices)
+    at = gate.audit_broker_source(
+        _value_without_lots(1_100.0 * gate.SUBLOT_MAX_SHARES), prices)
+    assert under["passed"] and not at["passed"], (
+        "the bound must be the exact boundary between tolerated and fatal")
+
+    # Unadjudicable rows fail closed, in both ways they can arise.
+    no_price_row = gate.audit_broker_source(
+        _value_without_lots(110_000.0), _gate_price_frame(dates=("2026-01-01",)))
+    assert not no_price_row["passed"], (
+        "a row with no close price cannot be adjudicated and must not be tolerated")
+    no_frame = gate.audit_broker_source(_value_without_lots(110_000.0), None)
+    assert not no_frame["passed"], (
+        "supplying no price frame must fail loudly, not weaken the audit")
+
+    # The reverse direction has no rounding story and stays fatal regardless of price.
+    reverse = _gate_broker_frame()
+    reverse["bval"] = [0.0, 0.0]
+    reverse["nval"] = [-400_000.0, -500_000.0]
+    report = gate.audit_broker_source(reverse, prices)
+    assert not report["passed"], "lots with no value must stay unconditionally fatal"
+    assert report["blot_positive_bval_nonpositive"] == 1
+    print("test_1f_one_lot_rounding_is_tolerated_but_a_real_defect_is_not passed")
+
+
 def test_1f_input_manifest_never_auto_establishes():
     """A missing manifest is a failure, not an invitation.
 
@@ -2474,6 +2545,7 @@ if __name__ == "__main__":
     test_1f_universe_validation_rejects_excel_type_coercion()
     test_1f_date_validation_rejects_impossible_calendar_dates()
     test_1f_broker_source_audit_catches_incoherent_rows()
+    test_1f_one_lot_rounding_is_tolerated_but_a_real_defect_is_not()
     test_1f_input_manifest_never_auto_establishes()
     test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately()
     test_1f_structural_integrity_is_a_gate_not_a_report()

@@ -146,6 +146,25 @@ NVAL_TOLERANCE_RUPIAH = 1.0
 #: Lots are integers; this only absorbs float representation noise.
 NLOT_TOLERANCE = 1e-6
 
+# A vendor row can carry a rupiah value while reporting ZERO lots. Measured on the
+# frozen harvest: 733 such rows (0.027% of 2,689,458) across exactly three tickers
+# -- CTRA, BRPT, TINS -- whose implied quantity, value / that session's close,
+# clusters on exactly one lot: median 100.0 shares, sd 2.0, max 109.7. The reverse
+# direction, lots with no value, does not occur at all.
+#
+# Our ingest is not the cause and must not be "fixed": exact_lots() RAISES on a
+# non-integral lot rather than flooring, and the raw cache carries a literal 0.0
+# beside the correct rupiah value, so the zero is what the vendor sent.
+#
+# The rule is therefore BOUNDED, not dropped -- the same shape as BASIS_MIN_LOT_GAP,
+# which kept the basis rule and added an absolute discriminator rather than relaxing
+# the ratio. A value-without-lots row is tolerated only when its implied quantity is
+# under two lots: 1.82x the largest observed, and still under the smallest quantity
+# that could not be a one-lot artifact. At or above that bound it stays FATAL, and so
+# does any row whose price is missing, so an unadjudicable claim is never waved
+# through as tolerated.
+SUBLOT_MAX_SHARES = 2.0 * SHARES_PER_LOT
+
 REQUIRED_BROKER_NUMERIC = ("nlot", "blot", "slot", "nval", "bval", "sval")
 
 #: Unsigned 32-bit modulus, the observed vendor volume wrap. Matched exactly, in
@@ -556,7 +575,82 @@ def audit_raw_ohlc(frame, calendar, scope="full harvest"):
     return report
 
 
-def audit_broker_source(frame):
+def adjudicate_value_without_lots(frame, prices=None):
+    """Separate a one-lot vendor rounding artifact from a real coherence defect.
+
+    A row reporting rupiah value with zero lots is not self-describing: the same
+    shape covers a trade too small for the vendor's lot field to represent, and a
+    genuinely corrupt row that lost a large quantity. Counting them together, which
+    is what a pure sign test does, cannot tell those apart -- so it either rejects
+    the whole harvest over the market's smallest possible trade, or it waves a real
+    defect through. Neither is a measurement.
+
+    The discriminator is the implied quantity, value / that session's close, in
+    shares. It uses no lot field at all, so it cannot be satisfied by the same defect
+    it is adjudicating.
+
+    Adjudication is deliberately conservative in both unresolved directions. A row
+    whose price is missing or non-positive is FATAL, not tolerated: an unadjudicable
+    claim must never be silently accepted. And passing no price frame at all makes
+    every such row fatal, so a caller that forgets to supply prices gets a loud
+    failure rather than a quietly weaker audit.
+    """
+    result = {
+        "rows": 0, "tolerated": 0, "fatal": 0,
+        "max_implied_shares": 0.0, "bound_shares": SUBLOT_MAX_SHARES,
+        "tickers": [], "failures": [],
+    }
+
+    sides = []
+    for value_col, lot_col in (("bval", "blot"), ("sval", "slot")):
+        mask = (frame[value_col] > 0) & (frame[lot_col] <= 0)
+        if mask.any():
+            part = frame.loc[mask, ["date", "ticker", value_col]].copy()
+            part = part.rename(columns={value_col: "value"})
+            part["side"] = lot_col
+            sides.append(part)
+    if not sides:
+        return result
+
+    offending = pd.concat(sides, ignore_index=True)
+    result["rows"] = int(len(offending))
+    result["tickers"] = sorted(offending["ticker"].unique().tolist())
+
+    if prices is None:
+        result["fatal"] = int(len(offending))
+        result["failures"].append(
+            f"{len(offending)} rows carry value with zero lots and no price frame was "
+            "supplied to adjudicate them; refusing to tolerate unadjudicated rows")
+        return result
+
+    close = prices[["date", "ticker", "close"]].drop_duplicates(["date", "ticker"])
+    merged = offending.merge(close, on=["date", "ticker"], how="left")
+
+    close_values = merged["close"].to_numpy(dtype=float)
+    unpriced = ~np.isfinite(close_values) | (close_values <= 0)
+    implied = np.full(len(merged), np.nan)
+    np.divide(merged["value"].to_numpy(dtype=float), close_values,
+              out=implied, where=~unpriced)
+
+    over = ~unpriced & (implied >= SUBLOT_MAX_SHARES)
+    result["max_implied_shares"] = float(np.nanmax(implied)) if (~unpriced).any() else 0.0
+    result["tolerated"] = int((~unpriced & ~over).sum())
+    result["fatal"] = int(unpriced.sum() + over.sum())
+
+    if unpriced.any():
+        result["failures"].append(
+            f"{int(unpriced.sum())} rows carry value with zero lots and no usable close "
+            "price, so the implied quantity cannot be adjudicated")
+    if over.any():
+        worst = float(np.nanmax(np.where(over, implied, np.nan)))
+        result["failures"].append(
+            f"{int(over.sum())} rows carry value with zero lots at an implied quantity "
+            f"of {SUBLOT_MAX_SHARES:g} shares or more (worst {worst:.1f}); that is too "
+            "large to be a one-lot rounding artifact")
+    return result
+
+
+def audit_broker_source(frame, prices=None):
     """Source-integrity audit of the RAW broker harvest, before any conversion.
 
     Normalization must not run on incoherent inputs: converting units or
@@ -630,9 +724,17 @@ def audit_broker_source(frame):
         "slot_positive_sval_nonpositive": int(((frame["slot"] > 0) & (frame["sval"] <= 0)).sum()),
     }
     report.update(coherence)
-    for name, count in coherence.items():
-        if count:
-            failures.append(f"{count} rows failing value/lot coherence: {name}")
+
+    # Lots without value has no rounding story -- a trade cannot move a lot for no
+    # money -- so it stays unconditionally fatal.
+    for name in ("blot_positive_bval_nonpositive", "slot_positive_sval_nonpositive"):
+        if coherence[name]:
+            failures.append(f"{coherence[name]} rows failing value/lot coherence: {name}")
+
+    # Value without lots is adjudicated per row against the implied quantity.
+    sublot = adjudicate_value_without_lots(frame, prices)
+    report["value_without_lots"] = sublot
+    failures.extend(sublot["failures"])
 
     report["failures"] = failures
     report["passed"] = not failures
@@ -687,7 +789,7 @@ def price_coverage(full_frame, universe, fingerprint, calendar):
     return covered, coverage
 
 
-def load_frozen_broker(universe, path=BROKER_PARQUET):
+def load_frozen_broker(universe, path=BROKER_PARQUET, prices=None):
     """Audit the raw broker harvest, then normalize into #1E's unit convention.
 
     The harvest stores plain rupiah with an explicit buy/sell split
@@ -731,7 +833,7 @@ def load_frozen_broker(universe, path=BROKER_PARQUET):
             "B/C/D would silently shrink:\n  - " + "\n  - ".join(failures))
 
     rows = frame[frame["ticker"].isin(covered)].copy()
-    source_audit = audit_broker_source(rows)
+    source_audit = audit_broker_source(rows, prices)
     if not source_audit["passed"]:
         raise GateFailure(
             "broker source integrity audit failed - refusing to normalize "
@@ -1421,7 +1523,7 @@ def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, establish_manifest=False,
 
     full_harvest, calendar, ohlc_fingerprint = load_full_harvest()
     covered, price_cov = price_coverage(full_harvest, tickers, ohlc_fingerprint, calendar)
-    broker, broker_source, broker_cov = load_frozen_broker(tickers)
+    broker, broker_source, broker_cov = load_frozen_broker(tickers, prices=full_harvest)
 
     manifest = verify_input_manifest(
         [ohlc_fingerprint, broker_cov["fingerprint"]], establish=establish_manifest)
