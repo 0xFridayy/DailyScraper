@@ -1,8 +1,11 @@
 """Quick macro analysis: is the market in accumulation or distribution mode?"""
+import os
 import sqlite3
 import pandas as pd
 
-con = sqlite3.connect(r'C:\Users\jason\Desktop\VsCode\Claude\neobdm.db')
+# The DB lives in this repo; an absolute path pinned it to one machine.
+HERE = os.path.dirname(os.path.abspath(__file__))
+con = sqlite3.connect(os.environ.get("NEOBDM_DB", os.path.join(HERE, "neobdm.db")))
 bf = pd.read_sql('SELECT date, ticker, broker_code, netval FROM broker_flow ORDER BY date, ticker', con)
 con.close()
 

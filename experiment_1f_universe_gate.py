@@ -75,9 +75,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #: writes to it. Once frozen into FROZEN_UNIVERSE_JSON that artifact becomes the
 #: reproducible source of record, so #1F does not depend on a Desktop path
 #: staying put -- see resolve_universe().
-UNIVERSE_XLSX = os.path.join(
-    r"C:\Users\jason\Desktop\Inventory + Broker Summary ML\Extract Data dulu",
-    "Stock Universe Set.xlsx",
+#: The workbook lives OUTSIDE the repo, so its location is machine-local and is
+#: read from the environment rather than hardcoded. It is consulted only to
+#: CREATE the freeze; once FROZEN_UNIVERSE_JSON exists that artifact is
+#: authoritative and the workbook is never reread, so an unset variable is not
+#: an error path for any normal run.
+UNIVERSE_XLSX = os.environ.get(
+    "IDX_UNIVERSE_XLSX",
+    os.path.join(os.path.expanduser("~"), "Desktop",
+                 "Inventory + Broker Summary ML", "Extract Data dulu",
+                 "Stock Universe Set.xlsx"),
 )
 UNIVERSE_SHEET = "Universe for ML"
 UNIVERSE_HEADER = "symbol"
@@ -349,7 +356,10 @@ def write_frozen_universe(tickers, audit, path=FROZEN_UNIVERSE_JSON):
     payload = {
         "universe_digest": audit["universe_digest"],
         "n_tickers": len(tickers),
-        "source_path": audit["source_path"],
+        # Basename only: this artifact is committed, and the directory the
+        # workbook happened to sit in identifies nothing. The filename plus
+        # source_sheet is what identifies it.
+        "source_path": os.path.basename(audit["source_path"] or ""),
         "source_sheet": audit["sheet"],
         "frozen_at_utc": _dt.datetime.utcnow().isoformat() + "Z",
         "tickers": tickers,

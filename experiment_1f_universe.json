@@ -1,7 +1,7 @@
 {
   "frozen_at_utc": "2026-09-05T18:50:36.127697Z",
   "n_tickers": 298,
-  "source_path": "C:\\Users\\jason\\Desktop\\Inventory + Broker Summary ML\\Extract Data dulu\\Stock Universe Set.xlsx",
+  "source_path": "Stock Universe Set.xlsx",
   "source_sheet": "Universe for ML",
   "tickers": [
     "AADI",
