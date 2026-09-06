@@ -367,6 +367,275 @@ def test_close_window_validity_fix_holds_for_h_greater_than_1():
     print("test_close_window_validity_fix_holds_for_h_greater_than_1 passed")
 
 
+# ── Experiment #1F Gate A ─────────────────────
+
+def _gate_ohlc_frame(ticker, dates, base):
+    """Minimal well-formed OHLC rows for one ticker."""
+    return pd.DataFrame({
+        "date": dates,
+        "ticker": [ticker] * len(dates),
+        "open": [base + i for i in range(len(dates))],
+        "high": [base + 1.0 + i for i in range(len(dates))],
+        "low": [base - 1.0 + i for i in range(len(dates))],
+        "close": [base + 0.5 + i for i in range(len(dates))],
+        "volume": [1000.0 + i for i in range(len(dates))],
+    })
+
+
+def test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined():
+    """The detector must see the FULL harvest, not just the approved universe.
+
+    cross_ticker_dup is CROSS-SECTIONAL: it finds one stock's OHLCV copied onto
+    another. If the harvest were filtered to the approved names first, an
+    approved ticker cloned against a ticker OUTSIDE the universe would look
+    perfectly unique -- the other half of the pair having been thrown away --
+    and the contamination would sail straight into the panel.
+
+    The counter-check at the end is the point of this test: it proves the
+    subset-only path really does miss it, so this is a regression guard rather
+    than a tautology.
+    """
+    import experiment_1f_universe_gate as gate
+    import price_audit as pa
+
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+    approved = _gate_ohlc_frame("AAAA", dates, 100.0)
+    excluded = _gate_ohlc_frame("ZZZZ", dates, 500.0)
+    # ZZZZ's middle row is a byte-identical clone of AAAA's middle row.
+    clone_src = approved[approved["date"] == "2026-01-02"].iloc[0]
+    target = excluded.index[excluded["date"] == "2026-01-02"][0]
+    for col in ("open", "high", "low", "close", "volume"):
+        excluded.loc[target, col] = clone_src[col]
+    full = pd.concat([approved, excluded], ignore_index=True)
+
+    panel, flagged, universe_rows = gate.build_validated_panel(
+        full, ["AAAA"], dates, horizons=(1,), lags=())
+
+    flagged_aaaa = flagged[(flagged["ticker"] == "AAAA")
+                           & (flagged["date"] == "2026-01-02")]
+    assert bool(flagged_aaaa["cross_ticker_dup"].iloc[0]), (
+        "the approved ticker's cloned row must be flagged cross_ticker_dup when "
+        "the detector sees the full cross-section")
+    assert not ((panel["ticker"] == "AAAA") & (panel["date"] == "2026-01-02")).any(), (
+        "the cloned approved row must be quarantined out of the model panel")
+    assert (panel["ticker"] == "AAAA").all(), (
+        "an out-of-universe ticker must never enter the #1F model panel")
+
+    # Counter-check: had detect() run on the approved subset alone, the clone
+    # would have been invisible. If this ever stops holding the test is no
+    # longer proving anything.
+    subset_flagged = pa.detect(approved)
+    assert not subset_flagged["cross_ticker_dup"].any(), (
+        "counter-check failed: subset-only detection was expected to miss the "
+        "cross-ticker clone")
+    print("test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined passed")
+
+
+def test_1f_universe_validation_rejects_excel_type_coercion():
+    """A boolean where a ticker belongs is the exact spreadsheet failure mode."""
+    import experiment_1f_universe_gate as gate
+
+    cells = ["symbol", "AADI", True, "AALI"]
+    try:
+        gate.validate_universe_cells(cells)
+        assert False, "a non-string cell must fail validation"
+    except gate.GateFailure as e:
+        assert "non-string" in str(e).lower()
+
+    for label, cells in (
+        ("blank", ["symbol", "AADI", "", "AALI"]),
+        ("duplicate", ["symbol", "AADI", "AADI"]),
+        ("malformed", ["symbol", "AADI", "AA1I"]),
+        ("bad header", ["ticker", "AADI"]),
+    ):
+        try:
+            gate.validate_universe_cells(cells)
+            assert False, f"{label} must fail validation"
+        except gate.GateFailure:
+            pass
+    print("test_1f_universe_validation_rejects_excel_type_coercion passed")
+
+
+def test_1f_date_validation_rejects_impossible_calendar_dates():
+    """Shape is not validity: 2026-99-77 matches the regex and is not a date."""
+    import experiment_1f_universe_gate as gate
+
+    series = pd.Series(["2026-01-02", "2026-99-77", "2026-02-30", "not-a-date", None])
+    mask = gate.invalid_date_mask(series)
+    assert not bool(mask.iloc[0]), "a real date must pass"
+    assert bool(mask.iloc[1]), "month 99 / day 77 must fail despite matching the regex"
+    assert bool(mask.iloc[2]), "2026-02-30 does not exist and must fail"
+    assert bool(mask.iloc[3]) and bool(mask.iloc[4])
+
+    dates = ["2026-01-01", "2026-01-02"]
+    frame = _gate_ohlc_frame("AAAA", dates, 100.0)
+    frame.loc[1, "date"] = "2026-99-77"
+    try:
+        gate.audit_raw_ohlc(frame, dates)
+        assert False, "an impossible date must fail the raw OHLC audit"
+    except gate.GateFailure as e:
+        assert "date" in str(e).lower()
+    print("test_1f_date_validation_rejects_impossible_calendar_dates passed")
+
+
+def _gate_broker_frame():
+    return pd.DataFrame({
+        "date": ["2026-01-01", "2026-01-02"],
+        "ticker": ["AAAA", "AAAA"],
+        "broker": ["AI", "AI"],
+        "blot": [10.0, 0.0],
+        "slot": [4.0, 5.0],
+        "nlot": [6.0, -5.0],
+        "bval": [1_000_000.0, 0.0],
+        "sval": [400_000.0, 500_000.0],
+        "nval": [600_000.0, -500_000.0],
+    })
+
+
+def test_1f_broker_source_audit_catches_incoherent_rows():
+    """Every arithmetic and coherence invariant must fail loudly, NaN included.
+
+    NaN is checked explicitly because `NaN < 0` is False -- a comparison-only
+    audit waves non-finite values straight through.
+    """
+    import experiment_1f_universe_gate as gate
+
+    clean = _gate_broker_frame()
+    assert gate.audit_broker_source(clean)["passed"], "the clean fixture must pass"
+
+    def fails(mutate, label):
+        frame = _gate_broker_frame()
+        mutate(frame)
+        report = gate.audit_broker_source(frame)
+        assert not report["passed"], f"{label} must fail the broker source audit"
+        return report
+
+    fails(lambda f: f.__setitem__("nlot", [999.0, -5.0]), "nlot != blot - slot")
+    fails(lambda f: f.__setitem__("nval", [999.0, -500_000.0]), "nval != bval - sval")
+    fails(lambda f: f.__setitem__("blot", [-1.0, 0.0]), "negative gross lots")
+    r = fails(lambda f: f.__setitem__("nlot", [np.nan, -5.0]), "NaN in a required field")
+    assert r["non_finite"]["nlot"] == 1, "NaN must be caught explicitly, not by comparison"
+
+    # Both directions of value/lot coherence.
+    r = fails(lambda f: (f.__setitem__("bval", [1_000_000.0, 7.0]),
+                         f.__setitem__("nval", [600_000.0, -499_993.0])),
+              "bval>0 with blot<=0")
+    assert r["bval_positive_blot_nonpositive"] == 1
+    r = fails(lambda f: (f.__setitem__("bval", [0.0, 0.0]),
+                         f.__setitem__("nval", [-400_000.0, -500_000.0])),
+              "blot>0 with bval<=0")
+    assert r["blot_positive_bval_nonpositive"] == 1
+
+    dupe = pd.concat([_gate_broker_frame().iloc[[0]]] * 2, ignore_index=True)
+    assert not gate.audit_broker_source(dupe)["passed"], (
+        "duplicate (date,ticker,broker) must fail")
+    print("test_1f_broker_source_audit_catches_incoherent_rows passed")
+
+
+def test_1f_input_manifest_never_auto_establishes():
+    """A missing manifest is a failure, not an invitation.
+
+    Auto-creating one would reopen the hole it closes: delete the manifest,
+    refresh the parquet, and whatever bytes are on disk quietly become the
+    'reviewed' snapshot.
+    """
+    import os
+    import tempfile
+    import experiment_1f_universe_gate as gate
+
+    fingerprints = [{"path": "ohlc.parquet", "sha256": "a" * 64, "size_bytes": 10},
+                    {"path": "broker_daily.parquet", "sha256": "b" * 64, "size_bytes": 20}]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "manifest.json")
+        try:
+            gate.verify_input_manifest(fingerprints, path=path)
+            assert False, "a missing manifest must raise, never auto-establish"
+        except gate.GateFailure as e:
+            assert "missing" in str(e).lower()
+        assert not os.path.exists(path), "the failed call must not have written a manifest"
+
+        established = gate.verify_input_manifest(fingerprints, path=path, establish=True)
+        assert "ESTABLISHED" in established["status"]
+        assert gate.verify_input_manifest(fingerprints, path=path)["status"] == "verified"
+
+        changed = [dict(fingerprints[0], sha256="c" * 64), fingerprints[1]]
+        try:
+            gate.verify_input_manifest(changed, path=path)
+            assert False, "changed bytes must fail verification"
+        except gate.GateFailure as e:
+            assert "sha256" in str(e).lower()
+    print("test_1f_input_manifest_never_auto_establishes passed")
+
+
+def test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately():
+    """A broker that did not trade at all is zero-sided, not one-sided.
+
+    Also pins the consequence the audit exists to surface: those rows take
+    frozen #1E's netval/close fallback rather than the exact split path.
+    """
+    import experiment_1f_universe_gate as gate
+
+    broker = pd.DataFrame({
+        "date": ["2026-01-01"] * 3,
+        "ticker": ["AAAA"] * 3,
+        "broker_code": ["AI", "BK", "CC"],
+        "nlot": [6.0, 10.0, 0.0],
+        "blot": [10.0, 10.0, 0.0],
+        "slot": [4.0, 0.0, 0.0],
+        "netval": [0.0006, 0.001, 0.0],
+        "bval": [0.001, 0.001, 0.0],
+        "sval": [0.0004, 0.0, 0.0],
+        "bavg": [1000.0, 1000.0, np.nan],
+        "savg": [1000.0, np.nan, np.nan],
+    })
+    panel = pd.DataFrame({"date": ["2026-01-01"], "ticker": ["AAAA"], "close": [1000.0]})
+
+    report = gate.audit_net_lot_recovery(broker, panel)
+    assert report["rows_audited"] == 3
+    assert report["one_sided_rows"] == 1, (
+        f"exactly one XOR one-sided row expected, got {report['one_sided_rows']}")
+    assert report["zero_sided_rows"] == 1, (
+        f"exactly one zero-sided row expected, got {report['zero_sided_rows']}")
+    assert report["exact_split_path_rows"] == 1, (
+        "only the two-sided row has both averages defined")
+    assert report["fallback_path_rows"] == 2
+    print("test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately passed")
+
+
+def test_1f_structural_integrity_is_a_gate_not_a_report():
+    """The docstring promises failures raise, so the implementation must."""
+    import experiment_1f_universe_gate as gate
+
+    ok = {
+        "duplicate_date_ticker": 0, "blank_dates": 0, "nonpositive_close": 0,
+        "surviving_cross_ticker_dup": 0, "out_of_universe_rows_in_panel": 0,
+        "first_row_lag_leak": 0, "last_row_forward_leak": 0,
+        "dates_monotonic_per_ticker": True,
+    }
+    assert gate.assert_structural_integrity(dict(ok)) is True
+
+    for key, bad in (("duplicate_date_ticker", 1), ("blank_dates", 1),
+                     ("nonpositive_close", 1), ("surviving_cross_ticker_dup", 1),
+                     ("out_of_universe_rows_in_panel", 1),
+                     ("first_row_lag_leak", 1), ("last_row_forward_leak", 1),
+                     ("dates_monotonic_per_ticker", False)):
+        broken = dict(ok)
+        broken[key] = bad
+        try:
+            gate.assert_structural_integrity(broken)
+            assert False, f"{key} must hard-fail the structural gate"
+        except gate.GateFailure:
+            pass
+
+    # An invalid open anchor is NOT fatal: the contract withholds the label and
+    # keeps the row. Repairing or deleting it would be the wrong response.
+    tolerated = dict(ok)
+    tolerated["open_outside_high_low"] = 25
+    assert gate.assert_structural_integrity(tolerated) is True, (
+        "an invalid open anchor must not fail the gate; its label goes NaN instead")
+    print("test_1f_structural_integrity_is_a_gate_not_a_report passed")
+
+
 def test_both_realization_purges_hold_on_timestamps():
     """decision at EOD(i); label enters OPEN(i+1) and realizes OPEN(i+1+h).
 
@@ -1618,6 +1887,13 @@ if __name__ == "__main__":
     test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass()
     test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1()
     test_close_window_validity_fix_holds_for_h_greater_than_1()
+    test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined()
+    test_1f_universe_validation_rejects_excel_type_coercion()
+    test_1f_date_validation_rejects_impossible_calendar_dates()
+    test_1f_broker_source_audit_catches_incoherent_rows()
+    test_1f_input_manifest_never_auto_establishes()
+    test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately()
+    test_1f_structural_integrity_is_a_gate_not_a_report()
     test_both_realization_purges_hold_on_timestamps()
     test_thin_and_infeasible_folds_are_skipped_and_counted()
     test_legacy_experiment1_digest_is_frozen()
