@@ -5,7 +5,22 @@
 
 Rows where a broker did nothing that day are dropped, so broker_daily is sparse.
 Streamed through pyarrow so the whole universe never has to sit in memory.
+
+This is the INGEST layer: a faithful, lossless transcription of the immutable
+vendor cache. It performs no economic normalisation -- no volume repair, no
+basis harmonisation. Those live in normalize_market_data.py, which reads the
+same raw cache and emits provenance artifacts alongside it.
+
+Lot columns are int64. The vendor reports lots as exact integers (measured:
+63,679,923 values, zero non-integral, zero null, max 80,883,692), so int64 is
+the faithful representation. The previous float32 was lossy well below its
+2**24 exact-integer ceiling, because downstream `blot * 100.0` on a float32
+column evaluates in float32 and loses precision from 671,089 lots upward --
+0.30% of in-universe rows, not the 105 values that exceed 2**24. Integrality
+is asserted before the cast so a future cache that violates it fails loudly
+rather than being silently truncated.
 """
+import argparse
 import glob
 import gzip
 import json
@@ -19,6 +34,8 @@ import pyarrow.parquet as pq
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
 
+LOT_FIELDS = ("nlot", "blot", "slot")
+
 OHLC_SCHEMA = pa.schema([
     ("date", pa.string()), ("ticker", pa.string()),
     ("open", pa.float64()), ("high", pa.float64()), ("low", pa.float64()),
@@ -26,18 +43,47 @@ OHLC_SCHEMA = pa.schema([
 ])
 BRK_SCHEMA = pa.schema([
     ("date", pa.string()), ("ticker", pa.string()), ("broker", pa.string()),
-    ("nlot", pa.float32()), ("nval", pa.float64()),
-    ("blot", pa.float32()), ("bval", pa.float64()),
-    ("slot", pa.float32()), ("sval", pa.float64()),
+    ("nlot", pa.int64()), ("nval", pa.float64()),
+    ("blot", pa.int64()), ("bval", pa.float64()),
+    ("slot", pa.int64()), ("sval", pa.float64()),
 ])
 
 
+def exact_lots(values, ticker, field):
+    """Cast a float64 lot vector to int64, refusing anything not exactly integral.
+
+    The vendor's lot fields are a counting quantity. A non-integral or non-finite
+    value means the source contract changed, and silently rounding it would hide
+    exactly the class of defect this rebuild exists to remove.
+    """
+    if not np.isfinite(values).all():
+        bad = int((~np.isfinite(values)).sum())
+        raise ValueError(f"{ticker}: {bad} non-finite {field} values; "
+                         "lots must be finite integers")
+    rounded = np.rint(values)
+    if not np.array_equal(values, rounded):
+        bad = int((values != rounded).sum())
+        worst = float(np.abs(values - rounded).max())
+        raise ValueError(f"{ticker}: {bad} non-integral {field} values "
+                         f"(max fractional part {worst:g}); lots must be integers")
+    return rounded.astype(np.int64)
+
+
 def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out-dir", default=HERE,
+                    help="directory to write the parquets into (default: repo root). "
+                         "Point this at a scratch directory to build a candidate "
+                         "rebuild without touching the current artifacts.")
+    a = ap.parse_args()
+    out_dir = os.path.abspath(a.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
     files = sorted(glob.glob(os.path.join(RAW, "*.json.gz")))
-    print(f"{len(files)} cached tickers")
-    w_o = pq.ParquetWriter(os.path.join(HERE, "ohlc.parquet"), OHLC_SCHEMA,
+    print(f"{len(files)} cached tickers -> {out_dir}")
+    w_o = pq.ParquetWriter(os.path.join(out_dir, "ohlc.parquet"), OHLC_SCHEMA,
                            compression="zstd")
-    w_b = pq.ParquetWriter(os.path.join(HERE, "broker_daily.parquet"), BRK_SCHEMA,
+    w_b = pq.ParquetWriter(os.path.join(out_dir, "broker_daily.parquet"), BRK_SCHEMA,
                            compression="zstd")
     n_o = n_b = 0
     empty = []
@@ -84,11 +130,14 @@ def main():
                 for k in fields:
                     mask |= cols[k] != 0
                 if mask.any():
+                    kept = {k: cols[k][mask] for k in fields}
+                    for k in LOT_FIELDS:
+                        kept[k] = exact_lots(kept[k], t, k)
                     df = pd.DataFrame({
                         "date": np.tile(np.asarray(dates, dtype=object), nb)[mask],
                         "ticker": t,
                         "broker": np.repeat(np.asarray(brokers, dtype=object), nd)[mask],
-                        **{k: cols[k][mask] for k in fields},
+                        **kept,
                     })[["date", "ticker", "broker", "nlot", "nval",
                         "blot", "bval", "slot", "sval"]]
                     w_b.write_table(pa.Table.from_pandas(df, schema=BRK_SCHEMA,
