@@ -2139,22 +2139,33 @@ def test_normalization_never_bleeds_across_ticker_boundaries():
 
 
 def _gate_frames():
-    """A tiny harvest + broker pair: one clean ticker, one on a 5x basis."""
+    """A tiny harvest + broker pair: one clean ticker, one on a 5x basis.
+
+    Internally coherent by construction: every broker value equals
+    lots * SHARES_PER_LOT * price, so a broker's implied VWAP lands inside the
+    session range. BBBB's in-regime rows carry the AS-TRADED price (4600) against
+    an ADJUSTED quoted range (~920) -- the real shape of the basis mismatch.
+    """
+    lots = 1000.0
     rows, brk = [], []
     for i in range(6):
         day = "2026-01-%02d" % (i + 1)
-        rows.append({"date": day, "ticker": "AAAA", "open": 100.0, "high": 100.0,
-                     "low": 100.0, "close": 100.0, "volume": 100000.0})
+        rows.append({"date": day, "ticker": "AAAA", "open": 100.0, "high": 101.0,
+                     "low": 99.0, "close": 100.0, "volume": 100000.0})
+        value = lots * 100.0 * 100.0
         brk.append({"date": day, "ticker": "AAAA", "broker_code": "AK",
-                    "blot": 1000.0, "slot": 1000.0, "nlot": 0.0,
-                    "bval": 1e8, "sval": 1e8, "nval": 0.0})
+                    "blot": lots, "slot": lots, "nlot": 0.0,
+                    "bval": value, "sval": value, "nval": 0.0})
+
         in_regime = i < 3
-        rows.append({"date": day, "ticker": "BBBB", "open": 920.0, "high": 920.0,
-                     "low": 920.0, "close": 920.0,
+        rows.append({"date": day, "ticker": "BBBB", "open": 920.0, "high": 940.0,
+                     "low": 900.0, "close": 920.0,
                      "volume": 500000.0 if in_regime else 100000.0})
+        traded = 4600.0 if in_regime else 920.0
+        value = lots * 100.0 * traded
         brk.append({"date": day, "ticker": "BBBB", "broker_code": "AK",
-                    "blot": 1000.0, "slot": 1000.0, "nlot": 0.0,
-                    "bval": 1e8, "sval": 1e8, "nval": 0.0})
+                    "blot": lots, "slot": lots, "nlot": 0.0,
+                    "bval": value, "sval": value, "nval": 0.0})
     return pd.DataFrame(rows), pd.DataFrame(brk)
 
 
@@ -2300,6 +2311,8 @@ def test_gate_treats_lot_coverage_deficits_as_reported_not_fatal():
     scale = (brk.ticker == "AAAA")
     brk.loc[scale, "blot"] = 10000.0
     brk.loc[scale, "slot"] = 10000.0
+    brk.loc[scale, "bval"] = 10000.0 * 100.0 * 100.0
+    brk.loc[scale, "sval"] = 10000.0 * 100.0 * 100.0
     ohlc.loc[ohlc.ticker == "AAAA", "volume"] = 1000000.0
     mask = scale & (brk.date == "2026-01-02")
     brk.loc[mask, "blot"] = 9998.0
@@ -2330,6 +2343,80 @@ def test_gate_fails_when_value_conservation_breaks():
     else:
         raise AssertionError("a value-conservation break must fail the gate")
     print("test_gate_fails_when_value_conservation_breaks passed")
+
+
+def test_gate_implied_price_confirms_the_basis_correction():
+    """I6 is a volume-free, row-level confirmation that harmonisation worked.
+
+    Before harmonisation the broker's implied VWAP sits far outside the session
+    range because the two sides are on different bases. After scaling lots by the
+    factor it falls inside. Because it never touches volume, it cannot be
+    satisfied by the same error that would satisfy the I1 ratio check.
+    """
+    ohlc, brk = _gate_frames()
+    # BBBB's in-regime rows already carry an as-traded 4600 against a 900-940 range
+    before = gate.implied_price_containment(ohlc, brk)
+    assert before["violations"] > 0, \
+        "an implied price of 4600 against a 900-940 range must be flagged"
+    assert any(w.startswith("BBBB") for w in before["worst_tickers"]), \
+        "the offending ticker must be named"
+
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    harmonised, _ = gate.harmonise_broker_basis(brk, recon)
+    after = gate.implied_price_containment(ohlc, harmonised)
+    assert after["violations"] == 0, \
+        "harmonisation must bring the implied price back inside the session range"
+    assert after["rows_checked"] == before["rows_checked"], \
+        "harmonisation must not change how many rows are checkable"
+
+    # and it stays REPORTED, not FATAL: a residual must not stop the gate
+    report = gate.cross_source_invariants(ohlc, harmonised, artifacts)
+    assert "i6_implied_price_outside_range" in report, "I6 must appear in the report"
+    report["i6_implied_price_outside_range"] = 4713
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_implied_price_confirms_the_basis_correction passed")
+
+
+def test_gate_does_not_call_a_thin_stock_deficit_a_basis_break():
+    """A few lots missing on a thinly traded name is coverage, not a basis error.
+
+    MTDL loses 3-8 lots on 14 scattered sessions while trading only 1,003-6,087
+    lots a day, which reads as |r-1| up to 4.8e-3. A ratio-only rule calls that a
+    basis break and fails the gate; requiring an absolute lot gap as well keeps
+    the two phenomena apart. Real basis regimes move at least 343 lots.
+    """
+    ohlc, brk = _gate_frames()
+    thin = ohlc.ticker == "AAAA"
+    ohlc.loc[thin, "volume"] = 200000.0           # 2,000 lots: a thin session
+    brk_thin = brk.ticker == "AAAA"
+    brk.loc[brk_thin, "blot"] = 2000.0
+    brk.loc[brk_thin, "slot"] = 2000.0
+    brk.loc[brk_thin, "bval"] = 2000.0 * 100.0 * 100.0
+    brk.loc[brk_thin, "sval"] = 2000.0 * 100.0 * 100.0
+    day = brk_thin & (brk.date == "2026-01-02")
+    brk.loc[day, "blot"] = 1994.0                 # 6 lots short: 3e-3 by ratio
+    brk.loc[day, "slot"] = 1994.0
+
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    harmonised, _ = gate.harmonise_broker_basis(brk, recon)
+    report = gate.cross_source_invariants(ohlc, harmonised, artifacts)
+
+    assert report["i1_buy_vs_volume"] >= 1, "the deficit must still be measured"
+    assert report["i1_basis_scale_breaks"] == 0,         "a 6-lot gap must never be classified as a basis break"
+    assert report["i1_rounding_deficits"] >= 1,         "it must be counted as a rounding deficit instead"
+    gate.assert_cross_source_integrity(report)
+
+    # and the absolute rule must not blind the check to a real basis break
+    big = brk.copy()
+    big_day = (big.ticker == "AAAA") & (big.date == "2026-01-03")
+    big.loc[big_day, "blot"] = 400.0              # 1,600 lots short on 2,000
+    big.loc[big_day, "slot"] = 400.0
+    harmonised_big, _ = gate.harmonise_broker_basis(big, recon)
+    broken = gate.cross_source_invariants(ohlc, harmonised_big, artifacts)
+    assert broken["i1_basis_scale_breaks"] >= 1,         "a genuine large-scale break must still be caught"
+    print("test_gate_does_not_call_a_thin_stock_deficit_a_basis_break passed")
 
 
 if __name__ == "__main__":
@@ -2433,4 +2520,6 @@ if __name__ == "__main__":
     test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker()
     test_gate_treats_lot_coverage_deficits_as_reported_not_fatal()
     test_gate_fails_when_value_conservation_breaks()
+    test_gate_implied_price_confirms_the_basis_correction()
+    test_gate_does_not_call_a_thin_stock_deficit_a_basis_break()
     print("\nAll tests passed.")

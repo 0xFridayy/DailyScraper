@@ -161,11 +161,40 @@ VOLUME_WRAP_MODULUS = 2 ** 32
 #: threshold routes to QUARANTINE: the conservative direction.
 BASIS_RATIO_TOLERANCE = 1e-3
 
+#: ...but a ratio alone misclassifies thin stocks. MTDL loses 3-8 lots on 14
+#: scattered sessions; because it trades only 1,003-6,087 lots a day that reads
+#: as |r-1| up to 4.8e-3 and would be called a basis break, which it is not.
+#:
+#: The two populations separate on ABSOLUTE size far more cleanly than on ratio:
+#: every measured basis regime moves at least 343 lots (WINS) and typically
+#: ~434,000 (RAJA moves 1,647,440), while the worst coverage deficit anywhere in
+#: the cache is 23 lots. A basis break must therefore be BOTH ratio-significant
+#: AND absolutely large -- the conjunction is what encodes the finding that these
+#: are two different phenomena, not two ends of one scale.
+BASIS_MIN_LOT_GAP = 100.0
+
 #: Lot conservation is NOT source-guaranteed, so it can never be FATAL. Buy- and
 #: sell-side agreement with volume is symmetric (96.0986% vs 96.1081%), all 101
 #: declared broker codes appear, and the residual is a handful of lots. Making
 #: exact equality fatal would reject 15 in-universe tickers on ~100% of days.
 LOT_COVERAGE_DEFICIT_IS_FATAL = False
+
+#: A broker's implied average execution price, bval / (blot * SHARES_PER_LOT),
+#: must lie inside that session's [low, high]. A VWAP is an average of executed
+#: prices, so it cannot escape the day's range unless the two sides are on
+#: different bases or one of them is wrong.
+#:
+#: This is a ROW-LEVEL, independent confirmation that basis harmonisation
+#: worked: before harmonisation RAJA's implied price reads ~4641 against a
+#: [low, high] near 920; after scaling lots by the factor it reads ~928 and
+#: falls inside. Unlike the aggregate ratio checks, it does not use volume at
+#: all, so it cannot be satisfied by the same error that satisfies I1.
+#:
+#: REPORTED, not FATAL. 90.1% of the raw violations are downstream of the basis
+#: mismatch and clear once harmonisation and quarantine run; the remainder sits
+#: on otherwise-clean tickers and has no established cause yet. Failing the gate
+#: on an unexplained residual would be a guess dressed as a rule.
+IMPLIED_PRICE_TOLERANCE = 1e-3
 
 HORIZONS = (1, 2, 3, 4, 5)
 LAGS = (1, 3, 5, 10, 20)
@@ -1014,6 +1043,48 @@ def harmonise_broker_basis(broker, reconstructible):
     }
 
 
+def implied_price_containment(ohlc, broker, tolerance=IMPLIED_PRICE_TOLERANCE):
+    """Row-level check: each broker's implied VWAP must sit inside [low, high].
+
+    Independent of volume, so it confirms the basis correction from a direction
+    the aggregate ratio checks cannot. Both sides are checked -- a buy-side-only
+    test would miss a sell-side basis error entirely.
+    """
+    if broker.empty or ohlc.empty:
+        return {"rows_checked": 0, "violations": 0, "worst_tickers": []}
+    ranges = ohlc[["ticker", "date", "low", "high"]]
+    merged = broker.merge(ranges, on=["ticker", "date"], how="inner")
+    if merged.empty:
+        return {"rows_checked": 0, "violations": 0, "worst_tickers": []}
+
+    low = merged["low"].to_numpy(dtype="float64")
+    high = merged["high"].to_numpy(dtype="float64")
+    valid_range = np.isfinite(low) & np.isfinite(high) & (low > 0)
+
+    checked = 0
+    offending = np.zeros(len(merged), dtype=bool)
+    for lots_column, value_column in (("blot", "bval"), ("slot", "sval")):
+        lots = merged[lots_column].to_numpy(dtype="float64")
+        values = merged[value_column].to_numpy(dtype="float64")
+        usable = valid_range & (lots > 0) & np.isfinite(values) & (values > 0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            price = np.where(usable, values / (lots * SHARES_PER_LOT), np.nan)
+        bad = usable & ((price < low * (1.0 - tolerance))
+                        | (price > high * (1.0 + tolerance)))
+        checked += int(usable.sum())
+        offending |= bad
+
+    worst = []
+    if offending.any():
+        counts = merged.loc[offending, "ticker"].value_counts()
+        worst = [f"{t}:{int(n)}" for t, n in counts.head(10).items()]
+    return {
+        "rows_checked": checked,
+        "violations": int(offending.sum()),
+        "worst_tickers": worst,
+    }
+
+
 def cross_source_invariants(ohlc, broker, artifacts):
     """Measure the cross-source identities the price-only detectors cannot see.
 
@@ -1022,6 +1093,8 @@ def cross_source_invariants(ohlc, broker, artifacts):
     visible against the broker table -- which is why these live here and not in
     price_audit.detect(), whose behaviour is frozen for Experiment #1E.
     """
+    implied = implied_price_containment(ohlc, broker)
+
     totals = (broker.groupby(["ticker", "date"], sort=True)
               [["blot", "slot", "nlot", "bval", "sval", "nval"]].sum().reset_index())
     merged = totals.merge(ohlc[["ticker", "date", "volume"]], on=["ticker", "date"],
@@ -1032,7 +1105,10 @@ def cross_source_invariants(ohlc, broker, artifacts):
 
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = np.where(buy_shares > 0, volume / buy_shares, np.nan)
-    off = np.isfinite(ratio) & (np.abs(ratio - 1.0) > BASIS_RATIO_TOLERANCE)
+    lot_gap = np.abs(buy_shares - volume) / SHARES_PER_LOT
+    off = (np.isfinite(ratio)
+           & (np.abs(ratio - 1.0) > BASIS_RATIO_TOLERANCE)
+           & (lot_gap > BASIS_MIN_LOT_GAP))
     residual = np.isfinite(ratio) & ~off & (buy_shares != volume)
 
     delta = buy_shares - volume
@@ -1058,6 +1134,9 @@ def cross_source_invariants(ohlc, broker, artifacts):
         "unrepaired_wrap_keys": sorted(
             f"{t} {d}" for t, d in zip(merged.loc[wraps, "ticker"],
                                        merged.loc[wraps, "date"])) if wraps.any() else [],
+        "i6_implied_price_outside_range": implied["violations"],
+        "i6_rows_checked": implied["rows_checked"],
+        "i6_worst_tickers": implied["worst_tickers"],
         "ledger_digest": artifacts["ledger_digest"],
         "factor_digest": artifacts["factor_digest"],
     }
