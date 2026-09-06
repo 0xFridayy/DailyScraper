@@ -94,6 +94,13 @@ INPUT_MANIFEST_JSON = os.path.join(HERE, "experiment_1f_input_manifest.json")
 OHLC_PARQUET = os.path.join(HERE, "ohlc.parquet")
 BROKER_PARQUET = os.path.join(HERE, "broker_daily.parquet")
 
+#: Normalized-layer artifacts, produced by normalize_market_data.py from the
+#: immutable raw cache. The gate CONSUMES these; it never derives a repair of
+#: its own. A wrap-shaped observation absent from the ledger is a hard failure,
+#: not something to fix in place.
+VOLUME_REPAIR_LEDGER_JSON = os.path.join(HERE, "volume_repair_ledger.json")
+OBSERVED_BASIS_FACTOR_JSON = os.path.join(HERE, "observed_basis_factor.json")
+
 #: A ticker is four uppercase letters. Enforced as a real pattern, not implied
 #: by a digest: duplicates, blanks and type corruption can all leave the
 #: DISTINCT set -- and therefore the digest -- completely unchanged.
@@ -140,6 +147,25 @@ NVAL_TOLERANCE_RUPIAH = 1.0
 NLOT_TOLERANCE = 1e-6
 
 REQUIRED_BROKER_NUMERIC = ("nlot", "blot", "slot", "nval", "bval", "sval")
+
+#: Unsigned 32-bit modulus, the observed vendor volume wrap. Matched exactly, in
+#: integer arithmetic: the nearest non-wrap observation in the whole cache sits
+#: 3.5% of the modulus away, so a tolerance would add risk and buy nothing.
+VOLUME_WRAP_MODULUS = 2 ** 32
+
+#: A cross-source ratio this far from 1 is a BASIS mismatch (the deficit scales
+#: with volume); anything closer is source rounding (a small absolute lot count,
+#: 2-23 lots against millions traded). Measured separation inside the universe is
+#: 15.9x -- every basis regime is at least 1.35e-2 from 1, every rounding deficit
+#: at most 8.5e-4. Market-wide there is a middle band with no gap, which this
+#: threshold routes to QUARANTINE: the conservative direction.
+BASIS_RATIO_TOLERANCE = 1e-3
+
+#: Lot conservation is NOT source-guaranteed, so it can never be FATAL. Buy- and
+#: sell-side agreement with volume is symmetric (96.0986% vs 96.1081%), all 101
+#: declared broker codes appear, and the residual is a handful of lots. Making
+#: exact equality fatal would reject 15 in-universe tickers on ~100% of days.
+LOT_COVERAGE_DEFICIT_IS_FATAL = False
 
 HORIZONS = (1, 2, 3, 4, 5)
 LAGS = (1, 3, 5, 10, 20)
@@ -844,6 +870,232 @@ def broker_provenance(broker, db_path=os.path.join(HERE, "neobdm.db")):
 
 # ── validated panel construction ──────────────
 
+def load_normalized_artifacts(ledger_path=VOLUME_REPAIR_LEDGER_JSON,
+                              factors_path=OBSERVED_BASIS_FACTOR_JSON):
+    """Load the normalized layer. Absence is a failure, never an empty default.
+
+    Defaulting to "no repairs, no regimes" would let the gate pass a harvest whose
+    defects simply had not been measured yet, which is the exact failure mode the
+    normalized layer exists to prevent.
+    """
+    missing = [q for q in (ledger_path, factors_path) if not os.path.exists(q)]
+    if missing:
+        raise GateFailure(
+            "normalized-layer artifacts are missing: "
+            + ", ".join(os.path.basename(q) for q in missing)
+            + "\nRun: py normalize_market_data.py --verify")
+    with open(ledger_path, encoding="utf-8") as fh:
+        ledger = json.load(fh)
+    with open(factors_path, encoding="utf-8") as fh:
+        factors = json.load(fh)
+    authorised = {(r["ticker"], r["date"]): r
+                  for r in ledger.get("authorised_repairs", [])}
+    regimes = {r["ticker"]: r for r in factors.get("regimes", [])}
+    return {
+        "authorised_repairs": authorised,
+        "diagnostic_only": ledger.get("diagnostic_only", []),
+        "regimes": regimes,
+        "ledger_digest": _digest([f"{t}|{d}|{r['normalized_volume']}"
+                                  for (t, d), r in sorted(authorised.items())]),
+        "factor_digest": _digest([f"{t}|{r['factor']:.12g}|{r['classification']}"
+                                  for t, r in sorted(regimes.items())]),
+    }
+
+
+def apply_volume_repairs(frame, artifacts):
+    """Apply ledger repairs, and refuse any wrap-shaped row the ledger omits.
+
+    The detector proposes; the ledger authorises. A new wrap must fail review
+    rather than be silently corrected, so an unlisted candidate stops the gate.
+    """
+    out = frame.copy()
+    authorised = artifacts["authorised_repairs"]
+    applied, unlisted = [], []
+    volume = np.array(out["volume"], dtype="float64", copy=True)
+    keys = list(zip(out["ticker"], out["date"]))
+    for i, key in enumerate(keys):
+        hit = authorised.get(key)
+        if hit is None:
+            continue
+        if float(volume[i]) != float(hit["raw_volume"]):
+            raise GateFailure(
+                f"ledger entry {key[0]} {key[1]} expects raw volume "
+                f"{hit['raw_volume']:,} but the harvest holds {volume[i]:,.0f}; "
+                "the ledger and the parquet disagree about the source")
+        volume[i] = float(hit["normalized_volume"])
+        applied.append(key)
+    out["volume"] = volume
+
+    seen = set(applied)
+    for key in authorised:
+        if key not in seen:
+            unlisted.append(key)
+    report = {
+        "authorised_in_ledger": len(authorised),
+        "applied": len(applied),
+        "ledger_entries_not_present_in_harvest": len(unlisted),
+        "diagnostic_only_not_repaired": len(artifacts["diagnostic_only"]),
+        "ledger_digest": artifacts["ledger_digest"],
+        "applied_keys": sorted(f"{t} {d}" for t, d in applied),
+    }
+    return out, report
+
+
+def basis_dispositions(artifacts, universe):
+    """Split the measured regimes into what may be corrected and what may not."""
+    reconstructible, quarantined = {}, {}
+    for ticker, regime in artifacts["regimes"].items():
+        if ticker not in universe:
+            continue
+        if regime["classification"] == "RECONSTRUCTIBLE":
+            reconstructible[ticker] = regime
+        else:
+            quarantined[ticker] = regime
+    return reconstructible, quarantined
+
+
+def quarantine_basis_regimes(frame, quarantined):
+    """Drop only the affected regime, never the whole ticker.
+
+    The post-transition tail is verifiably clean (the ratio is exactly 1 there),
+    so dropping the ticker outright would discard good data. The transition
+    session goes too: it carries a real unadjusted price discontinuity, so any
+    return spanning it is meaningless.
+    """
+    if frame.empty or not quarantined:
+        return frame.copy(), {"tickers": 0, "rows_dropped": 0, "detail": {}}
+    drop = pd.Series(False, index=frame.index)
+    detail = {}
+    for ticker, regime in quarantined.items():
+        mask = (frame["ticker"] == ticker) & (frame["date"] <= regime["regime_last_date"])
+        detail[ticker] = int(mask.sum())
+        drop |= mask
+    return frame.loc[~drop].copy(), {
+        "tickers": len(quarantined),
+        "rows_dropped": int(drop.sum()),
+        "detail": dict(sorted(detail.items())),
+    }
+
+
+def harmonise_broker_basis(broker, reconstructible):
+    """Scale lots onto the basis the price and volume series already use.
+
+    The vendor's price and volume are mutually consistent; only the broker lots
+    sit on the other basis. So harmonising means multiplying LOTS by the factor
+    and leaving price and volume alone. That keeps the return series continuous
+    -- reconstructing as-traded prices instead would reintroduce the very split
+    discontinuity the vendor already removed -- and an integer factor keeps lots
+    integral. Rupiah values are basis-invariant and are never touched.
+    """
+    out = broker.copy()
+    if not reconstructible:
+        return out, {"tickers": 0, "rows_scaled": 0, "detail": {}}
+    detail = {}
+    for ticker, regime in reconstructible.items():
+        factor = float(regime["factor"])
+        mask = ((out["ticker"] == ticker)
+                & (out["date"] <= regime["regime_last_date"]))
+        n = int(mask.sum())
+        if not n:
+            continue
+        for column in ("nlot", "blot", "slot"):
+            scaled = out.loc[mask, column].to_numpy(dtype="float64") * factor
+            rounded = np.rint(scaled)
+            if not np.allclose(scaled, rounded, atol=1e-9):
+                raise GateFailure(
+                    f"{ticker}: basis factor {factor:g} does not keep {column} "
+                    "integral; the regime should not have been certified")
+            out.loc[mask, column] = rounded
+        detail[ticker] = {"factor": factor, "rows": n}
+    return out, {
+        "tickers": len(detail),
+        "rows_scaled": int(sum(d["rows"] for d in detail.values())),
+        "detail": dict(sorted(detail.items())),
+    }
+
+
+def cross_source_invariants(ohlc, broker, artifacts):
+    """Measure the cross-source identities the price-only detectors cannot see.
+
+    A back-adjusted price series is internally consistent, so limit_violation,
+    cross_ticker_dup and series_break are all silent on it. The mismatch is only
+    visible against the broker table -- which is why these live here and not in
+    price_audit.detect(), whose behaviour is frozen for Experiment #1E.
+    """
+    totals = (broker.groupby(["ticker", "date"], sort=True)
+              [["blot", "slot", "nlot", "bval", "sval", "nval"]].sum().reset_index())
+    merged = totals.merge(ohlc[["ticker", "date", "volume"]], on=["ticker", "date"],
+                          how="inner")
+    buy_shares = merged["blot"].to_numpy(dtype="float64") * SHARES_PER_LOT
+    sell_shares = merged["slot"].to_numpy(dtype="float64") * SHARES_PER_LOT
+    volume = merged["volume"].to_numpy(dtype="float64")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.where(buy_shares > 0, volume / buy_shares, np.nan)
+    off = np.isfinite(ratio) & (np.abs(ratio - 1.0) > BASIS_RATIO_TOLERANCE)
+    residual = np.isfinite(ratio) & ~off & (buy_shares != volume)
+
+    delta = buy_shares - volume
+    with np.errstate(invalid="ignore"):
+        wraps = np.isfinite(delta) & (np.abs(np.remainder(delta, VOLUME_WRAP_MODULUS)) < 1.0) \
+            & (np.abs(delta) >= VOLUME_WRAP_MODULUS)
+
+    report = {
+        "ticker_days": int(len(merged)),
+        "i1_buy_vs_volume": int((buy_shares != volume).sum()),
+        "i2_sell_vs_volume": int((sell_shares != volume).sum()),
+        "i1_basis_scale_breaks": int(off.sum()),
+        "i1_rounding_deficits": int(residual.sum()),
+        "i3b_sum_nlot_nonzero": int((merged["nlot"].to_numpy() != 0).sum()),
+        "i4_value_conservation": int(
+            (np.abs(merged["bval"].to_numpy() - merged["sval"].to_numpy())
+             > NVAL_TOLERANCE_RUPIAH).sum()),
+        "i5_sum_nval_nonzero": int(
+            (np.abs(merged["nval"].to_numpy()) > NVAL_TOLERANCE_RUPIAH).sum()),
+        "unrepaired_volume_wraps": int(wraps.sum()),
+        "basis_scale_break_tickers": sorted(
+            set(merged.loc[off, "ticker"].tolist())) if off.any() else [],
+        "unrepaired_wrap_keys": sorted(
+            f"{t} {d}" for t, d in zip(merged.loc[wraps, "ticker"],
+                                       merged.loc[wraps, "date"])) if wraps.any() else [],
+        "ledger_digest": artifacts["ledger_digest"],
+        "factor_digest": artifacts["factor_digest"],
+    }
+    return report
+
+
+def assert_cross_source_integrity(report):
+    """Hard gate on the identities the source actually guarantees.
+
+    FATAL   an unrepaired volume wrap, or a surviving basis-scale break. Both
+            mean a feature column would mix two scales.
+    FATAL   value conservation, the control that proves lots rather than values
+            are the broken field.
+    REPORTED lot-coverage deficits and sum(nlot) != 0. The source does not
+            guarantee complete broker coverage, so these are measured, not fatal.
+    """
+    failures = []
+    if report["unrepaired_volume_wraps"]:
+        failures.append(
+            f"{report['unrepaired_volume_wraps']} volume wrap(s) not covered by the "
+            f"repair ledger: {', '.join(report['unrepaired_wrap_keys'][:5])}")
+    if report["i1_basis_scale_breaks"]:
+        failures.append(
+            f"{report['i1_basis_scale_breaks']} ticker-day(s) on a mismatched basis "
+            f"survived quarantine: {', '.join(report['basis_scale_break_tickers'][:8])}")
+    if report["i4_value_conservation"]:
+        failures.append(
+            f"{report['i4_value_conservation']} ticker-day(s) break value conservation "
+            "(sum(bval) != sum(sval))")
+    if report["i5_sum_nval_nonzero"]:
+        failures.append(
+            f"{report['i5_sum_nval_nonzero']} ticker-day(s) where sum(nval) != 0")
+    if failures:
+        raise GateFailure(
+            "cross-source integrity failed:\n  - " + "\n  - ".join(failures))
+    return True
+
+
 def build_validated_panel(full_harvest, universe, calendar, horizons=HORIZONS,
                           lags=LAGS):
     """detect() on the FULL harvest, then narrow to the approved universe.
@@ -1095,6 +1347,19 @@ def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, establish_manifest=False,
     manifest = verify_input_manifest(
         [ohlc_fingerprint, broker_cov["fingerprint"]], establish=establish_manifest)
 
+    artifacts = load_normalized_artifacts()
+    full_harvest, repair_report = apply_volume_repairs(full_harvest, artifacts)
+    reconstructible, quarantined = basis_dispositions(artifacts, set(covered))
+    broker, harmonise_report = harmonise_broker_basis(broker, reconstructible)
+    full_harvest, quarantine_report = quarantine_basis_regimes(full_harvest, quarantined)
+    broker, broker_quarantine = quarantine_basis_regimes(broker, quarantined)
+    cross_source = cross_source_invariants(full_harvest, broker, artifacts)
+    cross_source["volume_repairs"] = repair_report
+    cross_source["basis_harmonised"] = harmonise_report
+    cross_source["basis_quarantined"] = quarantine_report
+    cross_source["basis_quarantined_broker_rows"] = broker_quarantine["rows_dropped"]
+    assert_cross_source_integrity(cross_source)
+
     raw_audit = audit_raw_ohlc(full_harvest, calendar, scope="full harvest")
     panel, flagged_full, universe_rows = build_validated_panel(
         full_harvest, covered, calendar)
@@ -1109,6 +1374,7 @@ def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, establish_manifest=False,
         "price_coverage": price_cov,
         "broker_coverage": broker_cov,
         "raw_ohlc_audit": raw_audit,
+        "cross_source": cross_source,
         "broker_source_audit": broker_source,
         "integrity": integrity,
         "open_anchor": open_anchor_diagnostics(panel, calendar),

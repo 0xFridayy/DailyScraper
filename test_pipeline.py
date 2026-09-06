@@ -17,6 +17,7 @@ import sqlite3
 
 import build_inventory_db as bidb
 import normalize_market_data as nm
+import experiment_1f_universe_gate as gate
 
 from walk_forward_backtest import (
     _broker_day_aggregates, _broker_correlation_1d, _price_features_and_target,
@@ -2137,6 +2138,200 @@ def test_normalization_never_bleeds_across_ticker_boundaries():
     print("test_normalization_never_bleeds_across_ticker_boundaries passed")
 
 
+def _gate_frames():
+    """A tiny harvest + broker pair: one clean ticker, one on a 5x basis."""
+    rows, brk = [], []
+    for i in range(6):
+        day = "2026-01-%02d" % (i + 1)
+        rows.append({"date": day, "ticker": "AAAA", "open": 100.0, "high": 100.0,
+                     "low": 100.0, "close": 100.0, "volume": 100000.0})
+        brk.append({"date": day, "ticker": "AAAA", "broker_code": "AK",
+                    "blot": 1000.0, "slot": 1000.0, "nlot": 0.0,
+                    "bval": 1e8, "sval": 1e8, "nval": 0.0})
+        in_regime = i < 3
+        rows.append({"date": day, "ticker": "BBBB", "open": 920.0, "high": 920.0,
+                     "low": 920.0, "close": 920.0,
+                     "volume": 500000.0 if in_regime else 100000.0})
+        brk.append({"date": day, "ticker": "BBBB", "broker_code": "AK",
+                    "blot": 1000.0, "slot": 1000.0, "nlot": 0.0,
+                    "bval": 1e8, "sval": 1e8, "nval": 0.0})
+    return pd.DataFrame(rows), pd.DataFrame(brk)
+
+
+def _gate_artifacts(classification="RECONSTRUCTIBLE"):
+    return {
+        "authorised_repairs": {},
+        "diagnostic_only": [],
+        "regimes": {"BBBB": {"ticker": "BBBB", "factor": 5.0,
+                             "regime_last_date": "2026-01-03",
+                             "classification": classification}},
+        "ledger_digest": "test", "factor_digest": "test",
+    }
+
+
+def test_gate_refuses_to_run_without_the_normalized_artifacts():
+    """Absence of the ledger must stop the gate, never default to 'no repairs'."""
+    try:
+        gate.load_normalized_artifacts(ledger_path="does_not_exist.json",
+                                       factors_path="also_missing.json")
+    except gate.GateFailure as exc:
+        assert "normalize_market_data" in str(exc), \
+            "the failure must say how to produce the missing artifacts"
+    else:
+        raise AssertionError("a missing repair ledger must fail the gate")
+
+    if os.path.exists(gate.VOLUME_REPAIR_LEDGER_JSON):
+        loaded = gate.load_normalized_artifacts()
+        assert loaded["ledger_digest"] and loaded["factor_digest"], \
+            "real artifacts must produce stable digests"
+    print("test_gate_refuses_to_run_without_the_normalized_artifacts passed")
+
+
+def test_gate_applies_only_ledger_authorised_volume_repairs():
+    """The ledger authorises; the detector alone never does."""
+    ohlc, _ = _gate_frames()
+    raw = float(ohlc.loc[0, "volume"])
+    artifacts = _gate_artifacts()
+    artifacts["authorised_repairs"] = {
+        ("AAAA", "2026-01-01"): {"ticker": "AAAA", "date": "2026-01-01",
+                                 "raw_volume": raw,
+                                 "normalized_volume": raw + gate.VOLUME_WRAP_MODULUS},
+    }
+    repaired, report = gate.apply_volume_repairs(ohlc, artifacts)
+    assert report["applied"] == 1, "the single authorised repair must be applied"
+    assert float(repaired.loc[0, "volume"]) == raw + gate.VOLUME_WRAP_MODULUS, \
+        "the repaired row must carry the ledger's normalized volume"
+    untouched = repaired[(repaired.ticker == "AAAA") & (repaired.date != "2026-01-01")]
+    assert (untouched["volume"] == raw).all(), "no other row may be altered"
+
+    # a ledger that disagrees with the harvest is a stop, not a silent overwrite
+    artifacts["authorised_repairs"][("AAAA", "2026-01-01")]["raw_volume"] = raw + 1
+    try:
+        gate.apply_volume_repairs(ohlc, artifacts)
+    except gate.GateFailure:
+        pass
+    else:
+        raise AssertionError("a ledger/harvest source disagreement must fail the gate")
+    print("test_gate_applies_only_ledger_authorised_volume_repairs passed")
+
+
+def test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover():
+    """A new wrap must fail review rather than be silently corrected."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    # bury a wrap in a ticker the ledger says nothing about
+    mask = (ohlc.ticker == "AAAA") & (ohlc.date == "2026-01-02")
+    ohlc.loc[mask, "volume"] = 100000.0 - gate.VOLUME_WRAP_MODULUS
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["unrepaired_volume_wraps"] >= 1, "the wrap must be detected"
+    try:
+        gate.assert_cross_source_integrity(report)
+    except gate.GateFailure as exc:
+        assert "repair ledger" in str(exc), "the failure must name the ledger"
+    else:
+        raise AssertionError("an unrepaired wrap must fail the gate")
+    print("test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover passed")
+
+
+def test_gate_harmonises_a_certified_basis_and_keeps_lots_integral():
+    """Lots scale onto the price/volume basis; rupiah values never move."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    assert set(recon) == {"BBBB"} and not quar, "BBBB must be the certified regime"
+
+    before = brk[(brk.ticker == "BBBB") & (brk.date <= "2026-01-03")]
+    scaled, report = gate.harmonise_broker_basis(brk, recon)
+    after = scaled[(scaled.ticker == "BBBB") & (scaled.date <= "2026-01-03")]
+    assert report["rows_scaled"] == len(before), "every in-regime row must be scaled"
+    assert (after["blot"].to_numpy() == before["blot"].to_numpy() * 5).all(), \
+        "lots must be multiplied by the factor"
+    assert (after["bval"].to_numpy() == before["bval"].to_numpy()).all(), \
+        "rupiah values are basis-invariant and must not be touched"
+    assert np.allclose(after["blot"].to_numpy(), np.rint(after["blot"].to_numpy())), \
+        "an integer factor must leave lots integral"
+
+    outside = scaled[(scaled.ticker == "BBBB") & (scaled.date > "2026-01-03")]
+    assert (outside["blot"].to_numpy() == 1000.0).all(), \
+        "rows outside the regime must not be scaled"
+    untouched = scaled[scaled.ticker == "AAAA"]
+    assert (untouched["blot"].to_numpy() == 1000.0).all(), \
+        "a ticker with no regime must not be scaled"
+
+    # and after harmonisation the cross-source identity holds
+    report = gate.cross_source_invariants(ohlc, scaled, artifacts)
+    assert report["i1_basis_scale_breaks"] == 0, \
+        "harmonisation must clear the basis-scale break it was applied for"
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_harmonises_a_certified_basis_and_keeps_lots_integral passed")
+
+
+def test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker():
+    """The verifiably clean tail survives; the mismatched prefix does not."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts(classification="QUARANTINE")
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    assert not recon and set(quar) == {"BBBB"}, "BBBB must be quarantined"
+
+    kept, report = gate.quarantine_basis_regimes(ohlc, quar)
+    assert report["rows_dropped"] == 3, "only the 3 in-regime sessions may be dropped"
+    assert (kept.ticker == "BBBB").sum() == 3, "the clean tail must be retained"
+    assert (kept.ticker == "AAAA").sum() == 6, "the other ticker must be untouched"
+
+    kept_brk, _ = gate.quarantine_basis_regimes(brk, quar)
+    surviving = gate.cross_source_invariants(kept, kept_brk, artifacts)
+    assert surviving["i1_basis_scale_breaks"] == 0, \
+        "no mismatched-basis ticker-day may survive quarantine"
+    gate.assert_cross_source_integrity(surviving)
+    print("test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker passed")
+
+
+def test_gate_treats_lot_coverage_deficits_as_reported_not_fatal():
+    """Lot conservation is not source-guaranteed, so it must never stop the gate."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    # Realistic magnitudes: real coverage deficits are 2-23 lots against MILLIONS
+    # of lots (BRPT loses 23 of 1,413,470, i.e. 1.6e-5). At fixture scale a 2-lot
+    # gap on 1,000 lots would be 2e-3 and would correctly read as a basis break.
+    scale = (brk.ticker == "AAAA")
+    brk.loc[scale, "blot"] = 10000.0
+    brk.loc[scale, "slot"] = 10000.0
+    ohlc.loc[ohlc.ticker == "AAAA", "volume"] = 1000000.0
+    mask = scale & (brk.date == "2026-01-02")
+    brk.loc[mask, "blot"] = 9998.0
+    brk.loc[mask, "slot"] = 9998.0
+
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["i1_buy_vs_volume"] >= 1, "the deficit must still be measured"
+    assert gate.LOT_COVERAGE_DEFICIT_IS_FATAL is False, \
+        "lot conservation must be declared non-fatal"
+    gate.assert_cross_source_integrity(report)
+    print("test_gate_treats_lot_coverage_deficits_as_reported_not_fatal passed")
+
+
+def test_gate_fails_when_value_conservation_breaks():
+    """Value conservation is the control that proves lots are the broken field."""
+    ohlc, brk = _gate_frames()
+    artifacts = _gate_artifacts()
+    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    brk, _ = gate.harmonise_broker_basis(brk, recon)
+    brk.loc[(brk.ticker == "AAAA") & (brk.date == "2026-01-02"), "sval"] = 5e7
+
+    report = gate.cross_source_invariants(ohlc, brk, artifacts)
+    assert report["i4_value_conservation"] >= 1, "the break must be measured"
+    try:
+        gate.assert_cross_source_integrity(report)
+    except gate.GateFailure as exc:
+        assert "value conservation" in str(exc), "the failure must name the invariant"
+    else:
+        raise AssertionError("a value-conservation break must fail the gate")
+    print("test_gate_fails_when_value_conservation_breaks passed")
+
+
 if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
@@ -2231,4 +2426,11 @@ if __name__ == "__main__":
     test_noisy_nonconstant_factor_is_quarantined()
     test_wrap_hidden_behind_a_basis_factor_is_never_silently_repaired()
     test_normalization_never_bleeds_across_ticker_boundaries()
+    test_gate_refuses_to_run_without_the_normalized_artifacts()
+    test_gate_applies_only_ledger_authorised_volume_repairs()
+    test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover()
+    test_gate_harmonises_a_certified_basis_and_keeps_lots_integral()
+    test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker()
+    test_gate_treats_lot_coverage_deficits_as_reported_not_fatal()
+    test_gate_fails_when_value_conservation_breaks()
     print("\nAll tests passed.")
