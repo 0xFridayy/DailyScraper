@@ -42,8 +42,16 @@ jobs:
       # which would roughly triple install time on every PR. check_ml_health.py
       # degrades those two to a compile check and says so in its output, so the
       # coverage lost is syntax-only.
+      #
+      # pyarrow is NOT optional in the same way and must stay listed. test_pipeline.py
+      # imports build_inventory_db at module level, and that module imports pyarrow at
+      # module level for its parquet schemas -- so a missing pyarrow is not a degraded
+      # compile check, it is an ImportError that takes the whole test file down before
+      # a single test runs. openpyxl is the opposite case and is correctly absent: the
+      # gate imports it inside read_universe_xlsx(), which only runs when the frozen
+      # universe is being created, never on a normal validation run.
       - name: Install ML dependencies
-        run: python -m pip install --upgrade pip pandas numpy xgboost shap requests
+        run: python -m pip install --upgrade pip pandas numpy xgboost shap requests pyarrow
 
       # Telegram only on the scheduled run. A PR failing should show up as a red
       # check on the PR, not as a phone notification.
