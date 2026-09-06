@@ -67,6 +67,21 @@ MODULUS = 2 ** 32                 # unsigned 32-bit wrap observed in vendor volu
 # |r-1| is >= 1.35e-2 for every basis regime and <= 8.5e-4 for every coverage
 # deficit, a 15.9x gap, and they separate again on the ratio correlation below.
 BASIS_MIN_DEVIATION = 1e-3
+
+#: ...and a ratio alone is not enough, because it punishes thin stocks. Nine
+#: tickers (KOIN, BBLD, FMII, CCSI, MDKI, SKBM, PDPP, INCI, UFOE) lose only 1-8
+#: lots a day but trade so little that this reads as |r-1| up to 9.2e-3. Detected
+#: on ratio alone they become "regimes" and get quarantined for what is ordinary
+#: source rounding.
+#:
+#: The populations separate on ABSOLUTE size, cleanly and market-wide: no ticker
+#: without a real basis regime has a median gap above 23 lots, while every real
+#: regime moves at least 343 lots and typically hundreds of thousands. A regime
+#: day must therefore clear both bars. This is the same conjunction Gate A
+#: applies, and the two must agree or the gate would quarantine tickers whose
+#: days it would never flag.
+BASIS_MIN_LOT_GAP = 100.0
+
 RATIO_CORRELATION_MIN = 0.90
 MIN_REGIME_DAYS = 20
 
@@ -293,7 +308,10 @@ def observed_basis_factor(ticker, totals, repaired_volume):
     for i in usable:
         ratios[i] = Fraction(int(repaired_volume[i]),
                              SHARES_PER_LOT * totals["blot"][i])
-    off = [i for i in usable if abs(float(ratios[i]) - 1.0) > BASIS_MIN_DEVIATION]
+    off = [i for i in usable
+           if abs(float(ratios[i]) - 1.0) > BASIS_MIN_DEVIATION
+           and abs(int(repaired_volume[i]) - SHARES_PER_LOT * totals["blot"][i])
+           / SHARES_PER_LOT > BASIS_MIN_LOT_GAP]
     if len(off) < MIN_REGIME_DAYS:
         return None
 

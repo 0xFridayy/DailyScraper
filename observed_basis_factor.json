@@ -5,45 +5,24 @@
   "regimes": [
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 84,
-      "days_outside_regime": 155,
+      "days_in_regime": 27,
+      "days_outside_regime": 212,
       "evidence": {
-        "estimator_relative_gap": 0.00661981165536063,
-        "estimator_volume_based": 0.959399361153621,
-        "estimator_volume_free": 0.9657504042267313,
+        "estimator_relative_gap": 0.0007639532366099377,
+        "estimator_volume_based": 0.9532098371127435,
+        "estimator_volume_free": 0.9539380448529743,
         "estimators_disagree": false,
         "exactly_constant": false,
         "prefix_block": false,
         "ratio_like_correlation": 0.965084334907939,
-        "reconstruction_integral_rate": 0.005952380952380952,
+        "reconstruction_integral_rate": 0.037037037037037035,
         "reconstruction_on_grid_rate": 0.0
       },
-      "factor": 0.959399361153621,
-      "factor_exact": "93410/97363",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-13",
+      "factor": 0.9532098371127435,
+      "factor_exact": "5969/6262",
+      "regime_first_date": "2025-09-26",
+      "regime_last_date": "2025-11-07",
       "ticker": "ASRM"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 209,
-      "days_outside_regime": 28,
-      "evidence": {
-        "estimator_relative_gap": 0.005421847287697901,
-        "estimator_volume_based": 1.0089285714285714,
-        "estimator_volume_free": 1.0143988280670524,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.3982113171734876,
-        "reconstruction_integral_rate": 0.03708133971291866,
-        "reconstruction_on_grid_rate": 0.007177033492822967
-      },
-      "factor": 1.0089285714285714,
-      "factor_exact": "113/112",
-      "regime_first_date": "2025-08-25",
-      "regime_last_date": "2026-08-21",
-      "ticker": "BBLD"
     },
     {
       "classification": "QUARANTINE",
@@ -89,27 +68,6 @@
     },
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 130,
-      "days_outside_regime": 109,
-      "evidence": {
-        "estimator_relative_gap": 0.0034875737164232756,
-        "estimator_volume_based": 1.0022104500933724,
-        "estimator_volume_free": 0.998715167269302,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.24551729513989246,
-        "reconstruction_integral_rate": 0.0,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.0022104500933724,
-      "factor_exact": "26297/26239",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-14",
-      "ticker": "CCSI"
-    },
-    {
-      "classification": "QUARANTINE",
       "days_in_regime": 33,
       "days_outside_regime": 206,
       "evidence": {
@@ -128,48 +86,6 @@
       "regime_first_date": "2025-08-22",
       "regime_last_date": "2025-10-08",
       "ticker": "COCO"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 200,
-      "days_outside_regime": 39,
-      "evidence": {
-        "estimator_relative_gap": 0.0022390987289612196,
-        "estimator_volume_based": 1.005738880918221,
-        "estimator_volume_free": 1.0034869322682902,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.636522321643261,
-        "reconstruction_integral_rate": 0.00625,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.005738880918221,
-      "factor_exact": "701/697",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-21",
-      "ticker": "FMII"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 232,
-      "days_outside_regime": 7,
-      "evidence": {
-        "estimator_relative_gap": 0.0003808059573114919,
-        "estimator_volume_based": 1.0092453436427897,
-        "estimator_volume_free": 1.0088610170035417,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.34796280270233476,
-        "reconstruction_integral_rate": 0.0,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.0092453436427897,
-      "factor_exact": "97373/96481",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-21",
-      "ticker": "INCI"
     },
     {
       "classification": "QUARANTINE",
@@ -194,65 +110,23 @@
     },
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 123,
-      "days_outside_regime": 79,
+      "days_in_regime": 84,
+      "days_outside_regime": 155,
       "evidence": {
-        "estimator_relative_gap": 0.0004956875185881948,
-        "estimator_volume_based": 1.003831417624521,
-        "estimator_volume_free": 1.0043290043290043,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.2939252171169161,
-        "reconstruction_integral_rate": 0.0,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.003831417624521,
-      "factor_exact": "262/261",
-      "regime_first_date": "2025-08-26",
-      "regime_last_date": "2026-06-30",
-      "ticker": "KOIN"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 73,
-      "days_outside_regime": 166,
-      "evidence": {
-        "estimator_relative_gap": 0.000600233988175547,
-        "estimator_volume_based": 1.0021505376344086,
-        "estimator_volume_free": 1.001549012820452,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.530004147234449,
-        "reconstruction_integral_rate": 0.0,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.0021505376344086,
-      "factor_exact": "466/465",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-19",
-      "ticker": "MDKI"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 158,
-      "days_outside_regime": 81,
-      "evidence": {
-        "estimator_relative_gap": 0.0012249838728104478,
+        "estimator_relative_gap": 0.0008399390623345937,
         "estimator_volume_based": 0.5,
-        "estimator_volume_free": 0.5006124919364052,
+        "estimator_volume_free": 0.5004199695311673,
         "estimators_disagree": false,
         "exactly_constant": false,
         "prefix_block": false,
         "ratio_like_correlation": 0.9991966259296554,
-        "reconstruction_integral_rate": 0.9857594936708861,
-        "reconstruction_on_grid_rate": 0.8987341772151899
+        "reconstruction_integral_rate": 0.9880952380952381,
+        "reconstruction_on_grid_rate": 0.8244047619047619
       },
       "factor": 0.5,
       "factor_exact": "1/2",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-21",
+      "regime_first_date": "2025-08-25",
+      "regime_last_date": "2026-04-09",
       "ticker": "MEGA"
     },
     {
@@ -319,27 +193,6 @@
       "ticker": "PACK"
     },
     {
-      "classification": "QUARANTINE",
-      "days_in_regime": 176,
-      "days_outside_regime": 63,
-      "evidence": {
-        "estimator_relative_gap": 0.002276340062011717,
-        "estimator_volume_based": 1.0023902108380007,
-        "estimator_volume_free": 1.0001084298433018,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.535763722587125,
-        "reconstruction_integral_rate": 0.007102272727272727,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.0023902108380007,
-      "factor_exact": "28098/28031",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-20",
-      "ticker": "PDPP"
-    },
-    {
       "classification": "RECONSTRUCTIBLE",
       "days_in_regime": 212,
       "days_outside_regime": 26,
@@ -362,23 +215,23 @@
     },
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 106,
-      "days_outside_regime": 124,
+      "days_in_regime": 87,
+      "days_outside_regime": 143,
       "evidence": {
-        "estimator_relative_gap": 0.0010247643166347853,
-        "estimator_volume_based": 0.6765220939524287,
-        "estimator_volume_free": 0.6772153696537262,
+        "estimator_relative_gap": 0.00043507151300570257,
+        "estimator_volume_based": 0.6763063110090306,
+        "estimator_volume_free": 0.6760120693990446,
         "estimators_disagree": false,
         "exactly_constant": false,
         "prefix_block": false,
         "ratio_like_correlation": 0.6497696707086097,
-        "reconstruction_integral_rate": 0.11084905660377359,
+        "reconstruction_integral_rate": 0.09482758620689655,
         "reconstruction_on_grid_rate": 0.0
       },
-      "factor": 0.6765220939524287,
-      "factor_exact": "39791/58817",
+      "factor": 0.6763063110090306,
+      "factor_exact": "12956/19157",
       "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-08-20",
+      "regime_last_date": "2026-01-19",
       "ticker": "RISE"
     },
     {
@@ -404,66 +257,24 @@
     },
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 128,
-      "days_outside_regime": 110,
+      "days_in_regime": 55,
+      "days_outside_regime": 184,
       "evidence": {
-        "estimator_relative_gap": 0.004060518492560172,
-        "estimator_volume_based": 1.0021966012786188,
-        "estimator_volume_free": 1.0062660391112916,
+        "estimator_relative_gap": 0.000685989200020054,
+        "estimator_volume_based": 0.7697536108751062,
+        "estimator_volume_free": 0.7692255682113694,
         "estimators_disagree": false,
         "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.6967732119462794,
-        "reconstruction_integral_rate": 0.0,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 1.0021966012786188,
-      "factor_exact": "91706/91505",
-      "regime_first_date": "2025-08-26",
-      "regime_last_date": "2026-08-19",
-      "ticker": "SKBM"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 95,
-      "days_outside_regime": 144,
-      "evidence": {
-        "estimator_relative_gap": 0.00933305156491393,
-        "estimator_volume_based": 0.7709443099273607,
-        "estimator_volume_free": 0.7781395729255898,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
+        "prefix_block": true,
         "ratio_like_correlation": 0.980578219364409,
-        "reconstruction_integral_rate": 0.007894736842105263,
-        "reconstruction_on_grid_rate": 0.0
-      },
-      "factor": 0.7709443099273607,
-      "factor_exact": "1592/2065",
-      "regime_first_date": "2025-08-22",
-      "regime_last_date": "2026-07-01",
-      "ticker": "SPMA"
-    },
-    {
-      "classification": "QUARANTINE",
-      "days_in_regime": 163,
-      "days_outside_regime": 75,
-      "evidence": {
-        "estimator_relative_gap": 0.002539392647184502,
-        "estimator_volume_based": 1.0035026269702276,
-        "estimator_volume_free": 1.000954339777869,
-        "estimators_disagree": false,
-        "exactly_constant": false,
-        "prefix_block": false,
-        "ratio_like_correlation": 0.46831015096483675,
         "reconstruction_integral_rate": 0.0,
         "reconstruction_on_grid_rate": 0.0
       },
-      "factor": 1.0035026269702276,
-      "factor_exact": "573/571",
-      "regime_first_date": "2025-08-25",
-      "regime_last_date": "2026-08-21",
-      "ticker": "UFOE"
+      "factor": 0.7697536108751062,
+      "factor_exact": "906/1177",
+      "regime_first_date": "2025-08-22",
+      "regime_last_date": "2025-11-07",
+      "ticker": "SPMA"
     },
     {
       "classification": "QUARANTINE",
@@ -488,21 +299,21 @@
     },
     {
       "classification": "QUARANTINE",
-      "days_in_regime": 180,
-      "days_outside_regime": 59,
+      "days_in_regime": 169,
+      "days_outside_regime": 70,
       "evidence": {
-        "estimator_relative_gap": 0.0006294575565876093,
-        "estimator_volume_based": 0.9864234868394987,
-        "estimator_volume_free": 0.985802575121712,
+        "estimator_relative_gap": 0.0004314220715531114,
+        "estimator_volume_based": 0.9864130434782609,
+        "estimator_volume_free": 0.9859874831196365,
         "estimators_disagree": false,
         "exactly_constant": false,
-        "prefix_block": true,
+        "prefix_block": false,
         "ratio_like_correlation": 0.9434238467805218,
-        "reconstruction_integral_rate": 0.013888888888888888,
+        "reconstruction_integral_rate": 0.042899408284023666,
         "reconstruction_on_grid_rate": 0.0
       },
-      "factor": 0.9864234868394987,
-      "factor_exact": "74691/75719",
+      "factor": 0.9864130434782609,
+      "factor_exact": "363/368",
       "regime_first_date": "2025-08-22",
       "regime_last_date": "2026-05-25",
       "ticker": "WINS"
