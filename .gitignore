@@ -68,3 +68,34 @@ idx_foreign_daily.csv
 # Raw API response dumps
 inventory_*_sample.json
 get_choices.json
+
+# ---------------------------------------------------------------------------
+# Scratch & probe artifacts — reproducible, never commit
+# ---------------------------------------------------------------------------
+
+# Local scratch area: throwaway scripts and pre-migration DB backups.
+scratchpad/
+
+# Throwaway reconcile fixture built by the inventory rebuild spike. The
+# authoritative DBs are neobdm.db / neobdm_ownership.db, both tracked.
+neobdm_reconcile_test.db
+
+# Captured console output from test/analysis runs (regenerate by re-running).
+adds.txt
+full_test.txt
+interim_test.txt
+ticker_analysis.txt
+
+# Raw API response dumps from the discover_*.py probes, same rationale as
+# get_choices.json above: large, re-pullable, and not a durable record.
+discovery.json
+discovery_*.json
+
+# One-off endpoint probes and ticker spot-checks kept only for a single
+# session; the durable findings live in STOCK_DETAIL_OWNERSHIP_DISCOVERY.md.
+probe2.py
+probe3.py
+probe4.py
+probe_inventory_api.py
+scratch_check_ticker.py
+universe_tickers.json
