@@ -77,6 +77,15 @@ MIN_REGIME_DAYS = 20
 # closer than ~16% to 1.
 RECONSTRUCTION_MIN_RATE = 0.999
 
+# The volume-free estimator is used as a one-sided VETO, never as a certificate.
+# On clean (r == 1) tickers its own ratio spans [0.873, 1.196] at the 99.8% level
+# (sd 0.024, n=22,727 ticker-days), because a broker VWAP is not a close. So it
+# cannot confirm a factor -- it agrees with every regime we measured, including
+# ones that are demonstrably not reconstructible. It can still refute one: a
+# disagreement wider than that measured noise band means the price series and the
+# volume series disagree about the basis, and the regime is not trustworthy.
+DUAL_ESTIMATOR_MAX_DISAGREEMENT = 0.20
+
 # IDX fraksi harga (tick size) by price band.
 TICK_BANDS = ((200, 1.0), (500, 2.0), (2000, 5.0), (5000, 10.0))
 TICK_ABOVE = 25.0
@@ -325,12 +334,21 @@ def observed_basis_factor(ticker, totals, repaired_volume):
         rate_integral = float(np.isclose(rebuilt, np.round(rebuilt)).mean())
         rate_on_grid = float(on_tick_grid(np.round(rebuilt, 6)).mean())
 
+    # One-sided veto: agreement proves nothing, but gross disagreement refutes.
+    if np.isnan(estimator_volume_free) or float(representative) == 0:
+        estimators_disagree = False
+        estimator_gap = float("nan")
+    else:
+        estimator_gap = abs(estimator_volume_free / float(representative) - 1.0)
+        estimators_disagree = estimator_gap > DUAL_ESTIMATOR_MAX_DISAGREEMENT
+
     reconstructible = bool(
         exactly_constant
         and prefix_block
         and (np.isnan(correlation) or correlation >= RATIO_CORRELATION_MIN)
         and rate_integral >= RECONSTRUCTION_MIN_RATE
         and rate_on_grid >= RECONSTRUCTION_MIN_RATE
+        and not estimators_disagree
     )
     return {
         "ticker": ticker,
@@ -346,6 +364,8 @@ def observed_basis_factor(ticker, totals, repaired_volume):
             "ratio_like_correlation": correlation,
             "estimator_volume_based": float(representative),
             "estimator_volume_free": estimator_volume_free,
+            "estimator_relative_gap": estimator_gap,
+            "estimators_disagree": estimators_disagree,
             "reconstruction_integral_rate": rate_integral,
             "reconstruction_on_grid_rate": rate_on_grid,
         },

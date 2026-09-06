@@ -1,0 +1,140 @@
+{
+  "authorised_repairs": [
+    {
+      "date": "2026-03-05",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 4589182700,
+      "raw_volume": 294215404,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "09e0872fab708c5e",
+      "ticker": "BIPI",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-02-27",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 4853064000,
+      "raw_volume": 558096704,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "b4c9532e00f25d12",
+      "ticker": "BUMI",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-03-02",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 5332814900,
+      "raw_volume": 1037847604,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "b4c9532e00f25d12",
+      "ticker": "BUMI",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-03-03",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 4765414000,
+      "raw_volume": 470446704,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "b4c9532e00f25d12",
+      "ticker": "BUMI",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-03-04",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 7871080200,
+      "raw_volume": 3576112904,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "b4c9532e00f25d12",
+      "ticker": "BUMI",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-02-27",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 5304076700,
+      "raw_volume": 1009109404,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "a687ea5140067e24",
+      "ticker": "GOTO",
+      "wrap_count": 1
+    },
+    {
+      "date": "2026-03-04",
+      "delta": 4294967296,
+      "evidence": {
+        "equals_sum_blot_shares": true,
+        "equals_sum_slot_shares": true,
+        "lot_residue_consistent": true,
+        "raw_below_modulus": true
+      },
+      "normalized_volume": 5917790200,
+      "raw_volume": 1622822904,
+      "rule": "uint32_volume_wrap_stage_a",
+      "source_fingerprint": "a687ea5140067e24",
+      "ticker": "GOTO",
+      "wrap_count": 1
+    }
+  ],
+  "diagnostic_only": [
+    {
+      "authorised_repair": false,
+      "basis_factor": 1.191,
+      "date": "2026-02-27",
+      "implied_as_traded_shares": 791010204,
+      "raw_volume": 942093153.0,
+      "rule": "uint32_volume_wrap_stage_b_diagnostic",
+      "ticker": "BNBR",
+      "wrap_count": 1
+    },
+    {
+      "authorised_repair": false,
+      "basis_factor": 1.191,
+      "date": "2026-03-02",
+      "implied_as_traded_shares": 3709922604,
+      "raw_volume": 4418517821.0,
+      "rule": "uint32_volume_wrap_stage_b_diagnostic",
+      "ticker": "BNBR",
+      "wrap_count": 1
+    }
+  ],
+  "modulus": 4294967296,
+  "rule_version": "uint32_volume_wrap/1"
+}
