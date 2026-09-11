@@ -374,8 +374,12 @@ def observed_basis_factor(ticker, totals, repaired_volume):
         "factor_exact": f"{representative.numerator}/{representative.denominator}",
         "days_in_regime": len(off),
         "days_outside_regime": len(on),
-        "regime_first_date": dates[min(off)],
-        "regime_last_date": dates[max(off)],
+        # Canonical inclusive interval. Renamed from regime_first_date /
+        # regime_last_date: consumers must select `start <= date <= end`, and
+        # the old "last_date" name invited the `date <= last_date` cutoff that
+        # silently swept every clean session ahead of a non-prefix regime.
+        "start_date": dates[min(off)],
+        "end_date": dates[max(off)],
         "evidence": {
             "exactly_constant": exactly_constant,
             "prefix_block": prefix_block,

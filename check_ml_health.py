@@ -167,14 +167,23 @@ def check_imports(problems, notes, stats):
 def check_unit_tests(problems, stats):
     """test_pipeline.py holds the leakage and gap-guard invariants. If those
     regress, every downstream number is void, so this runs first among the
-    behavioural checks."""
-    r = subprocess.run([sys.executable, os.path.join(HERE, "test_pipeline.py")],
-                       capture_output=True, text=True, cwd=HERE, timeout=900)
-    passed = r.stdout.count(" passed")
+    behavioural checks.
+
+    test_experiment_1f_phase2.py holds the #1F candidate data contract: strict
+    source domain, detection-is-not-authorisation, regime segmentation and exact
+    factor arithmetic. It lives in its own file so a candidate rule can never be
+    satisfied by relaxing a production test, and it runs here so the separation
+    does not become an excuse for it to stop running.
+    """
+    passed = 0
+    for name in ("test_pipeline.py", "test_experiment_1f_phase2.py"):
+        r = subprocess.run([sys.executable, os.path.join(HERE, name)],
+                           capture_output=True, text=True, cwd=HERE, timeout=900)
+        passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
+        if r.returncode != 0:
+            tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
+            problems.append(f"{name} FAILED — " + " | ".join(tail))
     stats["tests_passed"] = passed
-    if r.returncode != 0:
-        tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
-        problems.append("test_pipeline.py FAILED — " + " | ".join(tail))
 
 
 def check_panel(problems, notes, stats):

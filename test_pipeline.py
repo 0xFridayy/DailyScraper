@@ -10,6 +10,7 @@ exception. Run after touching build_panel(), signal_quality(), or
 kelly_fraction() — before trusting a new backtest run's results.
 """
 
+import json
 import os
 import pandas as pd
 import numpy as np
@@ -2244,9 +2245,16 @@ def _gate_artifacts(classification="RECONSTRUCTIBLE"):
     return {
         "authorised_repairs": {},
         "diagnostic_only": [],
-        "regimes": {"BBBB": {"ticker": "BBBB", "factor": 5.0,
-                             "regime_last_date": "2026-01-03",
-                             "classification": classification}},
+        # A ticker maps to a LIST of regimes, each an inclusive interval. The
+        # superseded shape was {ticker: one_regime} selected with
+        # `date <= regime_last_date`, which silently discarded every regime but
+        # one and swept clean sessions ahead of any non-prefix regime. BBBB's
+        # regime is still the 2026-01-01..2026-01-03 prefix, so every assertion
+        # below is unchanged -- only the shape of the fixture moved.
+        "regimes": {"BBBB": [{"ticker": "BBBB", "factor": 5.0,
+                              "start_date": "2026-01-01",
+                              "end_date": "2026-01-03",
+                              "classification": classification}]},
         "ledger_digest": "test", "factor_digest": "test",
     }
 
@@ -2262,10 +2270,31 @@ def test_gate_refuses_to_run_without_the_normalized_artifacts():
     else:
         raise AssertionError("a missing repair ledger must fail the gate")
 
-    if os.path.exists(gate.VOLUME_REPAIR_LEDGER_JSON):
-        loaded = gate.load_normalized_artifacts()
-        assert loaded["ledger_digest"] and loaded["factor_digest"], \
-            "real artifacts must produce stable digests"
+    # A LEGACY single-regime artifact is refused, never converted. Deriving a
+    # start date for a regime that only records its last one would reimpose the
+    # prefix assumption the segmented contract exists to remove, so the on-disk
+    # artifact from the previous producer must fail loudly until regenerated.
+    if os.path.exists(gate.VOLUME_REPAIR_LEDGER_JSON) and \
+            os.path.exists(gate.OBSERVED_BASIS_FACTOR_JSON):
+        with open(gate.OBSERVED_BASIS_FACTOR_JSON, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        segmented = all("start_date" in r and "end_date" in r
+                        for r in on_disk.get("regimes", []))
+        if segmented:
+            loaded = gate.load_normalized_artifacts()
+            assert loaded["ledger_digest"] and loaded["factor_digest"], \
+                "real artifacts must produce stable digests"
+            assert all(isinstance(v, list) for v in loaded["regimes"].values()), \
+                "regimes must load as a list per ticker, never a single record"
+        else:
+            try:
+                gate.load_normalized_artifacts()
+            except gate.GateFailure as exc:
+                assert "LEGACY" in str(exc), \
+                    "a legacy artifact must be refused by name, not by KeyError"
+            else:
+                raise AssertionError(
+                    "a legacy single-regime artifact must not load silently")
     print("test_gate_refuses_to_run_without_the_normalized_artifacts passed")
 
 
@@ -2318,10 +2347,19 @@ def test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover():
 
 
 def test_gate_harmonises_a_certified_basis_and_keeps_lots_integral():
-    """Lots scale onto the price/volume basis; rupiah values never move."""
+    """Lots scale onto the price/volume basis; rupiah values never move.
+
+    Harmonisation is now reachable only under the explicitly retrospective
+    mode, so this test names it. The mechanism is unchanged and every assertion
+    below is the same; what moved is that PRIMARY no longer applies it, because
+    a certified factor is an economic claim while broker_basis_valid answers a
+    point-in-time one. test_gate_primary_mode_harmonises_nothing covers the
+    other side.
+    """
     ohlc, brk = _gate_frames()
     artifacts = _gate_artifacts()
-    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"},
+                                          mode=gate.SECONDARY_MODE)
     assert set(recon) == {"BBBB"} and not quar, "BBBB must be the certified regime"
 
     before = brk[(brk.ticker == "BBBB") & (brk.date <= "2026-01-03")]
@@ -2350,11 +2388,69 @@ def test_gate_harmonises_a_certified_basis_and_keeps_lots_integral():
     print("test_gate_harmonises_a_certified_basis_and_keeps_lots_integral passed")
 
 
+def test_gate_primary_mode_harmonises_nothing():
+    """PRIMARY_PIT_APPLIES_BASIS_HARMONISATION must be real, not decorative.
+
+    An earlier run_gate called basis_dispositions with no mode, so a certified
+    regime was harmonised in the primary path regardless of the constant that
+    said it would not be.
+    """
+    artifacts = _gate_artifacts()                      # BBBB is RECONSTRUCTIBLE
+    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    assert recon == {}, "PRIMARY must harmonise nothing, got " + repr(sorted(recon))
+    assert set(quar) == {"BBBB"}, "the certified regime must be quarantined instead"
+    assert gate.PRIMARY_PIT_APPLIES_BASIS_HARMONISATION is False
+
+    recon2, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"},
+                                        mode=gate.SECONDARY_MODE)
+    assert set(recon2) == {"BBBB"}, "the retrospective mode may harmonise it"
+    print("test_gate_primary_mode_harmonises_nothing passed")
+
+
+def test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones():
+    """Behavioural: assert on what is OPENED, not on the declared input dict.
+
+    run_gate used to call load_normalized_artifacts() with no arguments, whose
+    defaults are the two repo-root LEGACY artifacts that candidate_inputs()
+    declares provenance-only. The declaration guard passed anyway because it
+    only inspected the dict, and the whole candidates+authorisation contract
+    had no production caller at all.
+    """
+    inputs = gate.candidate_inputs()
+    if not all(os.path.exists(inputs[k]) for k in
+               ("repair_candidates", "repair_authorization", "basis_artifact")):
+        print("test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones "
+              "skipped (candidate artifacts absent)")
+        return
+    opened = []
+    with gate.traced_open_paths(opened):
+        artifacts = gate.load_candidate_artifacts(inputs)
+    gate.assert_no_legacy_artifact_was_opened(opened, inputs)
+
+    touched = {os.path.abspath(p) for p in opened}
+    assert os.path.abspath(gate.VOLUME_REPAIR_LEDGER_JSON) not in touched
+    assert os.path.abspath(gate.OBSERVED_BASIS_FACTOR_JSON) not in touched
+    for key in ("repair_candidates", "repair_authorization", "basis_artifact"):
+        assert os.path.abspath(inputs[key]) in touched, f"{key} was never read"
+
+    # the authorisation contract really is the thing that produced the repairs
+    assert artifacts["mode"] == gate.PRIMARY_MODE
+    assert artifacts["parent_candidate_sha256"]
+    assert set(artifacts["authorised_repairs"]) == {
+        ("BIPI", "2026-03-05"), ("BUMI", "2026-02-27"), ("BUMI", "2026-03-02"),
+        ("BUMI", "2026-03-03"), ("BUMI", "2026-03-04")}
+    assert all(isinstance(v, list) for v in artifacts["regimes"].values())
+    print("test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones passed")
+
+
 def test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker():
     """The verifiably clean tail survives; the mismatched prefix does not."""
     ohlc, brk = _gate_frames()
     artifacts = _gate_artifacts(classification="QUARANTINE")
-    recon, quar = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    # harmonisation is SECONDARY-only; this test uses it as setup for the
+    # invariant it actually checks, so it names the mode explicitly.
+    recon, quar = gate.basis_dispositions(
+            artifacts, {"AAAA", "BBBB"}, mode=gate.SECONDARY_MODE)
     assert not recon and set(quar) == {"BBBB"}, "BBBB must be quarantined"
 
     kept, report = gate.quarantine_basis_regimes(ohlc, quar)
@@ -2374,7 +2470,10 @@ def test_gate_treats_lot_coverage_deficits_as_reported_not_fatal():
     """Lot conservation is not source-guaranteed, so it must never stop the gate."""
     ohlc, brk = _gate_frames()
     artifacts = _gate_artifacts()
-    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    # harmonisation is SECONDARY-only; this test uses it as setup for the
+    # invariant it actually checks, so it names the mode explicitly.
+    recon, _ = gate.basis_dispositions(
+            artifacts, {"AAAA", "BBBB"}, mode=gate.SECONDARY_MODE)
     brk, _ = gate.harmonise_broker_basis(brk, recon)
     # Realistic magnitudes: real coverage deficits are 2-23 lots against MILLIONS
     # of lots (BRPT loses 23 of 1,413,470, i.e. 1.6e-5). At fixture scale a 2-lot
@@ -2401,7 +2500,10 @@ def test_gate_fails_when_value_conservation_breaks():
     """Value conservation is the control that proves lots are the broken field."""
     ohlc, brk = _gate_frames()
     artifacts = _gate_artifacts()
-    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    # harmonisation is SECONDARY-only; this test uses it as setup for the
+    # invariant it actually checks, so it names the mode explicitly.
+    recon, _ = gate.basis_dispositions(
+            artifacts, {"AAAA", "BBBB"}, mode=gate.SECONDARY_MODE)
     brk, _ = gate.harmonise_broker_basis(brk, recon)
     brk.loc[(brk.ticker == "AAAA") & (brk.date == "2026-01-02"), "sval"] = 5e7
 
@@ -2433,7 +2535,10 @@ def test_gate_implied_price_confirms_the_basis_correction():
         "the offending ticker must be named"
 
     artifacts = _gate_artifacts()
-    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    # harmonisation is SECONDARY-only; this test uses it as setup for the
+    # invariant it actually checks, so it names the mode explicitly.
+    recon, _ = gate.basis_dispositions(
+            artifacts, {"AAAA", "BBBB"}, mode=gate.SECONDARY_MODE)
     harmonised, _ = gate.harmonise_broker_basis(brk, recon)
     after = gate.implied_price_containment(ohlc, harmonised)
     assert after["violations"] == 0, \
@@ -2470,7 +2575,10 @@ def test_gate_does_not_call_a_thin_stock_deficit_a_basis_break():
     brk.loc[day, "slot"] = 1994.0
 
     artifacts = _gate_artifacts()
-    recon, _ = gate.basis_dispositions(artifacts, {"AAAA", "BBBB"})
+    # harmonisation is SECONDARY-only; this test uses it as setup for the
+    # invariant it actually checks, so it names the mode explicitly.
+    recon, _ = gate.basis_dispositions(
+            artifacts, {"AAAA", "BBBB"}, mode=gate.SECONDARY_MODE)
     harmonised, _ = gate.harmonise_broker_basis(brk, recon)
     report = gate.cross_source_invariants(ohlc, harmonised, artifacts)
 
@@ -2589,6 +2697,8 @@ if __name__ == "__main__":
     test_gate_applies_only_ledger_authorised_volume_repairs()
     test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover()
     test_gate_harmonises_a_certified_basis_and_keeps_lots_integral()
+    test_gate_primary_mode_harmonises_nothing()
+    test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones()
     test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker()
     test_gate_treats_lot_coverage_deficits_as_reported_not_fatal()
     test_gate_fails_when_value_conservation_breaks()
