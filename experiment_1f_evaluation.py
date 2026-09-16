@@ -358,13 +358,20 @@ def basic_bootstrap_ci(theta_hat, boot, level=BOOTSTRAP["level"]):
 
 def basic_bootstrap_pvalue(theta_hat, boot):
     """Equal-tailed two-sided p for H0: theta = 0 from the centred bootstrap:
-    p = min(1, 2 * min(1 + #{theta* - theta_hat >= theta_hat},
-                       1 + #{theta* - theta_hat <= -theta_hat}) / (1 + B)).
+    p = min(1, 2 * min(1 + #{theta* - theta_hat >= |theta_hat|},
+                       1 + #{theta* - theta_hat <= -|theta_hat|}) / (1 + B)).
     The basic 95% interval excludes 0 exactly when this p is <= 0.05, up to the
-    +1 finite-sample correction."""
+    +1 finite-sample correction.
+
+    The thresholds use |theta_hat|. Signed thresholds (as before PR #41 review)
+    are correct only for theta_hat > 0: for a negative estimate both counts span
+    the centre of the distribution and p collapses to 1 even when the interval
+    excludes 0 -- the Stage-1 record's p = 1.0 for the negative C-B and D-C
+    increments came from that."""
     centred = np.asarray(boot) - theta_hat
-    upper = 1 + int((centred >= theta_hat).sum())
-    lower = 1 + int((centred <= -theta_hat).sum())
+    magnitude = abs(theta_hat)
+    upper = 1 + int((centred >= magnitude).sum())
+    lower = 1 + int((centred <= -magnitude).sum())
     return float(min(1.0, 2.0 * min(upper, lower) / (1 + len(centred))))
 
 

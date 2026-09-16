@@ -164,16 +164,22 @@ def strict_dates(dates, ticker):
     if not dates:
         raise StrictSourceError(f"{ticker}: empty date axis")
     seen = set()
+    previous = None
     for d in dates:
         if not isinstance(d, str):
             raise StrictSourceError(f"{ticker}: non-string date {d!r}")
         try:
-            datetime.date.fromisoformat(d)
+            day = datetime.date.fromisoformat(d)
         except ValueError:
             raise StrictSourceError(f"{ticker}: not a real calendar date {d!r}")
         if d in seen:
             raise StrictSourceError(f"{ticker}: duplicate date {d!r}")
+        # Broker series are paired to this axis by position and regimes are cut by
+        # position, so an out-of-order axis must fail here, not invert an interval.
+        if previous is not None and day <= previous:
+            raise StrictSourceError(f"{ticker}: date axis not ascending ({previous.isoformat()} then {d!r})")
         seen.add(d)
+        previous = day
     return list(dates)
 
 

@@ -546,6 +546,26 @@ def test_bootstrap_deterministic_and_basic_interval_agrees_with_pvalue():
     assert results["positive"] <= 0.05 < results["null"]
 
 
+def test_bootstrap_pvalue_is_symmetric_for_negative_effects():
+    # PR #41 review (P1): with signed thresholds a negative estimate counted the
+    # centre of the bootstrap distribution on both sides and returned p = 1 even
+    # when the basic interval excluded zero.
+    x = np.random.default_rng(5).normal(0.02, 0.05, size=180)
+    boot = ev.circular_block_bootstrap_means(x, 10, 4000, ev.bootstrap_rng(0, 10))
+    theta = float(x.mean())
+    neg_x, neg_boot, neg_theta = -x, -boot, -theta
+    lo, hi = ev.basic_bootstrap_ci(neg_theta, neg_boot)
+    p_neg = ev.basic_bootstrap_pvalue(neg_theta, neg_boot)
+    assert hi < 0 and p_neg <= 0.05, (lo, hi, p_neg)
+    assert p_neg == ev.basic_bootstrap_pvalue(theta, boot)        # mirror image, same evidence
+    null = neg_x - neg_x.mean() - 1e-4
+    null_boot = ev.circular_block_bootstrap_means(null, 10, 4000, ev.bootstrap_rng(0, 10))
+    null_theta = float(null.mean())
+    lo, hi = ev.basic_bootstrap_ci(null_theta, null_boot)
+    p_null = ev.basic_bootstrap_pvalue(null_theta, null_boot)
+    assert lo < 0 < hi and p_null > 0.05 and p_null < 1.0, (lo, hi, p_null)
+
+
 def test_holm_step_down():
     out = ev.holm({"B-A": 0.01, "C-B": 0.04, "D-C": 0.03})
     assert out["B-A"][1] and not out["D-C"][1] and not out["C-B"][1]

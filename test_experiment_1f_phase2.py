@@ -82,6 +82,29 @@ def test_strict_lot_rejects_every_non_lot_type():
     print("  ok strict_lot rejects non-lots and keeps large int64 exact")
 
 
+def test_strict_dates_rejects_a_non_ascending_axis():
+    """PR #41 review (P2): the contract promises an ascending axis; broker series
+    and regimes are positional, so shuffled or descending dates must fail closed."""
+    ok = ["2026-01-02", "2026-01-05", "2026-01-06"]
+    assert bidb.strict_dates(ok, "T") == ok
+    for bad in (["2026-01-05", "2026-01-02"],
+                ["2026-01-02", "2026-01-06", "2026-01-05"],
+                ["2026-01-06", "2026-01-05", "2026-01-02"],
+                ["2026-01-02", "20260102"]):
+        try:
+            bidb.strict_dates(bad, "T")
+        except bidb.StrictSourceError:
+            continue
+        raise AssertionError(f"strict_dates accepted {bad!r}")
+    try:
+        bidb.strict_dates(["2026-01-02", "2026-01-02"], "T")
+    except bidb.StrictSourceError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("a duplicate date was accepted")
+    print("  ok strict_dates rejects descending, shuffled and same-day re-spelled axes")
+
+
 def test_bool_is_rejected_before_float_coercion_can_hide_it():
     """np.asarray([True], float) is 1.0; validation must run on the RAW object."""
     assert float(np.asarray([True], dtype=np.float64)[0]) == 1.0
