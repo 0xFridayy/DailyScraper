@@ -53,11 +53,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Commit updated neobdm.db
+      - name: Commit updated neobdm.db and market-summary raw fragments
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Only these two paths -- never `git add .` / `git add -A`.
+          # market_summary_raw_fragments/ holds the immutable screener responses the
+          # capture manifest (ms_capture_manifest) points at: content-addressed and
+          # write-once (neobdm_source_contract.store_raw_bytes), so an unchanged
+          # response re-adds nothing and no step here can stage a deletion. The
+          # guard keeps a run that stored no response from failing under `set -e`.
           git add neobdm.db
+          if [ -d market_summary_raw_fragments ]; then
+            git add market_summary_raw_fragments/
+          fi
           git diff --staged --quiet || git commit -m "Update neobdm.db ($(date -u +%Y-%m-%d))"
           git pull --rebase
           git push

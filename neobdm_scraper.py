@@ -20,6 +20,7 @@ import pytz
 # Pure, playwright-free helpers parked in price_audit so CI can test them.
 from price_audit import (bagholders_from_payloads, inventory_date_blocks,
                          date_offset_holds)
+import neobdm_source_contract as nsc
 
 
 # ─────────────────────────────────────────────
@@ -94,17 +95,18 @@ GORENGAN_FILTERS = [
 #                      so target/stop rules can be tested, not just close-to-close)
 #   the three signals  m_dn_0 (akum bandar), nr_dn_0 (retail jualan), f_dn_0 (asing)
 #   accumulation       m_cn_5 (5-candle cumulative), m_dn_3, top_5_buyer (who)
-#   screen conditions  is_unusual_volume, clean_score
+#   screen conditions  clean_score (is_unusual_volume RETIRED, see below)
 #   confound controls  tval, market_cap_t, pct_5 (is the signal just momentum?)
 # is_liquid/is_pinky/is_crossing are deliberately absent: GORENGAN_FILTERS makes
 # them constant, so they would burn slots carrying zero information.
-ML_COLUMNS = [
-    "symbol", "close", "high", "low",
-    "m_dn_0", "nr_dn_0", "f_dn_0",
-    "m_cn_5", "m_dn_3", "top_5_buyer",
-    "is_unusual_volume", "clean_score",
-    "tval", "market_cap_t", "pct_5",
-]
+#
+# 2026-09-14: NeoBDM removed is_unusual_volume from its column catalog (live probe
+# 2026-09-15; evidence in neobdm_source_contract.FIELD_LIFECYCLE). It is no longer
+# requested and NOT replaced: is_spike_volume_* exist but are not established as
+# equivalent, and the freed slot stays empty until an explicit contract change.
+# The request set lives in neobdm_source_contract so the integrity checks read
+# the same contract without importing playwright.
+ML_COLUMNS = list(nsc.ACTIVE_REQUEST_COLUMNS)
 CAPTURE_SORT_FIELD = "symbol"   # stable order => pages don't shift mid-walk
 
 # Raw broker-flow history for the ML backtest pipeline (Roadmap #2). Committed
@@ -408,21 +410,44 @@ def _api_json(resp):
         return None
 
 
-def get_market_columns(req):
-    j = _api_json(req.get(f"{API_BASE}/market-summary/columns")) or {}
-    return [c["field"] for c in (j.get("data") or [])
-            if isinstance(c, dict) and c.get("field")]
+def _json_of(recorder, method, endpoint, resp, schema, screener_id=None, page=None, select=None):
+    """Parsed JSON of an API response. With a recorder, the response is also kept
+    as immutable provenance (neobdm_source_contract.CaptureRecorder), limited to
+    what `schema` allows: the fragment store is committed to a public repository.
+    `select` narrows an account-scoped endpoint to the object this capture uses;
+    the account's other screeners/universes are not market data."""
+    if recorder is None:
+        return _api_json(resp)
+    return recorder.record(method, endpoint, resp, schema=schema, select=select,
+                           screener_id=screener_id, page=page)
 
 
-def get_universe_id(req, name=MARKET_UNIVERSE):
-    j = _api_json(req.get(f"{API_BASE}/stock-universe")) or {}
+def _named(name):
+    return (f"data[name={name}]", lambda o: str(o.get("name", "")).upper() == name.upper())
+
+
+def _screener(sid):
+    return (f"data[id={sid}|name={SCRAPER_SCREENER_NAME}]",
+            lambda o: o.get("id") == sid or o.get("name") == SCRAPER_SCREENER_NAME)
+
+
+def get_market_columns(req, recorder=None):
+    """Field names of the live column catalog, or None if it could not be read."""
+    j = _json_of(recorder, "GET", "/market-summary/columns",
+                 req.get(f"{API_BASE}/market-summary/columns"), nsc.CATALOG_RESPONSE_SCHEMA)
+    return nsc.catalog_field_names(j)
+
+
+def get_universe_id(req, name=MARKET_UNIVERSE, recorder=None):
+    j = _json_of(recorder, "GET", "/stock-universe", req.get(f"{API_BASE}/stock-universe"),
+                 nsc.UNIVERSE_RESPONSE_SCHEMA, select=_named(name)) or {}
     for u in (j.get("data") or []):
         if str(u.get("name", "")).upper() == name.upper():
             return u.get("id")
     return None
 
 
-def ensure_scraper_screener(req, headers, universe_id):
+def ensure_scraper_screener(req, headers, universe_id, recorder=None):
     """Find-or-create the DAILY_SCRAPER screener and point it at `universe_id`
     carrying ML_COLUMNS with GORENGAN_FILTERS applied. Returns its id, or None if
     NeoBDM rejected the config.
@@ -433,20 +458,26 @@ def ensure_scraper_screener(req, headers, universe_id):
     ALL universe -- warrants included -- while every run assumed otherwise.
     """
     import json as _json
-    j = _api_json(req.get(f"{API_BASE}/screeners")) or {}
+    j = _json_of(recorder, "GET", "/screeners", req.get(f"{API_BASE}/screeners"),
+                 nsc.SCREENERS_RESPONSE_SCHEMA, select=_named(SCRAPER_SCREENER_NAME)) or {}
     mine = next((s for s in (j.get("data") or [])
                  if s.get("name") == SCRAPER_SCREENER_NAME), None)
     if not mine:
         r = req.post(f"{API_BASE}/screeners",
                      data=_json.dumps({"name": SCRAPER_SCREENER_NAME}), headers=headers)
-        mine = (_api_json(r) or {}).get("data") or {}
+        mine = (_json_of(recorder, "POST", "/screeners", r, nsc.SCREENER_RESPONSE_SCHEMA,
+                         select=_named(SCRAPER_SCREENER_NAME)) or {}).get("data") or {}
         log.info(f"Created screener '{SCRAPER_SCREENER_NAME}'")
     sid = mine.get("id")
     body = {"columns": ML_COLUMNS, "filters": GORENGAN_FILTERS,
             "stock_universe_id": universe_id,
             "sort_field": CAPTURE_SORT_FIELD, "sort_direction": "asc"}
-    resp = _api_json(req.patch(f"{API_BASE}/screeners/{sid}",
-                               data=_json.dumps(body), headers=headers)) or {}
+    # success=True is NOT proof the config was stored as sent: on 2026-09-14 NeoBDM
+    # accepted a PATCH naming a column it had removed and silently dropped it. The
+    # stored config is re-read after this call and checked (capture_market_summary).
+    resp = _json_of(recorder, "PATCH", f"/screeners/{sid}",
+                    req.patch(f"{API_BASE}/screeners/{sid}", data=_json.dumps(body), headers=headers),
+                    nsc.SCREENER_RESPONSE_SCHEMA, screener_id=sid, select=_screener(sid)) or {}
     if not resp.get("success"):
         log.error(f"Screener config REJECTED: {resp.get('message')}")
         return None
@@ -454,16 +485,21 @@ def ensure_scraper_screener(req, headers, universe_id):
 
 
 def _fetch_summary_pages(req, headers, sid, max_pages=None,
-                         sort_field=CAPTURE_SORT_FIELD, sort_direction="asc"):
+                         sort_field=CAPTURE_SORT_FIELD, sort_direction="asc", recorder=None):
     """Page through /market-summary/summary/{sid}, paced. Stops at last_page or
-    max_pages, whichever comes first. Returns (rows, last_page)."""
+    max_pages, whichever comes first. Returns (rows, last_page, pages_fetched).
+    A recorded page may store only the requested columns and tolerated aliases."""
     import json as _json
-    rows, page_no, last = [], 1, 1
+    schema = nsc.summary_response_schema(list(ML_COLUMNS) + sorted(nsc.TOLERATED_ADDITIVE_KEYS))
+    rows, page_no, last, fetched = [], 1, 1, 0
     while page_no <= last and (max_pages is None or page_no <= max_pages):
         body = {"page": page_no, "size": MARKET_PAGE_SIZE,
                 "sort_field": sort_field, "sort_direction": sort_direction}
-        j = _api_json(req.post(f"{API_BASE}/market-summary/summary/{sid}",
-                               data=_json.dumps(body), headers=headers)) or {}
+        j = _json_of(recorder, "POST", f"/market-summary/summary/{sid}",
+                     req.post(f"{API_BASE}/market-summary/summary/{sid}",
+                              data=_json.dumps(body), headers=headers),
+                     schema, screener_id=sid, page=page_no) or {}
+        fetched += 1
         if not j.get("success"):
             log.error(f"Summary fetch failed (p{page_no}): {j.get('message')}")
             break
@@ -472,30 +508,48 @@ def _fetch_summary_pages(req, headers, sid, max_pages=None,
         rows.extend((d.get("data") if isinstance(d, dict) else d) or [])
         page_no += 1
         time.sleep(API_PAGE_PAUSE)
-    return rows, last
+    return rows, last, fetched
 
 
-def fetch_market_summary(page):
-    """One bounded, paced walk of the gorengan-free COMPOSITE slice (~200 names,
-    ~10 pages). These rows serve double duty: the Telegram Top-2 Akum pick AND the
-    daily ML feature capture, so the whole job costs ~10 page POSTs against
-    NeoBDM's ~50-request abuse budget. Returns (columns, rows)."""
-    req, headers = _api_session(page)
-    composite = get_universe_id(req, MARKET_UNIVERSE)
+def capture_market_summary(req, headers, recorder, capture_date, state):
+    """The capture itself, against an authenticated request context. Fills `state`
+    as it goes so a failure part-way still leaves an honest manifest. Adds two
+    cheap reads to the budget: the column catalog and the stored screener config
+    AFTER the PATCH."""
+    state.update(requested=list(ML_COLUMNS), rows=[], last_page=None, pages_fetched=0,
+                 screener_id=None, universe_id=None, catalog_fields=None, stored_columns=None)
+    composite = get_universe_id(req, MARKET_UNIVERSE, recorder=recorder)
+    state["universe_id"] = composite
     if not composite:
         log.error(f"Market summary: universe '{MARKET_UNIVERSE}' not found")
-        return [], []
-    sid = ensure_scraper_screener(req, headers, composite)
+        return state
+    sid = ensure_scraper_screener(req, headers, composite, recorder=recorder)
+    state["screener_id"] = sid
     if not sid:
-        return [], []
+        return state
+    state["catalog_fields"] = get_market_columns(req, recorder=recorder)
+    stored = _json_of(recorder, "GET", "/screeners", req.get(f"{API_BASE}/screeners"),
+                      nsc.SCREENERS_RESPONSE_SCHEMA, screener_id=sid, select=_screener(sid))
+    state["stored_columns"] = nsc.stored_config_columns(stored, sid)
 
-    rows, last = _fetch_summary_pages(req, headers, sid, max_pages=MAX_CAPTURE_PAGES)
+    rows, last, fetched = _fetch_summary_pages(req, headers, sid, max_pages=MAX_CAPTURE_PAGES,
+                                               recorder=recorder)
+    state.update(rows=rows, last_page=last, pages_fetched=fetched)
     log.info(f"Capture: {len(rows)} rows over {min(last, MAX_CAPTURE_PAGES)}/{last} "
              f"pages ({MARKET_UNIVERSE}, liquid + non-gorengan)")
     if last > MAX_CAPTURE_PAGES:
         log.error(f"Capture hit the page cap (last_page={last}) — the filters may "
                   f"not have applied; rows are truncated")
-    return ML_COLUMNS, rows
+    return state
+
+
+def fetch_market_summary(page, capture_date, recorder, state):
+    """One bounded, paced walk of the gorengan-free COMPOSITE slice (~200 names,
+    ~10 pages). These rows serve double duty: the Telegram Top-2 Akum pick AND the
+    daily ML feature capture, so the whole job costs ~12 page POSTs plus 5 reads
+    against NeoBDM's ~50-request abuse budget."""
+    req, headers = _api_session(page)
+    return capture_market_summary(req, headers, recorder, capture_date, state)
 
 
 # ── 2a. MARKET SUMMARY PERSISTENCE (full 385-col rows) ────────
@@ -557,50 +611,136 @@ def save_market_summary_daily(date_str, columns, rows, keep_tickers):
 MARKET_DN0_MIN = 0.0  # TODO recalibrate strong-accumulation threshold on m_dn_0
 
 
-def _truthy(v):
-    return v is True or str(v).strip().lower() in ("true", "v", "1")
+TOP_AKUM_SOURCE = "top_akum_bandar"
+UNUSUAL_FIELD = "is_unusual_volume"
 
 
-def screen_market_summary(rows):
-    """Top-2 Akum Bandar out of the whole captured universe. Every captured name is
-    already liquid / non-pinky / non-crossing (GORENGAN_FILTERS), so the old
-    is_liquid tiebreak is constant and drops out. This now screens ~200 filtered
-    names rather than the first 120 of an unsorted market walk."""
-    cands = [r for r in rows if _truthy(r.get("is_unusual_volume"))]
-    cands.sort(key=lambda r: (parse_num(r.get("m_dn_0")), parse_num(r.get("m_dn_3"))),
-               reverse=True)
+def screen_market_summary(rows, field_availability=None, capture_date=None, capture_id=None):
+    """Top-2 Akum Bandar out of the whole captured universe, as a SignalResult.
+
+    The screen filters on is_unusual_volume, so its status follows that field:
+      RETIRED_SOURCE      the field is retired for this capture regime (today)
+      SOURCE_UNAVAILABLE  capture failed, or the field is absent/null throughout
+      NO_HITS             the field is healthy and no row is TRUE
+      HITS                one or more TRUE rows
+    A missing or null flag is UNKNOWN and never counts as "not unusual"."""
+    if (nsc.lifecycle_state(UNUSUAL_FIELD, capture_date) == nsc.RETIRED
+            or field_availability == nsc.RETIRED):
+        entry = nsc.FIELD_LIFECYCLE.get(UNUSUAL_FIELD, {})
+        detail = (f"{UNUSUAL_FIELD} RETIRED by NeoBDM (capture regime from "
+                  f"{entry.get('effective_capture_date', '?')}); no replacement approved")
+        log.warning(f"Top-2 Akum Bandar: {detail}")
+        return nsc.SignalResult(TOP_AKUM_SOURCE, nsc.RETIRED_SOURCE, [], detail, capture_id)
+    if not rows:
+        return nsc.SignalResult(TOP_AKUM_SOURCE, nsc.SOURCE_UNAVAILABLE, [],
+                                "no market summary rows were captured", capture_id)
+    states = [nsc.flag_state(r.get(UNUSUAL_FIELD)) for r in rows]
+    unknown = sum(1 for s in states if s is None)
+    if field_availability == nsc.UNAVAILABLE or unknown == len(rows):
+        return nsc.SignalResult(TOP_AKUM_SOURCE, nsc.SOURCE_UNAVAILABLE, [],
+                                f"{UNUSUAL_FIELD} absent or null on all {len(rows)} captured rows",
+                                capture_id)
+    # The ranking inputs are source-backed numbers: a candidate whose m_dn_0 or
+    # m_dn_3 is absent/null cannot be ranked, so it is excluded and counted rather
+    # than ranked on an invented 0.0 (parse_num(None) == 0.0).
+    cands, unrankable = [], 0
+    for r, s in zip(rows, states):
+        if s != nsc.TRUE:
+            continue
+        dn0, dn3 = nsc.source_number(r, "m_dn_0"), nsc.source_number(r, "m_dn_3")
+        if dn0 is None or dn3 is None:
+            unrankable += 1
+            continue
+        cands.append((dn0, dn3, r))
+    cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
     out = []
-    for r in cands[:2]:
+    for dn0, dn3, r in cands[:2]:
         out.append({
             "symbol":  r.get("symbol", ""),
             "unusual": "v",
-            "dn-0":    round(parse_num(r.get("m_dn_0")), 4),
-            "dn-3":    round(parse_num(r.get("m_dn_3")), 4),
+            "dn-0":    round(dn0, 4),
+            "dn-3":    round(dn3, 4),
             "likuid":  "v",   # guaranteed by the server-side filter
             "price":   r.get("close"),
-            "_caution": parse_num(r.get("m_dn_0")) < MARKET_DN0_MIN,
+            "_caution": dn0 < MARKET_DN0_MIN,
         })
-    log.info(f"{len(cands)} unusual stock(s); top {len(out)} selected")
-    return out
+    detail = "; ".join(part for part in (
+        f"{unknown} row(s) with unknown {UNUSUAL_FIELD} excluded" if unknown else "",
+        f"{unrankable} unusual row(s) with unavailable m_dn_0/m_dn_3 excluded from ranking"
+        if unrankable else "") if part)
+    if unrankable and not out:
+        return nsc.SignalResult(TOP_AKUM_SOURCE, nsc.SOURCE_UNAVAILABLE, [],
+                                f"every unusual row lacks m_dn_0/m_dn_3 ({detail})", capture_id)
+    log.info(f"{len(cands)} unusual stock(s); top {len(out)} selected"
+             + (f"; {detail}" if detail else ""))
+    return nsc.SignalResult(TOP_AKUM_SOURCE, nsc.HITS if out else nsc.NO_HITS, out, detail, capture_id)
+
+
+def _write_capture_provenance(recorder, capture_date, persisted, state, contract):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        nsc.ensure_schema(conn)
+        nsc.annotate_retired_signal_days(conn)
+        nsc.write_capture(conn, recorder, capture_date=capture_date, persisted=persisted,
+                          screener_id=state.get("screener_id"), universe_id=state.get("universe_id"),
+                          requested=state["requested"], catalog_fields=state.get("catalog_fields"),
+                          stored_columns=state.get("stored_columns"), rows=state.get("rows") or [],
+                          pages_fetched=state.get("pages_fetched") or 0,
+                          last_page=state.get("last_page"), contract=contract)
+    finally:
+        conn.close()
 
 
 def scrape_market_summary(page):
     """API-based Market Summary: one bounded capture, persist EVERY captured row,
-    return Top-2. The full capture is the ML panel -- signalled and unsignalled
-    names alike -- so forward returns have a control group to compare against."""
+    return the Top-2 SignalResult. The full capture is the ML panel -- signalled
+    and unsignalled names alike -- so forward returns have a control group.
+
+    Every API response is kept as raw provenance and summarised in a capture
+    manifest (requested vs catalog vs stored config vs returned keys). A missing
+    required field is recorded and reported but does not discard the other fields;
+    only an identity/column ambiguity blocks the market_summary_daily write."""
+    capture_date = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+    recorder = nsc.CaptureRecorder(root=os.path.dirname(DB_PATH))
+    state = {"requested": list(ML_COLUMNS)}
+    error = None
     try:
-        columns, rows = fetch_market_summary(page)
+        fetch_market_summary(page, capture_date, recorder, state)
     except Exception as e:
+        error = e
         log.error(f"Market summary API failed: {e}")
-        return []
-    top = screen_market_summary(rows)
+    rows = state.get("rows") or []
+    contract = nsc.evaluate_capture_contract(state["requested"], state.get("catalog_fields"),
+                                             state.get("stored_columns"), rows,
+                                             capture_date=capture_date)
+    for issue in contract["issues"]:
+        if issue["severity"] != nsc.INFO:
+            log.warning(f"source contract {issue['severity']} {issue['code']} "
+                        f"{issue['field'] or ''} {issue['detail'] or ''}".rstrip())
+    log.info(f"source contract status: {contract['status']} (capture {recorder.capture_id})")
+
+    if error is not None:
+        result = nsc.SignalResult(TOP_AKUM_SOURCE, nsc.SOURCE_UNAVAILABLE, [],
+                                  f"market summary capture failed: {str(error)[:120]}", recorder.capture_id)
+    else:
+        result = screen_market_summary(rows, contract["availability"].get(UNUSUAL_FIELD),
+                                       capture_date, recorder.capture_id)
+
+    persisted = False
     try:
-        if _offset_safe("market_summary_daily persistence"):
-            date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
-            save_market_summary_daily(date_str, columns, rows, keep_tickers=None)
+        if contract["blocking_codes"]:
+            log.error(f"market_summary_daily NOT written: {contract['blocking_codes']} "
+                      f"makes row identity or a column ambiguous (raw + manifest kept)")
+        elif rows and _offset_safe("market_summary_daily persistence"):
+            save_market_summary_daily(capture_date, state["requested"], rows, keep_tickers=None)
+            persisted = True
     except Exception as e:
         log.error(f"market_summary_daily persistence failed: {e}")
-    return top
+    try:
+        _write_capture_provenance(recorder, capture_date, persisted, state, contract)
+    except Exception as e:
+        log.error(f"capture manifest persistence failed: {e}")
+    return result
 
 
 # ── 2b. DASHBOARD "TOP AKUM" PRESETS ──────────
@@ -641,12 +781,20 @@ def scrape_dashboard_presets(page):
                     headers=headers)) or {}
                 d = jj.get("data")
                 batch = (d.get("data") if isinstance(d, dict) else d) or []
+                unavailable = 0
                 for r in batch:
                     sym = r.get("symbol")
                     if _is_real_ticker(sym):
-                        rows.append({"tick": sym, "tx": f"{parse_num(r.get(field)) * 100:.1f}%"})
+                        # The rank value is source-backed: absent/null is not 0.0%.
+                        value = nsc.source_number(r, field)
+                        if value is None:
+                            unavailable += 1
+                            continue
+                        rows.append({"tick": sym, "tx": f"{value * 100:.1f}%"})
                     if len(rows) >= DASH_TOP_N:
                         break
+                if unavailable:
+                    log.warning(f"Dashboard {label}: {unavailable} row(s) without {field} excluded")
                 time.sleep(API_PAGE_PAUSE)
             except Exception as e:
                 log.error(f"Dashboard preset {label} failed: {e}")
@@ -991,10 +1139,19 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
     tracked = set(TRACKED_TICKERS)
     hits = {}  # ticker -> set of source labels
 
+    # Source availability per family, recorded even on zero hits, so a day whose
+    # source was unavailable or retired is never read as a genuine no-signal day.
+    statuses = [ms_data if isinstance(ms_data, nsc.SignalResult)
+                else nsc.signal_status_from_rows(TOP_AKUM_SOURCE, list(ms_data))]
+    statuses += [nsc.signal_status_from_rows(f"dashboard_{label}", rows)
+                 for label, _emoji, rows in dash_data]
+    statuses.append(nsc.signal_status_from_rows("broker_stalker", list(bs_data)))
+    nsc.record_signal_source_status(conn, date_str, statuses)
+
     for r in ms_data:
         t = r.get("symbol")
         if t:
-            hits.setdefault(t, set()).add("top_akum_bandar")
+            hits.setdefault(t, set()).add(TOP_AKUM_SOURCE)
 
     for label, _emoji, rows in dash_data:
         for r in rows:
@@ -1052,7 +1209,7 @@ def now_str():
 
 def format_market_summary_message(data):
     now = now_str()
-    if not data:
+    if not data and not isinstance(data, nsc.SignalResult):
         return (
             f"⚠️ NeoBDM Market Summary\n{now}\n\n"
             f"No data scraped today. Check screenshots."
@@ -1066,6 +1223,20 @@ def _market_summary_lines(data):
         "📊 Top 2 Akum Bandar (Daily)",
         "Universe: likuid, non-gorengan | Filter: unusual=v | Rank: dn-0 > dn-3",
     ]
+    if isinstance(data, nsc.SignalResult):
+        if data.status == nsc.RETIRED_SOURCE:
+            lines.append("⛔ Source retired: NeoBDM no longer provides is_unusual_volume "
+                         "(since the 2026-09-14 capture). No replacement approved, so no "
+                         "Top-2 is produced. This is not a zero-candidate day.")
+            return lines
+        if data.status == nsc.SOURCE_UNAVAILABLE:
+            lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a "
+                         f"zero-candidate day.")
+            return lines
+        if data.status == nsc.NO_HITS:
+            lines.append("No unusual-volume candidates today (source healthy).")
+            return lines
+        data = data.hits
     if not data:
         lines.append("No data scraped today.")
         return lines

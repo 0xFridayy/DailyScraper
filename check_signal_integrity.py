@@ -42,17 +42,21 @@ by one day.
 
 Run:  py check_signal_integrity.py            -> print status
       py check_signal_integrity.py --telegram -> also send it
-Exit code is non-zero when something is wrong, so the workflow goes red too.
+Exit code is non-zero when something is wrong, so the workflow goes red too:
+1 = failed, 2 = SOURCE_CONTRACT_BREAK_ACKNOWLEDGED (see check_schema_and_coverage).
 """
 
+import json
 import os
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta
+from statistics import median
 
 import pandas as pd
 import requests
 
+import neobdm_source_contract as nsc
 from price_audit import detect, load
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,16 +78,32 @@ MIN_PAIRS_TO_JUDGE = 15   # under this the sample is too thin to fail a build on
 # fields the API returns, and market_summary_daily has never carried `volume`
 # either - all four are NULL on every captured date. Listing them here would
 # fail the build on day one for a condition that has always held.
-CRITICAL_FIELDS = ["close", "high", "low", "tval", "clean_score",
-                   "m_dn_0", "nr_dn_0", "f_dn_0", "market_cap_t", "pct_5"]
+CRITICAL_FIELDS = list(nsc.ACTIVE_CRITICAL_FIELDS)
 MIN_COVERAGE = 0.90
 
-# Everything else is checked against its OWN history instead of a hardcoded
-# list, so a column that NeoBDM starts returning empty is caught without anyone
-# having to predict which column it will be. Self-calibrating: a field that was
-# always NULL stays ignored; a field that was full and goes empty fails.
+# Every column of the ACTIVE request contract is judged on the latest capture by
+# itself -- no baseline -- so a field that stays empty keeps failing every day.
+#
+# Other columns are checked against their OWN history, so a column NeoBDM starts
+# returning empty is caught without predicting which. The history is the FULL
+# history, counted in healthy days: on 2026-09-15 the old 9-day AVERAGE put the
+# first empty day of is_unusual_volume into the baseline (8/9 = 89% < 90%), the
+# field was classed "never reliably populated", and the check went green while the
+# field was still gone. A bad day can no longer remove a healthy day.
+#
+# A field intentionally dropped from the contract must be RETIRED in
+# neobdm_source_contract.FIELD_LIFECYCLE; it is then reported explicitly instead
+# of failing forever or being silently forgotten. Health is judged against the
+# contract the capture ran under (its manifest, or the legacy contract when it has
+# none), so a capture taken while the field was still requested stays a
+# SOURCE_CONTRACT_BREAK_ACKNOWLEDGED, never a retroactive green.
 MIN_BASELINE_COVERAGE = 0.90
 MIN_BASELINE_DAYS = 2
+
+# Response cardinality vs the median of recent captures (normal range ~195-225).
+CARDINALITY_BASELINE_DAYS = 10
+MIN_ROW_RATIO, MAX_ROW_RATIO = 0.60, 1.67
+MIN_ROWS_FOR_COLLAPSE = 20   # constant-field collapse needs a real cross-section
 
 # A signalled ticker with no captured close cannot be scored. Some churn is
 # normal and structural: the screener panel applies liquidity filters, so a
@@ -283,13 +303,45 @@ def check_cross_source(conn, problems, notes, stats):
             f"screener API or the inventory chart has drifted. Worst: {sample}")
 
 
-def check_schema_and_coverage(conn, problems, notes, stats):
-    """A NeoBDM API change shows up as a column vanishing or going all-null."""
-    dates = _recent_dates(conn, "market_summary_daily", WINDOW_DAYS)
+def _coverage_by_date(conn, field):
+    return {d: (n / total if total else 0.0) for d, n, total in conn.execute(
+        f'SELECT date, COUNT("{field}"), COUNT(*) FROM market_summary_daily GROUP BY date')}
+
+
+def _storage_classes(conn, field, dates):
+    """SQLite storage classes of non-null values; integer and real are one class."""
+    if not dates:
+        return set()
+    qs = ",".join("?" * len(dates))
+    kinds = {r[0] for r in conn.execute(
+        f'SELECT DISTINCT typeof("{field}") FROM market_summary_daily '
+        f'WHERE date IN ({qs}) AND "{field}" IS NOT NULL', dates)}
+    return {"numeric" if k in ("integer", "real") else k for k in kinds}
+
+
+def _contract_at_capture(conn, capture_date):
+    """(contract_version, requested_columns) the capture on `capture_date` ran under.
+    Its manifest says so; a capture without one predates the repair and ran under
+    the legacy contract. No manifest is ever inferred for such a capture."""
+    if nsc.table_exists(conn, "ms_capture_manifest"):
+        row = conn.execute(
+            "SELECT contract_version, requested_columns FROM ms_capture_manifest WHERE capture_date=? "
+            "ORDER BY capture_started_utc DESC LIMIT 1", (capture_date,)).fetchone()
+        if row:
+            return row[0], json.loads(row[1])
+    return nsc.LEGACY_CONTRACT_VERSION, list(nsc.LEGACY_REQUEST_COLUMNS)
+
+
+def check_schema_and_coverage(conn, problems, notes, stats, lifecycle=None):
+    """A NeoBDM contract change shows up as a column vanishing, going all-null,
+    changing type, collapsing to one value, or the panel changing size."""
+    lc = nsc.FIELD_LIFECYCLE if lifecycle is None else lifecycle
+    dates = [r[0] for r in conn.execute(
+        "SELECT DISTINCT date FROM market_summary_daily ORDER BY date DESC")]
     if not dates:
         problems.append("market_summary_daily is EMPTY")
         return
-    latest, baseline = dates[0], dates[1:]
+    latest, history = dates[0], dates[1:]
     cols = [r[1] for r in conn.execute("PRAGMA table_info(market_summary_daily)")]
     rows = conn.execute(
         "SELECT COUNT(*) FROM market_summary_daily WHERE date=?", (latest,)).fetchone()[0]
@@ -299,48 +351,196 @@ def check_schema_and_coverage(conn, problems, notes, stats):
         problems.append(f"market_summary_daily has no rows on {latest}")
         return
 
-    missing = [f for f in CRITICAL_FIELDS if f not in cols]
+    retired = [f for f in lc if nsc.lifecycle_state(f, latest, lc) == nsc.RETIRED]
+    # HEALTH AT CAPTURE is judged against the contract that capture ran under, not
+    # the one in force today. Historically critical fields stay critical wherever
+    # that contract still requested them.
+    contract_version, requested = _contract_at_capture(conn, latest)
+    stats["contract_at_capture"] = contract_version
+    critical = CRITICAL_FIELDS + [f for f in nsc.HISTORICAL_CRITICAL_FIELDS
+                                  if (f in requested or f not in retired) and f not in CRITICAL_FIELDS]
+    active = list(dict.fromkeys(list(requested) + critical))
+
+    coverage = {f: _coverage_by_date(conn, f) for f in cols if f not in ("date", "ticker")}
+
+    # A field the then-active contract requested but did not get, and that the
+    # lifecycle registry has since RETIRED, is a source-contract break the human
+    # retirement EXPLAINS -- not a healthy capture, and not an unexplained failure.
+    breaks = [f for f in active if f in retired and f in requested
+              and coverage.get(f, {}).get(latest, 0.0) < MIN_COVERAGE]
+    judged = [f for f in active if f not in breaks]
+
+    missing = [f for f in judged if f not in cols]
     if missing:
-        problems.append(f"signal field(s) GONE from market_summary_daily: "
+        problems.append(f"active contract field(s) GONE from market_summary_daily: "
                         f"{', '.join(missing)} — the screener API changed shape")
 
-    def coverage(field, on_date, total=None):
-        n = conn.execute(f'SELECT COUNT("{field}") FROM market_summary_daily WHERE date=?',
-                         (on_date,)).fetchone()[0]
-        total = total or conn.execute(
-            "SELECT COUNT(*) FROM market_summary_daily WHERE date=?", (on_date,)).fetchone()[0]
-        return n / total if total else 0.0
-
-    thin = [f"{f} {coverage(f, latest, rows):.0%}" for f in CRITICAL_FIELDS
-            if f not in missing and coverage(f, latest, rows) < MIN_COVERAGE]
+    thin = [f"{f} {coverage[f].get(latest, 0.0):.0%}" for f in judged
+            if f not in missing and coverage[f].get(latest, 0.0) < MIN_COVERAGE]
     if thin:
-        problems.append(f"critical field(s) mostly NULL on {latest}: {', '.join(thin)} "
-                        f"— the screener returned the column but stopped filling it")
+        problems.append(f"active contract field(s) mostly NULL/absent on {latest}: "
+                        f"{', '.join(thin)} — the screener stopped delivering them (a field "
+                        f"NeoBDM dropped on purpose must be RETIRED in the lifecycle registry)")
 
-    # Self-calibrating sweep over every other column.
-    if len(baseline) < MIN_BASELINE_DAYS:
-        notes.append(f"coverage-regression sweep skipped — only {len(baseline)} "
-                     f"baseline day(s), need {MIN_BASELINE_DAYS}")
-        return
-
-    regressed = []
-    for f in cols:
-        if f in ("date", "ticker") or f in CRITICAL_FIELDS:
+    for f in breaks:
+        entry = lc[f]
+        notes.append(f"{nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED}: the {latest} capture ran under "
+                     f"{contract_version}, which requested {f}; it came back "
+                     f"{coverage.get(f, {}).get(latest, 0.0):.0%} populated — a source-contract break at "
+                     f"capture. The lifecycle registry RETIRED {f} from the {entry['effective_capture_date']} "
+                     f"capture ({entry.get('acknowledged_in_contract') or 'not yet acknowledged'}); that "
+                     f"explains the break, it does not make this capture healthy. Signal(s) "
+                     f"{', '.join(entry.get('signals') or []) or 'none'}: source unavailable at capture, "
+                     f"RETIRED_SOURCE under the current lifecycle")
+    for f in retired:
+        entry = lc[f]
+        if f in breaks:
             continue
-        base = sum(coverage(f, d) for d in baseline) / len(baseline)
-        if base < MIN_BASELINE_COVERAGE:
-            continue                      # never reliably populated — not our problem
-        now = coverage(f, latest, rows)
-        if now < MIN_COVERAGE:
-            regressed.append(f"{f} {base:.0%}→{now:.0%}")
+        if coverage.get(f, {}).get(latest, 0.0) > 0:
+            problems.append(f"{f} is RETIRED since the {entry['effective_capture_date']} capture but "
+                            f"is populated again on {latest} — the source contract changed back; "
+                            f"review the lifecycle registry before trusting either reading")
+        else:
+            notes.append(f"{f} RETIRED by NeoBDM since the {entry['effective_capture_date']} capture "
+                         f"(lifecycle registry): no longer requested, no replacement approved; "
+                         f"signal(s) built on it ({', '.join(entry.get('signals') or []) or 'none'}) "
+                         f"are RETIRED_SOURCE, not zero-signal days")
+    stats["retired_fields"] = retired
+    stats["contract_breaks"] = breaks
+    stats["capture_health"] = nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED if breaks else nsc.HEALTHY
 
+    # Every other column, against its full history in healthy days.
+    regressed = []
+    for f, by_date in coverage.items():
+        if f in active or f in retired:
+            continue
+        healthy = sum(1 for d in history if by_date.get(d, 0.0) >= MIN_BASELINE_COVERAGE)
+        if healthy >= MIN_BASELINE_DAYS and by_date.get(latest, 0.0) < MIN_COVERAGE:
+            regressed.append(f"{f} healthy on {healthy} earlier day(s)→{by_date.get(latest, 0.0):.0%}")
     stats["cols_swept"] = len(cols)
     if regressed:
         problems.append(
-            f"{len(regressed)} column(s) were populated on the baseline days and "
-            f"went empty on {latest}: {', '.join(regressed[:6])}"
-            + (" …" if len(regressed) > 6 else "")
+            f"{len(regressed)} column(s) populated on earlier captures are empty on {latest}: "
+            f"{', '.join(regressed[:6])}" + (" …" if len(regressed) > 6 else "")
             + " — the screener API changed what it returns")
+
+    # Storage-class drift on active fields (e.g. a numeric column turning into text).
+    drift = []
+    for f in judged:
+        if f in missing:
+            continue
+        before, now = _storage_classes(conn, f, history), _storage_classes(conn, f, [latest])
+        if before and now - before:
+            drift.append(f"{f} {sorted(before)}→{sorted(now)}")
+    if drift:
+        problems.append(f"type change on {latest}: {', '.join(drift)} — the field's meaning or "
+                        f"encoding changed")
+
+    # Constant-field collapse: a cross-section that suddenly carries one value.
+    if rows >= MIN_ROWS_FOR_COLLAPSE:
+        collapsed = []
+        recent = history[:CARDINALITY_BASELINE_DAYS]
+        for f in judged:
+            if f in missing or f == nsc.IDENTITY_KEY:
+                continue
+            now = conn.execute(f'SELECT COUNT(DISTINCT "{f}") FROM market_summary_daily '
+                               f'WHERE date=? AND "{f}" IS NOT NULL', (latest,)).fetchone()[0]
+            if now != 1 or not recent:
+                continue
+            past = [conn.execute(f'SELECT COUNT(DISTINCT "{f}") FROM market_summary_daily '
+                                 f'WHERE date=? AND "{f}" IS NOT NULL', (d,)).fetchone()[0] for d in recent]
+            if median(past) > 1:
+                collapsed.append(f)
+        if collapsed:
+            problems.append(f"constant-field collapse on {latest}: {', '.join(collapsed)} carry a single "
+                            f"value across {rows} names")
+
+    # Response cardinality.
+    recent = history[:CARDINALITY_BASELINE_DAYS]
+    if len(recent) >= MIN_BASELINE_DAYS:
+        base = median(conn.execute("SELECT COUNT(*) FROM market_summary_daily WHERE date=?",
+                                   (d,)).fetchone()[0] for d in recent)
+        ratio = rows / base if base else 0.0
+        stats["cardinality"] = f"{rows} vs median {base:g}"
+        if ratio < MIN_ROW_RATIO or ratio > MAX_ROW_RATIO:
+            problems.append(f"panel size changed on {latest}: {rows} rows vs median {base:g} of the "
+                            f"previous {len(recent)} captures — filters, universe or pagination moved")
+
+
+def check_capture_contract(conn, problems, notes, stats):
+    """requested vs catalog vs stored config vs returned keys, from the capture
+    manifest the scraper writes for every capture (neobdm_source_contract)."""
+    if not nsc.table_exists(conn, "ms_capture_manifest"):
+        notes.append("no capture manifest yet — captures before the source-contract repair carry "
+                     "no raw provenance")
+        return
+    latest = conn.execute("SELECT MAX(date) FROM market_summary_daily").fetchone()[0]
+    manifests = conn.execute(
+        "SELECT capture_id, contract_status, contract_issues, requested_columns, catalog_columns_sha256, "
+        "catalog_column_count, capture_started_utc FROM ms_capture_manifest WHERE capture_date=? "
+        "ORDER BY capture_started_utc DESC", (latest,)).fetchall()
+    if not manifests:
+        any_manifest = conn.execute("SELECT COUNT(*) FROM ms_capture_manifest").fetchone()[0]
+        (problems if any_manifest else notes).append(
+            f"no capture manifest for {latest} — the raw-provenance path did not run for that capture")
+        return
+    capture_id, status, issues_json, requested_json, catalog_sha, catalog_n, started = manifests[0]
+    stats["contract"] = f"{status} ({capture_id})"
+    issues = json.loads(issues_json)
+    if json.loads(requested_json) != list(nsc.ACTIVE_REQUEST_COLUMNS):
+        problems.append(f"capture {capture_id} requested columns that differ from the active contract "
+                        f"— the deployed scraper and neobdm_source_contract disagree")
+
+    def summary(severity):
+        return ", ".join(f"{i['code']}{'(' + i['field'] + ')' if i['field'] else ''}"
+                         for i in issues if i["severity"] == severity)
+
+    if status == nsc.CONTRACT_FAILED:
+        problems.append(f"source contract FAILED for capture {capture_id}: {summary(nsc.FAIL)}")
+    for i in issues:
+        if i["code"] == nsc.RETIRED_FIELD_REAPPEARED:
+            problems.append(f"{nsc.RETIRED_FIELD_REAPPEARED}: {i['field']} — {i['detail']} (capture "
+                            f"{capture_id}). The active contract is unaffected; do not re-request or "
+                            f"bridge the field until a human has verified what the reappeared name means")
+    if summary(nsc.WARN):
+        notes.append(f"source contract warnings for capture {capture_id}: {summary(nsc.WARN)} "
+                     f"(recorded; additive keys do not invalidate the capture)")
+
+    previous = conn.execute(
+        "SELECT catalog_columns_sha256, catalog_column_count FROM ms_capture_manifest "
+        "WHERE capture_started_utc < ? AND catalog_columns_sha256 IS NOT NULL "
+        "ORDER BY capture_started_utc DESC LIMIT 1", (started,)).fetchone()
+    if previous and catalog_sha and previous[0] != catalog_sha:
+        notes.append(f"NeoBDM column catalog changed ({previous[1]}→{catalog_n} fields) — raw catalog "
+                     f"responses are kept for both captures")
+
+
+def check_signal_sources(conn, problems, notes, stats, lifecycle=None):
+    """Zero hits is only a signal outcome when the source was actually healthy."""
+    lc = nsc.FIELD_LIFECYCLE if lifecycle is None else lifecycle
+    if not nsc.table_exists(conn, "signal_source_status"):
+        return
+    latest = conn.execute("SELECT MAX(flag_date) FROM signal_source_status").fetchone()[0]
+    if not latest:
+        return
+    retired_signals = {s for f, e in lc.items()
+                       if nsc.lifecycle_state(f, latest, lc) == nsc.RETIRED for s in e.get("signals") or []}
+    has_at_capture = "status_at_capture" in {
+        r[1] for r in conn.execute("PRAGMA table_info(signal_source_status)")}
+    for source, status, detail, at_capture in conn.execute(
+            "SELECT source, status, detail, " + ("status_at_capture" if has_at_capture else "NULL")
+            + " FROM signal_source_status WHERE flag_date=? ORDER BY source", (latest,)):
+        if at_capture and at_capture != status:
+            notes.append(f"signal source {source} on {latest}: {at_capture} at capture, {status} under the "
+                         f"current lifecycle")
+        if status == nsc.SOURCE_UNAVAILABLE:
+            problems.append(f"signal source {source} UNAVAILABLE on {latest}: {detail}")
+        elif status == nsc.RETIRED_SOURCE and source not in retired_signals:
+            problems.append(f"signal source {source} marked RETIRED_SOURCE on {latest} without a "
+                            f"retired field in the lifecycle registry")
+        elif status == nsc.EMPTY_UNVERIFIED:
+            notes.append(f"signal source {source} returned nothing on {latest} and cannot tell "
+                         f"'no hits' from a failed scrape")
 
 
 def check_signals_measurable(conn, problems, notes, stats):
@@ -401,20 +601,35 @@ def check(conn):
     problems, notes, stats = [], [], {}
     check_freshness(conn, problems)
     check_schema_and_coverage(conn, problems, notes, stats)
+    check_capture_contract(conn, problems, notes, stats)
     check_new_contamination(conn, problems, notes, stats)
     check_cross_source(conn, problems, notes, stats)
     check_signals_measurable(conn, problems, notes, stats)
+    check_signal_sources(conn, problems, notes, stats)
     check_value_sanity(conn, problems)
     return problems, notes, stats
 
 
 def format_report(problems, notes, stats):
-    head = "🔴 SIGNAL INTEGRITY FAILED" if problems else "🟢 signal integrity OK"
+    if problems:
+        head = "🔴 SIGNAL INTEGRITY FAILED"
+    elif stats.get("capture_health") == nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED:
+        head = (f"🟠 {nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED} — the latest capture broke its then-active "
+                f"contract ({', '.join(stats.get('contract_breaks') or [])}); the retirement explains it, "
+                f"it is not healthy")
+    elif stats.get("retired_fields"):
+        head = (f"🟢 signal integrity OK — active contract valid; RETIRED source field(s): "
+                f"{', '.join(stats['retired_fields'])}")
+    else:
+        head = "🟢 signal integrity OK"
     lines = [head]
     if stats.get("latest_ms"):
         lines.append(f"{stats['latest_ms']}: {stats.get('ms_rows', 0)} panel rows | "
                      f"{stats.get('signals', 0)} signals | "
-                     f"{stats.get('cross_source', 'cross-source n/a')}")
+                     f"{stats.get('cross_source', 'cross-source n/a')} | "
+                     f"contract {stats.get('contract', 'no manifest')} | "
+                     f"health at capture {stats.get('capture_health', 'n/a')} under "
+                     f"{stats.get('contract_at_capture', 'n/a')}")
     if "fresh_suspects" in stats:
         lines.append(f"new contamination in last {WINDOW_DAYS}d: "
                      f"{stats['fresh_suspects']} of {stats.get('window_rows', 0)} rows")
@@ -451,7 +666,17 @@ def main():
     print(report)
     if "--telegram" in sys.argv:
         send_telegram(report)
-    sys.exit(1 if problems else 0)
+    sys.exit(exit_code(problems, stats))
+
+
+def exit_code(problems, stats):
+    """1 = failed; 2 = source-contract break acknowledged (explained, still not
+    healthy, so the run stays red); 0 = healthy."""
+    if problems:
+        return 1
+    if stats.get("capture_health") == nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
