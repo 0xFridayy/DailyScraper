@@ -56,6 +56,7 @@ backfill or fabricate a single price.
 """
 
 import argparse
+import contextlib
 import datetime as _dt
 import hashlib
 import json
@@ -90,6 +91,49 @@ UNIVERSE_SHEET = "Universe for ML"
 UNIVERSE_HEADER = "symbol"
 FROZEN_UNIVERSE_JSON = os.path.join(HERE, "experiment_1f_universe.json")
 INPUT_MANIFEST_JSON = os.path.join(HERE, "experiment_1f_input_manifest.json")
+#: The reviewed manifest-v3, the only manifest the candidate contract verifies
+#: against. It does not exist yet and this module never writes it: establishment
+#: belongs to experiment_1f_manifest.py, after commit, on a clean semantic tree.
+MANIFEST_V3_VERSION = "experiment_1f/3"
+REVIEWED_MANIFEST_V3_JSON = os.path.join(
+    HERE, "backtest_out", "experiment_1f_candidate", "experiment_1f_manifest_v3.json")
+
+#: The COMPLETE execution-input contract, as (manifest name, candidate_inputs key).
+#:
+#: One tuple, two consumers. experiment_1f_manifest.build() constructs
+#: A_execution_inputs by iterating this, and verify_reviewed_manifest_v3()
+#: verifies against it, so the produced manifest and the verified manifest cannot
+#: structurally diverge. They already had: the manifest pinned seven inputs while
+#: the gate verified three, which meant a REAL established manifest would have
+#: failed Gate A on the other four -- and the orchestration test could not see it
+#: because its synthetic manifest pinned only the three the gate happened to hash.
+#:
+#: A pin that is never verified is decoration; an input that is consumed but not
+#: pinned is unaudited. Both directions are failures, so the sets must be equal.
+#: Two identity rules, because two kinds of file are being pinned.
+#:
+#: RAW_BYTES     generated, experiment-owned artifacts. Their exact reviewed
+#:               bytes ARE the thing under review, they are gitignored, and no
+#:               filter ever touches them, so literal sha256 is correct.
+#: GIT_CONTENT   tracked repository text. The authoritative identity is the
+#:               content Git stores at the pinned commit, NOT the checkout's
+#:               newline bytes -- see git_content_sha256(). Worktree binding is
+#:               kept by a separate, mandatory cleanliness check.
+IDENTITY_RAW_BYTES = "RAW_BYTES"
+IDENTITY_GIT_CONTENT = "GIT_CONTENT"
+UNAVAILABLE_UNTIL_COMMIT = "UNAVAILABLE_UNTIL_COMMIT"
+
+EXECUTION_INPUTS = (
+    ("ohlc_full_market_parquet", "ohlc_parquet", IDENTITY_RAW_BYTES),
+    ("broker_daily_v2_parquet", "broker_parquet", IDENTITY_RAW_BYTES),
+    # tracked repository text, and an execution input: it must not become
+    # machine-bound merely because its JSON whitespace is CRLF rather than LF
+    ("universe_json", "universe_json", IDENTITY_GIT_CONTENT),
+    ("source_manifest_json", "source_manifest", IDENTITY_RAW_BYTES),
+    ("volume_repair_candidates_json", "repair_candidates", IDENTITY_RAW_BYTES),
+    ("volume_repair_authorization_json", "repair_authorization", IDENTITY_RAW_BYTES),
+    ("observed_basis_factor_candidate_json", "basis_artifact", IDENTITY_RAW_BYTES),
+)
 
 OHLC_PARQUET = os.path.join(HERE, "ohlc.parquet")
 BROKER_PARQUET = os.path.join(HERE, "broker_daily.parquet")
@@ -100,6 +144,48 @@ BROKER_PARQUET = os.path.join(HERE, "broker_daily.parquet")
 #: not something to fix in place.
 VOLUME_REPAIR_LEDGER_JSON = os.path.join(HERE, "volume_repair_ledger.json")
 OBSERVED_BASIS_FACTOR_JSON = os.path.join(HERE, "observed_basis_factor.json")
+
+#: Experiment #1F candidate contract (Phase 2 / 2.5). Segmented regimes, and a
+#: repair authorisation kept in its own artifact so review is a separate act
+#: from detection.
+CANDIDATE_DIR = os.path.join(HERE, "backtest_out", "experiment_1f_candidate")
+VOLUME_REPAIR_CANDIDATES_JSON = os.path.join(CANDIDATE_DIR,
+                                             "volume_repair_candidates.json")
+VOLUME_REPAIR_AUTHORIZATION_JSON = os.path.join(CANDIDATE_DIR,
+                                                "volume_repair_authorization.json")
+OBSERVED_BASIS_FACTOR_CANDIDATE_JSON = os.path.join(
+    CANDIDATE_DIR, "observed_basis_factor_candidate.json")
+
+AUTHORIZATION_SCOPE = "EXACT KEY SET ONLY"
+
+#: The shared checkout the experiment copied its frozen inputs FROM. Only ever
+#: used to name provenance; nothing at execution time reads it.
+SHARED_ROOT = os.environ.get("NEOBDM_SHARED_ROOT",
+                             os.path.join(os.path.dirname(HERE), "Claude"))
+
+#: Validity/normalisation mode. PRIMARY is the default in every signature; no
+#: argument default may select the retrospective mode implicitly.
+#: Named CONSERVATIVE, not SAFE: the policy refuses retrospective harmonisation,
+#: but the basis-invalid mask is itself reconstructed from the full frozen
+#: window, so point-in-time observability of the classification is UNESTABLISHED.
+PRIMARY_MODE = "PRIMARY_PIT_CONSERVATIVE"
+PIT_OBSERVABILITY = "UNESTABLISHED"
+SECONDARY_MODE = "RETROSPECTIVE_ECONOMIC_NORMALIZATION_SENSITIVITY"
+
+#: Classifications a regime may carry and still be economically harmonised.
+#: This is NOT the same question as whether harmonisation may be applied to the
+#: primary path -- see PRIMARY_PIT_APPLIES_BASIS_HARMONISATION.
+CERTIFIED_CLASSIFICATIONS = ("RECONSTRUCTIBLE", "CANDIDATE_HARMONIZABLE")
+
+#: The primary, tradable #1F path does NOT apply retrospective basis
+#: harmonisation. The measured factors are economically coherent, but the source
+#: carries no corporate-action metadata, no publication date and no available_at
+#: field, and each regime's boundary was inferred from the whole frozen window.
+#: An economically harmonisable regime is therefore broker-basis INVALID for
+#: primary use; the factors survive as a clearly labelled retrospective
+#: sensitivity, never as headline tradable evidence.
+PRIMARY_PIT_APPLIES_BASIS_HARMONISATION = False
+SECONDARY_ANALYSIS_LABEL = "RETROSPECTIVE ECONOMIC-NORMALIZATION SENSITIVITY"
 
 #: A ticker is four uppercase letters. Enforced as a real pattern, not implied
 #: by a digest: duplicates, blanks and type corruption can all leave the
@@ -120,6 +206,29 @@ EXPECTED_PRICE_MISSING = ("WIKA",)
 #: shrinking A, making the variants incomparable.
 EXPECTED_BROKER_COVERED = 297
 EXPECTED_BROKER_MISSING = ("WIKA",)
+
+#: The same pins, gathered so they travel with the execution contract instead of
+#: being read out of module globals deep inside three separate loaders. Making
+#: them an explicit input is what lets the full run_gate orchestration be
+#: exercised end-to-end against a synthetic fixture: the pins are the only thing
+#: in the pipeline that is specific to the production snapshot, and testing the
+#: orchestration is not the same act as relaxing them. Production callers get
+#: PRODUCTION_EXPECTATIONS and nothing else.
+PRODUCTION_EXPECTATIONS = {
+    "universe_size": EXPECTED_UNIVERSE_SIZE,
+    "universe_digest": ACCEPTED_UNIVERSE_DIGEST,
+    "price_covered": EXPECTED_PRICE_COVERED,
+    "price_missing": EXPECTED_PRICE_MISSING,
+    "broker_covered": EXPECTED_BROKER_COVERED,
+    "broker_missing": EXPECTED_BROKER_MISSING,
+}
+
+
+def _expect(expectations):
+    """Fill any unspecified pin from the production set."""
+    merged = dict(PRODUCTION_EXPECTATIONS)
+    merged.update(expectations or {})
+    return merged
 
 #: Where the harvest's broker values can be checked against independently
 #: observed data. neobdm.db holds live-scraped rows (bval IS NOT NULL) from this
@@ -262,6 +371,39 @@ def invalid_date_mask(series):
     return series.isna() | ~shape_ok.fillna(False) | parsed.isna()
 
 
+def file_fingerprint_full(path):
+    """FULL sha256. Semantic provenance never travels on a truncated hash."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _semantic_digest(payload):
+    """Content identity of a JSON artifact, independent of formatting."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   default=str).encode()
+    ).hexdigest()
+
+
+def regime_factor(regime):
+    """The regime's factor, preferring the exact rational over its float shadow.
+
+    `candidate_factor` is a float rendering kept for display. When the exact
+    numerator/denominator is present it is authoritative, because the float is
+    a lossy view of it and never the other way round.
+    """
+    exact = regime.get("candidate_factor_exact")
+    if exact:
+        return exact["numerator"] / exact["denominator"]
+    for key in ("candidate_factor", "factor"):
+        if key in regime:
+            return float(regime[key])
+    raise GateFailure(f"{regime.get('ticker', '?')}: regime carries no factor")
+
+
 def file_fingerprint(path):
     """Full SHA-256 + size of a raw input snapshot."""
     digest = hashlib.sha256()
@@ -270,7 +412,13 @@ def file_fingerprint(path):
             digest.update(chunk)
     stat = os.stat(path)
     return {
+        # `path` stays the BASENAME: the legacy two-file manifest is keyed on it
+        # and re-keying that artifact would invalidate a pin for a reason that
+        # has nothing to do with content. `abspath` is additive, and is what
+        # manifest-v3 matches on -- v3 pins several files that can share a
+        # basename across directories, so a basename is not an identity there.
         "path": os.path.basename(path),
+        "abspath": os.path.abspath(path),
         "sha256": digest.hexdigest(),
         "size_bytes": stat.st_size,
         "mtime_utc": _dt.datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
@@ -280,11 +428,15 @@ def file_fingerprint(path):
 def verify_input_manifest(fingerprints, path=INPUT_MANIFEST_JSON, establish=False):
     """Pin the reviewed raw snapshot so a refreshed harvest cannot slip in.
 
+    LEGACY two-file manifest. Retained as a primitive because the older
+    production entry points still verify against it, but it is NO LONGER
+    REACHABLE FROM run_gate: see verify_reviewed_manifest_v3(). In particular
+    `establish=True` can no longer be reached from the Gate A CLI at all.
+
     A MISSING manifest is a failure, not an invitation. Auto-establishing one
     would reopen the exact hole this closes: delete the manifest, refresh the
     parquet, and whatever bytes happen to be on disk quietly become the
-    "reviewed" snapshot. Establishing or re-establishing is therefore an
-    explicit, reviewed action (--establish-manifest).
+    "reviewed" snapshot.
 
     `mtime` is recorded but never compared: touching a file does not change its
     content.
@@ -335,6 +487,605 @@ def verify_input_manifest(fingerprints, path=INPUT_MANIFEST_JSON, establish=Fals
             "hash is never silently accepted -- re-establish deliberately with "
             "--establish-manifest after review:\n  - " + "\n  - ".join(failures))
     return {"status": "verified", "manifest_path": path, "inputs": current}
+
+
+class ManifestEstablishmentRefused(GateFailure):
+    """Gate A tried to write its own manifest. That is never its job."""
+
+
+def execution_input_fingerprints(inputs, root=HERE):
+    """Fingerprint EVERY execution input the manifest contract pins. No subset.
+
+    Each input is fingerprinted under ITS OWN identity rule: generated artifacts
+    by raw bytes, tracked repository text by the content Git stores at HEAD.
+    See EXECUTION_INPUTS and git_content_sha256().
+
+    The exact bytes, taken BEFORE any semantic application: a JSON artifact is
+    hashed as it sits on disk, not after parsing, so the pin covers what was
+    reviewed rather than what the parser happened to reconstruct.
+
+    run_gate previously handed the verifier three of the seven, and the verifier
+    fails any pinned input it was not given -- so a real established manifest
+    would have failed Gate A on source_manifest, the two repair artifacts and
+    the basis artifact. That defect was invisible to a test whose synthetic
+    manifest pinned the same three the gate hashed; the fix belongs here, in the
+    production contract, not in a test expectation.
+    """
+    missing, out = [], {}
+    for name, key, identity in EXECUTION_INPUTS:
+        path = inputs.get(key)
+        if not path:
+            raise GateFailure(
+                f"execution input {key!r} is not declared by candidate_inputs(); "
+                f"the manifest pins it as {name}")
+        if not os.path.exists(path):
+            missing.append(f"{name} -> {path}")
+            continue
+        fingerprint = file_fingerprint(path)
+        fingerprint["identity"] = identity
+        if identity == IDENTITY_GIT_CONTENT:
+            fingerprint.update(tracked_text_identity(
+                path, root=inputs.get("git_root", root)))
+            fingerprint["abspath"] = os.path.abspath(path)
+        out[name] = fingerprint
+    if missing:
+        raise GateFailure(
+            "declared execution inputs are missing on disk; absence is never an "
+            "empty default:\n  - " + "\n  - ".join(missing))
+    return out
+
+
+class ManifestEstablishmentRefused(GateFailure):
+    """Gate A tried to write its own manifest. That is never its job."""
+
+
+def _git(root, *args, text=True):
+    """Run one git command. Returns (ok, output). Never raises on a git error."""
+    import subprocess
+    try:
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True,
+                                text=text)
+    except OSError as exc:                       # git absent
+        return False, f"git is not runnable here ({exc})"
+    if result.returncode != 0:
+        if text:
+            return False, (result.stderr or "").strip() or f"git {args[0]} failed"
+        return False, (result.stderr or b"").decode("utf-8", "replace").strip()
+    return True, result.stdout
+
+
+def _git_head(root=HERE):
+    """The commit the code being executed actually sits on."""
+    ok, out = _git(root, "rev-parse", "HEAD")
+    if not ok:
+        return None, out
+    return out.strip() or None, None
+
+
+def git_path_is_tracked(path, ref="HEAD", root=HERE):
+    """Is this path present in the commit `ref`?"""
+    ok, _ = _git(root, "cat-file", "-e", f"{ref}:{_git_rel(path, root)}")
+    return ok
+
+
+def _git_rel(path, root):
+    return os.path.relpath(os.path.abspath(path), root).replace(os.sep, "/")
+
+
+def git_content_sha256(path, ref="HEAD", root=HERE):
+    """SHA256 of the bytes GIT HAS STORED for this path at `ref`.
+
+    THE AUTHORITATIVE IDENTITY FOR TRACKED REPOSITORY TEXT, and deliberately not
+    the sha256 of the file as it sits in the working tree.
+
+    With core.autocrlf=true and no .gitattributes -- this repository's actual
+    configuration -- a clean checkout of the pinned commit holds CRLF while the
+    committed blob holds LF. Hashing the checkout bytes therefore produced this:
+
+        same HEAD, git status clean, identical Git content,
+        different raw sha256  ->  manifest verification FAILS
+
+    That makes the pin machine-bound rather than commit-bound, which is the
+    opposite of what a reproducibility contract is for. Git's own object store
+    already holds one canonical byte sequence per commit, so that is what is
+    hashed.
+
+    This is NOT a licence to run edited code: on its own, a git-content hash
+    would still verify while the working tree carried local modifications. The
+    worktree binding is restored separately by git_worktree_matches_ref(), which
+    lets Git's clean/filter semantics decide what counts as a difference -- a
+    CRLF-only checkout difference is clean, a real edit is not.
+
+    Returns None for a path that is not tracked at `ref`; the caller decides
+    whether that is fatal (it is, at establishment).
+    """
+    if not git_path_is_tracked(path, ref=ref, root=root):
+        return None
+    ok, blob = _git(root, "show", f"{ref}:{_git_rel(path, root)}", text=False)
+    if not ok:
+        return None
+    return hashlib.sha256(blob).hexdigest()
+
+
+def git_worktree_matches_ref(path, ref="HEAD", root=HERE):
+    """Does the file on disk carry no semantic Git difference against `ref`?
+
+    Covers staged AND unstaged differences, because `git diff <ref> -- <path>`
+    compares the working tree against the commit rather than against the index.
+
+    Git applies the repository's own clean filter here, which is exactly the
+    behaviour required: a checkout whose only difference is CRLF vs LF is clean
+    and must not invalidate the experiment, while a one-character content edit
+    is dirty and must.
+    """
+    if not git_path_is_tracked(path, ref=ref, root=root):
+        return False
+    ok, _ = _git(root, "diff", "--quiet", ref, "--", _git_rel(path, root))
+    return ok
+
+
+def tracked_text_identity(path, ref="HEAD", root=HERE):
+    """The full identity record for one TRACKED pinned path.
+
+    `worktree_raw_sha256` is FORENSIC ONLY and gates nothing: it records which
+    literal bytes were on disk, which is useful when diagnosing a failure and
+    meaningless as an acceptance criterion.
+    """
+    tracked = git_path_is_tracked(path, ref=ref, root=root)
+    exists = os.path.exists(path)
+    return {
+        "identity": IDENTITY_GIT_CONTENT,
+        "path": _git_rel(path, root),
+        "present": exists,
+        "tracked_at_head": tracked,
+        "git_content_sha256": git_content_sha256(path, ref=ref, root=root),
+        "worktree_matches_head": git_worktree_matches_ref(path, ref=ref, root=root),
+        "worktree_raw_sha256": file_fingerprint_full(path) if exists else None,
+        "worktree_raw_sha256_role": "FORENSIC ONLY -- never gates acceptance",
+        "canonical_identity_status": (
+            "AVAILABLE" if tracked else UNAVAILABLE_UNTIL_COMMIT),
+    }
+
+
+def _git_content_failures(label, entry, actual):
+    """The four conditions a GIT_CONTENT pin must satisfy. All are mandatory.
+
+    Hashing Git content instead of checkout bytes fixes portability, and on its
+    own it would open a worse hole: a locally edited implementation would verify
+    because HEAD had not moved. The tracked + clean checks close it, and they
+    delegate the CRLF question to Git rather than re-deciding it here.
+    """
+    failures = []
+    if not actual.get("tracked_at_head"):
+        failures.append(
+            f"{label} is pinned as tracked repository text but is NOT tracked at "
+            f"HEAD ({actual.get('canonical_identity_status')}); a canonical "
+            "identity cannot be invented for a file the commit does not contain")
+        return failures
+    if not actual.get("present"):
+        failures.append(f"{label} is tracked at HEAD but absent from the worktree")
+    if not actual.get("worktree_matches_head"):
+        failures.append(
+            f"{label} carries a staged or unstaged difference against HEAD. Git "
+            "itself reports this file as modified, so the pinned commit does not "
+            "describe the bytes about to run. (A CRLF-only checkout difference "
+            "is clean to Git and would NOT appear here.)")
+    pinned = entry.get("git_content_sha256")
+    if len(pinned or "") != 64:
+        failures.append(
+            f"{label} carries no full git_content_sha256 in the manifest "
+            f"({pinned!r}); an unestablishable proposal was pinned as a manifest")
+    elif pinned != actual.get("git_content_sha256"):
+        failures.append(
+            f"{label} git content {str(actual.get('git_content_sha256'))[:16]}... "
+            f"!= reviewed {pinned[:16]}... (the committed content changed)")
+    return failures
+
+
+def _verify_code_identity(manifest, root, failures):
+    """Re-hash every pinned implementation file. The manifest is a claim only.
+
+    Identity is the GIT CONTENT at HEAD, plus a mandatory proof that the working
+    tree carries no semantic difference from it. See git_content_sha256().
+    """
+    code = manifest.get("E_code_identity")
+    if not isinstance(code, dict):
+        failures.append("E_code_identity is absent; the manifest pins no code")
+        return {}
+    files = code.get("files") or []
+    if not files:
+        failures.append("E_code_identity pins no files")
+        return {}
+    checked, planes = {}, set()
+    for entry in files:
+        name = entry.get("path", "")
+        path = os.path.join(root, name)
+        planes.add(entry.get("plane"))
+        actual = tracked_text_identity(path, root=root)
+        checked[name] = {"plane": entry.get("plane"),
+                         "pinned_git_content_sha256": entry.get("git_content_sha256"),
+                         "actual_git_content_sha256": actual["git_content_sha256"],
+                         "worktree_matches_head": actual["worktree_matches_head"],
+                         "worktree_raw_sha256": actual["worktree_raw_sha256"]}
+        failures.extend(_git_content_failures(f"pinned code file {name}",
+                                              entry, actual))
+    if "CONTROL PLANE" not in planes:
+        failures.append(
+            "no CONTROL PLANE file is pinned; the manifest verifier itself must "
+            "be part of the identity it enforces, or the control can be rewritten "
+            "without invalidating anything")
+    if "DATA PLANE" not in planes:
+        failures.append("no DATA PLANE file is pinned")
+    return checked
+
+
+def _verify_policy(manifest, mode, failures):
+    """The normalization policy must be the reviewed one, not merely present."""
+    policy = manifest.get("C_normalization_policy")
+    if not isinstance(policy, dict):
+        failures.append("C_normalization_policy is absent")
+        return {}
+    if policy.get("mode") != PRIMARY_MODE:
+        failures.append(
+            f"manifest primary mode is {policy.get('mode')!r}, expected "
+            f"{PRIMARY_MODE!r}")
+    if policy.get("pit_observability") != PIT_OBSERVABILITY:
+        failures.append(
+            f"manifest pit_observability is {policy.get('pit_observability')!r}, "
+            f"expected {PIT_OBSERVABILITY!r}. A manifest claiming PIT "
+            "observability had been established would authorise a claim no "
+            "evidence in this cache supports.")
+    if policy.get("primary_applies_basis_harmonisation") is not False:
+        failures.append(
+            "manifest says PRIMARY applies basis harmonisation; the reviewed "
+            "policy is that it applies none")
+    if policy.get("observable_inventory_resets_at_a_hole") is not False:
+        failures.append(
+            "manifest says observable inventory resets at a hole; the reviewed "
+            "policy is that it never resets and never re-anchors")
+
+    # SECONDARY is a DIFFERENT run under the same data pins, and it must say so
+    # out loud. Silently running a retrospective sensitivity mode against a
+    # manifest that only authorises PRIMARY would let a non-tradable result
+    # inherit a reviewed manifest's authority.
+    if mode == SECONDARY_MODE:
+        if policy.get("secondary_mode") != SECONDARY_MODE:
+            failures.append(
+                f"this run requested {SECONDARY_MODE!r} but the manifest "
+                f"declares secondary_mode {policy.get('secondary_mode')!r}")
+        if policy.get("secondary_is_not_tradable_evidence") is not True:
+            failures.append(
+                "the manifest does not record that SECONDARY is not tradable "
+                "evidence; a sensitivity run may not borrow PRIMARY's standing")
+    return {
+        "mode": policy.get("mode"),
+        "pit_observability": policy.get("pit_observability"),
+        "run_mode": mode,
+        "run_is_sensitivity_only": mode == SECONDARY_MODE,
+    }
+
+
+def _verify_authorization(manifest, inputs, artifacts, failures):
+    """Cross-check the manifest's authorisation against the loaded artifact.
+
+    The manifest records the reviewed key set and the parent identity; the gate
+    has already loaded the same authorisation through the fail-closed contract.
+    If the two disagree, one of them is describing a different review.
+    """
+    auth = manifest.get("D_authorization")
+    if not isinstance(auth, dict):
+        failures.append("D_authorization is absent")
+        return {}
+    if auth.get("scope") != AUTHORIZATION_SCOPE:
+        failures.append(
+            f"manifest authorization scope is {auth.get('scope')!r}, expected "
+            f"{AUTHORIZATION_SCOPE!r}")
+    if artifacts is None:
+        return {"scope": auth.get("scope"), "cross_checked_with_artifact": False}
+
+    physical = file_fingerprint_full(inputs["repair_candidates"])
+    if auth.get("parent_candidate_sha256") != physical:
+        failures.append(
+            f"manifest authorisation parent {str(auth.get('parent_candidate_sha256'))[:16]}"
+            f"... != candidate artifact on disk {physical[:16]}...")
+    if auth.get("parent_candidate_sha256") != artifacts["parent_candidate_sha256"]:
+        failures.append(
+            "the manifest and the loaded authorisation disagree about which "
+            "candidate artifact was reviewed")
+    with open(inputs["repair_candidates"], encoding="utf-8") as handle:
+        semantic = _semantic_digest(json.load(handle))
+    if auth.get("parent_candidate_semantic_digest") != semantic:
+        failures.append(
+            "manifest parent_candidate_semantic_digest does not match the "
+            "candidate artifact's recomputed semantic digest")
+
+    manifest_keys = sorted(auth.get("authorized_keys") or [])
+    loaded_keys = sorted(f"{t} {d}" for t, d in artifacts["authorised_repairs"])
+    if manifest_keys != loaded_keys:
+        failures.append(
+            f"manifest authorises {manifest_keys} but the loaded authorisation "
+            f"carries {loaded_keys}; an EXACT key set cannot differ by one entry")
+
+    stage_b = sorted(f"{h['ticker']} {h['date']}"
+                     for h in artifacts.get("diagnostic_only", []))
+    if sorted(auth.get("stage_b_structurally_ineligible") or []) != stage_b:
+        failures.append(
+            "the manifest's stage-B ineligible set does not match the artifact's")
+    if set(auth.get("authorized_keys") or []) & set(stage_b):
+        failures.append(
+            "a stage-B diagnostic appears in the manifest's authorised keys; it "
+            "has no proposed volume and can never be authorised")
+    return {"scope": auth.get("scope"), "authorized_keys": manifest_keys,
+            "stage_b_structurally_ineligible": stage_b,
+            "cross_checked_with_artifact": True}
+
+
+def _verify_rule_versions(manifest, artifacts, failures):
+    """The rule versions the manifest names must be the ones actually imported."""
+    # Imported lazily: the gate needs two string constants, not a dependency on
+    # the producer, and a module-level import would make the consumer of the
+    # contract depend on the module that writes it.
+    import experiment_1f_normalization as _norm
+
+    rules = manifest.get("G_rule_versions")
+    if not isinstance(rules, dict):
+        failures.append("G_rule_versions is absent")
+        return {}
+    actual = {"volume_wrap": _norm.RULE_VERSION_WRAP,
+              "basis_regime": _norm.RULE_VERSION_BASIS}
+    for name, value in actual.items():
+        if rules.get(name) != value:
+            failures.append(
+                f"rule version {name} is {rules.get(name)!r} in the manifest but "
+                f"{value!r} in the imported implementation")
+    if artifacts is not None:
+        pinned_n = rules.get("n_regimes")
+        actual_n = sum(len(v) for v in artifacts["regimes"].values())
+        if pinned_n is not None and int(pinned_n) != actual_n:
+            failures.append(
+                f"manifest pins {pinned_n} basis regimes but the artifact "
+                f"carries {actual_n}")
+    return dict(actual, n_regimes=rules.get("n_regimes"))
+
+
+def _verify_parentage(manifest, inputs, failures):
+    """RECOMPUTE the critical bindings. A stored boolean proves nothing.
+
+    `H_parentage["all_bindings_ok"] = true` is a claim written by the producer
+    into a file the producer also wrote. Trusting it would make the parentage
+    check self-certifying, so every binding that can be recomputed from files on
+    disk is recomputed here instead.
+    """
+    import experiment_1f_candidate as _cand
+
+    chain = (manifest.get("H_parentage") or {}).get("chain")
+    if not isinstance(chain, list) or not chain:
+        failures.append("H_parentage carries no chain")
+        return {}
+    if (manifest.get("H_parentage") or {}).get("all_bindings_ok") is not True:
+        failures.append("the reviewed manifest itself records a broken parentage")
+
+    with open(inputs["source_manifest"], encoding="utf-8") as handle:
+        source_manifest = json.load(handle)
+    recorded_aggregate = source_manifest.get("source_aggregate_sha256")
+    recomputed = _cand.aggregate_digest(
+        (entry["ticker"], entry["sha256"])
+        for entry in source_manifest.get("files", []))
+    if recomputed != recorded_aggregate:
+        failures.append(
+            f"source_manifest aggregate {str(recorded_aggregate)[:16]}... does not "
+            f"match the digest recomputed from its own file list {recomputed[:16]}...")
+
+    for link in chain:
+        pinned = link.get("parent_identity")
+        if pinned is not None and pinned != recomputed:
+            failures.append(
+                f"parentage link for {link.get('child')} names parent identity "
+                f"{str(pinned)[:16]}... which is not the recomputed source "
+                f"aggregate {recomputed[:16]}...")
+
+    # every stage-A candidate must name the source file the snapshot actually holds
+    by_ticker = {entry["ticker"]: entry["sha256"]
+                 for entry in source_manifest.get("files", [])}
+    with open(inputs["repair_candidates"], encoding="utf-8") as handle:
+        candidates = json.load(handle)
+    unbound = []
+    for hit in candidates.get("candidates", []):
+        expected = by_ticker.get(hit["ticker"])
+        if expected is None or hit.get("source_sha256") != expected:
+            unbound.append(f"{hit['ticker']} {hit['date']}")
+    if unbound:
+        failures.append(
+            "these repair candidates do not bind to the snapshot's source files: "
+            + ", ".join(unbound))
+
+    authorization_link = next(
+        (l for l in chain if l.get("child") == "volume_repair_authorization.json"),
+        None)
+    if authorization_link is not None:
+        physical = file_fingerprint_full(inputs["repair_candidates"])
+        if authorization_link.get("parent_sha256") != physical:
+            failures.append(
+                "the parentage chain's authorisation parent is not the candidate "
+                "artifact on disk")
+
+    return {
+        "source_aggregate_recomputed": recomputed,
+        "source_aggregate_matches_manifest": recomputed == recorded_aggregate,
+        "candidate_source_bindings_recomputed": len(candidates.get("candidates", [])),
+        "recomputed_not_trusted_from_json": True,
+    }
+
+
+def verify_reviewed_manifest_v3(inputs, fingerprints, artifacts=None,
+                                mode=None, path=None,
+                                expected_version=MANIFEST_V3_VERSION, root=HERE):
+    """VERIFY the reviewed manifest-v3. It cannot establish, by construction.
+
+    There is no `establish` parameter and no write path in this function, which
+    is the point. A verifier that can also establish is not a control: the
+    moment verification fails, the cheapest way out is to re-establish, and the
+    pin becomes a record of the last run rather than of the last review. The old
+    two-file verifier had exactly that shape and Gate A's CLI exposed it as
+    `--establish-manifest`, so a Gate A run could silently re-pin its own inputs.
+
+    Establishment lives in experiment_1f_manifest.establish_reviewed_manifest(),
+    is a separate act, and is only legitimate after the code is committed and
+    the semantic tree is clean -- conditions Gate A cannot check about itself
+    while it is running.
+
+    A REVIEWED MANIFEST IS A CLAIM; THIS FUNCTION PROVES IT. Everything it can
+    recompute from files on disk it recomputes, rather than reading a boolean
+    the producer wrote into its own output:
+
+      A  every one of the seven execution inputs, by name AND by resolved path
+      B  established_commit_sha == the actual git HEAD
+      C  E_code_identity re-hashed, data plane and control plane both present
+      D  the normalization policy, including the SECONDARY authorisation rule
+      E  the authorisation, cross-checked against the loaded artifact
+      F  the rule versions actually imported
+      G  the parentage bindings, recomputed from the snapshot
+
+    Manifest-v3 separates EXECUTION inputs from PROVENANCE inputs, so section A
+    covers A_execution_inputs only: a provenance file changing is an
+    investigation, not an automatic invalidation of a frozen 297-name experiment.
+    """
+    mode = mode or PRIMARY_MODE
+    # TWO roots, deliberately distinct. `root` resolves the manifest's relative
+    # paths, which _fp() writes relative to this module's directory. `code_root`
+    # is the REPOSITORY whose object store defines committed identity, and it is
+    # what the HEAD and code-identity checks run against. In production they are
+    # the same directory; keeping them separate is what lets the pinned
+    # implementation be verified against a repository other than the one the
+    # generated artifacts happen to sit under.
+    code_root = inputs.get("code_root", root)
+    path = path or inputs.get("reviewed_manifest") or REVIEWED_MANIFEST_V3_JSON
+    if not os.path.exists(path):
+        raise GateFailure(
+            f"the reviewed manifest {os.path.basename(path)} does not exist, so "
+            "there is nothing for Gate A to verify against. Gate A will NOT "
+            "establish one: a run that pins its own inputs records what it just "
+            "read, not what a human reviewed. Establishment is a separate act, "
+            "performed by experiment_1f_manifest.establish_reviewed_manifest(), "
+            "and only after the implementation is committed and the semantic "
+            "tree is clean.")
+
+    with open(path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    version = manifest.get("manifest_version")
+    if version != expected_version:
+        raise GateFailure(
+            f"reviewed manifest is version {version!r}, expected "
+            f"{expected_version!r}. A v2 (two-file) manifest cannot express the "
+            "execution/provenance split this gate depends on, so it is refused "
+            "rather than reinterpreted.")
+    established = manifest.get("established_commit_sha")
+    if not established:
+        raise GateFailure(
+            "the reviewed manifest carries no established_commit_sha; it is a "
+            "PROPOSAL, not a manifest. A proposal pins no code identity, so it "
+            "cannot certify that the implementation which produced the "
+            "artifacts is the implementation about to consume them.")
+
+    failures = []
+
+    # ── A: the COMPLETE execution-input set, both directions ──
+    pinned = {name: entry
+              for name, entry in (manifest.get("A_execution_inputs") or {}).items()
+              if not name.startswith("_")}
+    verified = {}
+    for name, fingerprint in sorted(fingerprints.items()):
+        entry = pinned.get(name)
+        if entry is None:
+            failures.append(
+                f"{name} was CONSUMED but is not pinned as an execution input")
+            continue
+        identity = fingerprint["identity"]
+        if entry.get("identity") != identity:
+            failures.append(
+                f"{name} is pinned under identity {entry.get('identity')!r} but "
+                f"the contract requires {identity!r}; the identity rule decides "
+                "what a matching hash even means")
+        elif identity == IDENTITY_RAW_BYTES:
+            if entry.get("sha256") != fingerprint["sha256"]:
+                failures.append(
+                    f"{name} sha256 {fingerprint['sha256'][:16]}... != reviewed "
+                    f"{str(entry.get('sha256'))[:16]}... (the snapshot changed)")
+            if entry.get("size_bytes") != fingerprint["size_bytes"]:
+                failures.append(
+                    f"{name} size {fingerprint['size_bytes']} != reviewed "
+                    f"{entry.get('size_bytes')}")
+        else:
+            # GIT_CONTENT. size_bytes is deliberately NOT compared: CRLF vs LF
+            # changes the byte count of identical Git content, and comparing it
+            # would reintroduce the machine-binding this rule removes.
+            failures.extend(_git_content_failures(name, entry, fingerprint))
+
+        pinned_path = os.path.normcase(os.path.normpath(
+            os.path.join(root, entry.get("path", ""))))
+        actual_path = os.path.normcase(os.path.normpath(fingerprint["abspath"]))
+        if pinned_path != actual_path:
+            failures.append(
+                f"{name} is pinned at {entry.get('path')} but the file consumed "
+                f"was {fingerprint['abspath']}; a pin that names a different file "
+                "certifies nothing about the one that was read")
+        verified[name] = {"identity": identity,
+                          "sha256": fingerprint.get("sha256"),
+                          "git_content_sha256": fingerprint.get("git_content_sha256"),
+                          "size_bytes": fingerprint["size_bytes"],
+                          "path": fingerprint["abspath"]}
+    for name in pinned:
+        if name not in verified:
+            failures.append(
+                f"{name} is pinned as an EXECUTION input but was not consumed by "
+                "this run; a pinned input the gate never opens is decoration, not "
+                "a contract")
+
+    # ── B: the commit the manifest names must be the commit being run ──
+    head, git_error = _git_head(code_root)
+    if git_error:
+        failures.append(
+            f"the commit the manifest pins cannot be checked: {git_error}. A "
+            "manifest names a commit precisely so the running code can be tied "
+            "to it, and an uncheckable pin is not a pin.")
+    elif head != established:
+        failures.append(
+            f"manifest established_commit_sha {established[:12]}... != current "
+            f"HEAD {str(head)[:12]}...; the pinned commit does not describe the "
+            "code about to run")
+
+    code = _verify_code_identity(manifest, code_root, failures)
+    policy = _verify_policy(manifest, mode, failures)
+    authorization = _verify_authorization(manifest, inputs, artifacts, failures)
+    rules = _verify_rule_versions(manifest, artifacts, failures)
+    parentage = _verify_parentage(manifest, inputs, failures)
+
+    if failures:
+        raise GateFailure(
+            "the reviewed manifest-v3 does not verify. Gate A cannot re-pin "
+            "itself out of this; re-review and re-establish deliberately:\n  - "
+            + "\n  - ".join(failures))
+
+    return {
+        "status": "verified against reviewed manifest-v3",
+        "manifest_version": version,
+        "manifest_path": path,
+        "established_commit_sha": established,
+        "head_commit_sha": head,
+        "establishment_reachable_from_gate": False,
+        "checks_performed": ["execution_inputs_complete", "commit_is_head",
+                             "code_identity_rehashed", "normalization_policy",
+                             "authorization_cross_checked", "rule_versions",
+                             "parentage_recomputed"],
+        "inputs": verified,
+        "code_identity": {"files_rehashed": len(code)},
+        "policy": policy,
+        "authorization": authorization,
+        "rule_versions": rules,
+        "parentage": parentage,
+    }
+
 
 
 # ── universe ingestion ────────────────────────
@@ -444,8 +1195,9 @@ def write_frozen_universe(tickers, audit, path=FROZEN_UNIVERSE_JSON):
     return payload
 
 
-def load_frozen_universe(path=FROZEN_UNIVERSE_JSON):
+def load_frozen_universe(path=FROZEN_UNIVERSE_JSON, expectations=None):
     """Load and re-verify the frozen artifact, independent of the workbook."""
+    expect = _expect(expectations)
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
     tickers = payload["tickers"]
@@ -456,11 +1208,12 @@ def load_frozen_universe(path=FROZEN_UNIVERSE_JSON):
     bad = [t for t in tickers if not isinstance(t, str) or not TICKER_PATTERN.match(t)]
     if bad:
         failures.append(f"frozen artifact contains malformed tickers: {bad[:5]}")
-    if len(tickers) != EXPECTED_UNIVERSE_SIZE:
-        failures.append(f"{len(tickers)} tickers, expected {EXPECTED_UNIVERSE_SIZE}")
+    if len(tickers) != expect["universe_size"]:
+        failures.append(f"{len(tickers)} tickers, expected {expect['universe_size']}")
     recomputed = _digest(sorted(tickers))
-    if recomputed != ACCEPTED_UNIVERSE_DIGEST:
-        failures.append(f"recomputed digest {recomputed} != accepted {ACCEPTED_UNIVERSE_DIGEST}")
+    if recomputed != expect["universe_digest"]:
+        failures.append(
+            f"recomputed digest {recomputed} != accepted {expect['universe_digest']}")
     if payload.get("universe_digest") != recomputed:
         failures.append(
             f"stored digest {payload.get('universe_digest')} != recomputed {recomputed}")
@@ -480,25 +1233,50 @@ def load_frozen_universe(path=FROZEN_UNIVERSE_JSON):
         "distinct_tickers": len(tickers),
         "universe_digest": recomputed,
         "loaded_from": "frozen artifact",
+        "consumed_path": os.path.abspath(path),
+        "consumed_fingerprint": file_fingerprint(path),
         "frozen_at_utc": payload.get("frozen_at_utc"),
     }
     return sorted(tickers), audit
 
 
 def resolve_universe(xlsx_path=UNIVERSE_XLSX, frozen_path=FROZEN_UNIVERSE_JSON,
-                     refreeze=False):
+                     refreeze=False, require_frozen=False, expectations=None):
     """Prefer the frozen artifact; fall back to the workbook only to create it.
 
     Gate B must never reread a mutable Desktop workbook, so once the freeze
     exists it is authoritative. `refreeze=True` re-reads the workbook
     deliberately -- and still hard-fails if its content no longer matches the
     accepted freeze, so a changed workbook can never be picked up silently.
+
+    `require_frozen=True` is the candidate contract's setting and removes BOTH
+    escapes. Falling back to the workbook would mean the universe actually
+    consumed is not the file the manifest pins, and re-reading the workbook
+    would let a mutable Desktop file re-enter a frozen experiment. Under it the
+    declared `universe_json` is the only file that can be read: a missing one is
+    a stop, not an invitation to regenerate it.
     """
+    if require_frozen:
+        if refreeze:
+            raise GateFailure(
+                "the candidate contract will not re-read the universe workbook: "
+                "refreeze is an act on production state, and the pinned "
+                f"{os.path.basename(frozen_path)} is the only universe an "
+                "experiment-owned run may consume")
+        if not os.path.exists(frozen_path):
+            raise GateFailure(
+                f"the declared universe artifact {frozen_path} does not exist. "
+                "The candidate contract will not silently fall back to the "
+                "repo-root default or to the workbook -- a declared input that "
+                "is not the file consumed is exactly the drift this pins shut.")
+        return load_frozen_universe(frozen_path, expectations=expectations)
     if os.path.exists(frozen_path) and not refreeze:
-        return load_frozen_universe(frozen_path)
+        return load_frozen_universe(frozen_path, expectations=expectations)
     tickers, audit = read_universe_xlsx(xlsx_path)
     payload = write_frozen_universe(tickers, audit, frozen_path)
     audit["loaded_from"] = "workbook (frozen now)"
+    audit["consumed_path"] = os.path.abspath(frozen_path)
+    audit["consumed_fingerprint"] = file_fingerprint(frozen_path)
     audit["frozen_at_utc"] = payload["frozen_at_utc"]
     return tickers, audit
 
@@ -759,8 +1537,9 @@ def load_full_harvest(path=OHLC_PARQUET):
     return frame, calendar, file_fingerprint(path)
 
 
-def price_coverage(full_frame, universe, fingerprint, calendar):
+def price_coverage(full_frame, universe, fingerprint, calendar, expectations=None):
     """Which approved names the price harvest carries, asserted against the freeze."""
+    expect = _expect(expectations)
     present = set(full_frame["ticker"].unique())
     covered = sorted(set(universe) & present)
     missing = sorted(set(universe) - present)
@@ -777,11 +1556,13 @@ def price_coverage(full_frame, universe, fingerprint, calendar):
     }
 
     failures = []
-    if len(covered) != EXPECTED_PRICE_COVERED:
-        failures.append(f"{len(covered)} tickers with prices, expected {EXPECTED_PRICE_COVERED}")
-    if tuple(missing) != EXPECTED_PRICE_MISSING:
+    if len(covered) != expect["price_covered"]:
         failures.append(
-            f"price-missing set is {missing}, expected exactly {list(EXPECTED_PRICE_MISSING)}")
+            f"{len(covered)} tickers with prices, expected {expect['price_covered']}")
+    if tuple(missing) != tuple(expect["price_missing"]):
+        failures.append(
+            f"price-missing set is {missing}, expected exactly "
+            f"{list(expect['price_missing'])}")
     if failures:
         raise GateFailure(
             "price coverage no longer matches the frozen snapshot - stop rather "
@@ -789,7 +1570,7 @@ def price_coverage(full_frame, universe, fingerprint, calendar):
     return covered, coverage
 
 
-def load_frozen_broker(universe, path=BROKER_PARQUET, prices=None):
+def load_frozen_broker(universe, path=BROKER_PARQUET, prices=None, expectations=None):
     """Audit the raw broker harvest, then normalize into #1E's unit convention.
 
     The harvest stores plain rupiah with an explicit buy/sell split
@@ -808,6 +1589,7 @@ def load_frozen_broker(universe, path=BROKER_PARQUET, prices=None):
 
     Raises before normalizing if the source audit fails.
     """
+    expect = _expect(expectations)
     frame = pd.read_parquet(path)
     present = set(frame["ticker"].unique())
     covered = sorted(set(universe) & present)
@@ -821,12 +1603,13 @@ def load_frozen_broker(universe, path=BROKER_PARQUET, prices=None):
         "broker_missing": missing,
     }
     failures = []
-    if len(covered) != EXPECTED_BROKER_COVERED:
+    if len(covered) != expect["broker_covered"]:
         failures.append(
-            f"{len(covered)} tickers with broker flow, expected {EXPECTED_BROKER_COVERED}")
-    if tuple(missing) != EXPECTED_BROKER_MISSING:
+            f"{len(covered)} tickers with broker flow, expected {expect['broker_covered']}")
+    if tuple(missing) != tuple(expect["broker_missing"]):
         failures.append(
-            f"broker-missing set is {missing}, expected exactly {list(EXPECTED_BROKER_MISSING)}")
+            f"broker-missing set is {missing}, expected exactly "
+            f"{list(expect['broker_missing'])}")
     if failures:
         raise GateFailure(
             "broker coverage no longer matches the frozen snapshot - variants "
@@ -919,6 +1702,27 @@ def audit_net_lot_recovery(broker, panel, sample=None):
 
 def broker_provenance(broker, db_path=os.path.join(HERE, "neobdm.db")):
     """Bound what the harvest's broker values can honestly be said to prove.
+
+    ROLE: DIAGNOSTIC PROVENANCE ONLY, and that is a load-bearing statement, not
+    a disclaimer. neobdm.db is NOT a manifest-pinned execution input, so the
+    claim "every path Gate A consumes comes from `inputs`" would be false if
+    this could influence anything. It cannot, and the boundary is exact:
+
+      - it returns a dict that is stored at report["broker_provenance"] and
+        printed; nothing reads it back
+      - it raises no GateFailure and feeds no assert_* function
+      - it is handed a COPY-free read of `broker` and mutates nothing
+      - neither panel_digest nor broker_digest covers any of its output, so the
+        determinism check is indifferent to it
+
+    Deleting neobdm.db therefore changes two lines of a printed report and
+    nothing else. test_neobdm_is_diagnostic_only_and_cannot_alter_the_gate
+    proves that by running the gate with the database present and absent and
+    comparing the panel, the broker table and both digests.
+
+    The path is passed explicitly by run_gate through
+    `inputs["diagnostic_only"]["neobdm_db"]` rather than left as a default that
+    silently resolves next to this file.
 
     Two DIFFERENT claims are at stake and must not be conflated:
 
@@ -1021,15 +1825,125 @@ def load_normalized_artifacts(ledger_path=VOLUME_REPAIR_LEDGER_JSON,
         factors = json.load(fh)
     authorised = {(r["ticker"], r["date"]): r
                   for r in ledger.get("authorised_repairs", [])}
-    regimes = {r["ticker"]: r for r in factors.get("regimes", [])}
+    regimes = {}
+    legacy = []
+    for regime in factors.get("regimes", []):
+        if "start_date" not in regime or "end_date" not in regime:
+            legacy.append(regime.get("ticker", "?"))
+        regimes.setdefault(regime["ticker"], []).append(regime)
+    if legacy:
+        raise GateFailure(
+            f"{os.path.basename(factors_path)} is a LEGACY single-regime "
+            f"artifact: {len(legacy)} regime(s) carry no start_date/end_date "
+            f"(first: {sorted(legacy)[:3]}). This gate requires the SEGMENTED "
+            "artifact. The legacy file is refused rather than converted, "
+            "because inventing a start date would silently reimpose the prefix "
+            "assumption this contract exists to remove. "
+            "Regenerate it: py normalize_market_data.py --verify")
+    assert_no_regime_overlap(regimes)
     return {
         "authorised_repairs": authorised,
         "diagnostic_only": ledger.get("diagnostic_only", []),
         "regimes": regimes,
         "ledger_digest": _digest([f"{t}|{d}|{r['normalized_volume']}"
                                   for (t, d), r in sorted(authorised.items())]),
-        "factor_digest": _digest([f"{t}|{r['factor']:.12g}|{r['classification']}"
-                                  for t, r in sorted(regimes.items())]),
+        "factor_digest": _digest(
+            [f"{t}|{regime_bounds(r)[0]}|{regime_bounds(r)[1]}"
+             f"|{regime_factor(r):.12g}|{r['classification']}"
+             for t, entries in sorted(regimes.items()) for r in entries]),
+    }
+
+
+def load_authorized_repairs(candidate_path=VOLUME_REPAIR_CANDIDATES_JSON,
+                            authorization_path=VOLUME_REPAIR_AUTHORIZATION_JSON,
+                            basis_path=OBSERVED_BASIS_FACTOR_CANDIDATE_JSON):
+    """The repair application contract. A file is not trusted for being named one.
+
+    Authorisation is bound to one reviewed artifact by identity and to an EXACT
+    key set. Every one of these is a stop, not a warning:
+
+      the candidate artifact is not the one that was reviewed
+      the detector found a hit the reviewer never saw
+      an approved hit is no longer detected
+      an approved hit's source file, raw volume or proposed volume moved
+
+    The asymmetry matters. An extra hit is not "more repairs available", it is
+    evidence the source changed under a review that no longer covers it.
+    """
+    for label, path in (("candidates", candidate_path),
+                        ("authorization", authorization_path),
+                        ("segmented basis", basis_path)):
+        if not os.path.exists(path):
+            raise GateFailure(
+                f"{label} artifact is missing: {os.path.basename(path)}. "
+                "Absence is never an empty default.")
+
+    with open(candidate_path, encoding="utf-8") as fh:
+        candidates = json.load(fh)
+    with open(authorization_path, encoding="utf-8") as fh:
+        auth = json.load(fh)
+
+    physical = file_fingerprint_full(candidate_path)
+    if auth.get("parent_candidate_sha256") != physical:
+        raise GateFailure(
+            "the authorization does not reference this candidate artifact "
+            f"(authorised {auth.get('parent_candidate_sha256')}, on disk {physical}). "
+            "Review is bound to the exact bytes that were reviewed.")
+    semantic = _semantic_digest(candidates)
+    if auth.get("parent_candidate_semantic_digest") != semantic:
+        raise GateFailure(
+            "the candidate artifact's semantic digest does not match the "
+            f"authorization ({semantic} vs "
+            f"{auth.get('parent_candidate_semantic_digest')})")
+
+    detected = {(c["ticker"], c["date"]): c for c in candidates["candidates"]}
+    approved = {(a["ticker"], a["date"]): a for a in auth["authorized"]}
+    if auth.get("scope") != AUTHORIZATION_SCOPE:
+        raise GateFailure(f"authorization scope must be {AUTHORIZATION_SCOPE!r}")
+    if set(detected) != set(approved):
+        extra = sorted(f"{t} {d}" for t, d in set(detected) - set(approved))
+        missing = sorted(f"{t} {d}" for t, d in set(approved) - set(detected))
+        raise GateFailure(
+            "detected volume-repair candidates do not match the authorised key "
+            f"set exactly. Newly detected and UNREVIEWED: {extra or 'none'}; "
+            f"authorised but no longer detected: {missing or 'none'}. "
+            "A new detector hit is a human-review event, never an extra repair.")
+
+    for key, record in sorted(approved.items()):
+        hit = detected[key]
+        for field, ours in (("source_sha256", "source_sha256"),
+                            ("raw_volume", "raw_volume"),
+                            ("proposed_normalized_volume",
+                             "proposed_normalized_volume"),
+                            ("delta", "delta")):
+            if hit[ours] != record[field]:
+                raise GateFailure(
+                    f"{key[0]} {key[1]}: {field} is {hit[ours]!r} but the "
+                    f"authorization approved {record[field]!r}; the reviewed "
+                    "repair is not the repair on disk")
+        if record.get("authorised") is not True:
+            raise GateFailure(f"{key[0]} {key[1]}: authorization record is not "
+                              "marked authorised")
+
+    # Stage-B diagnostics are structurally ineligible: they carry no proposed
+    # volume at all, so there is nothing an authorisation could ever approve.
+    for hit in candidates.get("stage_b_diagnostics_never_repaired", []):
+        if (hit["ticker"], hit["date"]) in approved:
+            raise GateFailure(
+                f"{hit['ticker']} {hit['date']}: a stage-B diagnostic can never "
+                "be authorised; it has no certified factor and no proposed volume")
+
+    return {
+        "authorised_repairs": {
+            key: {"ticker": key[0], "date": key[1],
+                  "raw_volume": record["raw_volume"],
+                  "normalized_volume": record["proposed_normalized_volume"]}
+            for key, record in approved.items()},
+        "diagnostic_only": candidates.get("stage_b_diagnostics_never_repaired", []),
+        "authorization_digest": _digest(
+            [f"{t}|{d}|{r['proposed_normalized_volume']}|{r['source_sha256']}"
+             for (t, d), r in sorted(approved.items())]),
+        "parent_candidate_sha256": physical,
     }
 
 
@@ -1072,33 +1986,179 @@ def apply_volume_repairs(frame, artifacts):
     return out, report
 
 
-def basis_dispositions(artifacts, universe):
-    """Split the measured regimes into what may be corrected and what may not."""
+def regime_bounds(regime):
+    """The regime's inclusive interval on the session axis.
+
+    A regime is an INTERVAL, not a cutoff. The superseded contract selected rows
+    with `date <= regime_last_date`, which is only correct when the regime is a
+    prefix of history; for a middle or suffix regime it also swept every clean
+    session before it. Measured on the frozen 297, 9 of 18 regimes are not
+    prefixes -- WINS alone carries six middle regimes -- so the cutoff form
+    would have quarantined or rescaled data it was never meant to touch.
+    """
+    try:
+        return regime["start_date"], regime["end_date"]
+    except KeyError:
+        raise GateFailure(
+            f"{regime.get('ticker', '?')}: regime carries no start_date/end_date. "
+            "This gate requires the SEGMENTED basis artifact. A legacy "
+            "single-regime record is refused rather than converted, because "
+            "inventing a start date would silently reimpose the prefix "
+            "assumption this contract exists to remove.")
+
+
+def rows_in_regime(frame, ticker, regime):
+    start, end = regime_bounds(regime)
+    return ((frame["ticker"] == ticker)
+            & (frame["date"] >= start) & (frame["date"] <= end))
+
+
+def assert_no_regime_overlap(regimes):
+    """Overlapping regimes for one ticker are contradictory, never merged."""
+    for ticker, entries in regimes.items():
+        bounds = sorted(regime_bounds(r) for r in entries)
+        for (a_start, a_end), (b_start, b_end) in zip(bounds, bounds[1:]):
+            if b_start <= a_end:
+                raise GateFailure(
+                    f"{ticker}: basis regimes {a_start}..{a_end} and "
+                    f"{b_start}..{b_end} overlap. Two factors cannot both hold on "
+                    "one session, and silently keeping either one would discard a "
+                    "measurement the artifact actually asserts.")
+
+
+def load_candidate_artifacts(inputs):
+    """The candidate contract's normalized layer, read ONLY from candidate paths.
+
+    run_gate previously called load_normalized_artifacts() with no arguments,
+    which silently defaulted to the two repo-root LEGACY artifacts that
+    candidate_inputs() itself declares provenance-only -- so the whole
+    candidates + authorisation contract was unreachable from execution, and
+    load_authorized_repairs() had no production caller at all. The guard did not
+    catch it because it inspected the returned dict rather than what was opened.
+    This function is the single execution path, and it takes its paths from
+    `inputs` so there is no default that can point somewhere else.
+    """
+    repairs = load_authorized_repairs(
+        candidate_path=inputs["repair_candidates"],
+        authorization_path=inputs["repair_authorization"],
+        basis_path=inputs["basis_artifact"])
+
+    with open(inputs["basis_artifact"], encoding="utf-8") as fh:
+        factors = json.load(fh)
+    regimes, legacy = {}, []
+    for regime in factors.get("regimes", []):
+        if "start_date" not in regime or "end_date" not in regime:
+            legacy.append(regime.get("ticker", "?"))
+        regimes.setdefault(regime["ticker"], []).append(regime)
+    if legacy:
+        raise GateFailure(
+            f"{os.path.basename(inputs['basis_artifact'])} carries "
+            f"{len(legacy)} legacy single-regime record(s); the candidate "
+            "contract requires the SEGMENTED artifact")
+    assert_no_regime_overlap(regimes)
+
+    return {
+        "mode": inputs["mode"],
+        "authorised_repairs": repairs["authorised_repairs"],
+        "diagnostic_only": repairs["diagnostic_only"],
+        "regimes": regimes,
+        "ledger_digest": repairs["authorization_digest"],
+        "parent_candidate_sha256": repairs["parent_candidate_sha256"],
+        "factor_digest": _digest(
+            [f"{t}|{regime_bounds(r)[0]}|{regime_bounds(r)[1]}"
+             f"|{regime_factor(r):.12g}|{r['classification']}"
+             for t, entries in sorted(regimes.items()) for r in entries]),
+        "sources": {
+            "repair_candidates": inputs["repair_candidates"],
+            "repair_authorization": inputs["repair_authorization"],
+            "basis_artifact": inputs["basis_artifact"],
+        },
+    }
+
+
+def basis_dispositions(artifacts, universe, mode=PRIMARY_MODE):
+    """Split the measured regimes into what may be corrected and what may not.
+
+    Both sides map a ticker to a LIST of regimes. A ticker may carry several,
+    and they need not agree: a certified regime and a quarantined one can sit in
+    the same ticker's history and must be handled independently.
+
+    In PRIMARY mode NOTHING is harmonisable. A certified factor is an economic
+    claim; whether it was knowable on the session it corrects is a
+    point-in-time one, and the basis-invalid mask is reconstructed from the full
+    frozen window. So PRIMARY quarantines every off-basis regime, certified or
+    not, and harmonisation exists only under the explicitly retrospective mode.
+    Without this branch PRIMARY_PIT_APPLIES_BASIS_HARMONISATION is decorative:
+    run_gate would harmonise MLPT/RAJA/RMKE in the primary path regardless.
+    """
     reconstructible, quarantined = {}, {}
-    for ticker, regime in artifacts["regimes"].items():
+    harmonisable = (mode == SECONDARY_MODE)
+    for ticker, entries in artifacts["regimes"].items():
         if ticker not in universe:
             continue
-        if regime["classification"] == "RECONSTRUCTIBLE":
-            reconstructible[ticker] = regime
-        else:
-            quarantined[ticker] = regime
+        for regime in entries:
+            certified = regime["classification"] in CERTIFIED_CLASSIFICATIONS
+            target = (reconstructible if (certified and harmonisable)
+                      else quarantined)
+            target.setdefault(ticker, []).append(regime)
     return reconstructible, quarantined
+
+
+def broker_basis_invalid_keys(frame, quarantined):
+    """The (ticker, date) sessions whose BROKER features are unavailable.
+
+    A basis regime is a statement about the broker LOT basis, not about the
+    price series. The vendor's price and volume are mutually consistent
+    throughout -- that is precisely why harmonise_broker_basis() scales lots and
+    leaves price and volume alone -- so a session inside a regime has a perfectly
+    usable price row and an unusable broker row.
+
+    Deleting those price rows, which is what routing the price frame through
+    quarantine_basis_regimes() did, made a broker-domain defect silently shrink
+    the price panel. It also made the two variant families incomparable for a
+    reason that has nothing to do with prices: variant A would lose the 1,425
+    PRIMARY basis-invalid sessions even though price_audit.detect() never
+    objected to a single one of them.
+
+    So the domains are separated. Price validity is decided by price_audit
+    alone; this function returns the broker-side unavailability mask, which
+    Gate B applies as NaN on broker-derived features rather than as row
+    deletion.
+    """
+    keys, detail = set(), {}
+    if frame.empty or not quarantined:
+        return {"keys": keys, "n_sessions": 0, "tickers": 0, "detail": {}}
+    for ticker, entries in quarantined.items():
+        mask = pd.Series(False, index=frame.index)
+        for regime in entries:
+            mask |= rows_in_regime(frame, ticker, regime)
+        affected = frame.loc[mask, ["ticker", "date"]]
+        detail[ticker] = int(len(affected))
+        keys.update(zip(affected["ticker"], affected["date"]))
+    return {"keys": keys, "n_sessions": len(keys), "tickers": len(quarantined),
+            "detail": dict(sorted(detail.items()))}
 
 
 def quarantine_basis_regimes(frame, quarantined):
     """Drop only the affected regime, never the whole ticker.
 
-    The post-transition tail is verifiably clean (the ratio is exactly 1 there),
-    so dropping the ticker outright would discard good data. The transition
-    session goes too: it carries a real unadjusted price discontinuity, so any
-    return spanning it is meaningless.
+    Applied to the BROKER table only. The post-transition tail is verifiably
+    clean (the ratio is exactly 1 there), so dropping the ticker outright would
+    discard good data.
+
+    Do NOT apply this to the price harvest. A broker-lot basis regime says
+    nothing about whether the price row is valid, and price validity has exactly
+    one authority -- price_audit.detect(). Use broker_basis_invalid_keys() to
+    obtain the broker-side unavailability mask instead.
     """
     if frame.empty or not quarantined:
         return frame.copy(), {"tickers": 0, "rows_dropped": 0, "detail": {}}
     drop = pd.Series(False, index=frame.index)
     detail = {}
-    for ticker, regime in quarantined.items():
-        mask = (frame["ticker"] == ticker) & (frame["date"] <= regime["regime_last_date"])
+    for ticker, entries in quarantined.items():
+        mask = pd.Series(False, index=frame.index)
+        for regime in entries:
+            mask |= rows_in_regime(frame, ticker, regime)
         detail[ticker] = int(mask.sum())
         drop |= mask
     return frame.loc[~drop].copy(), {
@@ -1122,22 +2182,33 @@ def harmonise_broker_basis(broker, reconstructible):
     if not reconstructible:
         return out, {"tickers": 0, "rows_scaled": 0, "detail": {}}
     detail = {}
-    for ticker, regime in reconstructible.items():
-        factor = float(regime["factor"])
-        mask = ((out["ticker"] == ticker)
-                & (out["date"] <= regime["regime_last_date"]))
-        n = int(mask.sum())
-        if not n:
-            continue
-        for column in ("nlot", "blot", "slot"):
-            scaled = out.loc[mask, column].to_numpy(dtype="float64") * factor
-            rounded = np.rint(scaled)
-            if not np.allclose(scaled, rounded, atol=1e-9):
-                raise GateFailure(
-                    f"{ticker}: basis factor {factor:g} does not keep {column} "
-                    "integral; the regime should not have been certified")
-            out.loc[mask, column] = rounded
-        detail[ticker] = {"factor": factor, "rows": n}
+    for ticker, entries in reconstructible.items():
+        rows = 0
+        factors = []
+        for regime in entries:
+            factor = regime_factor(regime)
+            mask = rows_in_regime(out, ticker, regime)
+            n = int(mask.sum())
+            if not n:
+                continue
+            for column in ("nlot", "blot", "slot"):
+                # A DERIVED equivalent quantity, not an exchange lot. Raw lots
+                # are integral by contract and stay int64 in the ingest layer;
+                # requiring the same of `raw_lots * r` would reject a perfectly
+                # valid rational factor -- r = 1/2 on an odd lot count -- for
+                # being fractional rather than for being wrong. The float64
+                # column carries the derived quantity exactly for the factors
+                # this contract can certify.
+                out.loc[mask, column] = (
+                    out.loc[mask, column].to_numpy(dtype="float64") * factor)
+            rows += n
+            factors.append({"factor": factor,
+                            "factor_exact": regime.get("candidate_factor_exact"),
+                            "start_date": regime_bounds(regime)[0],
+                            "end_date": regime_bounds(regime)[1],
+                            "rows": n})
+        if rows:
+            detail[ticker] = {"rows": rows, "regimes": factors}
     return out, {
         "tickers": len(detail),
         "rows_scaled": int(sum(d["rows"] for d in detail.values())),
@@ -1187,6 +2258,43 @@ def implied_price_containment(ohlc, broker, tolerance=IMPLIED_PRICE_TOLERANCE):
     }
 
 
+def rupiah_value_view(broker):
+    """Present either broker shape with `nval`/`bval`/`sval` in plain RUPIAH.
+
+    Two shapes exist and they disagree about both names and units. The RAW
+    harvest carries nval/bval/sval in rupiah; load_frozen_broker() converts to
+    #1E's convention, where the net column is called `netval` and all three are
+    in BILLIONS.
+
+    cross_source_invariants() documented rupiah, was unit-tested against the raw
+    shape, and was called by run_gate() with the normalized one. That is a
+    KeyError on `nval` the moment Gate A actually runs, and no amount of loader
+    testing could surface it: the defect is in how run_gate composes two
+    functions, not inside either one.
+
+    It cannot be papered over by reading `netval` instead, because the tolerance
+    is 1 RUPIAH and comparing billions against it would silently pass anything
+    under a billion rupiah. So the unit is restored explicitly here.
+
+    Reconstruction is a float round-trip and therefore not bit-exact. Measured
+    on the real 2,689,458-row candidate table the worst residue is 1.2e-4
+    rupiah, against a 1 rupiah tolerance -- a margin of ~8,000x.
+    test_rupiah_round_trip_stays_far_inside_the_tolerance measures it rather
+    than asserting the bound from theory.
+    """
+    if "nval" in broker.columns:
+        return broker
+    if "netval" not in broker.columns:
+        raise GateFailure(
+            "broker frame carries neither `nval` (raw rupiah) nor `netval` "
+            f"(#1E-normalized billions); columns are {list(broker.columns)}")
+    out = broker.copy()
+    out["nval"] = out["netval"].to_numpy(dtype="float64") * RUPIAH_PER_BILLION
+    out["bval"] = out["bval"].to_numpy(dtype="float64") * RUPIAH_PER_BILLION
+    out["sval"] = out["sval"].to_numpy(dtype="float64") * RUPIAH_PER_BILLION
+    return out
+
+
 def cross_source_invariants(ohlc, broker, artifacts):
     """Measure the cross-source identities the price-only detectors cannot see.
 
@@ -1194,7 +2302,17 @@ def cross_source_invariants(ohlc, broker, artifacts):
     cross_ticker_dup and series_break are all silent on it. The mismatch is only
     visible against the broker table -- which is why these live here and not in
     price_audit.detect(), whose behaviour is frozen for Experiment #1E.
+
+    Accepts either broker shape; see rupiah_value_view() for why the unit has to
+    be restored rather than reinterpreted.
     """
+    # The unit is restored FIRST. implied_price_containment divides a value by
+    # lots*SHARES_PER_LOT and compares the result against [low, high] in rupiah;
+    # handed the normalized frame it would compute a price 1e-9 too small and
+    # report every single row as a containment violation. i6 is reported rather
+    # than gated, so that would not have crashed anything -- it would have
+    # quietly turned a real cross-source control into noise.
+    broker = rupiah_value_view(broker)
     implied = implied_price_containment(ohlc, broker)
 
     totals = (broker.groupby(["ticker", "date"], sort=True)
@@ -1516,42 +2634,298 @@ def start_of_history(universe_rows, panel):
     }
 
 
-def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, establish_manifest=False,
-             net_lot_sample=None):
-    """Full Gate A pass. Returns (panel, broker, report)."""
-    tickers, universe_audit = resolve_universe(xlsx_path, refreeze=refreeze)
+def candidate_inputs(candidate_dir=CANDIDATE_DIR, mode=PRIMARY_MODE):
+    """The Experiment #1F execution inputs, as explicit paths.
 
-    full_harvest, calendar, ohlc_fingerprint = load_full_harvest()
-    covered, price_cov = price_coverage(full_harvest, tickers, ohlc_fingerprint, calendar)
-    broker, broker_source, broker_cov = load_frozen_broker(tickers, prices=full_harvest)
+    Asymmetric on purpose, and the asymmetry is measured rather than assumed:
 
-    manifest = verify_input_manifest(
-        [ohlc_fingerprint, broker_cov["fingerprint"]], establish=establish_manifest)
+      OHLC is FULL-MARKET, and experiment-owned. detect()'s cross_ticker_dup
+      compares OHLCV ACROSS tickers, so an approved name cloned against a name
+      outside the universe looks unique the moment the other half is filtered
+      away -- narrowing this input would blind the detector. What the candidate
+      copy changes is custody, not content: the same 936-ticker cross-section,
+      byte-identical, living where no other session can rewrite it.
 
-    artifacts = load_normalized_artifacts()
+      BROKER is the isolated 297. load_frozen_broker() filters to
+      `set(universe) & present` on its first statement and every downstream
+      broker computation -- audit_broker_source, cross_source_invariants,
+      implied_price_containment, net-lot recovery -- runs on that filtered
+      frame. No broker invariant reads an out-of-universe row. Keeping the
+      full-market table as the execution input would therefore let an
+      irrelevant out-of-universe refresh invalidate a frozen 297-name
+      experiment while changing nothing it actually consumes.
+
+    The full-market broker table remains pinned as PROVENANCE, together with
+    the proof that v2 reproduces its in-universe subset exactly.
+    """
+    if mode not in (PRIMARY_MODE, SECONDARY_MODE):
+        raise GateFailure(f"unknown mode {mode!r}")
+    return {
+        "mode": mode,
+        "expectations": dict(PRODUCTION_EXPECTATIONS),
+        # The repository the pinned identities are computed against. Declared,
+        # not assumed: tracked-content identity is meaningless without saying
+        # WHICH repository's object store is authoritative. `code_root` is the
+        # repo the pinned implementation lives in; `git_root` the repo a tracked
+        # execution input lives in. In production both are this worktree.
+        "git_root": HERE,
+        "code_root": HERE,
+        "ohlc_parquet": os.path.join(candidate_dir, "ohlc_full_market.parquet"),
+        "broker_parquet": os.path.join(candidate_dir, "broker_daily_v2.parquet"),
+        # CONSUMED, not merely declared. run_gate passes this to
+        # resolve_universe(require_frozen=True), so the pinned path is the only
+        # universe the gate can read: no repo-root default, no workbook fallback.
+        "universe_json": os.path.join(HERE, "experiment_1f_universe.json"),
+        "reviewed_manifest": REVIEWED_MANIFEST_V3_JSON,
+        "source_manifest": os.path.join(candidate_dir, "source_manifest.json"),
+        "repair_candidates": os.path.join(candidate_dir,
+                                          "volume_repair_candidates.json"),
+        "repair_authorization": os.path.join(candidate_dir,
+                                             "volume_repair_authorization.json"),
+        "basis_artifact": os.path.join(candidate_dir,
+                                       "observed_basis_factor_candidate.json"),
+        # DIAGNOSTIC ONLY, and separated from execution inputs for that reason.
+        # neobdm.db is read by broker_provenance() to bound a VALUE-fidelity
+        # claim; it cannot change pass/fail, the panel, the broker table, or
+        # either digest. It is therefore deliberately NOT manifest-pinned -- but
+        # it is named here rather than resolved from a default, so "every path
+        # is declared" stays literally true.
+        "diagnostic_only": {
+            "neobdm_db": os.path.join(HERE, "neobdm.db"),
+        },
+        "provenance_only": {
+            # The frozen sources these candidate copies were taken from. They
+            # live in the SHARED checkout, not in this worktree -- naming the
+            # worktree path here would make the guard compare against a file
+            # that does not exist and can never be opened.
+            "shared_checkout_ohlc_parquet": os.path.join(SHARED_ROOT, "ohlc.parquet"),
+            "shared_checkout_broker_parquet": os.path.join(SHARED_ROOT,
+                                                           "broker_daily.parquet"),
+            "worktree_ohlc_parquet": OHLC_PARQUET,
+            "full_market_broker_parquet": BROKER_PARQUET,
+            "legacy_repair_ledger": VOLUME_REPAIR_LEDGER_JSON,
+            "legacy_basis_artifact": OBSERVED_BASIS_FACTOR_JSON,
+            # The v2 two-file manifest. run_gate now verifies manifest-v3 and
+            # never opens this, so listing it here turns "we stopped using it"
+            # into something traced_open_paths can actually falsify.
+            "legacy_two_file_input_manifest": INPUT_MANIFEST_JSON,
+        },
+    }
+
+
+def assert_candidate_mode_reads_no_legacy_artifact(inputs):
+    """Declared execution inputs must not name a legacy production artifact.
+
+    This checks the DECLARATION only. It is necessary and not sufficient: an
+    earlier version of run_gate declared these inputs, passed this guard, and
+    then called load_normalized_artifacts() with no arguments -- reading the
+    legacy root artifacts anyway. Use `traced_open_paths` to assert on what a
+    call actually opens; a declaration cannot police a hard-coded default.
+    """
+    legacy = set(inputs["provenance_only"].values())
+    for key, value in inputs.items():
+        if key in ("mode", "provenance_only", "expectations", "diagnostic_only"):
+            continue
+        if not isinstance(value, str):
+            continue
+        if value in legacy:
+            raise GateFailure(
+                f"candidate input {key} points at the legacy artifact {value}; "
+                "legacy root artifacts are provenance, never execution inputs")
+    return True
+
+
+@contextlib.contextmanager
+def traced_open_paths(sink):
+    """Record every filesystem path opened inside the block.
+
+    The behavioural counterpart to the declaration guard above: it observes what
+    code DOES rather than what it says, which is the only way to catch a default
+    argument silently reintroducing a legacy path.
+    """
+    import builtins
+    real_open = builtins.open
+
+    def traced(file, *args, **kwargs):
+        try:
+            sink.append(os.path.abspath(os.fspath(file)))
+        except TypeError:
+            pass                                  # fd or path-like we cannot resolve
+        return real_open(file, *args, **kwargs)
+
+    builtins.open = traced
+    try:
+        yield sink
+    finally:
+        builtins.open = real_open
+
+
+def assert_no_legacy_artifact_was_opened(opened, inputs):
+    """Fail if any legacy root artifact was actually read."""
+    legacy = {os.path.abspath(p) for p in inputs["provenance_only"].values()}
+    touched = sorted({p for p in opened if p in legacy})
+    if touched:
+        raise GateFailure(
+            "the candidate contract OPENED legacy artifacts: "
+            + ", ".join(os.path.basename(p) for p in touched)
+            + ". Declaring candidate inputs is not enough; a hard-coded default "
+              "elsewhere reintroduced a provenance-only path.")
+    return True
+
+
+def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, net_lot_sample=None,
+             inputs=None, mode=PRIMARY_MODE, establish_manifest=False):
+    """Full Gate A pass. Returns (panel, broker, report).
+
+    `establish_manifest` survives only to REFUSE. It was a CLI flag that let a
+    Gate A run re-pin the very inputs it had just read; leaving the parameter in
+    place with a hard refusal is louder than deleting it, because any caller
+    still passing it gets an explanation instead of a silent no-op.
+
+    Every path this consumes comes from `inputs`. Nothing here falls back to a
+    module default: the previous version declared candidate inputs, passed the
+    declaration guard, and then read the legacy root artifacts anyway because
+    two calls used their own defaults.
+
+    `report["orchestration"]` records the ordered execution stages and the file
+    each one actually consumed, so the call path is an audited output rather
+    than something a reader has to reconstruct from the source.
+    """
+    if establish_manifest:
+        raise ManifestEstablishmentRefused(
+            "Gate A cannot establish or re-establish its own manifest. A run "
+            "that pins its own inputs records what it just read, not what a "
+            "human reviewed, so the pin stops being a control. Establishment is "
+            "a separate act performed by experiment_1f_manifest.py, valid only "
+            "after the implementation is committed and the semantic code tree "
+            "is clean -- conditions Gate A cannot check about itself mid-run.")
+
+    inputs = inputs or candidate_inputs(mode=mode)
+    if inputs["mode"] != mode:
+        raise GateFailure(
+            f"mode {mode!r} was requested but the execution inputs were built "
+            f"for {inputs['mode']!r}; the mode decides whether certified basis "
+            "regimes are harmonised, so a silent disagreement would change the "
+            "data contract without changing the declaration")
+    assert_candidate_mode_reads_no_legacy_artifact(inputs)
+    expectations = inputs.get("expectations")
+    stages = []
+
+    # 1. Hash the EXACT BYTES of all seven execution inputs, before any semantic
+    #    application, so the manifest pin covers what was reviewed rather than
+    #    what a parser reconstructed.
+    fingerprints = execution_input_fingerprints(inputs)
+    stages.append({"stage": "execution_input_fingerprints",
+                   "consumed": sorted(fp["abspath"] for fp in fingerprints.values()),
+                   "pinned_inputs": len(fingerprints)})
+
+    # 2. The normalized layer, loaded through the single candidate path.
+    artifacts = load_candidate_artifacts(inputs)
+    stages.append({"stage": "load_candidate_artifacts",
+                   "consumed": sorted(artifacts["sources"].values()),
+                   "authorised_repairs": len(artifacts["authorised_repairs"])})
+
+    # 3. The manifest, verified in full and BEFORE anything semantic is built.
+    #    Everything recomputable is recomputed; nothing is taken on the
+    #    manifest's own word.
+    manifest = verify_reviewed_manifest_v3(inputs, fingerprints,
+                                           artifacts=artifacts, mode=mode)
+    stages.append({"stage": "verify_reviewed_manifest_v3",
+                   "consumed": manifest["manifest_path"],
+                   "checks": manifest["checks_performed"],
+                   "can_establish": False})
+
+    tickers, universe_audit = resolve_universe(
+        xlsx_path, frozen_path=inputs["universe_json"], refreeze=refreeze,
+        require_frozen=True, expectations=expectations)
+    stages.append({"stage": "resolve_universe",
+                   "consumed": universe_audit.get("consumed_path"),
+                   "declared": os.path.abspath(inputs["universe_json"])})
+
+    full_harvest, calendar, ohlc_fingerprint = load_full_harvest(
+        inputs["ohlc_parquet"])
+    if ohlc_fingerprint["sha256"] != fingerprints["ohlc_full_market_parquet"]["sha256"]:
+        raise GateFailure(
+            "the OHLC parquet changed between fingerprinting and loading; the "
+            "verified manifest describes bytes that are no longer on disk")
+    stages.append({"stage": "load_full_harvest",
+                   "consumed": os.path.abspath(inputs["ohlc_parquet"]),
+                   "sha256": ohlc_fingerprint["sha256"]})
+    covered, price_cov = price_coverage(full_harvest, tickers, ohlc_fingerprint,
+                                        calendar, expectations=expectations)
+    broker, broker_source, broker_cov = load_frozen_broker(
+        tickers, path=inputs["broker_parquet"], prices=full_harvest,
+        expectations=expectations)
+    if broker_cov["fingerprint"]["sha256"] != \
+            fingerprints["broker_daily_v2_parquet"]["sha256"]:
+        raise GateFailure(
+            "the broker parquet changed between fingerprinting and loading; the "
+            "verified manifest describes bytes that are no longer on disk")
+    stages.append({"stage": "load_frozen_broker",
+                   "consumed": os.path.abspath(inputs["broker_parquet"]),
+                   "sha256": broker_cov["fingerprint"]["sha256"]})
+
     full_harvest, repair_report = apply_volume_repairs(full_harvest, artifacts)
-    reconstructible, quarantined = basis_dispositions(artifacts, set(covered))
+    reconstructible, quarantined = basis_dispositions(artifacts, set(covered), mode=mode)
+    stages.append({"stage": "basis_dispositions", "mode": mode,
+                   "harmonisable_tickers": sorted(reconstructible),
+                   "quarantined_tickers": sorted(quarantined)})
+
     broker, harmonise_report = harmonise_broker_basis(broker, reconstructible)
-    full_harvest, quarantine_report = quarantine_basis_regimes(full_harvest, quarantined)
+
+    # DOMAIN SEPARATION. The price harvest is NOT filtered here: a broker-lot
+    # basis regime is not a price defect, and price validity has exactly one
+    # authority, price_audit.detect(), which runs below on the untouched frame.
+    basis_invalid = broker_basis_invalid_keys(full_harvest, quarantined)
     broker, broker_quarantine = quarantine_basis_regimes(broker, quarantined)
+    stages.append({"stage": "broker_basis_invalid_keys",
+                   "price_rows_deleted": 0,
+                   "broker_invalid_sessions": basis_invalid["n_sessions"],
+                   "broker_rows_dropped": broker_quarantine["rows_dropped"]})
+
     cross_source = cross_source_invariants(full_harvest, broker, artifacts)
     cross_source["volume_repairs"] = repair_report
     cross_source["basis_harmonised"] = harmonise_report
-    cross_source["basis_quarantined"] = quarantine_report
     cross_source["basis_quarantined_broker_rows"] = broker_quarantine["rows_dropped"]
+    cross_source["basis_quarantined_broker_detail"] = broker_quarantine["detail"]
+    cross_source["broker_basis_invalid_sessions"] = basis_invalid["n_sessions"]
+    cross_source["broker_basis_invalid_detail"] = basis_invalid["detail"]
+    cross_source["price_rows_deleted_for_broker_basis"] = 0
     assert_cross_source_integrity(cross_source)
 
     raw_audit = audit_raw_ohlc(full_harvest, calendar, scope="full harvest")
     panel, flagged_full, universe_rows = build_validated_panel(
         full_harvest, covered, calendar)
+    stages.append({"stage": "build_validated_panel",
+                   "price_validity_authority": "price_audit.detect",
+                   "rows": int(len(panel))})
     price_cov["universe_rows"] = int(len(universe_rows))
 
     integrity = integrity_checks(universe_rows, panel, flagged_full, covered)
+    integrity["broker_invalid_price_valid_rows_retained"] = int(
+        sum(1 for t, d in zip(panel["ticker"], panel["date"])
+            if (t, d) in basis_invalid["keys"]))
     assert_structural_integrity(integrity)
 
     report = {
+        "orchestration": stages,
+        "mode": mode,
         "universe": universe_audit,
         "input_manifest": manifest,
+        "broker_basis_validity": {
+            "policy": ("broker-domain unavailability, applied as NaN on "
+                       "broker-derived features by Gate B. Never a price-row "
+                       "deletion: price validity is decided by price_audit "
+                       "alone."),
+            "invalid_sessions": basis_invalid["n_sessions"],
+            "detail": basis_invalid["detail"],
+            # The mask itself, exported so Gate B can NaN broker features on
+            # exactly these keys. A count is not actionable; the key set is.
+            "invalid_keys": sorted(f"{t} {d}" for t, d in basis_invalid["keys"]),
+            "price_rows_deleted": 0,
+            "price_valid_and_broker_invalid_rows_in_panel":
+                integrity["broker_invalid_price_valid_rows_retained"],
+        },
         "price_coverage": price_cov,
         "broker_coverage": broker_cov,
         "raw_ohlc_audit": raw_audit,
@@ -1561,7 +2935,13 @@ def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, establish_manifest=False,
         "open_anchor": open_anchor_diagnostics(panel, calendar),
         "history": start_of_history(universe_rows, panel),
         "net_lot_recovery": audit_net_lot_recovery(broker, panel, sample=net_lot_sample),
-        "broker_provenance": broker_provenance(broker),
+        # DIAGNOSTIC. Explicit path, explicit role; see broker_provenance().
+        "broker_provenance": dict(
+            broker_provenance(
+                broker, db_path=inputs["diagnostic_only"]["neobdm_db"]),
+            role="DIAGNOSTIC PROVENANCE ONLY -- not manifest-pinned, cannot "
+                 "alter pass/fail, the panel, the broker table or either digest",
+            db_path=inputs["diagnostic_only"]["neobdm_db"]),
         "broker_rows": int(len(broker)),
         "broker_tickers": int(broker["ticker"].nunique()),
         "broker_codes": int(broker["broker_code"].nunique()),
@@ -1601,11 +2981,24 @@ def print_report(report):
     print(f"  malformed         : {universe['malformed_tickers'] or 'none'}")
     print(f"  duplicates        : {universe['duplicates'] or 'none'}")
 
-    print("\n[2] FROZEN INPUT MANIFEST (missing manifest is a FAILURE, never auto-adopted)")
+    print("\n[2] REVIEWED MANIFEST v3 (missing manifest is a FAILURE, never auto-adopted)")
     print(f"  status   : {report['input_manifest']['status']}")
+    print(f"  version  : {report['input_manifest'].get('manifest_version')}")
+    print(f"  commit   : {report['input_manifest'].get('established_commit_sha')}")
+    print(f"  gate may establish : "
+          f"{report['input_manifest'].get('establishment_reachable_from_gate')} "
+          f"(establishment lives in experiment_1f_manifest.py, post-commit only)")
     for name, values in sorted(report["input_manifest"]["inputs"].items()):
         print(f"  {name:<20}: {values['sha256']}")
         print(f"  {'':<20}  {values['size_bytes']} bytes")
+
+    print("\n[2b] ORCHESTRATION CALL PATH (what each stage actually consumed)")
+    for i, stage in enumerate(report["orchestration"], start=1):
+        print(f"  {i}. {stage['stage']}")
+        for key, value in sorted(stage.items()):
+            if key == "stage":
+                continue
+            print(f"       {key:<28}: {value}")
 
     print("\n[3] COVERAGE (price and broker frozen independently)")
     print(f"  full harvest      : {price_cov['harvest_rows_total']} rows / "
@@ -1682,6 +3075,17 @@ def print_report(report):
     print(f"  open outside [low,high]    : {integrity['open_outside_high_low']} "
           f"(anchor contract withholds the label; row is kept)")
     print(f"  max |open-anchored label|  : {integrity['max_abs_label']}")
+
+    basis = report["broker_basis_validity"]
+    print("\n[7b] BROKER-BASIS VALIDITY (a BROKER domain fact, not a price fact)")
+    print(f"  broker-invalid sessions       : {basis['invalid_sessions']}")
+    print(f"  price rows deleted for it     : {basis['price_rows_deleted']} "
+          f"(price validity is price_audit.detect's alone)")
+    print(f"  price-valid & broker-invalid  : "
+          f"{basis['price_valid_and_broker_invalid_rows_in_panel']} row(s) RETAINED "
+          f"in the panel and eligible for variant A")
+    for ticker, count in sorted(basis["detail"].items()):
+        print(f"      {ticker:<8}: {count} session(s) with broker features NaN")
 
     print("\n[8] OPEN-ANCHOR REJECTION DIAGNOSTICS (Hn = open(T+1) -> open(T+1+n))")
     print(f"  rows with invalid open anchor : {anchors['rows_with_invalid_open_anchor']} "
@@ -1774,20 +3178,27 @@ def main():
     parser.add_argument("--refreeze", action="store_true",
                         help="deliberately re-read the workbook and re-freeze "
                              "(still hard-fails if its content changed)")
-    parser.add_argument("--establish-manifest", action="store_true",
-                        help="explicitly establish/re-establish the frozen input "
-                             "manifest after reviewing the hashes")
+    # --establish-manifest is GONE, not renamed. It let a Gate A run re-pin the
+    # inputs it had just read, which makes the manifest a record of the last run
+    # rather than of the last review. Establishment is a separate act:
+    #     py experiment_1f_manifest.py
+    # and it is only legitimate after commit, on a clean semantic code tree.
+    parser.add_argument("--mode", default=PRIMARY_MODE,
+                        choices=[PRIMARY_MODE, SECONDARY_MODE],
+                        help="PRIMARY is the reviewed policy; SECONDARY is "
+                             "retrospective sensitivity only, never tradable "
+                             "evidence")
     parser.add_argument("--net-lot-sample", type=int, default=None,
                         help="audit net-lot recovery on a seeded sample of N rows")
     args = parser.parse_args()
 
     panel, broker, report = run_gate(args.universe, refreeze=args.refreeze,
-                                     establish_manifest=args.establish_manifest,
+                                     mode=args.mode,
                                      net_lot_sample=args.net_lot_sample)
     print_report(report)
 
     if args.determinism_check:
-        panel2, broker2, report2 = run_gate(args.universe,
+        panel2, broker2, report2 = run_gate(args.universe, mode=args.mode,
                                             net_lot_sample=args.net_lot_sample)
         same_panel = report["panel_digest"] == report2["panel_digest"]
         same_broker = report["broker_digest"] == report2["broker_digest"]
