@@ -85,7 +85,7 @@ def run_xgboost_report(conn):
 
 def run_strategy_variants_report(conn):
     panel = build_panel(conn)
-    px = clean_panel(conn, horizons=(1,), lags=(1,))
+    px = clean_panel(conn, horizons=(1,), lags=(1,), open_anchored=True)
     result = run_strategy_search(panel, px)
     return dict(
         winner_label=result["winner_label"],

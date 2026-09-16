@@ -1704,6 +1704,87 @@ def test_predictions_carry_the_columns_the_scorer_reads():
     print("test_predictions_carry_the_columns_the_scorer_reads passed")
 
 
+def test_strategy_report_builds_the_open_anchored_price_frame():
+    # run_ml_reports.py died every night from 2026-09-05: ad5650d made
+    # simulate_trade() require gap_1, but run_strategy_variants_report() kept
+    # calling clean_panel() without open_anchored=True. Same blind spot as the
+    # KeyError above: nothing executed the production caller. This does, on a
+    # tiny in-memory price_history, with model training stubbed out.
+    import sys as _sys
+    import types as _types
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE price_history (date TEXT NOT NULL, ticker TEXT NOT NULL, open REAL, high REAL, "
+                 "low REAL, close REAL, volume REAL, PRIMARY KEY (date, ticker))")
+    conn.execute("CREATE TABLE price_quarantine (date TEXT, ticker TEXT, open REAL, high REAL, low REAL, "
+                 "close REAL, volume REAL, reasons TEXT, PRIMARY KEY (date, ticker))")
+    dates = [f"2026-09-{d:02d}" for d in range(1, 9)]
+    for t, base in (("AAA", 1000.0), ("BBB", 500.0)):
+        for i, d in enumerate(dates):
+            close = base * (1 + 0.01 * ((i % 3) - 1))
+            conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                         (d, t, close * 0.995, close * 1.02, close * 0.98, close, 1e6))
+
+    # run_ml_reports reads the Telegram secrets at import time and imports the
+    # DDQN module, which needs torch; ml-health runs this file without torch.
+    # Neither is used by the strategy-variants path, so stand in for both only
+    # when they are absent, and undo everything afterwards.
+    added_env = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if k not in os.environ]
+    for k in added_env:
+        os.environ[k] = "test-placeholder"
+    stubbed_ddqn = False
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        stub = _types.ModuleType("ddqn_entry_exit")
+        for name in ("build_episode_frame", "split_search_holdout", "fit_normalizer", "normalize_features",
+                     "make_envs", "train_ddqn", "evaluate_policy", "evaluate_policy_with_trade_log",
+                     "FEATURES", "STATE_EXTRA"):
+            setattr(stub, name, None)
+        _sys.modules["ddqn_entry_exit"] = stub
+        stubbed_ddqn = True
+    fresh_import = "run_ml_reports" not in _sys.modules
+    seen = {}
+    try:
+        import run_ml_reports as rmr
+        original = rmr.build_panel, rmr.run_strategy_search
+
+        def capture_search(panel, px):
+            seen["px"] = px
+            return dict(winner_label="stub", winner_search_mean=0.0, winner_holdout_mean=0.0,
+                        winner_holdout_n=0, search_results=pd.DataFrame(), holdout_results=pd.DataFrame())
+
+        rmr.build_panel = lambda c: pd.DataFrame()
+        rmr.run_strategy_search = capture_search
+        try:
+            rmr.run_strategy_variants_report(conn)
+        finally:
+            rmr.build_panel, rmr.run_strategy_search = original
+        plain = rmr.clean_panel(conn, horizons=(1,), lags=(1,))
+    finally:
+        for k in added_env:
+            os.environ.pop(k, None)
+        if stubbed_ddqn:
+            _sys.modules.pop("ddqn_entry_exit", None)
+        if fresh_import:
+            _sys.modules.pop("run_ml_reports", None)
+
+    px = seen["px"]
+    assert "gap_1" in px.columns, (
+        "run_strategy_variants_report() must build its frame with open_anchored=True: "
+        "simulate_trade() refuses a frame without gap_1")
+    # open_anchored=True is purely additive: same rows, same existing columns and values.
+    assert set(px.columns) - set(plain.columns) == {"gap_1", "fwd_oo_1", "fwd_oc_1"}
+    key = ["ticker", "date"]
+    pd.testing.assert_frame_equal(px.sort_values(key).reset_index(drop=True)[list(plain.columns)],
+                                  plain.sort_values(key).reset_index(drop=True))
+    # And the frame satisfies the simulator it feeds, guards intact.
+    by_ticker, by_date = _index_price_history(px)
+    decision = by_ticker["AAA"].loc[by_ticker["AAA"]["gap_1"].notna(), "date"].iloc[0]
+    assert simulate_trade(by_ticker, by_date, "AAA", decision, 1, None, None) is not None
+    print("test_strategy_report_builds_the_open_anchored_price_frame passed")
+
+
 def test_date_offset_only_holds_before_the_open():
     # The invariant every date join rests on (Appendix E) is "scrape date - 1 ==
     # data date", and it is true ONLY because the scheduled run beats the open.
@@ -2494,6 +2575,7 @@ if __name__ == "__main__":
     test_commit_gate_ignores_legitimate_volatility()
     test_commit_gate_catches_a_recontaminated_scrape()
     test_predictions_carry_the_columns_the_scorer_reads()
+    test_strategy_report_builds_the_open_anchored_price_frame()
     test_date_offset_only_holds_before_the_open()
     test_quarantined_row_is_not_a_baseline_for_the_next_row()
     test_authoritative_panel_identifies_only_the_cloned_duplicate()
