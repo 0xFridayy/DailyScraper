@@ -18,6 +18,20 @@ The control group is every panel name NOT signalled that day, run through the
 identical math -- so "signal returned +2%" only means something next to what the
 market did over the same window.
 
+"Not signalled" is only evidence when the source could have signalled. A source
+that was SOURCE_UNAVAILABLE or RETIRED_SOURCE on a day (signal_source_status, or
+the field lifecycle registry for days before that table existed) produced no
+negatives that day:
+  BY SOURCE   a source is compared only on days it was available: its hits and
+              its control both drop its unavailable days
+  ALL/MARKET  the combined signal is the union of the sources IN the strategy that
+              day. A retired source has left the strategy, so its days stay; a live
+              source that was SOURCE_UNAVAILABLE leaves the union incomplete, so
+              that day drops from both the combined hits and the control.
+A retirement changes which sources make up ALL SIGNALS, so ALL SIGNALS and MARKET
+are reported per strategy version (neobdm_source_contract.signal_strategy_regime),
+never pooled across versions.
+
 Run:  py evaluate_signals.py            -> print report
       py evaluate_signals.py --telegram -> also send it to the bot
 """
@@ -29,6 +43,8 @@ import sys
 from collections import defaultdict
 
 import requests
+
+import neobdm_source_contract as nsc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "neobdm.db")
@@ -73,6 +89,28 @@ def load_signals(conn):
     except sqlite3.OperationalError:
         return []
     return [(d, t, (s or "").split(",")) for d, t, s in rows]
+
+
+def load_source_status(conn):
+    """{source: {flag_date: status}} from signal_source_status (empty if absent)."""
+    if not nsc.table_exists(conn, "signal_source_status"):
+        return {}
+    out = defaultdict(dict)
+    for d, source, status in conn.execute("select flag_date, source, status from signal_source_status"):
+        out[source][d] = status
+    return dict(out)
+
+
+def source_state(status_by_source, source, day):
+    """RETIRED_SOURCE / SOURCE_UNAVAILABLE / None (available) for one source on one
+    day. The lifecycle registry covers retired days that have no status row."""
+    status = status_by_source.get(source, {}).get(day)
+    if status in (nsc.RETIRED_SOURCE, nsc.SOURCE_UNAVAILABLE):
+        return status
+    for field, entry in nsc.FIELD_LIFECYCLE.items():
+        if source in (entry.get("signals") or []) and nsc.lifecycle_state(field, day) == nsc.RETIRED:
+            return nsc.RETIRED_SOURCE
+    return None
 
 
 # ── measurement ───────────────────────────────
@@ -134,24 +172,34 @@ def summarise(samples):
 def evaluate(conn):
     panel, dates = load_panel(conn)
     signals = load_signals(conn)
+    status = load_source_status(conn)
 
     flagged = defaultdict(set)                 # date -> {ticker}
     for d, t, _s in signals:
         flagged[d].add(t)
 
+    sources = sorted({s for _d, _t, ss in signals for s in ss if s} | set(status))
+    # Days a live (non-retired) source failed: the combined union is incomplete.
+    incomplete = {d for d in dates if any(source_state(status, s, d) == nsc.SOURCE_UNAVAILABLE
+                                          for s in sources)}
+    unavailable = {s: {d for d in dates if source_state(status, s, d)} for s in sources}
+
+    regime = {d: nsc.signal_strategy_regime(d) for d in dates}
     by_source = defaultdict(lambda: defaultdict(list))   # source -> h -> samples
-    overall = defaultdict(list)                          # h -> samples
-    control = defaultdict(list)                          # h -> samples
+    source_control = defaultdict(lambda: defaultdict(list))
+    overall = defaultdict(lambda: defaultdict(list))     # strategy -> h -> samples
+    control = defaultdict(lambda: defaultdict(list))     # strategy -> h -> samples
     uncovered = [t for d, t, _s in signals if (d, t) not in panel]
 
-    for d, t, sources in signals:
+    for d, t, srcs in signals:
         for h in HORIZONS:
             o = outcome(panel, dates, t, d, h)
             if o is None:
                 continue
-            overall[h].append(o)
-            for s in sources:
-                if s:
+            if d not in incomplete:
+                overall[regime[d]["strategy"]][h].append(o)
+            for s in srcs:
+                if s and d not in unavailable[s]:
                     by_source[s][h].append(o)
 
     panel_dates = set(dates)
@@ -160,17 +208,30 @@ def evaluate(conn):
             continue
         for h in HORIZONS:
             o = outcome(panel, dates, t, d, h)
-            if o is not None:
-                control[h].append(o)
+            if o is None:
+                continue
+            if d not in incomplete:
+                control[regime[d]["strategy"]][h].append(o)
+            for s in sources:
+                if d not in unavailable[s]:
+                    source_control[s][h].append(o)
 
     return {
         "dates": dates,
         "n_signal_rows": len(signals),
         "uncovered": uncovered,
-        "overall": {h: summarise(v) for h, v in overall.items()},
-        "control": {h: summarise(v) for h, v in control.items()},
+        "overall": {st: {h: summarise(v) for h, v in hs.items()} for st, hs in overall.items()},
+        "control": {st: {h: summarise(v) for h, v in hs.items()} for st, hs in control.items()},
+        "strategies": {r["strategy"]: {"since": r["since"], "retired_sources": r["retired_sources"],
+                                       "first": min(d for d in dates if regime[d]["strategy"] == r["strategy"]),
+                                       "last": max(d for d in dates if regime[d]["strategy"] == r["strategy"])}
+                       for r in regime.values()},
         "by_source": {s: {h: summarise(v) for h, v in hs.items()}
                       for s, hs in by_source.items()},
+        "source_control": {s: {h: summarise(v) for h, v in hs.items()}
+                           for s, hs in source_control.items()},
+        "unavailable_days": {s: len(v) for s, v in unavailable.items() if v},
+        "incomplete_days": len(incomplete),
     }
 
 
@@ -196,28 +257,38 @@ def format_report(res):
     if res["uncovered"]:
         out.append(f"⚠️ {len(res['uncovered'])} signalled name(s) missing from the "
                    f"panel — not measurable")
+    for src, n in sorted(res.get("unavailable_days", {}).items()):
+        out.append(f"source {src} unavailable/retired on {n} panel day(s) — excluded from its own "
+                   f"comparison, not counted as no-signal days")
+    if res.get("incomplete_days"):
+        out.append(f"{res['incomplete_days']} day(s) with a live source unavailable — excluded from "
+                   f"ALL SIGNALS and MARKET")
 
-    measured = max((s["n"] for s in res["overall"].values() if s), default=0)
+    measured = max((s["n"] for hs in res["overall"].values() for s in hs.values() if s), default=0)
     if measured < MIN_SIGNALS:
         out += ["", f"⏳ Only {measured} measurable signal-outcomes so far "
                     f"(need ≥{MIN_SIGNALS}).", "Too early to call — still accumulating."]
         return "\n".join(out)
 
-    out += ["", "ALL SIGNALS vs market (same days, same universe)"]
-    for h in HORIZONS:
-        out.append(_line(f"{h}d", res["overall"].get(h), res["control"].get(h)))
-
-    out += ["", "MARKET (unsignalled control)"]
-    for h in HORIZONS:
-        out.append(_line(f"{h}d", res["control"].get(h), None))
+    for strategy, info in sorted(res["strategies"].items(), key=lambda kv: kv[1]["first"]):
+        retired = (f"; without retired {', '.join(info['retired_sources'])} since {info['since']}"
+                   if info["retired_sources"] else "")
+        out += ["", f"ALL SIGNALS [{strategy}: {info['first']} → {info['last']}{retired}] "
+                    f"vs market (same days, same universe)"]
+        for h in HORIZONS:
+            out.append(_line(f"{h}d", res["overall"].get(strategy, {}).get(h),
+                             res["control"].get(strategy, {}).get(h)))
+        out += ["", f"MARKET (unsignalled control) [{strategy}]"]
+        for h in HORIZONS:
+            out.append(_line(f"{h}d", res["control"].get(strategy, {}).get(h), None))
 
     for src in sorted(res["by_source"]):
         stats = res["by_source"][src]
         if not any(stats.values()):
             continue
-        out += ["", f"BY SOURCE — {src}"]
+        out += ["", f"BY SOURCE — {src} (vs control on days {src} was available)"]
         for h in HORIZONS:
-            out.append(_line(f"{h}d", stats.get(h), res["control"].get(h)))
+            out.append(_line(f"{h}d", stats.get(h), res["source_control"].get(src, {}).get(h)))
 
     out += ["", "entry = close of D+1 (signal is EOD on D); no costs/slippage applied"]
     return "\n".join(out)

@@ -44,6 +44,7 @@ from ddqn_entry_exit import (
 )
 from signal_metrics import trade_stats, format_trade_stats
 from price_audit import clean_panel
+import neobdm_source_contract as nsc
 
 RECENT_TRADES_SHOWN = 15
 
@@ -169,6 +170,7 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
         resolved = days_elapsed >= max_days
         entry = dict(
             ticker=row["ticker"], flag_date=row["flag_date"], sources=row["sources"],
+            strategy=nsc.signal_strategy_regime(row["flag_date"])["strategy"],
             days_elapsed=days_elapsed, resolved=resolved,
             current_pct=(window["close"].iloc[-1] - entry_close) / entry_close,
             highest_pct=(window["high"].max() - entry_close) / entry_close,
@@ -179,7 +181,21 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
             resolved_returns.append(entry["current_pct"])
 
     signals.sort(key=lambda e: e["flag_date"], reverse=True)
-    return dict(signals=signals, resolved=trade_stats(resolved_returns))
+    by_strategy = {}
+    for e in signals:
+        if e["resolved"]:
+            by_strategy[e["strategy"]] = by_strategy.get(e["strategy"], 0) + 1
+    return dict(signals=signals, resolved=trade_stats(resolved_returns), resolved_by_strategy=by_strategy)
+
+
+def strategy_mix_note(konglo):
+    """'' when resolved signals come from one strategy version; otherwise says the
+    pooled stats span versions with different signal-source compositions."""
+    mix = konglo.get("resolved_by_strategy") or {}
+    if len(mix) < 2:
+        return ""
+    return (" [pools " + " + ".join(f"{k} n={v}" for k, v in sorted(mix.items()))
+            + ": different signal-source compositions, not one unchanged strategy]")
 
 
 def format_telegram_message(xgb, strat, ddqn, konglo):
@@ -209,7 +225,7 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         )
     if konglo["resolved"]["n_trades"] >= 5:
         konglo_lines.append(
-            "  Resolved: " + format_trade_stats(konglo["resolved"])
+            "  Resolved: " + format_trade_stats(konglo["resolved"]) + strategy_mix_note(konglo)
         )
     elif konglo["resolved"]["n_trades"] > 0:
         konglo_lines.append(f"  {konglo['resolved']['n_trades']} resolved so far - too few to read.")
@@ -328,7 +344,7 @@ def write_step_summary(xgb, strat, ddqn, konglo):
             if konglo["resolved"]["n_trades"] > 0:
                 note = "" if konglo["resolved"]["n_trades"] >= 5 else " (too few resolved signals for this to mean much yet)"
                 f.write(f"Across {konglo['resolved']['n_trades']} resolved signals: "
-                        + format_trade_stats(konglo["resolved"]) + f"{note}.\n\n")
+                        + format_trade_stats(konglo["resolved"]) + f"{note}{strategy_mix_note(konglo)}.\n\n")
 
         # n_trades lives in the pooled stats dict, not at the top level of xgb -
         # run_xgboost_report() returns pooled=... alongside recent_trades=...
