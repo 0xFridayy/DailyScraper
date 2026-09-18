@@ -7,7 +7,7 @@ name: NeoBDM Daily ML Report
 # neobdm.db, so there's no git push step and no race risk with
 # daily-scrape.yml / price-history-topup.yml.
 #
-# Runs by request every evening (20:00 Asia/Jakarta, UTC+7, no DST) - well
+# Used to run every evening (20:00 Asia/Jakarta, UTC+7, no DST) - well
 # after both the morning scrape (23:00 UTC prev day = 06:00 WIB) and the
 # price_history top-up (00:30 UTC = 07:30 WIB), so it always sees that
 # day's fresh data. Results move little day-to-day at this data size (see
@@ -16,9 +16,9 @@ name: NeoBDM Daily ML Report
 # it's here for visibility, not because daily reruns are expected to find
 # something new most days.
 
+# Manual only since 2026-09 (owner asked for less noise; the report makes no
+# picks). Run it from the Actions tab when you want it.
 on:
-  schedule:
-    - cron: "0 13 * * *"  # 20:00 Asia/Jakarta (UTC+7) daily
   workflow_dispatch:
 
 permissions:

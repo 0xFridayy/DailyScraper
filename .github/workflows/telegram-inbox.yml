@@ -1,0 +1,51 @@
+name: Telegram Inbox (yes/stop replies)
+
+# Reads the owner's "yes TICKER" / "stop TICKER" / "list" replies and saves
+# them to telegram_follows.json, which the morning picks message reads.
+# Telegram keeps unread replies for only 24 hours and GitHub starts scheduled
+# jobs hours late, so this runs every 3 hours. It is the ONLY writer of
+# telegram_follows.json and never touches neobdm.db.
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-inbox
+  cancel-in-progress: false
+
+jobs:
+  inbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Read replies
+        run: python telegram_inbox.py
+
+      - name: Commit telegram_follows.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add telegram_follows.json
+          git diff --staged --quiet && exit 0
+          git commit -m "Update telegram follows ($(date -u +%Y-%m-%dT%H:%MZ))"
+          for i in 1 2 3; do
+            git pull --rebase && git push && break
+            sleep 10
+          done

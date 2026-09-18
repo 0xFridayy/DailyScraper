@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Never let a manual run overlap the scheduled one: both push neobdm.db.
+concurrency:
+  group: daily-scrape
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -34,8 +39,11 @@ jobs:
       - name: Install Playwright Chromium (+ system deps)
         run: python -m playwright install --with-deps chromium
 
-      - name: Run scraper (one-shot)
-        run: python neobdm_scraper.py --now
+      # morning.py runs the unchanged scrape (neobdm_scraper.run_all_jobs),
+      # then sends ONE message with picks + follow-ups instead of the raw list.
+      # To roll back, change this line back to: python neobdm_scraper.py --now
+      - name: Run scraper + morning picks (one-shot)
+        run: python morning.py
 
       # market_summary/dashboard scrapes have been silently failing
       # (selector timeouts, likely a NeoBDM site update) without failing the
@@ -53,7 +61,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Commit updated neobdm.db and market-summary raw fragments
+      - name: Commit updated neobdm.db, raw fragments and daily picks
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -67,6 +75,12 @@ jobs:
           if [ -d market_summary_raw_fragments ]; then
             git add market_summary_raw_fragments/
           fi
+          # daily_picks.db: picks, learned weights and sent-message log (morning.py).
+          if [ -f daily_picks.db ]; then
+            git add daily_picks.db
+          fi
           git diff --staged --quiet || git commit -m "Update neobdm.db ($(date -u +%Y-%m-%d))"
-          git pull --rebase
-          git push
+          for i in 1 2 3; do
+            git pull --rebase && git push && break
+            sleep 15
+          done

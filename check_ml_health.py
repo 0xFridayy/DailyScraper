@@ -58,7 +58,8 @@ CORE_MODULES = ["price_audit", "walk_forward_backtest", "strategy_variants",
                 "shap_analysis", "kelly_sizing", "ara_arb_simulation",
                 "horizon_scan", "evaluate_signals", "ml_v2_experiment_1",
                 "ml_v2_experiment_1_robustness", "pattern_type_backtest",
-                "foreign_flow_signal_backtest", "regime_gated_momentum"]
+                "foreign_flow_signal_backtest", "regime_gated_momentum",
+                "daily_picks", "telegram_inbox"]
 OPTIONAL_MODULES = ["ddqn_entry_exit"]
 
 # Panel shape. Wide bands - this catches "the panel collapsed", not drift.
@@ -176,7 +177,7 @@ def check_unit_tests(problems, stats):
     does not become an excuse for it to stop running.
     """
     passed = 0
-    for name in ("test_pipeline.py", "test_experiment_1f_phase2.py"):
+    for name in ("test_pipeline.py", "test_experiment_1f_phase2.py", "test_daily_picks.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
         passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
@@ -427,7 +428,8 @@ def main():
     problems, notes, stats = check(quick="--quick" in sys.argv)
     report = format_report(problems, notes, stats)
     print(report)
-    if "--telegram" in sys.argv:
+    # Quiet when healthy: Telegram only hears about problems.
+    if "--telegram" in sys.argv and problems:
         send_telegram(report)
     sys.exit(1 if problems else 0)
 
