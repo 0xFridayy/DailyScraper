@@ -376,21 +376,194 @@ def test_top2_ranking_excludes_unavailable_numeric_inputs_and_keeps_true_zero():
     assert only_unrankable.status == nsc.SOURCE_UNAVAILABLE and only_unrankable.hits == []
 
 
-def test_dashboard_rank_value_missing_is_excluded_not_zero(monkeypatch):
-    class Req:
-        def get(self, url):
-            return FakeResponse({"data": [{"id": name, "name": name} for _l, name, _f, _e in ns.DASHBOARD_PRESETS]})
+class FakeDashboard:
+    """GET /screeners/dashboard + POST /market-summary/summary/{id}. `post_rows(field)`
+    builds each screener's batch; a callable `get`/`post` override raises or returns
+    another response."""
+    def __init__(self, post_rows, names=None, get=None, post=None):
+        self.post_rows, self.get_override, self.post_override = post_rows, get, post
+        self.names = [n for _l, n, _f, _e in ns.DASHBOARD_PRESETS] if names is None else names
 
-        def post(self, url, data=None, headers=None):
-            field = json.loads(data)["sort_field"]
-            return FakeResponse({"data": [{"symbol": "NULL", field: None}, {"symbol": "ABSN"},
-                                          {"symbol": "ZERO", field: 0}, {"symbol": "GOOD", field: 0.123}]})
+    def get(self, url):
+        if self.get_override:
+            return self.get_override(url)
+        return FakeResponse({"success": True, "data": [{"id": name, "name": name} for name in self.names]})
 
-    monkeypatch.setattr(ns, "_api_session", lambda page: (Req(), {}))
+    def post(self, url, data=None, headers=None):
+        if self.post_override:
+            return self.post_override(url)
+        return FakeResponse({"success": True, "data": self.post_rows(json.loads(data)["sort_field"])})
+
+
+def dashboard(monkeypatch, fake, capture_rows=None, capture_id=None):
+    monkeypatch.setattr(ns, "_api_session", lambda page: (fake, {}))
     monkeypatch.setattr(ns, "API_PAGE_PAUSE", 0)
-    monkeypatch.setattr(ns, "_api_json", lambda resp: json.loads(resp.body()))
-    for _label, _emoji, rows in ns.scrape_dashboard_presets(page=None):
-        assert rows == [{"tick": "ZERO", "tx": "0.0%"}, {"tick": "GOOD", "tx": "12.3%"}]
+    out = ns.scrape_dashboard_presets(page=None, capture_rows=capture_rows, capture_id=capture_id)
+    assert [(label, emoji) for label, emoji, _r in out] == [(l, e) for l, _n, _f, e in ns.DASHBOARD_PRESETS]
+    for label, _emoji, result in out:
+        assert isinstance(result, nsc.SignalResult) and result.source == f"dashboard_{label}"
+    return {label: result for label, _emoji, result in out}
+
+
+def captured(symbol, m=0.2, nr=0.3, f=-0.05, **extra):
+    """A capture row whose three rank fields differ, so a lookup on the wrong one shows."""
+    return dict({"symbol": symbol, "m_dn_0": m, "nr_dn_0": nr, "f_dn_0": f}, **extra)
+
+
+def test_dashboard_rank_value_missing_is_kept_from_the_capture_or_na_never_zero(monkeypatch):
+    fake = FakeDashboard(lambda field: [{"symbol": "NULL", field: None}, {"symbol": "ABSN"},
+                                        {"symbol": "ZERO", field: 0}, {"symbol": "GOOD", field: 0.123}])
+    got = dashboard(monkeypatch, fake, [captured("ABSN")], "ms-cap")
+    expected_absn = {"Bandarmologi": "20.0%", "NonRetail": "30.0%", "Foreign": "-5.0%"}
+    for label, result in got.items():
+        assert result.hits == [{"tick": "NULL", "tx": "n/a"}, {"tick": "ABSN", "tx": expected_absn[label]},
+                               {"tick": "ZERO", "tx": "0.0%"}, {"tick": "GOOD", "tx": "12.3%"}]
+        assert result.status == nsc.HITS and result.capture_id == "ms-cap"
+        assert "['NULL', 'ABSN']" in result.detail and "ms-cap: ['ABSN']" in result.detail
+        assert "n/a (absent/null in that capture too): ['NULL']" in result.detail
+
+
+def test_dashboard_value_null_or_absent_in_the_capture_too_stays_na(monkeypatch):
+    fake = FakeDashboard(lambda field: [{"symbol": "NULL"}, {"symbol": "ABSN"}])
+    capture = [captured("NULL", m=None, nr=None, f=None), {"symbol": "ABSN", "close": 1000}]
+    for result in dashboard(monkeypatch, fake, capture, "ms-cap").values():
+        assert [r["tx"] for r in result.hits] == ["n/a", "n/a"]
+        assert "valued from market-summary capture ms-cap: []" in result.detail
+        assert "n/a (absent/null in that capture too): ['NULL', 'ABSN']" in result.detail
+
+
+def test_dashboard_list_whose_response_never_carries_the_rank_field_is_not_emptied(monkeypatch):
+    """2026-09-17: 'Top Akum Bandar' returned 7 tickers, none with m_dn_0, and the
+    list came out empty. The tickers are server-ranked, so they stay; the values
+    come from the same run's capture (where the dashboard values matched exactly)."""
+    tickers = ["MAPI", "AMRT", "INTP", "PEGE", "TOSK", "MBSS", "TLDN"]
+    fake = FakeDashboard(lambda field: [{"symbol": t, "close": 1000} for t in tickers])
+    capture = [captured(t, m=v) for t, v in zip(tickers, [0.1803, 0.1573, 0.1569, 0.1498, 0.1020, 0.09, 0.08])]
+    with_capture = dashboard(monkeypatch, fake, capture, "ms-1")["Bandarmologi"]
+    assert with_capture.status == nsc.HITS and with_capture.capture_id == "ms-1"
+    assert [(r["tick"], r["tx"]) for r in with_capture.hits] == [
+        ("MAPI", "18.0%"), ("AMRT", "15.7%"), ("INTP", "15.7%"), ("PEGE", "15.0%"), ("TOSK", "10.2%")]
+    without_capture = dashboard(monkeypatch, fake)["Bandarmologi"]
+    assert without_capture.status == nsc.HITS
+    assert [r["tx"] for r in without_capture.hits] == ["n/a"] * ns.DASH_TOP_N
+    assert without_capture.capture_id is None
+    assert "no usable market-summary capture this run" in without_capture.detail
+    assert "None" not in without_capture.detail
+
+
+def test_dashboard_value_present_in_the_response_wins_and_names_no_capture(monkeypatch):
+    fake = FakeDashboard(lambda field: [{"symbol": "GOOD", field: 0.123}])
+    for result in dashboard(monkeypatch, fake, [captured("GOOD", m=0.9, nr=0.9, f=0.9)], "ms-1").values():
+        assert result.hits == [{"tick": "GOOD", "tx": "12.3%"}]
+        assert result.capture_id is None and result.detail == ""
+
+
+def test_dashboard_never_reads_an_ambiguous_capture_symbol(monkeypatch):
+    fake = FakeDashboard(lambda field: [{"symbol": "DUPE"}])
+    capture = [captured("DUPE", m=0.1), captured("DUPE", m=0.9)]
+    assert dashboard(monkeypatch, fake, capture, "ms-1")["Bandarmologi"].hits == [{"tick": "DUPE", "tx": "n/a"}]
+
+
+def test_dashboard_request_failures_are_unavailable_and_an_empty_response_is_unverified(monkeypatch):
+    def boom(url):
+        raise RuntimeError("connection reset")
+
+    def respond(obj, **kw):
+        return lambda url: FakeResponse(obj, **kw)
+
+    login_page = respond(b"<html>login</html>", content_type="text/html")
+    api_error = respond({"success": False, "message": "abnormal usage detected", "data": None})
+    throttled = respond({"detail": "Request was throttled."}, status=429)
+    drf_error = respond({"detail": "Authentication credentials were not provided."})
+    ok_rows = lambda field: [{"symbol": "GOOD", field: 0.1}]   # noqa: E731
+
+    def all_unavailable(got, text):
+        assert {r.status for r in got.values()} == {nsc.SOURCE_UNAVAILABLE}
+        assert all(text in r.detail for r in got.values()), [r.detail for r in got.values()]
+
+    for bad in (boom, login_page, api_error, throttled, drf_error):
+        all_unavailable(dashboard(monkeypatch, FakeDashboard(ok_rows, get=bad)), "screeners list failed")
+        all_unavailable(dashboard(monkeypatch, FakeDashboard(ok_rows, post=bad)), "request failed")
+    all_unavailable(dashboard(monkeypatch, FakeDashboard(ok_rows, post=api_error)), "abnormal usage detected")
+    all_unavailable(dashboard(monkeypatch, FakeDashboard(ok_rows, post=throttled)), "HTTP 429")
+
+    no_identity = FakeDashboard(lambda field: [{field: 0.1}, {"symbol": None, "close": 1}])
+    all_unavailable(dashboard(monkeypatch, no_identity), "identity key symbol absent on 2/2 rows")
+
+    got = dashboard(monkeypatch, FakeDashboard(ok_rows, names=["Top Akum Asing"]))
+    assert got["Foreign"].status == nsc.HITS
+    assert got["Bandarmologi"].status == nsc.SOURCE_UNAVAILABLE and "not found" in got["Bandarmologi"].detail
+
+    empty = dashboard(monkeypatch, FakeDashboard(lambda field: []))
+    assert {r.status for r in empty.values()} == {nsc.EMPTY_UNVERIFIED}
+    warrants = dashboard(monkeypatch, FakeDashboard(lambda field: [{"symbol": "AADIBQCQ6A", field: 0.1}]))
+    assert {r.status for r in warrants.values()} == {nsc.EMPTY_UNVERIFIED}
+    assert "no plain equity ticker" in warrants["Foreign"].detail
+
+
+def test_dashboard_session_failure_is_unavailable_not_a_lost_run(monkeypatch):
+    def no_session(page):
+        raise TimeoutError("page.goto: Timeout 60000ms exceeded.")
+    monkeypatch.setattr(ns, "_api_session", no_session)
+    got = ns.scrape_dashboard_presets(page=None)
+    assert [r.status for _l, _e, r in got] == [nsc.SOURCE_UNAVAILABLE] * len(ns.DASHBOARD_PRESETS)
+    assert all("TimeoutError" in r.detail for _l, _e, r in got)
+
+
+def test_request_errors_never_print_the_playwright_call_log(monkeypatch, caplog):
+    """A failed Playwright API request lists every request header in its message:
+    the CSRF token and the session cookie would land in the PUBLIC Actions log."""
+    leaky = ("APIRequestContext.post: connect ECONNREFUSED 1.2.3.4:443\nCall log:\n  - -> POST /api/x\n"
+             f"    - X-CSRFToken: {SECRET}\n    - cookie: sessionid={SECRET}; csrftoken={SECRET}")
+    assert ns._safe_error(RuntimeError(leaky)) == "RuntimeError: APIRequestContext.post: connect ECONNREFUSED 1.2.3.4:443"
+
+    def boom(url):
+        raise RuntimeError(leaky)
+    for fake in (FakeDashboard(lambda f: [], get=boom), FakeDashboard(lambda f: [], post=boom)):
+        caplog.clear()
+        got = dashboard(monkeypatch, fake)
+        assert all(SECRET not in r.detail and "ECONNREFUSED" in r.detail for r in got.values())
+        assert SECRET not in caplog.text and "ECONNREFUSED" in caplog.text
+
+
+def test_run_all_jobs_hands_the_capture_to_the_dashboard(monkeypatch):
+    from unittest import mock
+    seen, sent = {}, []
+
+    def fake_market_summary(page, capture):
+        capture.update(rows=[captured("ABCD")], capture_id="ms-t")
+        return nsc.SignalResult("top_akum_bandar", nsc.RETIRED_SOURCE, [], "retired")
+
+    def fake_dashboard(page, capture_rows=None, capture_id=None):
+        seen.update(rows=capture_rows, capture_id=capture_id)
+        return [(l, e, nsc.SignalResult(f"dashboard_{l}", nsc.HITS, [{"tick": "ABCD", "tx": "20.0%"}]))
+                for l, _n, _f, e in ns.DASHBOARD_PRESETS]
+
+    monkeypatch.setattr(ns, "sync_playwright", mock.MagicMock())
+    for name, stub in {"login": lambda page: None, "scrape_market_summary": fake_market_summary,
+                       "scrape_dashboard_presets": fake_dashboard, "scrape_broker_stalker": lambda page: [],
+                       "save_daily_broker_flow": lambda page: None, "_offset_safe": lambda what: False,
+                       "send_telegram": sent.append}.items():
+        monkeypatch.setattr(ns, name, stub)
+    ns.run_all_jobs()
+    assert seen == {"rows": [captured("ABCD")], "capture_id": "ms-t"}
+    assert len(sent) == 1 and "Bandarmologi: ABCD(20.0%)" in sent[0]
+
+
+def test_dashboard_status_reaches_the_record_and_the_telegram_line():
+    conn = sqlite3.connect(":memory:")
+    dash = [("Bandarmologi", "b", nsc.SignalResult("dashboard_Bandarmologi", nsc.SOURCE_UNAVAILABLE, [], "request failed: x")),
+            ("NonRetail", "n", nsc.SignalResult("dashboard_NonRetail", nsc.EMPTY_UNVERIFIED, [], "screener returned no rows")),
+            ("Foreign", "f", nsc.SignalResult("dashboard_Foreign", nsc.HITS, [{"tick": "ABCD", "tx": "n/a"}], "d", "ms-1"))]
+    ns.record_konglo_signals(conn, "2026-09-18", nsc.SignalResult("top_akum_bandar", nsc.RETIRED_SOURCE), dash, [])
+    got = {s: (st, d, c) for s, st, d, c in conn.execute(
+        "SELECT source, status, detail, capture_id FROM signal_source_status WHERE source LIKE 'dashboard_%'")}
+    assert got == {"dashboard_Bandarmologi": (nsc.SOURCE_UNAVAILABLE, "request failed: x", None),
+                   "dashboard_NonRetail": (nsc.EMPTY_UNVERIFIED, "screener returned no rows", None),
+                   "dashboard_Foreign": (nsc.HITS, "d", "ms-1")}
+    assert conn.execute("SELECT sources FROM konglo_signal_watch WHERE ticker='ABCD'").fetchone() == ("dashboard_Foreign",)
+    lines = ns._dashboard_lines(dash)
+    assert lines[1:] == ["b Bandarmologi: ⚠️ unavailable", "n NonRetail: -", "f Foreign: ABCD(n/a)"]
 
 
 def test_persisted_source_null_stays_null_and_true_zero_stays_zero(tmpdir_path, monkeypatch):
@@ -724,6 +897,40 @@ def test_migration_is_additive_idempotent_and_never_backfills():
                                   for n in notes)
 
 
+def test_2026_09_17_bandarmologi_is_corrected_to_unavailable_once_and_only_there():
+    import evaluate_signals as ev
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE konglo_signal_watch (flag_date TEXT, ticker TEXT, sources TEXT, is_tracked INTEGER)")
+    conn.execute("INSERT INTO konglo_signal_watch VALUES ('2026-09-17', 'RANS', 'dashboard_NonRetail', 0)")
+    as_recorded = [nsc.signal_status_from_rows("dashboard_Bandarmologi", []),
+                   nsc.SignalResult("dashboard_Foreign", nsc.HITS, [1]),
+                   nsc.signal_status_from_rows("broker_stalker", [])]
+    nsc.record_signal_source_status(conn, "2026-09-17", as_recorded)
+    nsc.record_signal_source_status(conn, "2026-09-16", [nsc.signal_status_from_rows("dashboard_Bandarmologi", [])])
+    watch_before = conn.execute("SELECT * FROM konglo_signal_watch").fetchall()
+
+    assert nsc.apply_source_status_corrections(conn) == [("2026-09-17", "dashboard_Bandarmologi")]
+    assert nsc.apply_source_status_corrections(conn) == []                              # idempotent
+    rows = {(d, s): (st, at, by) for d, s, st, at, by in conn.execute(
+        "SELECT flag_date, source, status, status_at_capture, recorded_by FROM signal_source_status")}
+    assert rows == {
+        ("2026-09-17", "dashboard_Bandarmologi"): (nsc.SOURCE_UNAVAILABLE, nsc.EMPTY_UNVERIFIED, "status_correction"),
+        ("2026-09-17", "dashboard_Foreign"): (nsc.HITS, nsc.HITS, "scraper"),
+        ("2026-09-17", "broker_stalker"): (nsc.EMPTY_UNVERIFIED, nsc.EMPTY_UNVERIFIED, "scraper"),
+        ("2026-09-16", "dashboard_Bandarmologi"): (nsc.EMPTY_UNVERIFIED, nsc.EMPTY_UNVERIFIED, "scraper")}
+    assert conn.execute("SELECT * FROM konglo_signal_watch").fetchall() == watch_before
+    status = ev.load_source_status(conn)
+    assert ev.source_state(status, "dashboard_Bandarmologi", "2026-09-17") == nsc.SOURCE_UNAVAILABLE
+    assert ev.source_state(status, "dashboard_Foreign", "2026-09-17") is None
+
+    # A later re-record of that day is never overridden.
+    nsc.record_signal_source_status(conn, "2026-09-17", [nsc.SignalResult("dashboard_Bandarmologi", nsc.HITS, [1])])
+    assert nsc.apply_source_status_corrections(conn) == []
+    assert conn.execute("SELECT status FROM signal_source_status WHERE flag_date='2026-09-17' "
+                        "AND source='dashboard_Bandarmologi'").fetchone() == (nsc.HITS,)
+    assert nsc.apply_source_status_corrections(sqlite3.connect(":memory:")) == []        # no table, no-op
+
+
 def test_migration_dry_run_writes_nothing():
     conn = sqlite3.connect(":memory:", isolation_level=None)
     src = history_db()
@@ -810,8 +1017,11 @@ def test_end_to_end_capture_persists_active_fields_raw_and_manifest(tmpdir_path,
     monkeypatch.setattr(ns, "_offset_safe", lambda what: True)
     monkeypatch.setattr(ns, "_api_session", lambda page: (fake, {"Content-Type": "application/json",
                                                                  "X-CSRFToken": SECRET}))
-    result = ns.scrape_market_summary(page=None)
+    capture = {}
+    result = ns.scrape_market_summary(page=None, capture=capture)
 
+    assert [r["symbol"] for r in capture["rows"]] == ["AAAA", "BBBB", "CCCC"]    # handed to the dashboard presets
+    assert capture["capture_id"] and capture["capture_id"].startswith("ms-")
     assert fake.patched["columns"] == ACTIVE                       # retired field no longer requested, no replacement
     assert "is_unusual_volume" not in fake.patched["columns"] and "is_spike_volume_1" not in fake.patched["columns"]
     assert result.status == nsc.RETIRED_SOURCE and result.hits == []
@@ -852,7 +1062,9 @@ def test_end_to_end_required_field_loss_keeps_good_fields_and_reports_unavailabl
     monkeypatch.setattr(ns, "API_PAGE_PAUSE", 0)
     monkeypatch.setattr(ns, "_offset_safe", lambda what: True)
     monkeypatch.setattr(ns, "_api_session", lambda page: (fake, {"X-CSRFToken": SECRET}))
-    ns.scrape_market_summary(page=None)
+    capture = {}
+    ns.scrape_market_summary(page=None, capture=capture)
+    assert [r["symbol"] for r in capture["rows"]] == ["AAAA"]     # a degraded, non-blocking capture is still usable
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT close, clean_score FROM market_summary_daily").fetchone() == (1000, None)
     status, issues, availability = conn.execute(
@@ -871,7 +1083,9 @@ def test_end_to_end_identity_ambiguity_blocks_the_panel_write_but_keeps_provenan
     monkeypatch.setattr(ns, "API_PAGE_PAUSE", 0)
     monkeypatch.setattr(ns, "_offset_safe", lambda what: True)
     monkeypatch.setattr(ns, "_api_session", lambda page: (fake, {"X-CSRFToken": SECRET}))
-    ns.scrape_market_summary(page=None)
+    capture = {}
+    ns.scrape_market_summary(page=None, capture=capture)
+    assert capture == {}                          # ambiguous identity: no dashboard value is read from it
     conn = sqlite3.connect(db)
     assert not nsc.table_exists(conn, "market_summary_daily")
     assert conn.execute("SELECT persisted_to_market_summary_daily, contract_status FROM ms_capture_manifest").fetchone() == (

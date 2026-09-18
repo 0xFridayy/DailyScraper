@@ -749,6 +749,40 @@ def annotate_retired_signal_days(conn, lifecycle=None, recorded_utc=None, commit
     return added
 
 
+# Live signal_source_status rows later established to be wrong. Each entry
+# corrects one (flag_date, source) that still carries `recorded_status`; the
+# row's status_at_capture keeps what the scraper recorded at the time.
+SOURCE_STATUS_CORRECTIONS = [
+    {"flag_date": "2026-09-17", "source": "dashboard_Bandarmologi",
+     "recorded_status": EMPTY_UNVERIFIED, "status": SOURCE_UNAVAILABLE,
+     "evidence": "'Top Akum Bandar' returned 7 tickers (Actions run 35169122052, 01:07:15Z) but its "
+                 "response never carries m_dn_0, and the PR #45 missing-value rule dropped all of them. "
+                 "Not a no-hits day; the tickers were never persisted and cannot be recovered."},
+]
+
+
+def apply_source_status_corrections(conn, corrections=None, recorded_utc=None, commit=True):
+    """Apply SOURCE_STATUS_CORRECTIONS. Metadata only: no konglo_signal_watch or
+    market_summary_daily row is touched. A row is changed only while it still says
+    `recorded_status`, so this is idempotent and never overrides a later re-record.
+    Returns the (flag_date, source) pairs changed."""
+    cs = SOURCE_STATUS_CORRECTIONS if corrections is None else corrections
+    if not table_exists(conn, "signal_source_status"):
+        return []
+    changed = []
+    for c in cs:
+        cur = conn.execute(
+            "UPDATE signal_source_status SET status=?, detail=?, recorded_by=?, recorded_utc=?, "
+            "status_at_capture=COALESCE(status_at_capture, ?) WHERE flag_date=? AND source=? AND status=?",
+            (c["status"], f"corrected from {c['recorded_status']}: {c['evidence']}", "status_correction",
+             recorded_utc or utc_now(), c["recorded_status"], c["flag_date"], c["source"], c["recorded_status"]))
+        if cur.rowcount:
+            changed.append((c["flag_date"], c["source"]))
+    if commit:
+        conn.commit()
+    return changed
+
+
 def _public_issue(issue):
     field_name = issue.get("field")
     if field_name is None or _key_label(field_name) == field_name:

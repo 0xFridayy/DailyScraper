@@ -410,6 +410,13 @@ def _api_json(resp):
         return None
 
 
+def _safe_error(e, limit=120):
+    """Exception text fit for the PUBLIC Actions log. A failed Playwright API
+    request appends a 'Call log:' listing every request header -- X-CSRFToken and
+    the NeoBDM session cookie among them -- so that part is never printed."""
+    return f"{type(e).__name__}: {str(e).split('Call log:')[0].strip()[:limit]}"
+
+
 def _json_of(recorder, method, endpoint, resp, schema, screener_id=None, page=None, select=None):
     """Parsed JSON of an API response. With a recorder, the response is also kept
     as immutable provenance (neobdm_source_contract.CaptureRecorder), limited to
@@ -681,6 +688,7 @@ def _write_capture_provenance(recorder, capture_date, persisted, state, contract
     try:
         nsc.ensure_schema(conn)
         nsc.annotate_retired_signal_days(conn)
+        nsc.apply_source_status_corrections(conn)
         nsc.write_capture(conn, recorder, capture_date=capture_date, persisted=persisted,
                           screener_id=state.get("screener_id"), universe_id=state.get("universe_id"),
                           requested=state["requested"], catalog_fields=state.get("catalog_fields"),
@@ -691,7 +699,7 @@ def _write_capture_provenance(recorder, capture_date, persisted, state, contract
         conn.close()
 
 
-def scrape_market_summary(page):
+def scrape_market_summary(page, capture=None):
     """API-based Market Summary: one bounded capture, persist EVERY captured row,
     return the Top-2 SignalResult. The full capture is the ML panel -- signalled
     and unsignalled names alike -- so forward returns have a control group.
@@ -699,7 +707,11 @@ def scrape_market_summary(page):
     Every API response is kept as raw provenance and summarised in a capture
     manifest (requested vs catalog vs stored config vs returned keys). A missing
     required field is recorded and reported but does not discard the other fields;
-    only an identity/column ambiguity blocks the market_summary_daily write."""
+    only an identity/column ambiguity blocks the market_summary_daily write.
+
+    `capture`, if given, receives this capture's "rows" and "capture_id" for
+    scrape_dashboard_presets() -- but only when row identity is unambiguous, the
+    same condition that allows the market_summary_daily write."""
     capture_date = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
     recorder = nsc.CaptureRecorder(root=os.path.dirname(DB_PATH))
     state = {"requested": list(ML_COLUMNS)}
@@ -708,7 +720,7 @@ def scrape_market_summary(page):
         fetch_market_summary(page, capture_date, recorder, state)
     except Exception as e:
         error = e
-        log.error(f"Market summary API failed: {e}")
+        log.error(f"Market summary API failed: {_safe_error(e)}")
     rows = state.get("rows") or []
     contract = nsc.evaluate_capture_contract(state["requested"], state.get("catalog_fields"),
                                              state.get("stored_columns"), rows,
@@ -721,10 +733,12 @@ def scrape_market_summary(page):
 
     if error is not None:
         result = nsc.SignalResult(TOP_AKUM_SOURCE, nsc.SOURCE_UNAVAILABLE, [],
-                                  f"market summary capture failed: {str(error)[:120]}", recorder.capture_id)
+                                  f"market summary capture failed: {_safe_error(error)}", recorder.capture_id)
     else:
         result = screen_market_summary(rows, contract["availability"].get(UNUSUAL_FIELD),
                                        capture_date, recorder.capture_id)
+    if capture is not None and rows and not contract["blocking_codes"]:
+        capture.update(rows=rows, capture_id=recorder.capture_id)
 
     persisted = False
     try:
@@ -751,55 +765,122 @@ def _is_real_ticker(sym):
     return bool(sym) and sym.isalpha() and len(sym) <= 4
 
 
-def scrape_dashboard_presets(page):
+def _unambiguous_rows_by_symbol(rows):
+    """symbol -> row; a symbol that occurs more than once is ambiguous and left out."""
+    seen, dup = {}, set()
+    for r in rows or []:
+        sym = r.get("symbol")
+        if sym in seen:
+            dup.add(sym)
+        seen[sym] = r
+    return {s: r for s, r in seen.items() if s and s not in dup}
+
+
+def scrape_dashboard_presets(page, capture_rows=None, capture_id=None):
     """Dashboard 'Top Akum' lists via the screener API. The Bandarmologi/NonRetail/
     Foreign lists are now dashboard SCREENERS (GET /api/screeners/dashboard); we
-    POST /market-summary/summary/{id} for each and take the top tickers by its %M
-    rank field. Returns [(label, emoji, [rows with 'tick' + 'tx']), ...] — same
-    shape _dashboard_lines() expects."""
-    import json as _json
-    req, headers = _api_session(page)
-    try:
-        j = _api_json(req.get(f"{API_BASE}/screeners/dashboard")) or {}
-        by_name = {s.get("name"): s for s in (j.get("data") or [])}
-    except Exception as e:
-        log.error(f"Dashboard screeners list failed: {e}")
-        return [(lbl, emo, []) for lbl, _s, _f, emo in DASHBOARD_PRESETS]
+    POST /market-summary/summary/{id} for each and take the top tickers, ranked
+    server-side by the %M field. Returns [(label, emoji, SignalResult of rows with
+    'tick' + 'tx'), ...] — the shape _dashboard_lines() and record_konglo_signals()
+    expect.
 
+    A screener's response only carries its own configured columns, and 'Top Akum
+    Bandar' has not always carried m_dn_0 even though it sorts by it: on
+    2026-09-16 every Bandarmologi value read 0.0% (parse_num's zero for a missing
+    key), on 2026-09-17 the list emptied after PR #45, and on 2026-09-18 the
+    field was back. A row whose %M is missing is therefore KEPT -- the ticker and its rank are
+    source-backed -- and its value is read from this run's market-summary capture
+    (`capture_rows`, same session, same fields; NonRetail/Foreign values matched it
+    exactly on 2026-09-16), or shown as n/a if the capture lacks it. Never 0.0%.
+
+    Status per list: SOURCE_UNAVAILABLE when the session, the request or the
+    response failed (non-2xx, non-JSON, success=false, malformed data, rows with no
+    symbol at all); EMPTY_UNVERIFIED when a well-formed response yields no plain
+    equity ticker; HITS otherwise."""
+    import json as _json
+
+    def result(label, status, rows=(), detail="", cid=None):
+        return nsc.SignalResult(f"dashboard_{label}", status, list(rows), detail, cid)
+
+    def api_object(resp, what):
+        # _api_json ignores the HTTP status, and this API also answers 200 with
+        # success=false (cf. _fetch_summary_pages): neither is an empty screen.
+        status = getattr(resp, "status", 200)
+        if not 200 <= status < 300:
+            raise ValueError(f"{what}: HTTP {status}")
+        j = _api_json(resp)
+        if not isinstance(j, dict):
+            raise ValueError(f"{what}: response is not a JSON object")
+        if j.get("success") is False:
+            raise ValueError(f"{what}: API error {str(j.get('message'))[:100]}")
+        return j
+
+    try:
+        req, headers = _api_session(page)
+        screeners = api_object(req.get(f"{API_BASE}/screeners/dashboard"), "screeners list").get("data")
+        if not isinstance(screeners, list):
+            raise ValueError("screeners list: data is not a list")
+        by_name = {s.get("name"): s for s in screeners if isinstance(s, dict)}
+    except Exception as e:
+        err = _safe_error(e)
+        log.error(f"Dashboard screeners list failed: {err}")
+        return [(lbl, emo, result(lbl, nsc.SOURCE_UNAVAILABLE, detail=f"screeners list failed: {err}"))
+                for lbl, _s, _f, emo in DASHBOARD_PRESETS]
+
+    captured = _unambiguous_rows_by_symbol(capture_rows)
     results = []
     for label, sname, field, emoji in DASHBOARD_PRESETS:
-        rows = []
         s = by_name.get(sname)
         if not s:
             log.warning(f"Dashboard screener '{sname}' not found")
-        else:
-            try:
-                jj = _api_json(req.post(
-                    f"{API_BASE}/market-summary/summary/{s['id']}",
-                    data=_json.dumps({"page": 1, "size": MARKET_PAGE_SIZE,
-                                      "sort_field": field, "sort_direction": "desc"}),
-                    headers=headers)) or {}
-                d = jj.get("data")
-                batch = (d.get("data") if isinstance(d, dict) else d) or []
-                unavailable = 0
-                for r in batch:
-                    sym = r.get("symbol")
-                    if _is_real_ticker(sym):
-                        # The rank value is source-backed: absent/null is not 0.0%.
-                        value = nsc.source_number(r, field)
-                        if value is None:
-                            unavailable += 1
-                            continue
-                        rows.append({"tick": sym, "tx": f"{value * 100:.1f}%"})
-                    if len(rows) >= DASH_TOP_N:
-                        break
-                if unavailable:
-                    log.warning(f"Dashboard {label}: {unavailable} row(s) without {field} excluded")
-                time.sleep(API_PAGE_PAUSE)
-            except Exception as e:
-                log.error(f"Dashboard preset {label} failed: {e}")
+            results.append((label, emoji, result(label, nsc.SOURCE_UNAVAILABLE,
+                                                 detail=f"dashboard screener '{sname}' not found")))
+            continue
+        try:
+            d = api_object(req.post(
+                f"{API_BASE}/market-summary/summary/{s['id']}",
+                data=_json.dumps({"page": 1, "size": MARKET_PAGE_SIZE,
+                                  "sort_field": field, "sort_direction": "desc"}),
+                headers=headers), "summary").get("data")
+            batch = d.get("data") if isinstance(d, dict) else d
+            if not isinstance(batch, list):
+                raise ValueError("summary: data is not a list")
+            if batch and not any(isinstance(r, dict) and r.get("symbol") for r in batch):
+                raise ValueError(f"summary: identity key symbol absent on {len(batch)}/{len(batch)} rows")
+            rows, missing, valued, na = [], [], [], []
+            for r in batch:
+                sym = r.get("symbol")
+                if _is_real_ticker(sym):
+                    # The rank value is source-backed: absent/null is not 0.0%.
+                    value = nsc.source_number(r, field)
+                    if value is None:
+                        missing.append(sym)
+                        value = nsc.source_number(captured.get(sym, {}), field)
+                        (na if value is None else valued).append(sym)
+                    rows.append({"tick": sym, "tx": "n/a" if value is None else f"{value * 100:.1f}%"})
+                if len(rows) >= DASH_TOP_N:
+                    break
+            time.sleep(API_PAGE_PAUSE)
+        except Exception as e:
+            err = _safe_error(e)
+            log.error(f"Dashboard preset {label} failed: {err}")
+            results.append((label, emoji, result(label, nsc.SOURCE_UNAVAILABLE, detail=f"request failed: {err}")))
+            continue
+        detail, consulted = "", bool(missing and captured)
+        if missing:
+            detail = f"{field} absent/null in the dashboard response for {missing}; "
+            if consulted:
+                detail += f"valued from market-summary capture {capture_id}: {valued}"
+                detail += f"; n/a (absent/null in that capture too): {na}" if na else ""
+            else:
+                detail += "no usable market-summary capture this run, shown as n/a"
+            log.warning(f"Dashboard {label}: {detail}")
+        elif not rows:
+            detail = (f"{len(batch)} row(s) returned, no plain equity ticker" if batch
+                      else "screener returned no rows")
         log.info(f"Dashboard {label}: {[r['tick'] for r in rows]}")
-        results.append((label, emoji, rows))
+        results.append((label, emoji, result(label, nsc.HITS if rows else nsc.EMPTY_UNVERIFIED, rows, detail,
+                                             capture_id if consulted else None)))
     return results
 
 
@@ -1010,7 +1091,7 @@ def scrape_broker_stalker(page):
         try:
             holders = get_inventory_bagholders(page, symbol)
         except Exception as e:
-            log.error(f"inventory bagholders {symbol} failed: {e}")
+            log.error(f"inventory bagholders {symbol} failed: {_safe_error(e, 300)}")
             holders, failed = [], True
         log.info(f"{symbol} bag holders: {[(h['code'], round(h['cum'])) for h in holders]}")
         results.append({
@@ -1143,7 +1224,8 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
     # source was unavailable or retired is never read as a genuine no-signal day.
     statuses = [ms_data if isinstance(ms_data, nsc.SignalResult)
                 else nsc.signal_status_from_rows(TOP_AKUM_SOURCE, list(ms_data))]
-    statuses += [nsc.signal_status_from_rows(f"dashboard_{label}", rows)
+    statuses += [rows if isinstance(rows, nsc.SignalResult)
+                 else nsc.signal_status_from_rows(f"dashboard_{label}", rows)
                  for label, _emoji, rows in dash_data]
     statuses.append(nsc.signal_status_from_rows("broker_stalker", list(bs_data)))
     nsc.record_signal_source_status(conn, date_str, statuses)
@@ -1284,6 +1366,8 @@ def _dashboard_lines(data):
     for label, emoji, rows in data:
         if rows:
             tickers = " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
+        elif getattr(rows, "status", None) == nsc.SOURCE_UNAVAILABLE:
+            tickers = "⚠️ unavailable"
         else:
             tickers = "-"
         lines.append(f"{emoji} {label}: {tickers}")
@@ -1342,8 +1426,9 @@ def run_all_jobs():
             page.set_default_timeout(60000)
 
             login(page)
-            ms_data = scrape_market_summary(page)
-            dash_data = scrape_dashboard_presets(page)
+            capture = {}
+            ms_data = scrape_market_summary(page, capture)
+            dash_data = scrape_dashboard_presets(page, capture.get("rows"), capture.get("capture_id"))
             bs_data = scrape_broker_stalker(page)
 
             backfill_progress = None
@@ -1370,9 +1455,9 @@ def run_all_jobs():
             message = f"{message}\n\n{backfill_progress}"
         send_telegram(message)
     except Exception as e:
-        log.error(f"Job failed: {e}")
+        log.error(f"Job failed: {_safe_error(e, 300)}")
         try:
-            send_telegram(f"NeoBDM error: {str(e)[:200]}")
+            send_telegram(f"NeoBDM error: {_safe_error(e, 200)}")
         except Exception:
             pass
 
