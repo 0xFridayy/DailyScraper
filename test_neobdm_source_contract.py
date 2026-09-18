@@ -897,6 +897,40 @@ def test_migration_is_additive_idempotent_and_never_backfills():
                                   for n in notes)
 
 
+def test_2026_09_17_bandarmologi_is_corrected_to_unavailable_once_and_only_there():
+    import evaluate_signals as ev
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE konglo_signal_watch (flag_date TEXT, ticker TEXT, sources TEXT, is_tracked INTEGER)")
+    conn.execute("INSERT INTO konglo_signal_watch VALUES ('2026-09-17', 'RANS', 'dashboard_NonRetail', 0)")
+    as_recorded = [nsc.signal_status_from_rows("dashboard_Bandarmologi", []),
+                   nsc.SignalResult("dashboard_Foreign", nsc.HITS, [1]),
+                   nsc.signal_status_from_rows("broker_stalker", [])]
+    nsc.record_signal_source_status(conn, "2026-09-17", as_recorded)
+    nsc.record_signal_source_status(conn, "2026-09-16", [nsc.signal_status_from_rows("dashboard_Bandarmologi", [])])
+    watch_before = conn.execute("SELECT * FROM konglo_signal_watch").fetchall()
+
+    assert nsc.apply_source_status_corrections(conn) == [("2026-09-17", "dashboard_Bandarmologi")]
+    assert nsc.apply_source_status_corrections(conn) == []                              # idempotent
+    rows = {(d, s): (st, at, by) for d, s, st, at, by in conn.execute(
+        "SELECT flag_date, source, status, status_at_capture, recorded_by FROM signal_source_status")}
+    assert rows == {
+        ("2026-09-17", "dashboard_Bandarmologi"): (nsc.SOURCE_UNAVAILABLE, nsc.EMPTY_UNVERIFIED, "status_correction"),
+        ("2026-09-17", "dashboard_Foreign"): (nsc.HITS, nsc.HITS, "scraper"),
+        ("2026-09-17", "broker_stalker"): (nsc.EMPTY_UNVERIFIED, nsc.EMPTY_UNVERIFIED, "scraper"),
+        ("2026-09-16", "dashboard_Bandarmologi"): (nsc.EMPTY_UNVERIFIED, nsc.EMPTY_UNVERIFIED, "scraper")}
+    assert conn.execute("SELECT * FROM konglo_signal_watch").fetchall() == watch_before
+    status = ev.load_source_status(conn)
+    assert ev.source_state(status, "dashboard_Bandarmologi", "2026-09-17") == nsc.SOURCE_UNAVAILABLE
+    assert ev.source_state(status, "dashboard_Foreign", "2026-09-17") is None
+
+    # A later re-record of that day is never overridden.
+    nsc.record_signal_source_status(conn, "2026-09-17", [nsc.SignalResult("dashboard_Bandarmologi", nsc.HITS, [1])])
+    assert nsc.apply_source_status_corrections(conn) == []
+    assert conn.execute("SELECT status FROM signal_source_status WHERE flag_date='2026-09-17' "
+                        "AND source='dashboard_Bandarmologi'").fetchone() == (nsc.HITS,)
+    assert nsc.apply_source_status_corrections(sqlite3.connect(":memory:")) == []        # no table, no-op
+
+
 def test_migration_dry_run_writes_nothing():
     conn = sqlite3.connect(":memory:", isolation_level=None)
     src = history_db()

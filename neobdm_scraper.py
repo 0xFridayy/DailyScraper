@@ -688,6 +688,7 @@ def _write_capture_provenance(recorder, capture_date, persisted, state, contract
     try:
         nsc.ensure_schema(conn)
         nsc.annotate_retired_signal_days(conn)
+        nsc.apply_source_status_corrections(conn)
         nsc.write_capture(conn, recorder, capture_date=capture_date, persisted=persisted,
                           screener_id=state.get("screener_id"), universe_id=state.get("universe_id"),
                           requested=state["requested"], catalog_fields=state.get("catalog_fields"),
