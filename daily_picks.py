@@ -427,7 +427,9 @@ def active_follows(events, ended=None):
         current = active.get(ticker)
         if current is not None:
             done_at = ended.get((ticker, current["at"]))
-            if done_at is not None and datetime.fromisoformat(event["at"]) > datetime.fromisoformat(done_at):
+            if done_at is not None and (
+                    event.get("new")
+                    or datetime.fromisoformat(event["at"]) > datetime.fromisoformat(done_at)):
                 current = None
         if current is None:
             active[ticker] = {"at": event["at"], "days": event.get("days"),
@@ -435,6 +437,43 @@ def active_follows(events, ended=None):
         elif "days" in event:
             current["days"] = event["days"]
     return {t: f for t, f in active.items() if (t, f["at"]) not in ended}
+
+
+def stopped_follows(events):
+    """Your picks that you ended with 'stop': [{ticker, at, stop_at, days,
+    reason}], in order. Same rules as active_follows, but keeps the stops."""
+    active, stopped = {}, []
+    for event in events:
+        ticker = event["ticker"]
+        if event["action"] == "stop":
+            if ticker in active:
+                stopped.append(dict(active.pop(ticker), ticker=ticker, stop_at=event["at"]))
+        elif ticker not in active or event.get("new"):
+            active[ticker] = {"at": event["at"], "days": event.get("days"),
+                              "reason": event.get("reason", "")}
+        elif "days" in event:
+            active[ticker]["days"] = event["days"]
+    return stopped
+
+
+def stopped_block(snaps, pick, sent_at=None, stalker=None):
+    """Final result of a pick you stopped: from the price you saw at your yes
+    to the price you saw when you said stop. (lines, result)."""
+    ticker = pick["ticker"]
+    ref = reference_index(snaps, ticker, pick["at"], sent_at)
+    end = reference_index(snaps, ticker, pick["stop_at"], sent_at)
+    base = {"source": "you", "ticker": ticker, "started": pick["at"], "reason": pick["reason"],
+            "start_tags": ",".join(machine_view(snaps, ref, ticker, stalker)) if ref is not None else "",
+            "start_snapshot": snaps[ref].date if ref is not None else None}
+    if ref is None or end is None or end <= ref:
+        empty = {"days": 0, "end_snapshot": snaps[-1].date, "start_price": None, "end_price": None,
+                 "ret": None, "market_ret": None, "why": None, "facts": None}
+        return [f"⚪ {ticker} (you, stopped): no trading day between your yes and stop to score."], \
+            {**base, **empty}
+    n = end - ref
+    lines, result = finish_pick(snaps, ticker, ref, n, "you", label=f"you, stopped after {n} days")
+    lines[1:1] = [f"   Your reason: {pick['reason'] or '(none given)'}"]
+    return lines, {**base, "days": n, **result}
 
 
 def ended_follows(conn):
@@ -609,8 +648,9 @@ def main_reason(ret, facts):
     patterns in the flow data, not proof of cause."""
     market = facts["market_ret"]
     excess = ret - (market or 0)
+    # Only when the stock went the market's way and the gap is small.
     if (market is not None and abs(market) >= 0.02 and market * ret > 0
-            and abs(market) >= abs(excess)):
+            and abs(excess) <= abs(market) / 2):
         return "mostly moved with the market"
     bandar, foreign = facts["bandar_share"], facts["foreign_share"]
     trading, worst = facts["trading_ratio"], facts["worst_day"]
@@ -621,16 +661,18 @@ def main_reason(ret, facts):
             return "foreign kept buying"
         if trading is not None and trading >= 1.5:
             return "buyers rushed in (trading jumped)"
-        return "rose without a clear flow signal"
+        return "beat the market without a clear flow signal"
     if worst is not None and worst <= -0.07:
         return f"one bad day ({worst:.0%})"
     if bandar is not None and bandar <= 0.4:
         return "bandar turned seller"
     if foreign is not None and foreign <= 0.4:
         return "foreign sold"
+    if bandar is not None and bandar >= 0.6:
+        return "lagged even though bandar kept buying"
     if trading is not None and trading <= 0.6:
         return "interest dried up (trading fell)"
-    return "fell without a clear flow signal"
+    return "lagged the market without a clear flow signal"
 
 
 def fact_text(facts):
@@ -645,27 +687,35 @@ def fact_text(facts):
     return " · ".join(parts)
 
 
-def finish_pick(snaps, ticker, start, days, who):
+def finish_pick(snaps, ticker, start, days, who, label=None):
     """Final result of a pick held `days` sessions from snapshot `start`,
     measured from the price shown when it was picked: (lines, result)."""
     end = min(start + days, len(snaps) - 1)
     result = {"end_snapshot": snaps[end].date, "start_price": None, "end_price": None,
               "ret": None, "market_ret": None, "why": None, "facts": None}
     late = "" if end == len(snaps) - 1 else f", ended {session_label(snaps[end].date)}"
+    label = f"{label or f'{who}, {days} days'}{late}"
     first, last = _close(snaps, start, ticker), _close(snaps, end, ticker)
     broke = price_break(snaps, start, end, ticker)
     if not first or not last or broke:
         why = broke[1] if broke else "no price at the end"
-        return [f"⚪ {ticker} ({who}, {days} days{late}): not comparable - {why}"], result
+        return [f"⚪ {ticker} ({label}): not comparable - {why}"], result
     ret = last / first - 1
     facts = explain(snaps, ticker, start, end)
-    why = main_reason(ret, facts)
     market = facts["market_ret"]
-    excess = ret - (market or 0)
+    if market is None:
+        # A trading day is missing inside the window: no fair market number,
+        # so no win or loss is counted (the scoreboard needs market_ret).
+        result.update(start_price=first, end_price=last, ret=ret, facts=facts)
+        return [f"⚪ {ticker} ({label}): {ret * 100:+.1f}%, no market comparison - "
+                "a trading day is missing from the data",
+                f"   {fact_text(facts)}"], result
+    why = main_reason(ret, facts)
+    excess = ret - market
     mark = "✅" if excess > 0 else "❌"
     vs = (f", market {market * 100:+.1f}% → {'beat' if excess > 0 else 'lagged'} it by "
-          f"{abs(excess) * 100:.1f}%" if market is not None else "")
-    lines = [f"{mark} {ticker} ({who}, {days} days{late}): {ret * 100:+.1f}%{vs} - {why}",
+          f"{abs(excess) * 100:.1f}%")
+    lines = [f"{mark} {ticker} ({label}): {ret * 100:+.1f}%{vs} - {why}",
              f"   {fact_text(facts)}"]
     result.update(start_price=first, end_price=last, ret=ret, market_ret=market,
                   why=why, facts=facts)
@@ -843,13 +893,13 @@ def format_scoreboard(snaps, conn, learned, previous):
                       "trading_ratio", "start_tags"), r))
             for r in conn.execute("SELECT source, ret, market_ret, bandar_share, foreign_share, "
                                   "trading_ratio, start_tags FROM pick_results "
-                                  "WHERE ret IS NOT NULL")]
+                                  "WHERE ret IS NOT NULL AND market_ret IS NOT NULL")]
     for r in rows:
-        r["won"] = r["ret"] - (r["market_ret"] or 0) > 0
+        r["won"] = r["ret"] - r["market_ret"] > 0
     for source, label in (("machine", "🤖 Machine"), ("you", "🙋 You")):
         mine = [r for r in rows if r["source"] == source]
         if mine:
-            excess = [r["ret"] - (r["market_ret"] or 0) for r in mine]
+            excess = [r["ret"] - r["market_ret"] for r in mine]
             lines.append(f"{label}: {len(mine)} finished, {sum(r['won'] for r in mine)} won, "
                          f"{_mean(excess) * 100:+.1f}% vs market on average")
         else:
@@ -961,6 +1011,10 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         src.close()
 
     conn = sqlite3.connect(":memory:" if preview else picks_db)
+    if preview and os.path.exists(picks_db):
+        saved = sqlite3.connect(f"file:{picks_db}?mode=ro", uri=True)
+        saved.backup(conn)
+        saved.close()
     try:
         ensure_schema(conn)
         fresh_unsent = bool(snaps) and not already_sent(conn, "morning", snaps[-1].date)
@@ -992,10 +1046,15 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                               for t, v in learned.items()])
         weights = current_weights(conn)
 
+        pick_rows = conn.execute("SELECT snapshot_date, ticker, tags FROM picks "
+                                 "ORDER BY snapshot_date, rank").fetchall()
+        index = {s.date: i for i, s in enumerate(snaps)}
+        # A stock the machine is already holding isn't picked again (no double counting).
+        holding = {t for d, t, _ in pick_rows if d in index and k - index[d] < HORIZON}
         tagged = tag_snapshot(snaps, k, stalker.get(snap.date, frozenset()))
-        picks = rank_picks(tagged, weights)
-        follows = active_follows(load_follows(follows_json).get("events", []),
-                                 ended_follows(conn))
+        picks = rank_picks({t: c for t, c in tagged.items() if t not in holding}, weights)
+        events = load_follows(follows_json).get("events", [])
+        follows = active_follows(events, ended_follows(conn))
         sent_at = dict(conn.execute(
             "SELECT key, sent_utc FROM sent_messages WHERE kind = 'morning'").fetchall())
         recorded = set(conn.execute("SELECT source, ticker, started FROM pick_results").fetchall())
@@ -1007,8 +1066,11 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 results.append(result)
             else:
                 your_blocks.append(lines)
-        pick_rows = conn.execute("SELECT snapshot_date, ticker, tags FROM picks "
-                                 "ORDER BY snapshot_date, rank").fetchall()
+        for pick in stopped_follows(events):
+            if ("you", pick["ticker"], pick["at"]) not in recorded:
+                lines, result = stopped_block(snaps, pick, sent_at, stalker)
+                finished_blocks.append(lines)
+                results.append(result)
         running, machine_done = machine_progress(snaps, pick_rows, recorded)
         for lines, result in machine_done:
             finished_blocks.append(lines)

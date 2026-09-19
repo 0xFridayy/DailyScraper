@@ -461,8 +461,106 @@ def test_why_names_the_main_driver():
     assert dp.main_reason(-0.05, dict(base, bandar_share=0.2)) == "bandar turned seller"
     assert dp.main_reason(-0.05, dict(base, worst_day=-0.12)) == "one bad day (-12%)"
     assert dp.main_reason(-0.04, dict(base, market_ret=-0.05)) == "mostly moved with the market"
-    assert dp.main_reason(0.03, base) == "rose without a clear flow signal"
+    assert dp.main_reason(0.03, base) == "beat the market without a clear flow signal"
+    # the phrase always agrees with the ✅/❌ mark (review cases from real data)
+    assert dp.main_reason(-0.005, dict(base, market_ret=-0.015)) == \
+        "beat the market without a clear flow signal"
+    assert dp.main_reason(0.009, dict(base, market_ret=0.019, bandar_share=0.8,
+                                      foreign_share=0.8)) == "lagged even though bandar kept buying"
+    assert dp.main_reason(0.005, dict(base, market_ret=0.028)) == \
+        "lagged the market without a clear flow signal"             # not "moved with the market"
     print("  ok why")
+
+
+def test_everyday_words_that_are_tickers_stay_in_the_reason():
+    known = KNOWN | {"NAIK", "LABA", "GOLD", "CUAN", "BELI"}
+    assert cmd("yes BBCA naik terus karena asing masuk", known)[1:4] == (
+        ["BBCA"], None, "naik terus karena asing masuk")
+    assert cmd("yes ANTM gold rally", known)[1] == ["ANTM"]
+    assert cmd("yes bbca, bbri banks", known)[1] == ["BBCA", "BBRI"]
+    assert cmd("yes BBCA BBRI 2w banks", known)[1:3] == (["BBCA", "BBRI"], 10)
+    print("  ok everyday words")
+
+
+def test_stop_ignores_numbers_in_its_text():
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                   [_update(1, "yes BBCA 2w foreign buying")], "42", KNOWN)
+    state, reply = inbox.apply_updates(state, [_update(2, "stop BBCA 10% cuan")], "42", KNOWN)
+    assert "Stopped: BBCA" in reply and dp.active_follows(state["events"]) == {}
+    print("  ok stop with numbers")
+
+
+def test_new_pick_confirmed_by_inbox_restarts_even_if_sent_before_the_finish():
+    t_old, t_reply = 1_758_000_000, 1_758_600_000
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                   [_update(1, "yes AAAZ 5d why", ts=t_old)], "42", KNOWN)
+    first = state["events"][0]["at"]
+    ended = {("AAAZ", first): datetime.fromtimestamp(t_reply + 3600, timezone.utc).isoformat()}
+    # reply sent before the morning run recorded the finish, processed after it
+    state, reply = inbox.apply_updates(state, [_update(2, "yes AAAZ 2w still strong",
+                                                       ts=t_reply)], "42", KNOWN, ended)
+    assert "Your pick: AAAZ" in reply
+    assert dp.active_follows(state["events"], ended)["AAAZ"]["days"] == 10
+    print("  ok no lost re-pick")
+
+
+def test_missing_trading_day_gives_no_win_or_loss():
+    drift = {"AAAA": 0.005, "BBBB": 0.02, "CCCC": 0.02, "DDDD": 0.02}
+    days = panel(10, start="2026-09-07", drift=drift)
+    del days[3]                                              # Thu 10 capture missing
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "n.db")
+        make_db(path, days)
+        conn = sqlite3.connect(path)
+        snaps = dp.load_snapshots(conn)
+        conn.close()
+    lines, result = dp.finish_pick(snaps, "AAAA", 1, 5, "machine")
+    assert lines[0].startswith("⚪ AAAA") and "no market comparison" in lines[0], lines
+    assert result["market_ret"] is None
+    print("  ok gap gives no verdict")
+
+
+def test_stopped_pick_gets_its_result():
+    drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(8, start="2026-09-01", drift=drift)
+    follows = {"last_update_id": 2, "events": [
+        {"update_id": 1, "at": utc_at_myt(days[1][0], 11).isoformat(), "action": "yes",
+         "ticker": "AAAA", "days": 10, "reason": "breakout", "new": True},
+        {"update_id": 2, "at": utc_at_myt(days[4][0], 11).isoformat(), "action": "stop",
+         "ticker": "AAAA"}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:6], follows=follows)
+        status, text = dp.run_morning(utc_at_myt(days[5][0]), lambda t: True, **env)
+        env["neobdm_db"] = os.path.join(tmp, "n7.db")
+        make_db(env["neobdm_db"], days[:7])
+        _, text2 = dp.run_morning(utc_at_myt(days[6][0]), lambda t: True, **env)
+        conn = sqlite3.connect(env["picks_db"])
+        rows = conn.execute("SELECT days, ret, reason FROM pick_results WHERE source='you'").fetchall()
+        conn.close()
+    assert "✅ AAAA (you, stopped after 3 days" in text and "Your reason: breakout" in text, text
+    assert "AAAA (you" not in text2                              # once
+    assert len(rows) == 1 and rows[0][0] == 3 and abs(rows[0][1] - (1.01 ** 3 - 1)) < 1e-9
+    print("  ok stopped picks are scored")
+
+
+def test_machine_does_not_repick_a_stock_it_holds():
+    days = panel(9, start="2026-09-01")
+    for _, rows in days:
+        for t in ("BBBB", "CCCC", "DDDD"):
+            rows[t]["clean_score"] = 0                           # only AAAA qualifies
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:3])
+        texts = []
+        for n in range(3, 10):
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            make_db(env["neobdm_db"], days[:n])
+            texts.append(dp.run_morning(utc_at_myt(days[n - 1][0]), lambda t: True, **env)[1])
+        conn = sqlite3.connect(env["picks_db"])
+        picked = conn.execute("SELECT snapshot_date FROM picks WHERE ticker='AAAA'").fetchall()
+        conn.close()
+    assert "1. AAAA" in texts[0] and "No strong setup today" in texts[1]
+    assert [d for (d,) in picked] == [days[2][0], days[7][0]], picked    # again only after 5 days
+    print("  ok no re-pick while holding")
 
 
 # ── sending ────────────────────────────────────────────────────────────────

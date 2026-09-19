@@ -3,7 +3,8 @@
 Commands (case doesn't matter, a leading "/" and "@botname" are fine):
     yes BBCA 2w bandar accumulating before breakout
         your pick: tickers first, then how long (optional), then WHY
-        (required for a new pick). How long counts trading days: 5d, 2w
+        (required for a new pick). Several stocks: capitals or commas
+        (yes BBCA BBRI ... / yes bbca, bbri ...). How long counts trading days: 5d, 2w
         (=10), 1m (=21), also "10 hari", "2 minggu", "1 bulan", "seminggu",
         "sebulan". Without it: until you say stop. Sending yes again for a
         stock you hold only changes how long, counted from your first yes.
@@ -32,7 +33,7 @@ from daily_picks import (FOLLOWS_JSON, HERE, MAX_FOLLOWS, active_follows,
                          telegram_sender)
 
 COMMAND = re.compile(r"^\s*/?(yes|stop|list)(?:@\w+)?(?:\s+(.*))?$", re.I | re.S)
-TICKER = re.compile(r"([A-Za-z]{4})(?![\w.])[\s,]*")
+TICKER = re.compile(r"([A-Za-z]{4})(?![\w.])([\s,]*)")
 DURATION = re.compile(r"(\d{1,3})\s*(days?|hari|hr|weeks?|wks?|minggu|mgg|months?|mo|bulan|bln"
                       r"|d|w|m)(?![\w.])", re.I)
 WORD_DAYS = re.compile(r"(seminggu|sebulan)(?![\w.])", re.I)
@@ -55,21 +56,27 @@ PROBLEMS = {
 def parse_command(text, known=None):
     """{'action', 'tickers', 'days', 'reason', 'problem'} or None.
 
-    Format: yes TICKER [TICKER ...] [how long] [reason]. With `known`, a
-    4-letter word after the first ticker that is not a real ticker starts the
-    reason (so "yes BBCA high volume" keeps HIGH in the reason)."""
+    Format: yes TICKER [TICKER ...] [how long] [reason]. A second ticker must
+    be typed in CAPITALS or after a comma, so everyday words that happen to be
+    tickers (naik, cuan, laba, gold, bank...) stay in the reason."""
     match = COMMAND.match(text or "")
     if not match:
         return None
+    action = match.group(1).lower()
     rest = (match.group(2) or "").strip()
-    tickers = []
+    tickers, sep = [], ""
     while (token := TICKER.match(rest)):
-        word = token.group(1).upper()
-        if tickers and known is not None and word not in known:
+        typed, word = token.group(1), token.group(1).upper()
+        if tickers and ((known is not None and word not in known)
+                        or not (typed.isupper() or "," in sep)):
             break
         tickers.append(word)
+        sep = token.group(2)
         rest = rest[token.end():]
     days, problem = None, None
+    if action != "yes":                  # stop/list: the rest is free text
+        return {"action": action, "tickers": tickers, "days": None,
+                "reason": rest.strip(), "problem": None}
     found = DURATION.match(rest) or WORD_DAYS.match(rest)
     if found:
         if found.re is WORD_DAYS:
@@ -90,7 +97,7 @@ def parse_command(text, known=None):
     if (not problem and known is not None and len(words) >= 2
             and words[0].upper() in known and DURATION.match(" ".join(words[1:]))):
         problem = "order"
-    return {"action": match.group(1).lower(), "tickers": tickers, "days": days,
+    return {"action": action, "tickers": tickers, "days": days,
             "reason": reason, "problem": problem}
 
 
@@ -152,7 +159,7 @@ def apply_updates(state, updates, chat_id, known, ended=None):
                 if len(active) >= MAX_FOLLOWS:
                     full.append(ticker)
                     continue
-                events.append(event)
+                events.append(dict(event, new=True))
                 active[ticker] = {"at": at, "days": cmd["days"], "reason": cmd["reason"]}
                 added.append((ticker, cmd["days"], cmd["reason"]))
             elif cmd["action"] == "stop" and ticker in active:
