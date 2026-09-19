@@ -67,11 +67,13 @@ def snaps_from(days):
 
 
 def panel(n=12, start="2026-08-03", tickers=("AAAA", "BBBB", "CCCC", "DDDD"), drift=None):
-    """n weekday sessions; each ticker's close grows by its drift per session."""
+    """n weekday sessions; each ticker's close grows by its drift per session.
+    Bandar flow changes a little every day, so no day looks like a copy."""
     drift = drift or {t: 0.0 for t in tickers}
     days = []
     for i, day in enumerate(weekdays(start, n)):
-        days.append((day, {t: row(close=round(1000 * (1 + drift[t]) ** i, 6)) for t in tickers}))
+        days.append((day, {t: row(close=round(1000 * (1 + drift[t]) ** i, 6), m=0.1 + 0.001 * i)
+                           for t in tickers}))
     return days
 
 
@@ -227,8 +229,10 @@ def test_corporate_action_hint_and_limits():
     except Exception as e:
         print(f"  SKIP band cross-check ({type(e).__name__})")
     else:
-        for p in (50, 199, 200, 1000, 5000, 5001, 20000):
+        for p in (50, 199, 1000, 5000, 5001, 20000):
             assert dp.limit_up(p) == price_audit.ara_bound(p), p
+    assert dp.limit_up(200) == 0.35                      # IDX: Rp50-200 is the 35% tier
+    assert dp.corporate_action_hint(200, 270) is None    # a legal ARA from Rp200
     print("  ok corporate actions")
 
 
@@ -255,10 +259,10 @@ def test_follow_lines_report_flow_volume_and_warnings():
     lines = dp.follow_lines(snaps_from(days), "AAAA", since)
     text = "\n".join(lines)
     assert "since yes" in lines[0] and "+15.4%" in lines[0], lines[0]   # 1040 -> 1200
-    assert "Bandar: still buying (3 of last 3" in text
-    assert "Foreign: selling (0 of last 3" in text
+    assert "Bandar bought on 3 of the last 3 days" in text
+    assert "Foreign bought on 0 of the last 3 days" in text
     assert "BK still in today's top 5" in text
-    assert "spike" in text
+    assert "Trading spike" in text
     assert "Ran up 15% in 5 days" in text
     print("  ok follow-up lines")
 
@@ -401,18 +405,19 @@ def test_stale_data_warns_once_and_send_failure_saves_nothing():
     days = panel(8, start="2026-09-07")
     with tempfile.TemporaryDirectory() as tmp:
         env = _morning_env(tmp, days)
-        sent = []
-        send = lambda t: sent.append(t) or True
-        later = utc_at_myt("2026-09-17")                  # no capture for this day
-        assert dp.run_morning(later, send, **env)[0] == "stale"
-        assert dp.run_morning(later, send, **env)[0] == "stale_already_warned"
-        assert len(sent) == 1 and "No fresh NeoBDM data" in sent[0]
         status, _ = dp.run_morning(utc_at_myt(days[-1][0]), lambda t: False, **env)
         assert status == "send_failed"
         conn = sqlite3.connect(env["picks_db"])
         assert conn.execute("SELECT count(*) FROM picks").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM tag_weights").fetchone()[0] == 0
         conn.close()
+        sent = []
+        send = lambda t: sent.append(t) or True
+        assert dp.run_morning(utc_at_myt(days[-1][0]), send, **env)[0] == "sent"
+        later = utc_at_myt("2026-09-17")                  # no capture for this day
+        assert dp.run_morning(later, send, **env)[0] == "stale"
+        assert dp.run_morning(later, send, **env)[0] == "stale_already_warned"
+        assert len(sent) == 2 and "No fresh NeoBDM data" in sent[1]
     print("  ok stale and failed sends")
 
 
@@ -437,13 +442,86 @@ def test_failed_neobdm_list_says_unavailable_not_empty():
         conn = sqlite3.connect(path)
         conn.execute("INSERT INTO signal_source_status VALUES "
                      "('2026-09-17', 'dashboard_Bandarmologi', 'EMPTY_UNVERIFIED')")
+        conn.execute("INSERT INTO signal_source_status VALUES "
+                     "('2026-09-17', 'dashboard_Foreign', 'NO_HITS')")
         conn.commit()
         lists = dp.neobdm_lists(conn, "2026-09-17")
         conn.close()
     text = dp.format_morning(date(2026, 9, 17), dp.Snapshot("2026-09-17", {}), [], {}, {},
                              [], lists, 4)
     assert "Stalker: AAAA" in text and "Bandar: unavailable" in text and "Foreign: -" in text
+    assert "Non-retail: unavailable" in text             # no status row = not tracked
     print("  ok unavailable lists")
+
+
+def test_yes_reference_is_the_message_the_owner_saw():
+    days = panel(5, start="2026-09-14")                 # captures Mon 14 .. Fri 18
+    days[3][1]["AAAA"] = row(close=900)                 # Thu 17 capture shows 900
+    snaps = snaps_from(days)
+    sent_at = {"2026-09-17": utc_at_myt("2026-09-17", 9, 20).isoformat()}
+    before = utc_at_myt("2026-09-17", 9, 10).isoformat()
+    after = utc_at_myt("2026-09-17", 9, 30).isoformat()
+    assert snaps[dp.reference_index(snaps, "AAAA", before, sent_at)].date == "2026-09-16"
+    assert snaps[dp.reference_index(snaps, "AAAA", after, sent_at)].date == "2026-09-17"
+    del days[3][1]["BBBB"]
+    assert dp.reference_index(snaps_from(days), "BBBB", after, sent_at) is None  # no older price
+    print("  ok yes price = price in the message")
+
+
+def test_missed_capture_marks_a_gap_and_blocks_returns_across_it():
+    days = panel(10, start="2026-09-07")                # Mon 07 .. Fri 18
+    del days[2]                                          # Wed 09 capture missing
+    snaps = snaps_from([])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "n.db")
+        make_db(path, days)
+        conn = sqlite3.connect(path)
+        snaps = dp.load_snapshots(conn)
+        conn.close()
+    gaps = [s.date for s in snaps if s.gap_before]
+    assert gaps == ["2026-09-10"], gaps
+    assert dp.session_returns(snaps, 1, 3) == {}         # window crosses the lost session
+    assert dp.session_returns(snaps, 2, 4) != {}
+    print("  ok lost session detected")
+
+
+def test_holiday_copy_is_not_a_gap():
+    days = panel(4, start="2026-09-14")                 # captures Mon 14 .. Thu 17
+    wed = days[2][1]
+    days = days[:3] + [("2026-09-17", {t: dict(r) for t, r in wed.items()}),  # copy: Wed holiday
+                       ("2026-09-18", days[3][1])]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "n.db")
+        make_db(path, days)
+        conn = sqlite3.connect(path)
+        snaps = dp.load_snapshots(conn)
+        conn.close()
+    assert not any(s.gap_before for s in snaps), [(s.date, s.gap_before) for s in snaps]
+    print("  ok holiday is not a gap")
+
+
+def test_split_after_yes_is_not_shown_as_a_loss():
+    days = panel(8, start="2026-09-07")
+    for d, rows in days[4:]:
+        rows["AAAA"] = row(close=200)                   # 1000 -> 200 (1:5) after the yes
+    lines = dp.follow_lines(snaps_from(days), "AAAA", utc_at_myt(days[2][0], 11).isoformat())
+    assert "not comparable" in lines[0] and "1:5" in lines[0] and "%" not in lines[0], lines[0]
+    print("  ok split not shown as a loss")
+
+
+def test_monday_after_late_scrape_still_sends_fridays_session():
+    days = panel(5, start="2026-09-07")                 # Mon 07 .. Fri 11 captures
+    days.append(("2026-09-12", {t: row(close=1010) for t in ("AAAA", "BBBB", "CCCC", "DDDD")}))
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:5])               # what existed on Friday
+        sent = []
+        send = lambda t: sent.append(t) or True
+        assert dp.run_morning(utc_at_myt("2026-09-11"), send, **env)[0] == "sent"
+        env["neobdm_db"] = os.path.join(tmp, "monday.db")
+        make_db(env["neobdm_db"], days)                 # + Saturday's capture, no Monday rows
+        status, text = dp.run_morning(utc_at_myt("2026-09-14", 10, 30), send, **env)
+    assert status == "sent" and "From the Fri 11 Sep close" in text, (status, text)
+    print("  ok Monday late scrape")
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

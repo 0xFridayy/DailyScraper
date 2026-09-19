@@ -46,7 +46,7 @@ SPLIT_FACTORS = (2, 3, 4, 5, 10, 20, 25)
 # weekly learning step moves the weights; nothing here is proven yet.
 TAG_ORDER = ("broad_buying", "inst_foreign", "bandar_3days", "stalker", "value_up")
 TAG_LABEL = {
-    "broad_buying": "Most big-money groups buying",
+    "broad_buying": "Clean score +3 or more",
     "inst_foreign": "Local funds + foreigners buying",
     "bandar_3days": "Bandar bought 3 days in a row",
     "stalker": "Retail sold, big broker picked it up",
@@ -56,7 +56,10 @@ TAG_LABEL = {
 FIELDS = ("close", "high", "low", "m_dn_0", "nr_dn_0", "f_dn_0", "m_cn_5",
           "clean_score", "tval", "pct_5", "top_5_buyer")
 
-Snapshot = namedtuple("Snapshot", "date rows")
+# gap_before: a trading session between this snapshot and the previous one
+# was never captured (e.g. the scrape ran after 10:00 MYT), so returns and
+# streaks across it would silently span an extra session.
+Snapshot = namedtuple("Snapshot", "date rows gap_before", defaults=(False,))
 
 
 # ── Loading ────────────────────────────────────────────────────────────────
@@ -78,6 +81,32 @@ def _is_copy(prev_rows, rows):
     return same / len(common) > COPY_SHARE
 
 
+def _session_of(capture_date):
+    """A capture on day D holds the previous weekday's session."""
+    d = date.fromisoformat(capture_date) - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _lost_session(prev_date, cur_date, captured):
+    """True if a weekday session between two kept snapshots was never
+    captured at all. A holiday still leaves a (copy) capture the next day, so
+    it doesn't count; a missed or late scrape leaves no row."""
+    s = _session_of(prev_date) + timedelta(days=1)
+    end = _session_of(cur_date)
+    while s < end:
+        if s.weekday() < 5:
+            first = last = s + timedelta(days=1)    # captures that would hold s
+            while last.weekday() >= 5:
+                last += timedelta(days=1)
+            if not any((first + timedelta(days=i)).isoformat() in captured
+                       for i in range((last - first).days + 1)):
+                return True
+        s += timedelta(days=1)
+    return False
+
+
 def load_snapshots(conn):
     """One Snapshot per real trading session, oldest first."""
     by_date = {}
@@ -88,8 +117,13 @@ def load_snapshots(conn):
     for day in sorted(by_date):
         if snaps and _is_copy(snaps[-1].rows, by_date[day]):
             continue
-        snaps.append(Snapshot(day, by_date[day]))
+        gap = bool(snaps) and _lost_session(snaps[-1].date, day, by_date)
+        snaps.append(Snapshot(day, by_date[day], gap))
     return snaps
+
+
+def _gap_inside(snaps, a, b):
+    return any(snaps[j].gap_before for j in range(max(a, 0) + 1, b + 1))
 
 
 def latest_capture_date(conn):
@@ -127,21 +161,23 @@ def neobdm_lists(conn, capture_date):
             if source:
                 lists.setdefault(source, []).append(ticker)
     try:
-        for source, status in conn.execute(
-                "SELECT source, status FROM signal_source_status WHERE flag_date = ?",
-                (capture_date,)):
-            if status not in ("HITS", "NO_HITS"):
-                lists[source] = None
+        status = dict(conn.execute(
+            "SELECT source, status FROM signal_source_status WHERE flag_date = ?",
+            (capture_date,)).fetchall())
     except sqlite3.OperationalError:
-        pass  # older DBs have no status table
+        return lists  # older DBs have no status table
+    for source, _ in LIST_NAMES:
+        if status.get(source) not in ("HITS", "NO_HITS"):
+            lists[source] = None   # failed, or tracking was skipped that morning
     return lists
 
 
 # ── Price helpers ──────────────────────────────────────────────────────────
 
 def limit_up(prev_close):
-    """IDX auto-reject upper band; same tiers as price_audit.ara_bound."""
-    if prev_close < 200:
+    """IDX auto-reject upper band: Rp50-200 35%, >200-5000 25%, >5000 20%.
+    (price_audit.ara_bound puts exactly Rp200 in the 25% tier.)"""
+    if prev_close <= 200:
         return 0.35
     if prev_close <= 5000:
         return 0.25
@@ -175,11 +211,25 @@ def day_move(snaps, k, ticker):
     return cur / prev - 1 if prev and cur else None
 
 
+def price_break(snaps, a, b, ticker):
+    """First likely corporate action between snapshots a and b, comparing each
+    available close with the previous available one (so a split on a day the
+    name was missing from the list is still caught): (index, hint) or None."""
+    prev = None
+    for j in range(max(a, 0), b + 1):
+        close = _close(snaps, j, ticker)
+        if close is None:
+            continue
+        if prev is not None:
+            hint = corporate_action_hint(prev, close)
+            if hint:
+                return j, hint
+        prev = close
+    return None
+
+
 def recent_corporate_action(snaps, k, ticker, sessions=5):
-    for j in range(max(1, k - sessions + 1), k + 1):
-        if corporate_action_hint(_close(snaps, j - 1, ticker), _close(snaps, j, ticker)):
-            return True
-    return False
+    return price_break(snaps, k - sessions, k, ticker) is not None
 
 
 def value_ratio(snaps, k, ticker, lookback=5, min_prior=3):
@@ -229,7 +279,8 @@ def tag_snapshot(snaps, k, stalker=frozenset()):
         nr, fr = _num(row, "nr_dn_0"), _num(row, "f_dn_0")
         if nr is not None and fr is not None and nr > 0 and fr > 0:
             tags.append("inst_foreign")
-        if k >= 2 and _buying_days(snaps, k, ticker, "m_dn_0") == (3, 3):
+        if (k >= 2 and not _gap_inside(snaps, k - 2, k)
+                and _buying_days(snaps, k, ticker, "m_dn_0") == (3, 3)):
             tags.append("bandar_3days")
         if ticker in stalker:
             tags.append("stalker")
@@ -260,7 +311,7 @@ def rank_picks(tagged, weights, n=N_PICKS):
 
 def reason_text(tag, row, ratio):
     if tag == "broad_buying":
-        return f"Most big-money groups buying (flow score {int(row['clean_score']):+d})"
+        return f"Clean score {int(row['clean_score']):+d} (most money groups buying)"
     if tag == "value_up" and ratio is not None:
         return f"Trading value {ratio:.1f}x its normal"
     return TAG_LABEL[tag]
@@ -275,14 +326,16 @@ def pick_reason(cand, weights):
 
 def session_returns(snaps, entry, exit_):
     """{ticker: close-to-close return} from snapshot entry to exit, skipping
-    names with a likely corporate action inside the window."""
+    names with a likely corporate action inside the window. Empty when a
+    session inside the window was never captured."""
+    if _gap_inside(snaps, entry, exit_):
+        return {}
     rets = {}
     for ticker, row in snaps[exit_].rows.items():
         start, end = _close(snaps, entry, ticker), _num(row, "close")
         if not start or not end:
             continue
-        if any(corporate_action_hint(_close(snaps, j - 1, ticker), _close(snaps, j, ticker))
-               for j in range(entry + 1, exit_ + 1)):
+        if price_break(snaps, entry, exit_, ticker):
             continue
         rets[ticker] = end / start - 1
     return rets
@@ -307,8 +360,9 @@ def _mean(values):
 def learn_weights(snaps, stalker, down, h=HORIZON):
     """Per tag: the average excess return of tagged names in each session whose
     outcome has already happened (each name capped at +/-15%), shrunk toward
-    neutral so a few lucky weeks can't swing it:
-        weight = clip(1 + 0.5 * s/(s+20) * avg_excess_pct, 0.25, 2.0)
+    neutral so a few lucky weeks can't swing it. Neighbouring 5-session
+    windows share days, so only s/h of the s sessions count as independent:
+        weight = clip(1 + 0.5 * n/(n+20) * avg_excess_pct, 0.25, 2.0), n = s/h
     Only uses snapshots inside `snaps`; pass exactly what was known then."""
     per_tag = {t: [] for t in TAG_ORDER}
     for k in range(len(snaps) - 1 - h):
@@ -328,7 +382,8 @@ def learn_weights(snaps, stalker, down, h=HORIZON):
     for tag, sessions in per_tag.items():
         s = len(sessions)
         avg_pct = 100 * _mean(sessions) if s else 0.0
-        weight = max(0.25, min(2.0, 1 + 0.5 * (s / (s + 20)) * avg_pct))
+        n = s / h
+        weight = max(0.25, min(2.0, 1 + 0.5 * (n / (n + 20)) * avg_pct))
         result[tag] = {"weight": weight, "sessions": s, "avg_excess_pct": avg_pct}
     return result
 
@@ -362,19 +417,27 @@ def active_follows(events):
     return active
 
 
-def reference_index(snaps, ticker, since_utc):
-    """Last snapshot the owner could have seen when saying yes. Today's
-    snapshot usually lands ~09:15-10:00 MYT, so a reply before 10:00 MYT uses
-    the previous one."""
-    local = datetime.fromisoformat(since_utc).astimezone(MYT)
-    cutoff = local.date() if local.hour >= 10 else local.date() - timedelta(days=1)
+def reference_index(snaps, ticker, since_utc, sent_at=None):
+    """The snapshot the owner was looking at when saying yes: the latest one
+    whose morning message went out before the reply. Without a sent record
+    (weekends, first run) a snapshot counts once its day is over or it is
+    past 10:00 MYT that day. None if that snapshot doesn't have the stock -
+    never an older price."""
+    since = datetime.fromisoformat(since_utc)
+    local = since.astimezone(MYT)
     for j in range(len(snaps) - 1, -1, -1):
-        if date.fromisoformat(snaps[j].date) <= cutoff and ticker in snaps[j].rows:
-            return j
+        sent = (sent_at or {}).get(snaps[j].date)
+        if sent is not None:
+            visible = datetime.fromisoformat(sent) <= since
+        else:
+            day = date.fromisoformat(snaps[j].date)
+            visible = day < local.date() or (day == local.date() and local.hour >= 10)
+        if visible:
+            return j if ticker in snaps[j].rows else None
     return None
 
 
-def follow_lines(snaps, ticker, since_utc):
+def follow_lines(snaps, ticker, since_utc, sent_at=None):
     k = len(snaps) - 1
     row = snaps[k].rows.get(ticker)
     if row is None or not _num(row, "close"):
@@ -383,28 +446,28 @@ def follow_lines(snaps, ticker, since_utc):
         return [f"{ticker}: no NeoBDM data today (not in the liquid list).{tail}"]
 
     lines = []
-    ref = reference_index(snaps, ticker, since_utc)
+    ref = reference_index(snaps, ticker, since_utc, sent_at)
     close = _num(row, "close")
-    if ref is not None and ref < k and _close(snaps, ref, ticker) and close:
+    broke = price_break(snaps, ref, k, ticker) if ref is not None else None
+    if broke:
+        lines.append(f"{ticker}  Rp {close:,.0f} - not comparable with your yes price: "
+                     f"{broke[1]} around {session_label(snaps[broke[0]].date)}")
+    elif ref is not None and ref < k and _close(snaps, ref, ticker) and close:
         start = _close(snaps, ref, ticker)
         rets = session_returns(snaps, ref, k)
         market = f", market {_mean(rets.values()) * 100:+.1f}%" if rets else ""
         lines.append(f"{ticker}  {(close / start - 1) * 100:+.1f}% since yes "
                      f"(Rp {start:,.0f} → {close:,.0f}{market})")
+    elif ref == k:
+        lines.append(f"{ticker}  Rp {close:,.0f} (you said yes at this price)")
     else:
-        lines.append(f"{ticker}  Rp {close:,.0f} (followed from today)")
+        lines.append(f"{ticker}  Rp {close:,.0f} (no NeoBDM price from the day you said yes)")
 
     for label, field in (("Bandar", "m_dn_0"), ("Foreign", "f_dn_0")):
         buys, seen = _buying_days(snaps, k, ticker, field)
         if seen == 0:
             continue
-        if buys == seen:
-            state = "still buying"
-        elif buys == 0:
-            state = "selling"
-        else:
-            state = "mixed"
-        lines.append(f" • {label}: {state} ({buys} of last {seen} days buying)")
+        lines.append(f" • {label} bought on {buys} of the last {seen} days")
 
     if ref is not None:
         then = _top_buyers(snaps[ref].rows.get(ticker))[:2]
@@ -422,7 +485,7 @@ def follow_lines(snaps, ticker, since_utc):
             note = "drying up"
         else:
             note = "normal"
-        lines.append(f" • Trading: {ratio:.1f}x normal - {note}")
+        lines.append(f" • Trading {note} ({ratio:.1f}x its usual value)")
 
     lines += [f" ⚠️ {w}" for w in warnings(snaps, k, ticker)]
     return lines
@@ -437,9 +500,9 @@ def warnings(snaps, k, ticker):
         out.append(f"Ran up {pct5:.0%} in 5 days on heavy trading. Sharp drops follow "
                    "this pattern about 2x more often than usual - don't chase the open.")
     move = day_move(snaps, k, ticker)
-    hint = corporate_action_hint(_close(snaps, k - 1, ticker), _close(snaps, k, ticker)) if k else None
-    if hint:
-        out.append(f"{hint.capitalize()} - check IDX announcements; the numbers above may be off.")
+    broke = price_break(snaps, k - 5, k, ticker)
+    if broke and broke[0] == k:
+        out.append(f"{broke[1].capitalize()} - check IDX announcements; the numbers above may be off.")
     elif move is not None and move <= -0.14:
         out.append(f"Fell {move:.0%} yesterday (near the daily floor). About 1 in 5 do it "
                    "again the next day.")
@@ -533,12 +596,14 @@ def format_morning(today, snap, picks, tagged, weights, follow_blocks, lists, n_
 def format_scoreboard(snaps, conn, learned, previous):
     lines = ["📊 Weekly scoreboard"]
     index = {s.date: i for i, s in enumerate(snaps)}
-    done = []
+    done, unscored = [], 0
     for snap_date, ticker in conn.execute("SELECT snapshot_date, ticker FROM picks"):
-        if snap_date in index:
+        if snap_date in index and index[snap_date] + 1 + HORIZON < len(snaps):
             result = forward_excess(snaps, index[snap_date], ticker)
             if result:
                 done.append((ticker, *result))
+            else:
+                unscored += 1
     if done:
         excess = [x for _, _, x in done]
         best = max(done, key=lambda d: d[2])
@@ -546,12 +611,15 @@ def format_scoreboard(snaps, conn, learned, previous):
         lines.append(f"My picks after 1 week: {len(done)} scored, {_mean(excess) * 100:+.1f}% "
                      f"vs the average stock, {sum(x > 0 for x in excess)}/{len(done)} beat it. "
                      f"Best {best[0]} {best[2] * 100:+.1f}%, worst {worst[0]} {worst[2] * 100:+.1f}%.")
-    else:
+    elif not unscored:
         lines.append("My picks: none old enough to score yet (a pick needs 6 trading days).")
+    if unscored:
+        lines.append(f"{unscored} pick(s) left NeoBDM's list, had a split or hit a data gap "
+                     "- not scored.")
     lines.append("Signals, 1-week result vs the average stock (weight old → new):")
     for tag in TAG_ORDER:
         info = learned[tag]
-        early = " - too early" if info["sessions"] < 30 else ""
+        early = " - too early" if info["sessions"] < 60 else ""
         lines.append(f" • {TAG_LABEL[tag]}: {info['avg_excess_pct']:+.1f}% over "
                      f"{info['sessions']} days ({previous.get(tag, 1.0):.2f} → "
                      f"{info['weight']:.2f}){early}")
@@ -646,7 +714,8 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
     conn = sqlite3.connect(":memory:" if preview else picks_db)
     try:
         ensure_schema(conn)
-        if captured != today.isoformat() and not preview:
+        fresh_unsent = bool(snaps) and not already_sent(conn, "morning", snaps[-1].date)
+        if captured != today.isoformat() and not preview and not fresh_unsent:
             if already_sent(conn, "stale", today.isoformat()):
                 return "stale_already_warned", None
             text = ("⚠️ No fresh NeoBDM data this morning (the scrape ran late or "
@@ -677,7 +746,10 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         tagged = tag_snapshot(snaps, k, stalker.get(snap.date, frozenset()))
         picks = rank_picks(tagged, weights)
         follows = active_follows(load_follows(follows_json).get("events", []))
-        blocks = [follow_lines(snaps, t, since) for t, since in list(follows.items())[:MAX_FOLLOWS]]
+        sent_at = dict(conn.execute(
+            "SELECT key, sent_utc FROM sent_messages WHERE kind = 'morning'").fetchall())
+        blocks = [follow_lines(snaps, t, since, sent_at)
+                  for t, since in list(follows.items())[:MAX_FOLLOWS]]
         text = format_morning(today, snap, picks, tagged, weights, blocks, lists, len(snaps))
         if weekly:
             text += "\n\n" + format_scoreboard(snaps, conn, learned, previous)
