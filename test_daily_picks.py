@@ -277,15 +277,31 @@ def test_follow_of_unknown_stock_says_so():
 # ── telegram inbox ─────────────────────────────────────────────────────────
 
 def test_parse_command_variants():
-    assert inbox.parse_command("yes bbca") == ("yes", ["BBCA"])
-    assert inbox.parse_command("/YES@my_bot BBCA, bbri") == ("yes", ["BBCA", "BBRI"])
-    assert inbox.parse_command("Stop BBCA") == ("stop", ["BBCA"])
-    assert inbox.parse_command("list") == ("list", [])
+    assert inbox.parse_command("yes bbca") == ("yes", ["BBCA"], None)
+    assert inbox.parse_command("/YES@my_bot BBCA, bbri") == ("yes", ["BBCA", "BBRI"], None)
+    assert inbox.parse_command("Stop BBCA") == ("stop", ["BBCA"], None)
+    assert inbox.parse_command("list") == ("list", [], None)
     assert inbox.parse_command("yessir BBCA") is None
     assert inbox.parse_command("hello") is None
     assert inbox.parse_command(None) is None
-    assert inbox.parse_command("yes BBCAX") == ("yes", [])
+    assert inbox.parse_command("yes BBCAX") == ("yes", [], None)
     print("  ok command parsing")
+
+
+def test_parse_durations_in_trading_days():
+    cases = {
+        "yes BBCA 5d": 5, "yes BBCA 2w": 10, "yes bbca 1m": 21, "yes BBCA 3 days": 3,
+        "yes BBCA 10 hari": 10, "yes BBCA 2 minggu": 10, "yes BBCA 1 bulan": 21,
+        "yes BBCA 1 week": 5, "yes BBCA 2 months": 42, "yes BBCA 1mo": 21,
+        "yes BBCA": None, "yes BBCA 0d": None, "yes BBCA 99m": None,   # 0 and >1 year ignored
+    }
+    for text, days in cases.items():
+        action, tickers, got = inbox.parse_command(text)
+        assert (action, tickers, got) == ("yes", ["BBCA"], days), (text, tickers, got)
+    # the unit words are never read as tickers, and one duration covers all tickers
+    assert inbox.parse_command("yes BBCA BBRI 2 week") == ("yes", ["BBCA", "BBRI"], 10)
+    assert inbox.parse_command("yes 10 hari TLKM") == ("yes", ["TLKM"], 10)
+    print("  ok durations")
 
 
 def _update(uid, text, chat=42, ts=1_758_000_000):
@@ -301,8 +317,10 @@ def test_apply_updates_follow_stop_cap_and_idempotency():
         _update(3, "stop BBRI"),
     ], "42", known)
     assert state["last_update_id"] == 3
-    assert dp.active_follows(state["events"]) == {"BBCA": state["events"][0]["at"]}
-    assert "Following: BBCA, BBRI" in reply and "XXXX" in reply and "Stopped: BBRI" in reply
+    assert dp.active_follows(state["events"]) == {
+        "BBCA": {"at": state["events"][0]["at"], "days": None}}
+    assert "Following: BBCA (until you say stop), BBRI (until you say stop)" in reply
+    assert "XXXX" in reply and "Stopped: BBRI" in reply
     again, reply2 = inbox.apply_updates(state, [_update(1, "yes BBCA BBRI XXXX")], "42", known)
     assert again["events"] == state["events"]     # replayed update not applied twice
     many = [_update(10 + i, f"yes A{c}AZ") for i, c in enumerate("ABCDEFGHIJ")]
@@ -312,6 +330,71 @@ def test_apply_updates_follow_stop_cap_and_idempotency():
     _, quiet = inbox.apply_updates(state, [_update(40, "good morning")], "42", known)
     assert quiet is None
     print("  ok inbox")
+
+
+def test_inbox_durations_change_and_list():
+    known = {"BBCA", "BBRI"}
+    state, reply = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                       [_update(1, "yes BBCA 2w")], "42", known)
+    assert "Following: BBCA (10 trading days)" in reply
+    state, reply = inbox.apply_updates(state, [_update(2, "yes BBCA 1m"),
+                                               _update(3, "yes BBRI"),
+                                               _update(4, "yes BBRI")], "42", known)
+    follows = dp.active_follows(state["events"])
+    assert follows["BBCA"] == {"at": state["events"][0]["at"], "days": 21}  # same start
+    assert "Changed: BBCA (21 trading days)" in reply and "Already following: BBRI" in reply
+    assert "Following (2/10): BBCA (21 trading days), BBRI (until you say stop)" in reply
+    print("  ok duration changes")
+
+
+def test_finished_follow_frees_its_slot_and_can_restart():
+    known = {f"A{c}AZ" for c in "ABCDEFGHIJ"} | {"BBCA"}
+    ten = [_update(1 + i, f"yes A{c}AZ 5d") for i, c in enumerate("ABCDEFGHIJ")]
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []}, ten, "42", known)
+    first = state["events"][0]
+    ended = frozenset({(first["ticker"], first["at"])})              # AAAZ's 5 days are up
+    state, reply = inbox.apply_updates(state, [_update(20, "yes BBCA")], "42", known, ended)
+    assert "Following: BBCA" in reply and "(10/10)" in reply        # the ended one freed a slot
+    state, _ = inbox.apply_updates(state, [_update(21, "stop BBCA"),
+                                           _update(22, "yes AAAZ", ts=1_759_000_000)],
+                                   "42", known, ended)
+    again = dp.active_follows(state["events"], ended)["AAAZ"]
+    assert again["at"] != first["at"] and again["days"] is None     # a fresh follow
+    print("  ok finished follows free a slot")
+
+
+def test_timed_follow_shows_days_then_finishes_once_and_is_recorded():
+    drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(10, start="2026-09-01", drift=drift)          # Tue 01 .. Mon 14
+    yes_at = utc_at_myt(days[2][0], 11).isoformat()             # yes on the Thu 03 snapshot
+    follows = {"last_update_id": 1, "events": [
+        {"update_id": 1, "at": yes_at, "action": "yes", "ticker": "AAAA", "days": 3}]}
+    texts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:4], follows=follows)
+        for n in (4, 5, 6):                                      # three mornings in a row
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            make_db(env["neobdm_db"], days[:n])
+            status, text = dp.run_morning(utc_at_myt(days[n - 1][0]), lambda t: True, **env)
+            assert status == "sent", status
+            texts.append(text)
+        conn = sqlite3.connect(env["picks_db"])
+        rows = conn.execute("SELECT ticker, days, ended_snapshot, ret FROM follow_results").fetchall()
+        conn.close()
+    assert "day 1 of 3" in texts[0] and "day 2 of 3" in texts[1], texts[:2]
+    assert "🏁 AAAA: your 3-day follow is done: +3.0% since yes" in texts[2], texts[2]
+    assert rows == [("AAAA", 3, days[5][0], rows[0][3])] and abs(rows[0][3] - (1.01 ** 3 - 1)) < 1e-9
+    with tempfile.TemporaryDirectory() as tmp:                   # next day: gone
+        env2 = _morning_env(tmp, days[:7], follows=follows)
+        conn = sqlite3.connect(env2["picks_db"])
+        dp.ensure_schema(conn)
+        conn.execute("INSERT INTO follow_results VALUES ('AAAA', ?, 3, ?, 0.03, 0.0, 'x')",
+                     (yes_at, days[5][0]))
+        conn.commit()
+        conn.close()
+        status, text = dp.run_morning(utc_at_myt(days[6][0]), lambda t: True, **env2)
+    assert status == "sent" and "👀 Your stocks" not in text and "🏁" not in text, text
+    print("  ok timed follow")
 
 
 # ── sending ────────────────────────────────────────────────────────────────

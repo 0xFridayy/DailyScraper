@@ -406,15 +406,44 @@ def save_follows(path, state):
     os.replace(tmp, path)
 
 
-def active_follows(events):
-    """{ticker: time of the 'yes' that started the current follow}."""
+def active_follows(events, ended=frozenset()):
+    """{ticker: {"at": time of the yes that started the follow,
+                 "days": trading days to follow, or None = until stop}}.
+
+    A 'yes' with a duration on a stock already followed only changes the
+    duration. `ended` holds (ticker, at) pairs of timed follows that already
+    finished; those are dropped, and a later 'yes' starts a fresh follow."""
     active = {}
     for event in events:
+        ticker = event["ticker"]
+        current = active.get(ticker)
         if event["action"] == "yes":
-            active.setdefault(event["ticker"], event["at"])
+            if current is None or (ticker, current["at"]) in ended:
+                active[ticker] = {"at": event["at"], "days": event.get("days")}
+            elif "days" in event:
+                current["days"] = event["days"]
         elif event["action"] == "stop":
-            active.pop(event["ticker"], None)
-    return active
+            active.pop(ticker, None)
+    return {t: f for t, f in active.items() if (t, f["at"]) not in ended}
+
+
+def ended_follows(conn):
+    """(ticker, at) of timed follows that already finished."""
+    return frozenset(conn.execute("SELECT ticker, since_at FROM follow_results").fetchall())
+
+
+def ended_follows_from_file(path=None):
+    """Same, read-only from daily_picks.db; empty if it doesn't exist yet."""
+    path = path or PICKS_DB
+    if not os.path.exists(path):
+        return frozenset()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return ended_follows(conn)
+    except sqlite3.Error:
+        return frozenset()
+    finally:
+        conn.close()
 
 
 def reference_index(snaps, ticker, since_utc, sent_at=None):
@@ -491,6 +520,49 @@ def follow_lines(snaps, ticker, since_utc, sent_at=None):
     return lines
 
 
+def _sessions_since(snaps, since_utc, ref):
+    """Trading sessions that have closed since the yes."""
+    if ref is not None:
+        return len(snaps) - 1 - ref
+    day = datetime.fromisoformat(since_utc).astimezone(MYT).date()
+    return sum(1 for s in snaps if date.fromisoformat(s.date) > day)
+
+
+def follow_block(snaps, ticker, follow, sent_at=None):
+    """(message lines, result dict or None). A timed follow whose days are
+    up gets one final line and a result to record; otherwise the normal
+    follow-up lines, with 'day X of N' for timed follows."""
+    since, days = follow["at"], follow.get("days")
+    ref = reference_index(snaps, ticker, since, sent_at)
+    elapsed = _sessions_since(snaps, since, ref)
+    if days is None or elapsed < days:
+        lines = follow_lines(snaps, ticker, since, sent_at)
+        if days is not None:
+            lines[0] += f" · day {elapsed} of {days}"
+        return lines, None
+
+    result = {"ticker": ticker, "since_at": since, "days": days,
+              "ended_snapshot": snaps[-1].date, "ret": None, "market_ret": None}
+    head = f"🏁 {ticker}: your {days}-day follow is done"
+    if ref is None:
+        return [f"{head} (no NeoBDM price from the day you said yes)."], result
+    exit_ = min(ref + days, len(snaps) - 1)
+    result["ended_snapshot"] = snaps[exit_].date
+    start, end = _close(snaps, ref, ticker), _close(snaps, exit_, ticker)
+    broke = price_break(snaps, ref, exit_, ticker)
+    if not start or not end or broke:
+        why = broke[1] if broke else "no price at the end"
+        return [f"{head} - result not comparable ({why})."], result
+    result["ret"] = end / start - 1
+    rets = session_returns(snaps, ref, exit_)
+    market = ""
+    if rets:
+        result["market_ret"] = _mean(rets.values())
+        market = f", market {result['market_ret'] * 100:+.1f}%"
+    return [f"{head}: {result['ret'] * 100:+.1f}% since yes "
+            f"(Rp {start:,.0f} → {end:,.0f}{market})"], result
+
+
 def warnings(snaps, k, ticker):
     row = snaps[k].rows.get(ticker)
     out = []
@@ -523,6 +595,10 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sent_messages (
         kind TEXT NOT NULL, key TEXT NOT NULL, sent_utc TEXT NOT NULL,
         text TEXT NOT NULL, PRIMARY KEY (kind, key))""",
+    """CREATE TABLE IF NOT EXISTS follow_results (
+        ticker TEXT NOT NULL, since_at TEXT NOT NULL, days INTEGER NOT NULL,
+        ended_snapshot TEXT NOT NULL, ret REAL, market_ret REAL,
+        recorded_utc TEXT NOT NULL, PRIMARY KEY (ticker, since_at))""",
 ]
 
 
@@ -588,7 +664,7 @@ def format_morning(today, snap, picks, tagged, weights, follow_blocks, lists, n_
                             else ", ".join(lists.get(src) or []) or "-")
              for src, name in LIST_NAMES]
     lines += ["", "📋 NeoBDM lists · " + " · ".join(shown),
-              "", "Reply: yes TICKER · stop TICKER · list",
+              "", "Reply: yes TICKER (add 5d / 2w / 1m for how long) · stop TICKER · list",
               f"Not proven yet - tested on {n_sessions} trading days so far."]
     return "\n".join(lines)
 
@@ -616,6 +692,12 @@ def format_scoreboard(snaps, conn, learned, previous):
     if unscored:
         lines.append(f"{unscored} pick(s) left NeoBDM's list, had a split or hit a data gap "
                      "- not scored.")
+    mine = conn.execute("SELECT ret, market_ret FROM follow_results "
+                        "WHERE ret IS NOT NULL AND market_ret IS NOT NULL").fetchall()
+    if mine:
+        excess = [r - m for r, m in mine]
+        lines.append(f"Your finished follows: {len(mine)}, {_mean(excess) * 100:+.1f}% vs the "
+                     f"market on average, {sum(x > 0 for x in excess)}/{len(mine)} beat it.")
     lines.append("Signals, 1-week result vs the average stock (weight old → new):")
     for tag in TAG_ORDER:
         info = learned[tag]
@@ -745,11 +827,16 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
 
         tagged = tag_snapshot(snaps, k, stalker.get(snap.date, frozenset()))
         picks = rank_picks(tagged, weights)
-        follows = active_follows(load_follows(follows_json).get("events", []))
+        follows = active_follows(load_follows(follows_json).get("events", []),
+                                 ended_follows(conn))
         sent_at = dict(conn.execute(
             "SELECT key, sent_utc FROM sent_messages WHERE kind = 'morning'").fetchall())
-        blocks = [follow_lines(snaps, t, since, sent_at)
-                  for t, since in list(follows.items())[:MAX_FOLLOWS]]
+        blocks, finished = [], []
+        for ticker, follow in list(follows.items())[:MAX_FOLLOWS]:
+            lines, result = follow_block(snaps, ticker, follow, sent_at)
+            blocks.append(lines)
+            if result:
+                finished.append(result)
         text = format_morning(today, snap, picks, tagged, weights, blocks, lists, len(snaps))
         if weekly:
             text += "\n\n" + format_scoreboard(snaps, conn, learned, previous)
@@ -764,6 +851,10 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
             [(snap.date, t, i, score, ",".join(tagged[t]["tags"]),
               pick_reason(tagged[t], weights), _num(tagged[t]["row"], "close"),
               now_utc.isoformat()) for i, (t, score) in enumerate(picks, 1)])
+        conn.executemany(
+            "INSERT OR IGNORE INTO follow_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(r["ticker"], r["since_at"], r["days"], r["ended_snapshot"], r["ret"],
+              r["market_ret"], now_utc.isoformat()) for r in finished])
         record_sent(conn, "morning", snap.date, text, now_utc)
         if weekly:
             record_sent(conn, "scoreboard", week, text, now_utc)
