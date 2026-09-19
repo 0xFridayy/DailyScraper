@@ -664,7 +664,8 @@ def main():
         conn.close()
     report = format_report(problems, notes, stats)
     print(report)
-    if "--telegram" in sys.argv:
+    # Quiet when healthy: Telegram only hears about problems (exit 1 or 2).
+    if "--telegram" in sys.argv and exit_code(problems, stats) != 0:
         send_telegram(report)
     sys.exit(exit_code(problems, stats))
 
