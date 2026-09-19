@@ -116,7 +116,9 @@ def load_stalker(conn):
 
 
 def neobdm_lists(conn, capture_date):
-    """Today's raw NeoBDM lists, grouped by source, for one compact line."""
+    """Today's raw NeoBDM lists, grouped by source, for one compact line.
+    A source whose status says it failed maps to None ("unavailable"), so a
+    broken list never looks like an empty one."""
     lists = {}
     for ticker, sources in conn.execute(
             "SELECT ticker, sources FROM konglo_signal_watch WHERE flag_date = ? "
@@ -124,6 +126,14 @@ def neobdm_lists(conn, capture_date):
         for source in (sources or "").split(","):
             if source:
                 lists.setdefault(source, []).append(ticker)
+    try:
+        for source, status in conn.execute(
+                "SELECT source, status FROM signal_source_status WHERE flag_date = ?",
+                (capture_date,)):
+            if status not in ("HITS", "NO_HITS"):
+                lists[source] = None
+    except sqlite3.OperationalError:
+        pass  # older DBs have no status table
     return lists
 
 
@@ -471,8 +481,9 @@ def already_sent(conn, kind, key):
 
 
 def record_sent(conn, kind, key, text, now_utc):
+    # Only the length is kept: the repo is public and the text holds follows.
     conn.execute("INSERT OR IGNORE INTO sent_messages VALUES (?, ?, ?, ?)",
-                 (kind, key, now_utc.isoformat(), text))
+                 (kind, key, now_utc.isoformat(), f"{len(text)} chars"))
 
 
 # ── Messages ───────────────────────────────────────────────────────────────
@@ -510,7 +521,8 @@ def format_morning(today, snap, picks, tagged, weights, follow_blocks, lists, n_
         lines += ["", "👀 Your stocks"]
         for block in follow_blocks:
             lines += block
-    shown = [f"{name}: {', '.join(lists[src]) if lists.get(src) else '-'}"
+    shown = [f"{name}: " + ("unavailable" if src in lists and lists[src] is None
+                            else ", ".join(lists.get(src) or []) or "-")
              for src, name in LIST_NAMES]
     lines += ["", "📋 NeoBDM lists · " + " · ".join(shown),
               "", "Reply: yes TICKER · stop TICKER · list",

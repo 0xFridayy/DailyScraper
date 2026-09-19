@@ -81,6 +81,9 @@ jobs:
           fi
           git diff --staged --quiet || git commit -m "Update neobdm.db ($(date -u +%Y-%m-%d))"
           for i in 1 2 3; do
-            git pull --rebase && git push && break
+            if git pull --rebase && git push; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
             sleep 15
           done
+          echo "::error::push failed 3 times - today's data is NOT saved"
+          exit 1

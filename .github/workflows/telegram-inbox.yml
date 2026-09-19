@@ -46,6 +46,9 @@ jobs:
           git diff --staged --quiet && exit 0
           git commit -m "Update telegram follows ($(date -u +%Y-%m-%dT%H:%MZ))"
           for i in 1 2 3; do
-            git pull --rebase && git push && break
+            if git pull --rebase && git push; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
             sleep 10
           done
+          echo "::error::push failed 3 times - replies are NOT saved"
+          exit 1

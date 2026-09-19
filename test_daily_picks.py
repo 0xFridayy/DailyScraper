@@ -428,6 +428,24 @@ def test_morning_includes_follow_ups():
     print("  ok follow-ups in the message")
 
 
+def test_failed_neobdm_list_says_unavailable_not_empty():
+    days = panel(4, start="2026-09-14")
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "n.db")
+        make_db(path, days, stalker={"2026-09-17": ["AAAA"]},
+                status={"2026-09-17": "HITS"})
+        conn = sqlite3.connect(path)
+        conn.execute("INSERT INTO signal_source_status VALUES "
+                     "('2026-09-17', 'dashboard_Bandarmologi', 'EMPTY_UNVERIFIED')")
+        conn.commit()
+        lists = dp.neobdm_lists(conn, "2026-09-17")
+        conn.close()
+    text = dp.format_morning(date(2026, 9, 17), dp.Snapshot("2026-09-17", {}), [], {}, {},
+                             [], lists, 4)
+    assert "Stalker: AAAA" in text and "Bandar: unavailable" in text and "Foreign: -" in text
+    print("  ok unavailable lists")
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
