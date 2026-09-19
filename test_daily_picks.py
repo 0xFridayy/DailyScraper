@@ -152,11 +152,12 @@ def test_rank_needs_two_signals_and_follows_weights():
     last["CCCC"] = row(cs=1, nr=0.1, f=0.1, m=0.1)            # inst + bandar_3days
     last["DDDD"] = row(cs=0, nr=-0.1, f=-0.1, m=-0.1)         # none
     tagged = dp.tag_snapshot(snaps_from(days), 5, {"CCCC"})   # CCCC also stalker
-    picks = dp.rank_picks(tagged, {})
+    picks = dp.rank_picks(tagged, {}, min_tags=2)
     assert [t for t, _ in picks] == ["CCCC", "BBBB"], picks
     picks = dp.rank_picks(tagged, {"stalker": 0.25, "bandar_3days": 0.25, "inst_foreign": 1,
-                                   "broad_buying": 2})
+                                   "broad_buying": 2}, min_tags=2)
     assert [t for t, _ in picks] == ["BBBB", "CCCC"], picks
+    assert [t for t, _ in dp.rank_picks(tagged, {})] == ["CCCC"]    # the machine's 3+ bar
     print("  ok ranking")
 
 
@@ -166,7 +167,7 @@ def test_zero_clean_score_is_a_real_tiebreak_value():
     last["AAAA"] = row(cs=0, nr=0.1, f=0.1)
     last["BBBB"] = row(cs=None, nr=0.1, f=0.1)
     tagged = dp.tag_snapshot(snaps_from(days), 3)
-    ranked = dp.rank_picks(tagged, {}, n=10)
+    ranked = dp.rank_picks(tagged, {}, n=10, min_tags=2)
     names = [t for t, _ in ranked]
     assert names.index("AAAA") < names.index("BBBB"), names
     print("  ok zero is not missing")
@@ -276,42 +277,290 @@ def test_follow_of_unknown_stock_says_so():
 
 # ── telegram inbox ─────────────────────────────────────────────────────────
 
+KNOWN = {"BBCA", "BBRI", "TLKM", "BANK"} | {f"A{c}AZ" for c in "ABCDEFGHIJ"}
+
+
+def cmd(text, known=KNOWN):
+    c = inbox.parse_command(text, known)
+    return c and (c["action"], c["tickers"], c["days"], c["reason"], c["problem"])
+
+
 def test_parse_command_variants():
-    assert inbox.parse_command("yes bbca") == ("yes", ["BBCA"])
-    assert inbox.parse_command("/YES@my_bot BBCA, bbri") == ("yes", ["BBCA", "BBRI"])
-    assert inbox.parse_command("Stop BBCA") == ("stop", ["BBCA"])
-    assert inbox.parse_command("list") == ("list", [])
-    assert inbox.parse_command("yessir BBCA") is None
-    assert inbox.parse_command("hello") is None
-    assert inbox.parse_command(None) is None
-    assert inbox.parse_command("yes BBCAX") == ("yes", [])
+    assert cmd("yes bbca bandar buying") == ("yes", ["BBCA"], None, "bandar buying", None)
+    assert cmd("/YES@my_bot BBCA, bbri banks") == ("yes", ["BBCA", "BBRI"], None, "banks", None)
+    assert cmd("Stop BBCA taking profit")[:2] == ("stop", ["BBCA"])
+    assert cmd("list") == ("list", [], None, "", None)
+    assert cmd("yessir BBCA") is None and cmd("hello") is None and cmd(None) is None
+    assert cmd("yes BBCAX") == ("yes", [], None, "BBCAX", None)
+    assert cmd("yes BBCA high volume breakout")[1:4] == (["BBCA"], None, "high volume breakout")
+    assert cmd("yes BBCA 2w karena foreign masuk")[3] == "foreign masuk"
+    assert cmd("yes BBCA 2w bank rebound")[3:] == ("bank rebound", None)   # BANK is a ticker
     print("  ok command parsing")
+
+
+def test_parse_durations_in_trading_days():
+    cases = {
+        "yes BBCA 5d": 5, "yes BBCA 2w": 10, "yes bbca 1m": 21, "yes BBCA 3 days": 3,
+        "yes BBCA 10 hari": 10, "yes BBCA 2 minggu": 10, "yes BBCA 1 bulan": 21,
+        "yes BBCA 1 week": 5, "yes BBCA 2 months": 42, "yes BBCA 1mo": 21,
+        "yes BBCA 2 mgg": 10, "yes BBCA 1 bln": 21, "yes BBCA seminggu": 5,
+        "yes BBCA sebulan": 21, "yes BBCA": None,
+    }
+    for text, days in cases.items():
+        assert cmd(text + " why")[1:3] == (["BBCA"], days), (text, cmd(text + " why"))
+    for bad in ("yes BBCA 12m why", "yes BBCA 0d why", "yes BBCA 1.5m why", "yes BBCA 5 why"):
+        assert cmd(bad)[4] == "duration", bad
+    assert cmd("yes BBCA 5d BBRI 1m")[4] == "order"
+    assert cmd("yes BBCA BBRI 2 week banks")[1:3] == (["BBCA", "BBRI"], 10)
+    print("  ok durations")
 
 
 def _update(uid, text, chat=42, ts=1_758_000_000):
     return {"update_id": uid, "message": {"chat": {"id": chat}, "date": ts, "text": text}}
 
 
+def test_new_pick_needs_a_reason():
+    state, reply = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                       [_update(1, "yes BBCA 2w")], "42", KNOWN)
+    assert state["events"] == [] and "Add why you pick BBCA" in reply, reply
+    state, reply = inbox.apply_updates(state, [_update(2, "yes BBCA 2w foreign accumulating")],
+                                       "42", KNOWN)
+    assert dp.active_follows(state["events"])["BBCA"]["reason"] == "foreign accumulating"
+    assert "Your pick: BBCA (10 trading days) - reason: foreign accumulating" in reply
+    print("  ok reason required")
+
+
 def test_apply_updates_follow_stop_cap_and_idempotency():
-    known = {"BBCA", "BBRI", "TLKM"} | {f"A{c}AZ" for c in "ABCDEFGHIJ"}
     state = {"last_update_id": 0, "events": []}
     state, reply = inbox.apply_updates(state, [
-        _update(1, "yes BBCA BBRI XXXX"),
-        _update(2, "yes TLKM", chat=999),          # someone else's chat
+        _update(1, "yes BBCA BBRI XXXX banks cheap"),
+        _update(2, "yes TLKM telco", chat=999),              # someone else's chat
         _update(3, "stop BBRI"),
-    ], "42", known)
+    ], "42", KNOWN)
     assert state["last_update_id"] == 3
-    assert dp.active_follows(state["events"]) == {"BBCA": state["events"][0]["at"]}
-    assert "Following: BBCA, BBRI" in reply and "XXXX" in reply and "Stopped: BBRI" in reply
-    again, reply2 = inbox.apply_updates(state, [_update(1, "yes BBCA BBRI XXXX")], "42", known)
-    assert again["events"] == state["events"]     # replayed update not applied twice
-    many = [_update(10 + i, f"yes A{c}AZ") for i, c in enumerate("ABCDEFGHIJ")]
-    full, reply3 = inbox.apply_updates(state, many, "42", known)
+    assert list(dp.active_follows(state["events"])) == ["BBCA"]
+    assert "XXXX" in reply and "Stopped: BBRI" in reply
+    again, _ = inbox.apply_updates(state, [_update(1, "yes BBCA BBRI XXXX banks cheap")],
+                                   "42", KNOWN)
+    assert again["events"] == state["events"]                # replayed update not applied twice
+    many = [_update(10 + i, f"yes A{c}AZ why") for i, c in enumerate("ABCDEFGHIJ")]
+    full, reply3 = inbox.apply_updates(state, many, "42", KNOWN)
     assert len(dp.active_follows(full["events"])) == dp.MAX_FOLLOWS
-    assert "Already following 10" in reply3
-    _, quiet = inbox.apply_updates(state, [_update(40, "good morning")], "42", known)
+    assert "already have 10 picks" in reply3
+    _, quiet = inbox.apply_updates(state, [_update(40, "good morning")], "42", KNOWN)
     assert quiet is None
+    _, bad = inbox.apply_updates(state, [_update(41, "yes BBCA 12m why")], "42", KNOWN)
+    assert "Couldn't read how long" in bad
     print("  ok inbox")
+
+
+def test_inbox_durations_change_and_list():
+    state, reply = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                       [_update(1, "yes BBCA 2w foreign buying")], "42", KNOWN)
+    assert "BBCA (10 trading days)" in reply
+    state, reply = inbox.apply_updates(state, [_update(2, "yes BBCA 1m"),
+                                               _update(3, "yes BBRI rate cut play"),
+                                               _update(4, "yes BBRI")], "42", KNOWN)
+    follows = dp.active_follows(state["events"])
+    assert follows["BBCA"]["at"] == state["events"][0]["at"] and follows["BBCA"]["days"] == 21
+    assert "Changed: BBCA (21 trading days)" in reply and "Already your pick: BBRI" in reply
+    assert "Your picks (2/10): BBCA (21 trading days), BBRI (until you say stop)" in reply
+    print("  ok duration changes")
+
+
+def test_duration_change_never_restarts_a_finished_pick():
+    t1, t2, t3 = 1_758_000_000, 1_758_100_000, 1_759_000_000
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                   [_update(1, "yes AAAZ 3d why", ts=t1),
+                                    _update(2, "yes AAAZ 4d", ts=t2)], "42", KNOWN)
+    first = state["events"][0]["at"]
+    done_at = datetime.fromtimestamp(t2 + 50_000, timezone.utc).isoformat()   # 🏁 recorded
+    ended = {("AAAZ", first): done_at}
+    assert dp.active_follows(state["events"], ended) == {}       # stays finished
+    state, reply = inbox.apply_updates(state, [_update(3, "yes AAAZ 2w again", ts=t3)],
+                                       "42", KNOWN, ended)
+    again = dp.active_follows(state["events"], ended)["AAAZ"]
+    assert again["at"] != first and again["days"] == 10 and again["reason"] == "again"
+    print("  ok no double finish")
+
+
+def test_finished_pick_frees_its_slot():
+    ten = [_update(1 + i, f"yes A{c}AZ 5d why") for i, c in enumerate("ABCDEFGHIJ")]
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []}, ten, "42", KNOWN)
+    first = state["events"][0]
+    ended = {(first["ticker"], first["at"]): "2026-09-30T00:00:00+00:00"}
+    _, reply = inbox.apply_updates(state, [_update(20, "yes BBCA dividend")], "42", KNOWN, ended)
+    assert "Your pick: BBCA" in reply and "(10/10)" in reply
+    print("  ok finished picks free a slot")
+
+
+def test_your_timed_pick_shows_days_then_finishes_with_why():
+    drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(10, start="2026-09-01", drift=drift)          # Tue 01 .. Mon 14
+    yes_at = utc_at_myt(days[2][0], 11).isoformat()             # yes on the Thu 03 snapshot
+    follows = {"last_update_id": 1, "events": [
+        {"update_id": 1, "at": yes_at, "action": "yes", "ticker": "AAAA", "days": 3,
+         "reason": "bandar accumulating"}]}
+    texts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:4], follows=follows)
+        for n in (4, 5, 6, 7):                                   # four mornings in a row
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            make_db(env["neobdm_db"], days[:n])
+            status, text = dp.run_morning(utc_at_myt(days[n - 1][0]), lambda t: True, **env)
+            assert status == "sent", status
+            texts.append(text)
+        conn = sqlite3.connect(env["picks_db"])
+        rows = conn.execute("SELECT source, ticker, days, end_snapshot, ret, reason, why, "
+                            "bandar_share FROM pick_results WHERE source = 'you'").fetchall()
+        conn.close()
+    assert "day 1 of 3" in texts[0] and "Your reason: bandar accumulating" in texts[0]
+    assert "day 2 of 3" in texts[1]
+    assert "✅ AAAA (you, 3 days): +3.0%" in texts[2] and "bandar kept buying" in texts[2], texts[2]
+    assert "Your reason: bandar accumulating" in texts[2] and "Bandar bought 3/3 days" in texts[2]
+    assert "AAAA (you" not in texts[3]                          # shown once, then gone
+    assert len(rows) == 1 and rows[0][:4] == ("you", "AAAA", 3, days[5][0])
+    assert abs(rows[0][4] - (1.01 ** 3 - 1)) < 1e-9 and rows[0][5:] == (
+        "bandar accumulating", "bandar kept buying", 1.0)
+    print("  ok your timed pick")
+
+
+def test_machine_picks_are_tracked_and_finish_with_why():
+    drift = {"AAAA": -0.02, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(12, start="2026-09-01", drift=drift)
+    for i, (_, rows) in enumerate(days):
+        for t in ("BBBB", "CCCC", "DDDD"):
+            rows[t]["clean_score"] = 0                           # only AAAA passes 3 checks
+        if i >= 3:
+            rows["AAAA"]["m_dn_0"] = -0.1                        # bandar sells after the pick
+    texts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:3])
+        for n in range(3, 10):
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            make_db(env["neobdm_db"], days[:n])
+            status, text = dp.run_morning(utc_at_myt(days[n - 1][0]), lambda t: True, **env)
+            texts.append(text)
+        conn = sqlite3.connect(env["picks_db"])
+        rows = conn.execute("SELECT ticker, started, ret, why FROM pick_results "
+                            "WHERE source = 'machine' ORDER BY started").fetchall()
+        conn.close()
+    assert "1. AAAA" in texts[0]                                 # picked from the 3rd snapshot
+    assert "Machine picks running: AAAA" in texts[1] and "(day 1/5)" in texts[1]
+    done = next(t for t in texts if "AAAA (machine, 5 days)" in t)
+    assert "❌ AAAA (machine, 5 days)" in done and "bandar turned seller" in done, done
+    assert "Picked for:" in done
+    assert rows[0][0] == "AAAA" and rows[0][1] == days[2][0] and rows[0][3] == "bandar turned seller"
+    print("  ok machine picks tracked")
+
+
+def test_why_names_the_main_driver():
+    base = {"bandar_share": 0.5, "foreign_share": 0.5, "trading_ratio": 1.0,
+            "worst_day": -0.01, "market_ret": 0.0}
+    assert dp.main_reason(0.05, dict(base, bandar_share=0.8)) == "bandar kept buying"
+    assert dp.main_reason(-0.05, dict(base, bandar_share=0.2)) == "bandar turned seller"
+    assert dp.main_reason(-0.05, dict(base, worst_day=-0.12)) == "one bad day (-12%)"
+    assert dp.main_reason(-0.04, dict(base, market_ret=-0.05)) == "mostly moved with the market"
+    assert dp.main_reason(0.03, base) == "beat the market without a clear flow signal"
+    # the phrase always agrees with the ✅/❌ mark (review cases from real data)
+    assert dp.main_reason(-0.005, dict(base, market_ret=-0.015)) == \
+        "beat the market without a clear flow signal"
+    assert dp.main_reason(0.009, dict(base, market_ret=0.019, bandar_share=0.8,
+                                      foreign_share=0.8)) == "lagged even though bandar kept buying"
+    assert dp.main_reason(0.005, dict(base, market_ret=0.028)) == \
+        "lagged the market without a clear flow signal"             # not "moved with the market"
+    print("  ok why")
+
+
+def test_everyday_words_that_are_tickers_stay_in_the_reason():
+    known = KNOWN | {"NAIK", "LABA", "GOLD", "CUAN", "BELI"}
+    assert cmd("yes BBCA naik terus karena asing masuk", known)[1:4] == (
+        ["BBCA"], None, "naik terus karena asing masuk")
+    assert cmd("yes ANTM gold rally", known)[1] == ["ANTM"]
+    assert cmd("yes bbca, bbri banks", known)[1] == ["BBCA", "BBRI"]
+    assert cmd("yes BBCA BBRI 2w banks", known)[1:3] == (["BBCA", "BBRI"], 10)
+    print("  ok everyday words")
+
+
+def test_stop_ignores_numbers_in_its_text():
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                   [_update(1, "yes BBCA 2w foreign buying")], "42", KNOWN)
+    state, reply = inbox.apply_updates(state, [_update(2, "stop BBCA 10% cuan")], "42", KNOWN)
+    assert "Stopped: BBCA" in reply and dp.active_follows(state["events"]) == {}
+    print("  ok stop with numbers")
+
+
+def test_new_pick_confirmed_by_inbox_restarts_even_if_sent_before_the_finish():
+    t_old, t_reply = 1_758_000_000, 1_758_600_000
+    state, _ = inbox.apply_updates({"last_update_id": 0, "events": []},
+                                   [_update(1, "yes AAAZ 5d why", ts=t_old)], "42", KNOWN)
+    first = state["events"][0]["at"]
+    ended = {("AAAZ", first): datetime.fromtimestamp(t_reply + 3600, timezone.utc).isoformat()}
+    # reply sent before the morning run recorded the finish, processed after it
+    state, reply = inbox.apply_updates(state, [_update(2, "yes AAAZ 2w still strong",
+                                                       ts=t_reply)], "42", KNOWN, ended)
+    assert "Your pick: AAAZ" in reply
+    assert dp.active_follows(state["events"], ended)["AAAZ"]["days"] == 10
+    print("  ok no lost re-pick")
+
+
+def test_missing_trading_day_gives_no_win_or_loss():
+    drift = {"AAAA": 0.005, "BBBB": 0.02, "CCCC": 0.02, "DDDD": 0.02}
+    days = panel(10, start="2026-09-07", drift=drift)
+    del days[3]                                              # Thu 10 capture missing
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "n.db")
+        make_db(path, days)
+        conn = sqlite3.connect(path)
+        snaps = dp.load_snapshots(conn)
+        conn.close()
+    lines, result = dp.finish_pick(snaps, "AAAA", 1, 5, "machine")
+    assert lines[0].startswith("⚪ AAAA") and "no market comparison" in lines[0], lines
+    assert result["market_ret"] is None
+    print("  ok gap gives no verdict")
+
+
+def test_stopped_pick_gets_its_result():
+    drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(8, start="2026-09-01", drift=drift)
+    follows = {"last_update_id": 2, "events": [
+        {"update_id": 1, "at": utc_at_myt(days[1][0], 11).isoformat(), "action": "yes",
+         "ticker": "AAAA", "days": 10, "reason": "breakout", "new": True},
+        {"update_id": 2, "at": utc_at_myt(days[4][0], 11).isoformat(), "action": "stop",
+         "ticker": "AAAA"}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:6], follows=follows)
+        status, text = dp.run_morning(utc_at_myt(days[5][0]), lambda t: True, **env)
+        env["neobdm_db"] = os.path.join(tmp, "n7.db")
+        make_db(env["neobdm_db"], days[:7])
+        _, text2 = dp.run_morning(utc_at_myt(days[6][0]), lambda t: True, **env)
+        conn = sqlite3.connect(env["picks_db"])
+        rows = conn.execute("SELECT days, ret, reason FROM pick_results WHERE source='you'").fetchall()
+        conn.close()
+    assert "✅ AAAA (you, stopped after 3 days" in text and "Your reason: breakout" in text, text
+    assert "AAAA (you" not in text2                              # once
+    assert len(rows) == 1 and rows[0][0] == 3 and abs(rows[0][1] - (1.01 ** 3 - 1)) < 1e-9
+    print("  ok stopped picks are scored")
+
+
+def test_machine_does_not_repick_a_stock_it_holds():
+    days = panel(9, start="2026-09-01")
+    for _, rows in days:
+        for t in ("BBBB", "CCCC", "DDDD"):
+            rows[t]["clean_score"] = 0                           # only AAAA qualifies
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:3])
+        texts = []
+        for n in range(3, 10):
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            make_db(env["neobdm_db"], days[:n])
+            texts.append(dp.run_morning(utc_at_myt(days[n - 1][0]), lambda t: True, **env)[1])
+        conn = sqlite3.connect(env["picks_db"])
+        picked = conn.execute("SELECT snapshot_date FROM picks WHERE ticker='AAAA'").fetchall()
+        conn.close()
+    assert "1. AAAA" in texts[0] and "No strong setup today" in texts[1]
+    assert [d for (d,) in picked] == [days[2][0], days[7][0]], picked    # again only after 5 days
+    print("  ok no re-pick while holding")
 
 
 # ── sending ────────────────────────────────────────────────────────────────
@@ -373,14 +622,14 @@ def test_morning_sends_once_per_session_and_records_picks():
         today = days[-1][0]
         status, text = dp.run_morning(utc_at_myt(today), lambda t: sent.append(t) or True, **env)
         assert status == "sent", status
-        assert len(sent) == 1 and "Morning picks" in sent[0] and "Weekly scoreboard" in sent[0]
+        assert len(sent) == 1 and "Morning report" in sent[0] and "Weekly scoreboard" in sent[0]
         status, _ = dp.run_morning(utc_at_myt(today, 11), lambda t: sent.append(t) or True, **env)
         assert status == "already_sent" and len(sent) == 1
         conn = sqlite3.connect(env["picks_db"])
         n_picks = conn.execute("SELECT count(*) FROM picks").fetchone()[0]
         kinds = sorted(k for (k,) in conn.execute("SELECT kind FROM sent_messages"))
         conn.close()
-        assert n_picks == 4 and kinds == ["morning", "scoreboard"], (n_picks, kinds)
+        assert n_picks == 3 and kinds == ["morning", "scoreboard"], (n_picks, kinds)
     print("  ok once per session")
 
 
@@ -425,11 +674,11 @@ def test_morning_includes_follow_ups():
     days = panel(10, start="2026-09-01")
     follows = {"last_update_id": 5, "events": [
         {"update_id": 5, "at": utc_at_myt(days[3][0], 11).isoformat(), "action": "yes",
-         "ticker": "BBBB"}]}
+         "ticker": "BBBB", "reason": "cheap bank"}]}
     with tempfile.TemporaryDirectory() as tmp:
         env = _morning_env(tmp, days, follows=follows)
         status, text = dp.run_morning(utc_at_myt(days[-1][0]), lambda t: True, **env)
-    assert status == "sent" and "👀 Your stocks" in text and "BBBB" in text, text
+    assert status == "sent" and "🙋 Your picks" in text and "Your reason: cheap bank" in text, text
     print("  ok follow-ups in the message")
 
 
@@ -448,7 +697,7 @@ def test_failed_neobdm_list_says_unavailable_not_empty():
         lists = dp.neobdm_lists(conn, "2026-09-17")
         conn.close()
     text = dp.format_morning(date(2026, 9, 17), dp.Snapshot("2026-09-17", {}), [], {}, {},
-                             [], lists, 4)
+                             [], [], [], lists, 4)
     assert "Stalker: AAAA" in text and "Bandar: unavailable" in text and "Foreign: -" in text
     assert "Non-retail: unavailable" in text             # no status row = not tracked
     print("  ok unavailable lists")
@@ -520,7 +769,7 @@ def test_monday_after_late_scrape_still_sends_fridays_session():
         env["neobdm_db"] = os.path.join(tmp, "monday.db")
         make_db(env["neobdm_db"], days)                 # + Saturday's capture, no Monday rows
         status, text = dp.run_morning(utc_at_myt("2026-09-14", 10, 30), send, **env)
-    assert status == "sent" and "From the Fri 11 Sep close" in text, (status, text)
+    assert status == "sent" and "Data: Fri 11 Sep close" in text, (status, text)
     print("  ok Monday late scrape")
 
 

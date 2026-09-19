@@ -1,5 +1,7 @@
-"""Morning picks, follow-ups on the owner's "yes" stocks, and a slow learning
-loop - built only from data the daily scrape already stored in neobdm.db.
+"""Morning report: machine picks (strong setups only), your picks (with your
+reason), and a result for every finished pick - did it beat the market, and
+why - plus a slow learning loop. Built only from data the daily scrape
+already stored in neobdm.db.
 
 Standard library only (requests is imported lazily for sending), and it never
 imports neobdm_scraper, so CI can import and test it.
@@ -32,8 +34,8 @@ FOLLOWS_JSON = os.path.join(HERE, "telegram_follows.json")
 # The scraper dates rows in Asia/Kuala_Lumpur time (UTC+8, no DST).
 MYT = timezone(timedelta(hours=8))
 
-N_PICKS = 5
-MIN_TAGS = 2            # a pick needs at least two buy signals
+N_PICKS = 3             # machine picks per day, at most
+MIN_TAGS = 3            # a machine pick needs at least three of the five checks
 MIN_VALUE_BN = 2.0      # skip names trading under Rp 2 bn a day
 MAX_RUNUP = 0.25        # skip names already up 25%+ over 5 sessions
 RUNUP_WARN = 0.12       # warn (don't skip) from +12%
@@ -291,11 +293,11 @@ def tag_snapshot(snaps, k, stalker=frozenset()):
     return tagged
 
 
-def rank_picks(tagged, weights, n=N_PICKS):
-    """Top n names with at least MIN_TAGS signals, by summed tag weight."""
+def rank_picks(tagged, weights, n=N_PICKS, min_tags=MIN_TAGS):
+    """Top n names with at least min_tags signals, by summed tag weight."""
     ranked = []
     for ticker, cand in tagged.items():
-        if len(cand["tags"]) < MIN_TAGS:
+        if len(cand["tags"]) < min_tags:
             continue
         row = cand["row"]
         score = sum(weights.get(t, 1.0) for t in cand["tags"])
@@ -318,8 +320,9 @@ def reason_text(tag, row, ratio):
 
 
 def pick_reason(cand, weights):
-    top = sorted(cand["tags"], key=lambda t: (-weights.get(t, 1.0), TAG_ORDER.index(t)))[:2]
-    return " · ".join(reason_text(t, cand["row"], cand["value_ratio"]) for t in top)
+    """Every check the pick passed, strongest weight first."""
+    tags = sorted(cand["tags"], key=lambda t: (-weights.get(t, 1.0), TAG_ORDER.index(t)))
+    return " · ".join(reason_text(t, cand["row"], cand["value_ratio"]) for t in tags)
 
 
 # ── Outcomes and learning ──────────────────────────────────────────────────
@@ -388,7 +391,7 @@ def learn_weights(snaps, stalker, down, h=HORIZON):
     return result
 
 
-# ── Follows ────────────────────────────────────────────────────────────────
+# ── Your picks (follows) ───────────────────────────────────────────────────
 
 def load_follows(path=FOLLOWS_JSON):
     try:
@@ -406,15 +409,93 @@ def save_follows(path, state):
     os.replace(tmp, path)
 
 
-def active_follows(events):
-    """{ticker: time of the 'yes' that started the current follow}."""
+def active_follows(events, ended=None):
+    """Your current picks: {ticker: {"at", "days", "reason"}}.
+
+    "at" is the first yes, "days" the trading days to hold (None = until
+    stop), "reason" why you picked it. A later yes on a stock you already
+    hold only changes its days. `ended` maps (ticker, at) of finished timed
+    picks to when their result was recorded: a yes sent after that starts a
+    fresh pick, a yes sent before it (a duration change) never does."""
+    ended = ended or {}
     active = {}
     for event in events:
-        if event["action"] == "yes":
-            active.setdefault(event["ticker"], event["at"])
-        elif event["action"] == "stop":
-            active.pop(event["ticker"], None)
-    return active
+        ticker = event["ticker"]
+        if event["action"] == "stop":
+            active.pop(ticker, None)
+            continue
+        current = active.get(ticker)
+        if current is not None:
+            done_at = ended.get((ticker, current["at"]))
+            if done_at is not None and (
+                    event.get("new")
+                    or datetime.fromisoformat(event["at"]) > datetime.fromisoformat(done_at)):
+                current = None
+        if current is None:
+            active[ticker] = {"at": event["at"], "days": event.get("days"),
+                              "reason": event.get("reason", "")}
+        elif "days" in event:
+            current["days"] = event["days"]
+    return {t: f for t, f in active.items() if (t, f["at"]) not in ended}
+
+
+def stopped_follows(events):
+    """Your picks that you ended with 'stop': [{ticker, at, stop_at, days,
+    reason}], in order. Same rules as active_follows, but keeps the stops."""
+    active, stopped = {}, []
+    for event in events:
+        ticker = event["ticker"]
+        if event["action"] == "stop":
+            if ticker in active:
+                stopped.append(dict(active.pop(ticker), ticker=ticker, stop_at=event["at"]))
+        elif ticker not in active or event.get("new"):
+            active[ticker] = {"at": event["at"], "days": event.get("days"),
+                              "reason": event.get("reason", "")}
+        elif "days" in event:
+            active[ticker]["days"] = event["days"]
+    return stopped
+
+
+def stopped_block(snaps, pick, sent_at=None, stalker=None):
+    """Final result of a pick you stopped: from the price you saw at your yes
+    to the price you saw when you said stop. (lines, result)."""
+    ticker = pick["ticker"]
+    ref = reference_index(snaps, ticker, pick["at"], sent_at)
+    end = reference_index(snaps, ticker, pick["stop_at"], sent_at)
+    base = {"source": "you", "ticker": ticker, "started": pick["at"], "reason": pick["reason"],
+            "start_tags": ",".join(machine_view(snaps, ref, ticker, stalker)) if ref is not None else "",
+            "start_snapshot": snaps[ref].date if ref is not None else None}
+    if ref is None or end is None or end <= ref:
+        empty = {"days": 0, "end_snapshot": snaps[-1].date, "start_price": None, "end_price": None,
+                 "ret": None, "market_ret": None, "why": None, "facts": None}
+        return [f"⚪ {ticker} (you, stopped): no trading day between your yes and stop to score."], \
+            {**base, **empty}
+    n = end - ref
+    lines, result = finish_pick(snaps, ticker, ref, n, "you", label=f"you, stopped after {n} days")
+    lines[1:1] = [f"   Your reason: {pick['reason'] or '(none given)'}"]
+    return lines, {**base, "days": n, **result}
+
+
+def ended_follows(conn):
+    """{(ticker, first yes time): when the result was recorded} for your
+    finished timed picks."""
+    rows = conn.execute("SELECT ticker, started, recorded_utc FROM pick_results "
+                        "WHERE source = 'you'").fetchall()
+    return {(t, s): r for t, s, r in rows}
+
+
+def ended_follows_from_file(path=None):
+    """Same, read-only from daily_picks.db; empty if it doesn't exist yet."""
+    path = path or PICKS_DB
+    if not os.path.exists(path):
+        return {}
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return ended_follows(conn)
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
 
 
 def reference_index(snaps, ticker, since_utc, sent_at=None):
@@ -491,6 +572,196 @@ def follow_lines(snaps, ticker, since_utc, sent_at=None):
     return lines
 
 
+def _sessions_since(snaps, since_utc, ref):
+    """Trading sessions that have closed since the yes."""
+    if ref is not None:
+        return len(snaps) - 1 - ref
+    day = datetime.fromisoformat(since_utc).astimezone(MYT).date()
+    return sum(1 for s in snaps if date.fromisoformat(s.date) > day)
+
+
+def machine_view(snaps, j, ticker, stalker=None):
+    """The machine's checks that a stock passed on snapshot j."""
+    flagged = (stalker or {}).get(snaps[j].date, frozenset())
+    return tag_snapshot(snaps, j, flagged).get(ticker, {}).get("tags", [])
+
+
+def _labels(tags):
+    return ", ".join(TAG_LABEL[t] for t in tags if t in TAG_LABEL) or "none of its checks"
+
+
+def follow_block(snaps, ticker, follow, sent_at=None, stalker=None):
+    """(message lines, result to record or None) for one of your picks. A
+    timed pick whose days are up gets its final result; otherwise the normal
+    follow-up lines, with 'day X of N' for timed picks."""
+    since, days, reason = follow["at"], follow.get("days"), follow.get("reason") or ""
+    ref = reference_index(snaps, ticker, since, sent_at)
+    elapsed = _sessions_since(snaps, since, ref)
+    if days is None or elapsed < days:
+        lines = follow_lines(snaps, ticker, since, sent_at)
+        if days is not None:
+            lines[0] += f" · day {elapsed} of {days}"
+        lines.insert(1, f" • Your reason: {reason or '(none given)'}")
+        return lines, None
+
+    tags = machine_view(snaps, ref, ticker, stalker) if ref is not None else []
+    base = {"source": "you", "ticker": ticker, "started": since, "days": days,
+            "reason": reason, "start_tags": ",".join(tags),
+            "start_snapshot": snaps[ref].date if ref is not None else None}
+    if ref is None:
+        empty = {"end_snapshot": snaps[-1].date, "start_price": None, "end_price": None,
+                 "ret": None, "market_ret": None, "why": None, "facts": None}
+        return [f"⚪ {ticker} (you, {days} days): no NeoBDM price from the day you said yes."], \
+            {**base, **empty}
+    lines, result = finish_pick(snaps, ticker, ref, days, "you")
+    lines[1:1] = [f"   Your reason: {reason or '(none given)'}",
+                  f"   Machine's checks that day: {_labels(tags)}"]
+    return lines, {**base, **result}
+
+
+# ── Results and why ────────────────────────────────────────────────────────
+
+def explain(snaps, ticker, start, end):
+    """What happened while a pick was held (sessions start+1..end)."""
+    window = range(start + 1, end + 1)
+    rows = [snaps[j].rows.get(ticker) for j in window]
+    facts = {}
+    for name, field in (("bandar", "m_dn_0"), ("foreign", "f_dn_0")):
+        values = [v for r in rows if (v := _num(r, field)) is not None]
+        facts[name + "_buys"] = sum(v > 0 for v in values)
+        facts[name + "_days"] = len(values)
+        facts[name + "_share"] = facts[name + "_buys"] / len(values) if values else None
+    held = [v for r in rows if (v := _num(r, "tval")) is not None]
+    before = [v for j in range(max(0, start - 4), start + 1)
+              if (v := _num(snaps[j].rows.get(ticker), "tval")) is not None]
+    facts["trading_ratio"] = (_mean(held) / _mean(before)
+                              if held and before and _mean(before) > 0 else None)
+    moves = [m for j in window if (m := day_move(snaps, j, ticker)) is not None]
+    facts["worst_day"] = min(moves) if moves else None
+    rets = session_returns(snaps, start, end)
+    facts["market_ret"] = _mean(rets.values()) if rets else None
+    return facts
+
+
+def main_reason(ret, facts):
+    """The one plain reason that best fits what happened. These are
+    patterns in the flow data, not proof of cause."""
+    market = facts["market_ret"]
+    excess = ret - (market or 0)
+    # Only when the stock went the market's way and the gap is small.
+    if (market is not None and abs(market) >= 0.02 and market * ret > 0
+            and abs(excess) <= abs(market) / 2):
+        return "mostly moved with the market"
+    bandar, foreign = facts["bandar_share"], facts["foreign_share"]
+    trading, worst = facts["trading_ratio"], facts["worst_day"]
+    if excess > 0:
+        if bandar is not None and bandar >= 0.6:
+            return "bandar kept buying"
+        if foreign is not None and foreign >= 0.6:
+            return "foreign kept buying"
+        if trading is not None and trading >= 1.5:
+            return "buyers rushed in (trading jumped)"
+        return "beat the market without a clear flow signal"
+    if worst is not None and worst <= -0.07:
+        return f"one bad day ({worst:.0%})"
+    if bandar is not None and bandar <= 0.4:
+        return "bandar turned seller"
+    if foreign is not None and foreign <= 0.4:
+        return "foreign sold"
+    if bandar is not None and bandar >= 0.6:
+        return "lagged even though bandar kept buying"
+    if trading is not None and trading <= 0.6:
+        return "interest dried up (trading fell)"
+    return "lagged the market without a clear flow signal"
+
+
+def fact_text(facts):
+    parts = []
+    for label, name in (("Bandar bought", "bandar"), ("Foreign bought", "foreign")):
+        if facts[name + "_days"]:
+            parts.append(f"{label} {facts[name + '_buys']}/{facts[name + '_days']} days")
+    if facts["trading_ratio"] is not None:
+        parts.append(f"trading {facts['trading_ratio']:.1f}x usual")
+    if facts["worst_day"] is not None and facts["worst_day"] <= -0.05:
+        parts.append(f"worst day {facts['worst_day']:.0%}")
+    return " · ".join(parts)
+
+
+def finish_pick(snaps, ticker, start, days, who, label=None):
+    """Final result of a pick held `days` sessions from snapshot `start`,
+    measured from the price shown when it was picked: (lines, result)."""
+    end = min(start + days, len(snaps) - 1)
+    result = {"end_snapshot": snaps[end].date, "start_price": None, "end_price": None,
+              "ret": None, "market_ret": None, "why": None, "facts": None}
+    late = "" if end == len(snaps) - 1 else f", ended {session_label(snaps[end].date)}"
+    label = f"{label or f'{who}, {days} days'}{late}"
+    first, last = _close(snaps, start, ticker), _close(snaps, end, ticker)
+    broke = price_break(snaps, start, end, ticker)
+    if not first or not last or broke:
+        why = broke[1] if broke else "no price at the end"
+        return [f"⚪ {ticker} ({label}): not comparable - {why}"], result
+    ret = last / first - 1
+    facts = explain(snaps, ticker, start, end)
+    market = facts["market_ret"]
+    if market is None:
+        # A trading day is missing inside the window: no fair market number,
+        # so no win or loss is counted (the scoreboard needs market_ret).
+        result.update(start_price=first, end_price=last, ret=ret, facts=facts)
+        return [f"⚪ {ticker} ({label}): {ret * 100:+.1f}%, no market comparison - "
+                "a trading day is missing from the data",
+                f"   {fact_text(facts)}"], result
+    why = main_reason(ret, facts)
+    excess = ret - market
+    mark = "✅" if excess > 0 else "❌"
+    vs = (f", market {market * 100:+.1f}% → {'beat' if excess > 0 else 'lagged'} it by "
+          f"{abs(excess) * 100:.1f}%")
+    lines = [f"{mark} {ticker} ({label}): {ret * 100:+.1f}%{vs} - {why}",
+             f"   {fact_text(facts)}"]
+    result.update(start_price=first, end_price=last, ret=ret, market_ret=market,
+                  why=why, facts=facts)
+    return lines, result
+
+
+def machine_progress(snaps, pick_rows, recorded):
+    """(running line texts, [(lines, result)] finished) for machine picks.
+    pick_rows: (snapshot_date, ticker, tags); recorded: {(source, ticker,
+    started)} already in pick_results."""
+    index = {s.date: i for i, s in enumerate(snaps)}
+    k = len(snaps) - 1
+    running, finished = [], []
+    for snap_date, ticker, tags in pick_rows:
+        j = index.get(snap_date)
+        if j is None or ("machine", ticker, snap_date) in recorded:
+            continue
+        elapsed = k - j
+        if elapsed >= HORIZON:
+            lines, result = finish_pick(snaps, ticker, j, HORIZON, "machine")
+            lines.insert(1, f"   Picked for: {_labels(tags.split(','))}")
+            finished.append((lines, {"source": "machine", "ticker": ticker, "started": snap_date,
+                                     "days": HORIZON, "reason": "", "start_tags": tags,
+                                     "start_snapshot": snap_date, **result}))
+        elif elapsed >= 1:
+            first, now = _close(snaps, j, ticker), _close(snaps, k, ticker)
+            if first and now and not price_break(snaps, j, k, ticker):
+                running.append(f"{ticker} {(now / first - 1) * 100:+.1f}% (day {elapsed}/{HORIZON})")
+            else:
+                running.append(f"{ticker} n/a (day {elapsed}/{HORIZON})")
+    return running, finished
+
+
+def record_results(conn, results, now_utc):
+    rows = []
+    for r in results:
+        f = r.get("facts") or {}
+        rows.append((r["source"], r["ticker"], r["started"], r["days"], r["reason"],
+                     r["start_tags"], r["start_snapshot"], r["end_snapshot"],
+                     r["start_price"], r["end_price"], r["ret"], r["market_ret"],
+                     f.get("bandar_share"), f.get("foreign_share"), f.get("trading_ratio"),
+                     f.get("worst_day"), r["why"], now_utc.isoformat()))
+    conn.executemany("INSERT OR IGNORE INTO pick_results VALUES "
+                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+
+
 def warnings(snaps, k, ticker):
     row = snaps[k].rows.get(ticker)
     out = []
@@ -523,6 +794,14 @@ SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sent_messages (
         kind TEXT NOT NULL, key TEXT NOT NULL, sent_utc TEXT NOT NULL,
         text TEXT NOT NULL, PRIMARY KEY (kind, key))""",
+    # One row per finished pick, machine or yours: result, what happened, why.
+    """CREATE TABLE IF NOT EXISTS pick_results (
+        source TEXT NOT NULL, ticker TEXT NOT NULL, started TEXT NOT NULL,
+        days INTEGER NOT NULL, reason TEXT NOT NULL, start_tags TEXT NOT NULL,
+        start_snapshot TEXT, end_snapshot TEXT NOT NULL, start_price REAL,
+        end_price REAL, ret REAL, market_ret REAL, bandar_share REAL,
+        foreign_share REAL, trading_ratio REAL, worst_day REAL, why TEXT,
+        recorded_utc TEXT NOT NULL, PRIMARY KEY (source, ticker, started))""",
 ]
 
 
@@ -563,68 +842,88 @@ LIST_NAMES = (("broker_stalker", "Stalker"), ("dashboard_Bandarmologi", "Bandar"
               ("dashboard_NonRetail", "Non-retail"), ("dashboard_Foreign", "Foreign"))
 
 
-def format_morning(today, snap, picks, tagged, weights, follow_blocks, lists, n_sessions):
-    lines = [f"📈 Morning picks - {today:%a} {today.day} {today:%b}",
-             f"From the {session_label(snap.date)} close · hold idea about 1 week", ""]
+def format_morning(today, snap, picks, tagged, weights, your_blocks, running,
+                   finished_blocks, lists, n_sessions):
+    lines = [f"📈 Morning report - {today:%a} {today.day} {today:%b}",
+             f"Data: {session_label(snap.date)} close", "",
+             f"🤖 Machine picks - strong setups only ({MIN_TAGS}+ checks), hold about 1 week"]
     if picks:
         for i, (ticker, _) in enumerate(picks, 1):
             cand = tagged[ticker]
             lines.append(f"{i}. {ticker}  Rp {_num(cand['row'], 'close'):,.0f}")
             lines.append(f"   {pick_reason(cand, weights)}")
-        if len(picks) < N_PICKS:
-            lines.append(f"(Only {len(picks)} passed today's checks.)")
         for ticker, _ in picks:
             pct5 = _num(tagged[ticker]["row"], "pct_5")
             if pct5 is not None and pct5 >= RUNUP_WARN:
                 lines.append(f"⚠️ {ticker} is already up {pct5:.0%} in 5 days - don't chase.")
     else:
-        lines.append("No stock passed today's checks (needs 2+ buy signals).")
-
-    if follow_blocks:
-        lines += ["", "👀 Your stocks"]
-        for block in follow_blocks:
+        lines.append(f"No strong setup today - nothing passed {MIN_TAGS}+ checks.")
+    if running:
+        lines += ["", "🤖 Machine picks running: " + " · ".join(running)]
+    if your_blocks:
+        lines += ["", "🙋 Your picks"]
+        for block in your_blocks:
+            lines += block
+    if finished_blocks:
+        lines += ["", "🏁 Finished (✅ beat the market, ❌ didn't)"]
+        for block in finished_blocks:
             lines += block
     shown = [f"{name}: " + ("unavailable" if src in lists and lists[src] is None
                             else ", ".join(lists.get(src) or []) or "-")
              for src, name in LIST_NAMES]
     lines += ["", "📋 NeoBDM lists · " + " · ".join(shown),
-              "", "Reply: yes TICKER · stop TICKER · list",
-              f"Not proven yet - tested on {n_sessions} trading days so far."]
+              "", "Reply: yes TICKER 2w your reason · stop TICKER · list",
+              f"Not proven yet - {n_sessions} trading days of data so far."]
     return "\n".join(lines)
 
 
+WHY_BUCKETS = (
+    ("Bandar kept buying while held", "bandar_share", lambda v: v >= 0.6),
+    ("Bandar mostly sold while held", "bandar_share", lambda v: v <= 0.4),
+    ("Foreign kept buying while held", "foreign_share", lambda v: v >= 0.6),
+    ("Foreign mostly sold while held", "foreign_share", lambda v: v <= 0.4),
+    ("Trading rose while held", "trading_ratio", lambda v: v >= 1.3),
+    ("Trading dried up while held", "trading_ratio", lambda v: v <= 0.7),
+)
+
+
 def format_scoreboard(snaps, conn, learned, previous):
-    lines = ["📊 Weekly scoreboard"]
-    index = {s.date: i for i, s in enumerate(snaps)}
-    done, unscored = [], 0
-    for snap_date, ticker in conn.execute("SELECT snapshot_date, ticker FROM picks"):
-        if snap_date in index and index[snap_date] + 1 + HORIZON < len(snaps):
-            result = forward_excess(snaps, index[snap_date], ticker)
-            if result:
-                done.append((ticker, *result))
-            else:
-                unscored += 1
-    if done:
-        excess = [x for _, _, x in done]
-        best = max(done, key=lambda d: d[2])
-        worst = min(done, key=lambda d: d[2])
-        lines.append(f"My picks after 1 week: {len(done)} scored, {_mean(excess) * 100:+.1f}% "
-                     f"vs the average stock, {sum(x > 0 for x in excess)}/{len(done)} beat it. "
-                     f"Best {best[0]} {best[2] * 100:+.1f}%, worst {worst[0]} {worst[2] * 100:+.1f}%.")
-    elif not unscored:
-        lines.append("My picks: none old enough to score yet (a pick needs 6 trading days).")
-    if unscored:
-        lines.append(f"{unscored} pick(s) left NeoBDM's list, had a split or hit a data gap "
-                     "- not scored.")
-    lines.append("Signals, 1-week result vs the average stock (weight old → new):")
+    lines = ["📊 Weekly scoreboard (won = beat the market)"]
+    rows = [dict(zip(("source", "ret", "market_ret", "bandar_share", "foreign_share",
+                      "trading_ratio", "start_tags"), r))
+            for r in conn.execute("SELECT source, ret, market_ret, bandar_share, foreign_share, "
+                                  "trading_ratio, start_tags FROM pick_results "
+                                  "WHERE ret IS NOT NULL AND market_ret IS NOT NULL")]
+    for r in rows:
+        r["won"] = r["ret"] - r["market_ret"] > 0
+    for source, label in (("machine", "🤖 Machine"), ("you", "🙋 You")):
+        mine = [r for r in rows if r["source"] == source]
+        if mine:
+            excess = [r["ret"] - r["market_ret"] for r in mine]
+            lines.append(f"{label}: {len(mine)} finished, {sum(r['won'] for r in mine)} won, "
+                         f"{_mean(excess) * 100:+.1f}% vs market on average")
+        else:
+            lines.append(f"{label}: nothing finished yet")
+    if rows:
+        lines.append("What happened in winners vs losers (all finished picks):")
+        for name, field, test in WHY_BUCKETS:
+            hit = [r for r in rows if r[field] is not None and test(r[field])]
+            if hit:
+                lines.append(f" • {name}: {sum(r['won'] for r in hit)} of {len(hit)} won")
+        for tag in TAG_ORDER:
+            hit = [r for r in rows if tag in (r["start_tags"] or "").split(",")]
+            if hit:
+                lines.append(f" • Started with '{TAG_LABEL[tag]}': "
+                             f"{sum(r['won'] for r in hit)} of {len(hit)} won")
+    lines.append("Machine checks across all stocks, 1-week result (weight old → new):")
     for tag in TAG_ORDER:
         info = learned[tag]
         early = " - too early" if info["sessions"] < 60 else ""
         lines.append(f" • {TAG_LABEL[tag]}: {info['avg_excess_pct']:+.1f}% over "
                      f"{info['sessions']} days ({previous.get(tag, 1.0):.2f} → "
                      f"{info['weight']:.2f}){early}")
-    lines.append(f"Based on {len(snaps)} trading days. About 60 (3 months) are needed "
-                 "before this means much.")
+    lines.append(f"{len(rows)} finished picks so far - patterns need about 30 before they "
+                 f"mean much. {len(snaps)} trading days of market data.")
     return "\n".join(lines)
 
 
@@ -712,6 +1011,10 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         src.close()
 
     conn = sqlite3.connect(":memory:" if preview else picks_db)
+    if preview and os.path.exists(picks_db):
+        saved = sqlite3.connect(f"file:{picks_db}?mode=ro", uri=True)
+        saved.backup(conn)
+        saved.close()
     try:
         ensure_schema(conn)
         fresh_unsent = bool(snaps) and not already_sent(conn, "morning", snaps[-1].date)
@@ -743,14 +1046,39 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                               for t, v in learned.items()])
         weights = current_weights(conn)
 
+        pick_rows = conn.execute("SELECT snapshot_date, ticker, tags FROM picks "
+                                 "ORDER BY snapshot_date, rank").fetchall()
+        index = {s.date: i for i, s in enumerate(snaps)}
+        # A stock the machine is already holding isn't picked again (no double counting).
+        holding = {t for d, t, _ in pick_rows if d in index and k - index[d] < HORIZON}
         tagged = tag_snapshot(snaps, k, stalker.get(snap.date, frozenset()))
-        picks = rank_picks(tagged, weights)
-        follows = active_follows(load_follows(follows_json).get("events", []))
+        picks = rank_picks({t: c for t, c in tagged.items() if t not in holding}, weights)
+        events = load_follows(follows_json).get("events", [])
+        follows = active_follows(events, ended_follows(conn))
         sent_at = dict(conn.execute(
             "SELECT key, sent_utc FROM sent_messages WHERE kind = 'morning'").fetchall())
-        blocks = [follow_lines(snaps, t, since, sent_at)
-                  for t, since in list(follows.items())[:MAX_FOLLOWS]]
-        text = format_morning(today, snap, picks, tagged, weights, blocks, lists, len(snaps))
+        recorded = set(conn.execute("SELECT source, ticker, started FROM pick_results").fetchall())
+        your_blocks, finished_blocks, results = [], [], []
+        for ticker, follow in list(follows.items())[:MAX_FOLLOWS]:
+            lines, result = follow_block(snaps, ticker, follow, sent_at, stalker)
+            if result:
+                finished_blocks.append(lines)
+                results.append(result)
+            else:
+                your_blocks.append(lines)
+        for pick in stopped_follows(events):
+            if ("you", pick["ticker"], pick["at"]) not in recorded:
+                lines, result = stopped_block(snaps, pick, sent_at, stalker)
+                finished_blocks.append(lines)
+                results.append(result)
+        running, machine_done = machine_progress(snaps, pick_rows, recorded)
+        for lines, result in machine_done:
+            finished_blocks.append(lines)
+            results.append(result)
+        # Recorded before the scoreboard reads them; rolled back if the send fails.
+        record_results(conn, results, now_utc)
+        text = format_morning(today, snap, picks, tagged, weights, your_blocks, running,
+                              finished_blocks, lists, len(snaps))
         if weekly:
             text += "\n\n" + format_scoreboard(snaps, conn, learned, previous)
         if preview:
