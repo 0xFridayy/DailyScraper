@@ -1,4 +1,14 @@
 {
- "events": [],
- "last_update_id": 0
+ "events": [
+  {
+   "action": "yes",
+   "at": "2026-09-21T17:40:08+00:00",
+   "days": 10,
+   "new": true,
+   "reason": "big flow from retail sold to foreign 9 sept & 18sep, Price cross Ema 200, spring wyckoff phase passed",
+   "ticker": "BNGA",
+   "update_id": 353954001
+  }
+ ],
+ "last_update_id": 353954001
 }
