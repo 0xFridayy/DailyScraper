@@ -8,7 +8,16 @@
    "reason": "big flow from retail sold to foreign 9 sept & 18sep, Price cross Ema 200, spring wyckoff phase passed",
    "ticker": "BNGA",
    "update_id": 353954001
+  },
+  {
+   "action": "yes",
+   "at": "2026-09-22T17:52:25+00:00",
+   "days": 15,
+   "new": true,
+   "reason": "Broker-level absorption, Inventory migration from common beneficial owner LG RF thesis jason = same guy.",
+   "ticker": "MGLV",
+   "update_id": 353954002
   }
  ],
- "last_update_id": 353954001
+ "last_update_id": 353954002
 }
