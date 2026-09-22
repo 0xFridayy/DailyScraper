@@ -35,7 +35,7 @@ FOLLOWS_JSON = os.path.join(HERE, "telegram_follows.json")
 MYT = timezone(timedelta(hours=8))
 
 N_PICKS = 3             # machine picks per day, at most
-MIN_TAGS = 3            # a machine pick needs at least three of the five checks
+MIN_TAGS = 3            # a machine pick needs at least three of the four checks
 MIN_VALUE_BN = 2.0      # skip names trading under Rp 2 bn a day
 MAX_RUNUP = 0.25        # skip names already up 25%+ over 5 sessions
 RUNUP_WARN = 0.12       # warn (don't skip) from +12%
@@ -46,13 +46,17 @@ SPLIT_FACTORS = (2, 3, 4, 5, 10, 20, 25)
 
 # Starting guesses, checked on ~17 sessions only (2026-08-16..09-10). The
 # weekly learning step moves the weights; nothing here is proven yet.
-TAG_ORDER = ("broad_buying", "inst_foreign", "bandar_3days", "stalker", "value_up")
+TAG_ORDER = ("broad_buying", "inst_foreign", "bandar_3days", "value_up")
+# No longer a check, kept so older picks still show what they started with.
+# The Broker Stalker flag (top 3 XL+XC net sells) showed no edge over similar
+# stocks across a year of full broker data: 606 flags, -0.2% at 5 days.
+RETIRED_TAGS = ("stalker",)
 TAG_LABEL = {
     "broad_buying": "Clean score +3 or more",
     "inst_foreign": "Local funds + foreigners buying",
     "bandar_3days": "Bandar bought 3 days in a row",
-    "stalker": "Retail sold, big broker picked it up",
     "value_up": "Trading value jumped",
+    "stalker": "Retail sold, big broker picked it up (retired check)",
 }
 
 FIELDS = ("close", "high", "low", "m_dn_0", "nr_dn_0", "f_dn_0", "m_cn_5",
@@ -130,25 +134,6 @@ def _gap_inside(snaps, a, b):
 
 def latest_capture_date(conn):
     return conn.execute("SELECT max(date) FROM market_summary_daily").fetchone()[0]
-
-
-def load_stalker(conn):
-    """({date: tickers flagged by broker_stalker}, {dates the source was down}).
-    A down source means "unknown", not "not flagged", so learning skips it."""
-    flagged, down = {}, set()
-    for day, ticker, sources in conn.execute(
-            "SELECT flag_date, ticker, sources FROM konglo_signal_watch"):
-        if "broker_stalker" in (sources or "").split(","):
-            flagged.setdefault(day, set()).add(ticker)
-    try:
-        for day, status in conn.execute(
-                "SELECT flag_date, status FROM signal_source_status "
-                "WHERE source = 'broker_stalker'"):
-            if status not in ("HITS", "NO_HITS"):
-                down.add(day)
-    except sqlite3.OperationalError:
-        pass  # older DBs have no status table
-    return flagged, down
 
 
 def neobdm_lists(conn, capture_date):
@@ -267,7 +252,7 @@ def _top_buyers(row):
 
 # ── Scoring ────────────────────────────────────────────────────────────────
 
-def tag_snapshot(snaps, k, stalker=frozenset()):
+def tag_snapshot(snaps, k):
     """Buy signals for every name in snapshot k that passes the basic filters.
     Reads snapshots 0..k only."""
     tagged = {}
@@ -289,8 +274,6 @@ def tag_snapshot(snaps, k, stalker=frozenset()):
         if (k >= 2 and not _gap_inside(snaps, k - 2, k)
                 and _buying_days(snaps, k, ticker, "m_dn_0") == (3, 3)):
             tags.append("bandar_3days")
-        if ticker in stalker:
-            tags.append("stalker")
         ratio = value_ratio(snaps, k, ticker)
         if ratio is not None and ratio >= 1.5:
             tags.append("value_up")
@@ -365,7 +348,7 @@ def _mean(values):
     return sum(values) / len(values)
 
 
-def learn_weights(snaps, stalker, down, h=HORIZON):
+def learn_weights(snaps, h=HORIZON):
     """Per tag: the average excess return of tagged names in each session whose
     outcome has already happened (each name capped at +/-15%), shrunk toward
     neutral so a few lucky weeks can't swing it. Neighbouring 5-session
@@ -378,11 +361,9 @@ def learn_weights(snaps, stalker, down, h=HORIZON):
         if not rets:
             continue
         avg = _mean(rets.values())
-        tagged = tag_snapshot(snaps, k, stalker.get(snaps[k].date, frozenset()))
+        tagged = tag_snapshot(snaps, k)
         for tag in TAG_ORDER:
-            if tag == "stalker" and snaps[k].date in down:
-                continue
-            xs = [max(-0.15, min(0.15, rets[t] - avg))
+            xs =[max(-0.15, min(0.15, rets[t] - avg))
                   for t, cand in tagged.items() if tag in cand["tags"] and t in rets]
             if xs:
                 per_tag[tag].append(_mean(xs))
@@ -461,14 +442,14 @@ def stopped_follows(events):
     return stopped
 
 
-def stopped_block(snaps, pick, sent_at=None, stalker=None):
+def stopped_block(snaps, pick, sent_at=None):
     """Final result of a pick you stopped: from the price you saw at your yes
     to the price you saw when you said stop. (lines, result)."""
     ticker = pick["ticker"]
     ref = reference_index(snaps, ticker, pick["at"], sent_at)
     end = reference_index(snaps, ticker, pick["stop_at"], sent_at)
     base = {"source": "you", "ticker": ticker, "started": pick["at"], "reason": pick["reason"],
-            "start_tags": ",".join(machine_view(snaps, ref, ticker, stalker)) if ref is not None else "",
+            "start_tags": ",".join(machine_view(snaps, ref, ticker)) if ref is not None else "",
             "start_snapshot": snaps[ref].date if ref is not None else None}
     if ref is None or end is None or end <= ref:
         empty = {"days": 0, "end_snapshot": snaps[-1].date, "start_price": None, "end_price": None,
@@ -588,17 +569,16 @@ def _sessions_since(snaps, since_utc, ref):
     return sum(1 for s in snaps if date.fromisoformat(s.date) > day)
 
 
-def machine_view(snaps, j, ticker, stalker=None):
+def machine_view(snaps, j, ticker):
     """The machine's checks that a stock passed on snapshot j."""
-    flagged = (stalker or {}).get(snaps[j].date, frozenset())
-    return tag_snapshot(snaps, j, flagged).get(ticker, {}).get("tags", [])
+    return tag_snapshot(snaps, j).get(ticker, {}).get("tags", [])
 
 
 def _labels(tags):
     return ", ".join(TAG_LABEL[t] for t in tags if t in TAG_LABEL) or "none of its checks"
 
 
-def follow_block(snaps, ticker, follow, sent_at=None, stalker=None):
+def follow_block(snaps, ticker, follow, sent_at=None):
     """(message lines, result to record or None) for one of your picks. A
     timed pick whose days are up gets its final result; otherwise the normal
     follow-up lines, with 'day X of N' for timed picks."""
@@ -612,7 +592,7 @@ def follow_block(snaps, ticker, follow, sent_at=None, stalker=None):
         lines.insert(1, f" • Your reason: {reason or '(none given)'}")
         return lines, None
 
-    tags = machine_view(snaps, ref, ticker, stalker) if ref is not None else []
+    tags = machine_view(snaps, ref, ticker) if ref is not None else []
     base = {"source": "you", "ticker": ticker, "started": since, "days": days,
             "reason": reason, "start_tags": ",".join(tags),
             "start_snapshot": snaps[ref].date if ref is not None else None}
@@ -919,7 +899,7 @@ def format_scoreboard(snaps, conn, learned, previous):
             hit = [r for r in rows if r[field] is not None and test(r[field])]
             if hit:
                 lines.append(f" • {name}: {sum(r['won'] for r in hit)} of {len(hit)} won")
-        for tag in TAG_ORDER:
+        for tag in TAG_ORDER + RETIRED_TAGS:
             hit = [r for r in rows if tag in (r["start_tags"] or "").split(",")]
             if hit:
                 lines.append(f" • Started with '{TAG_LABEL[tag]}': "
@@ -1014,7 +994,6 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
     try:
         snaps = load_snapshots(src)
         captured = latest_capture_date(src)
-        stalker, down = load_stalker(src)
         lists = neobdm_lists(src, captured) if captured else {}
     finally:
         src.close()
@@ -1049,7 +1028,7 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         previous = current_weights(conn)
         learned = None
         if weekly:
-            learned = learn_weights(snaps, stalker, down)
+            learned = learn_weights(snaps)
             conn.executemany("INSERT OR REPLACE INTO tag_weights VALUES (?, ?, ?, ?, ?)",
                              [(snap.date, t, v["weight"], v["sessions"], v["avg_excess_pct"])
                               for t, v in learned.items()])
@@ -1060,7 +1039,7 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         index = {s.date: i for i, s in enumerate(snaps)}
         # A stock the machine is already holding isn't picked again (no double counting).
         holding = {t for d, t, _ in pick_rows if d in index and k - index[d] < HORIZON}
-        tagged = tag_snapshot(snaps, k, stalker.get(snap.date, frozenset()))
+        tagged = tag_snapshot(snaps, k)
         picks = rank_picks({t: c for t, c in tagged.items() if t not in holding}, weights)
         events = load_follows(follows_json).get("events", [])
         follows = active_follows(events, ended_follows(conn))
@@ -1069,7 +1048,7 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         recorded = set(conn.execute("SELECT source, ticker, started FROM pick_results").fetchall())
         your_blocks, finished_blocks, results = [], [], []
         for ticker, follow in list(follows.items())[:MAX_FOLLOWS]:
-            lines, result = follow_block(snaps, ticker, follow, sent_at, stalker)
+            lines, result = follow_block(snaps, ticker, follow, sent_at)
             if result:
                 finished_blocks.append(lines)
                 results.append(result)
@@ -1077,7 +1056,7 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 your_blocks.append(lines)
         for pick in stopped_follows(events):
             if ("you", pick["ticker"], pick["at"]) not in recorded:
-                lines, result = stopped_block(snaps, pick, sent_at, stalker)
+                lines, result = stopped_block(snaps, pick, sent_at)
                 finished_blocks.append(lines)
                 results.append(result)
         running, machine_done = machine_progress(snaps, pick_rows, recorded)
