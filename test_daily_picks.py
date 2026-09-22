@@ -112,10 +112,10 @@ def test_session_label_is_previous_weekday():
 def test_tags_never_read_later_snapshots():
     days = panel(10)
     snaps = snaps_from(days)
-    before = dp.tag_snapshot(snaps, 5, {"AAAA"})
+    before = dp.tag_snapshot(snaps, 5)
     later = [(d, {t: dict(r, close=r["close"] * 3, m_dn_0=-1, tval=999) for t, r in rows.items()})
              for d, rows in days[6:]]
-    after = dp.tag_snapshot(snaps_from(days[:6] + later), 5, {"AAAA"})
+    after = dp.tag_snapshot(snaps_from(days[:6] + later), 5)
     assert json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True)
     print("  ok no future data in tags")
 
@@ -149,12 +149,12 @@ def test_rank_needs_two_signals_and_follows_weights():
     last = days[-1][1]
     last["AAAA"] = row(cs=5, nr=-0.1, f=0.1, m=-0.1)          # 1 tag
     last["BBBB"] = row(cs=4, nr=0.1, f=0.1, m=-0.1)           # broad + inst
-    last["CCCC"] = row(cs=1, nr=0.1, f=0.1, m=0.1)            # inst + bandar_3days
+    last["CCCC"] = row(cs=1, nr=0.1, f=0.1, m=0.1, tval=20.0)  # inst + bandar_3days + value_up
     last["DDDD"] = row(cs=0, nr=-0.1, f=-0.1, m=-0.1)         # none
-    tagged = dp.tag_snapshot(snaps_from(days), 5, {"CCCC"})   # CCCC also stalker
+    tagged = dp.tag_snapshot(snaps_from(days), 5)
     picks = dp.rank_picks(tagged, {}, min_tags=2)
     assert [t for t, _ in picks] == ["CCCC", "BBBB"], picks
-    picks = dp.rank_picks(tagged, {"stalker": 0.25, "bandar_3days": 0.25, "inst_foreign": 1,
+    picks = dp.rank_picks(tagged, {"value_up": 0.25, "bandar_3days": 0.25, "inst_foreign": 1,
                                    "broad_buying": 2}, min_tags=2)
     assert [t for t, _ in picks] == ["BBBB", "CCCC"], picks
     assert [t for t, _ in dp.rank_picks(tagged, {})] == ["CCCC"]    # the machine's 3+ bar
@@ -196,26 +196,34 @@ def test_learning_is_slow_capped_and_uses_only_matured_sessions():
             rows[t * 4]["clean_score"] = 0
             rows[t * 4]["nr_dn_0"] = -0.1
     snaps = snaps_from(days)
-    few = dp.learn_weights(snaps[:9], {}, set())
+    few = dp.learn_weights(snaps[:9])
     assert few["broad_buying"]["sessions"] == 3                  # 9 - 1 - 5
-    many = dp.learn_weights(snaps, {}, set())
+    many = dp.learn_weights(snaps)
     assert many["broad_buying"]["sessions"] == 34
     assert few["broad_buying"]["weight"] < many["broad_buying"]["weight"] <= 2.0
     assert 0.25 <= many["inst_foreign"]["weight"] <= 2.0
     changed = snaps[:9] + snaps_from([(d, {t: dict(r, close=1) for t, r in rows.items()})
                                       for d, rows in days[9:]])
-    assert dp.learn_weights(changed[:9], {}, set()) == few       # later data never used
+    assert dp.learn_weights(changed[:9]) == few       # later data never used
     print("  ok learning")
 
 
-def test_stalker_down_days_are_skipped_in_learning():
-    days = panel(12)
-    snaps = snaps_from(days)
-    flagged = {d: {"AAAA", "BBBB"} for d, _ in days}
-    all_days = dp.learn_weights(snaps, flagged, set())
-    some_down = dp.learn_weights(snaps, flagged, {days[0][0], days[1][0]})
-    assert some_down["stalker"]["sessions"] == all_days["stalker"]["sessions"] - 2
-    print("  ok unknown source is not 'no'")
+def test_stalker_flag_is_shown_but_not_a_check():
+    # Retired: a year of full broker data showed no edge for the top-3
+    # retail-sell flag. It stays in the NeoBDM lists line as information.
+    days = panel(6, start="2026-09-07")
+    last = days[-1][1]
+    last["AAAA"] = row(cs=5, nr=0.1, f=0.1, m=-0.1)            # broad + inst = 2 checks
+    for t in ("BBBB", "CCCC", "DDDD"):
+        last[t] = row(cs=0, nr=-0.1, f=-0.1, m=-0.1)
+    capture = days[-1][0]
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days, stalker={capture: ["AAAA"]}, status={capture: "HITS"})
+        status, text = dp.run_morning(utc_at_myt(capture), lambda t: True, preview=True, **env)
+    assert "stalker" not in dp.TAG_ORDER and "stalker" not in dp.learn_weights(snaps_from(days))
+    assert status == "preview" and "No strong setup today" in text, text
+    assert "Stalker: AAAA" in text, text
+    print("  ok stalker is information only")
 
 
 def test_corporate_action_hint_and_limits():
@@ -520,6 +528,24 @@ def test_missing_trading_day_gives_no_win_or_loss():
     print("  ok gap gives no verdict")
 
 
+def test_suspended_day_has_no_price():
+    # NeoBDM keeps a suspended stock in the list with tval 0 and yesterday's
+    # price (seen live: PACK 1-16 Sep, SINI 8 Sep). That price can't be traded.
+    drift = {"AAAA": 0.03, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(8, start="2026-09-07", drift=drift)
+    frozen = days[5][1]["AAAA"]["close"]
+    days[6][1]["AAAA"] = row(close=frozen, tval=0.0)
+    snaps = snaps_from(days)
+    lines, result = dp.finish_pick(snaps, "AAAA", 1, 5, "machine")
+    assert lines[0].startswith("⚪ AAAA") and "no trading on the last day" in lines[0], lines
+    assert result["ret"] is None
+    rets = dp.session_returns(snaps, 1, 6)
+    assert "AAAA" not in rets and set(rets) == {"BBBB", "CCCC", "DDDD"}, rets
+    follow = dp.follow_lines(snaps[:7], "AAAA", utc_at_myt(days[2][0], 11).isoformat())
+    assert follow[0].startswith("AAAA: no trading") and "%" not in follow[0], follow
+    print("  ok suspended day is no price")
+
+
 def test_stopped_pick_gets_its_result():
     drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
     days = panel(8, start="2026-09-01", drift=drift)
@@ -606,9 +632,9 @@ def test_sender_retries_429_and_never_prints_token():
 
 # ── the morning run ────────────────────────────────────────────────────────
 
-def _morning_env(tmp, days, follows=None, stalker=None):
+def _morning_env(tmp, days, follows=None, stalker=None, status=None):
     neo = os.path.join(tmp, "neobdm.db")
-    make_db(neo, days, stalker=stalker)
+    make_db(neo, days, stalker=stalker, status=status)
     fol = os.path.join(tmp, "follows.json")
     dp.save_follows(fol, follows or {"last_update_id": 0, "events": []})
     return dict(neobdm_db=neo, picks_db=os.path.join(tmp, "picks.db"), follows_json=fol)
