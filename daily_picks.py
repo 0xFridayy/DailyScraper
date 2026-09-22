@@ -203,7 +203,12 @@ def corporate_action_hint(prev_close, close):
 
 
 def _close(snaps, j, ticker):
-    return _num(snaps[j].rows.get(ticker), "close")
+    """The session's close, or None if the stock didn't trade that day: for a
+    suspended stock NeoBDM keeps the row with tval 0 and the old price."""
+    row = snaps[j].rows.get(ticker)
+    if _num(row, "tval") == 0:
+        return None
+    return _num(row, "close")
 
 
 def day_move(snaps, k, ticker):
@@ -334,8 +339,8 @@ def session_returns(snaps, entry, exit_):
     if _gap_inside(snaps, entry, exit_):
         return {}
     rets = {}
-    for ticker, row in snaps[exit_].rows.items():
-        start, end = _close(snaps, entry, ticker), _num(row, "close")
+    for ticker in snaps[exit_].rows:
+        start, end = _close(snaps, entry, ticker), _close(snaps, exit_, ticker)
         if not start or not end:
             continue
         if price_break(snaps, entry, exit_, ticker):
@@ -521,6 +526,9 @@ def reference_index(snaps, ticker, since_utc, sent_at=None):
 def follow_lines(snaps, ticker, since_utc, sent_at=None):
     k = len(snaps) - 1
     row = snaps[k].rows.get(ticker)
+    if row is not None and _num(row, "tval") == 0:
+        return [f"{ticker}: no trading {session_label(snaps[k].date)} (suspended?). "
+                f"NeoBDM just repeats the last price, Rp {_num(row, 'close') or 0:,.0f}."]
     if row is None or not _num(row, "close"):
         seen = next((j for j in range(k, -1, -1) if ticker in snaps[j].rows), None)
         tail = f" Last seen {session_label(snaps[seen].date)}." if seen is not None else ""
@@ -698,7 +706,8 @@ def finish_pick(snaps, ticker, start, days, who, label=None):
     first, last = _close(snaps, start, ticker), _close(snaps, end, ticker)
     broke = price_break(snaps, start, end, ticker)
     if not first or not last or broke:
-        why = broke[1] if broke else "no price at the end"
+        why = (broke[1] if broke else "no trading on the first day" if not first
+               else "no trading on the last day (suspended or not in the list)")
         return [f"⚪ {ticker} ({label}): not comparable - {why}"], result
     ret = last / first - 1
     facts = explain(snaps, ticker, start, end)

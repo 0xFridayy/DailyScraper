@@ -520,6 +520,24 @@ def test_missing_trading_day_gives_no_win_or_loss():
     print("  ok gap gives no verdict")
 
 
+def test_suspended_day_has_no_price():
+    # NeoBDM keeps a suspended stock in the list with tval 0 and yesterday's
+    # price (seen live: PACK 1-16 Sep, SINI 8 Sep). That price can't be traded.
+    drift = {"AAAA": 0.03, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
+    days = panel(8, start="2026-09-07", drift=drift)
+    frozen = days[5][1]["AAAA"]["close"]
+    days[6][1]["AAAA"] = row(close=frozen, tval=0.0)
+    snaps = snaps_from(days)
+    lines, result = dp.finish_pick(snaps, "AAAA", 1, 5, "machine")
+    assert lines[0].startswith("⚪ AAAA") and "no trading on the last day" in lines[0], lines
+    assert result["ret"] is None
+    rets = dp.session_returns(snaps, 1, 6)
+    assert "AAAA" not in rets and set(rets) == {"BBBB", "CCCC", "DDDD"}, rets
+    follow = dp.follow_lines(snaps[:7], "AAAA", utc_at_myt(days[2][0], 11).isoformat())
+    assert follow[0].startswith("AAAA: no trading") and "%" not in follow[0], follow
+    print("  ok suspended day is no price")
+
+
 def test_stopped_pick_gets_its_result():
     drift = {"AAAA": 0.01, "BBBB": 0.0, "CCCC": 0.0, "DDDD": 0.0}
     days = panel(8, start="2026-09-01", drift=drift)
