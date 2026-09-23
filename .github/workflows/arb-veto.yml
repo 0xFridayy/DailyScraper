@@ -27,6 +27,12 @@ jobs:
     env:
       NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
       NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+      # Nothing here sends a message, but harvest_inventory.py imports
+      # neobdm_scraper, which calls _require_env() for all four secrets at
+      # module scope -- so importing it without these raises before the
+      # harvest starts. The other three steps need no secrets at all.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v5
 
