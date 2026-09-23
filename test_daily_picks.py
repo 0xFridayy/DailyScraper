@@ -799,6 +799,70 @@ def test_monday_after_late_scrape_still_sends_fridays_session():
     print("  ok Monday late scrape")
 
 
+def _seed_veto(picks_db, rows):
+    """rows: (as_of, ticker, valid_until). Writes the table arb_veto.py owns."""
+    conn = sqlite3.connect(picks_db)
+    dp.ensure_schema(conn)
+    conn.executemany(
+        "INSERT OR REPLACE INTO arb_veto "
+        "(as_of, ticker, p, rank, valid_until, recorded_utc) VALUES (?,?,0.9,1,?,'t')",
+        [(a, t, v) for a, t, v in rows])
+    conn.commit()
+    conn.close()
+
+
+def test_arb_veto_window_covers_the_session_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "picks.db")
+        _seed_veto(path, [("2026-09-07", "AAAA", "2026-09-14"),   # covers
+                          ("2026-09-15", "BBBB", "2026-09-22"),   # not issued yet
+                          ("2026-08-24", "CCCC", "2026-08-31")])  # expired
+        conn = sqlite3.connect(path)
+        assert dp.arb_veto(conn, "2026-09-14") == {"AAAA"}, dp.arb_veto(conn, "2026-09-14")
+        assert dp.arb_veto(conn, "2026-09-15") == {"BBBB"}
+        assert dp.arb_veto(conn, "2026-09-30") == set()
+        conn.close()
+    print("  ok veto expires with its own five-session window")
+
+
+def test_arb_veto_absent_or_empty_leaves_picks_alone():
+    days = panel(12, start="2026-08-31")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days)
+        _, before = dp.run_morning(utc_at_myt(days[-1][0]), lambda t: True,
+                                   preview=True, **env)
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days)
+        _seed_veto(env["picks_db"], [("2026-08-31", "ZZZZ", "2026-09-07")])
+        _, after = dp.run_morning(utc_at_myt(days[-1][0]), lambda t: True,
+                                  preview=True, **env)
+    assert before == after, "a veto naming nothing we hold changed the report"
+    print("  ok no veto rows, or none that bite, means no behaviour change")
+
+
+def test_arb_veto_blocks_a_name_that_would_have_been_picked():
+    days = panel(12, start="2026-08-31")
+    last = days[-1][1]
+    for t in ("AAAA", "BBBB"):                       # both clear all four checks
+        last[t] = row(cs=5, nr=0.2, f=0.2, m=0.2, tval=50.0)
+    capture = days[-1][0]
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days)
+        _, text = dp.run_morning(utc_at_myt(capture), lambda t: True, preview=True, **env)
+    assert "AAAA" in text, text                      # picked when nothing vetoes it
+
+    with tempfile.TemporaryDirectory() as tmp:       # a clean db, or it reads as already sent
+        env = _morning_env(tmp, days)
+        _seed_veto(env["picks_db"], [(capture, "AAAA", "2099-01-01")])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _, vetoed_text = dp.run_morning(utc_at_myt(capture), lambda t: True,
+                                            preview=True, **env)
+    assert "AAAA" not in vetoed_text, vetoed_text
+    assert "ARB veto dropped" in out.getvalue(), out.getvalue()
+    print("  ok vetoed name is dropped and the drop is logged")
+
+
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

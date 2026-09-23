@@ -281,6 +281,20 @@ def tag_snapshot(snaps, k):
     return tagged
 
 
+def arb_veto(conn, session_date):
+    """Tickers the weekly ARB model still flags as limit-down risks.
+
+    Written by arb_veto.py; a list is valid for the five sessions its label
+    covers, so an expired row simply stops vetoing. An empty set is the
+    honest answer both when nothing is flagged and when the weekly job has
+    never run, and either way picks carry on as before.
+    """
+    rows = conn.execute(
+        "SELECT ticker FROM arb_veto WHERE as_of <= ? AND valid_until >= ?",
+        (session_date, session_date)).fetchall()
+    return {ticker for (ticker,) in rows}
+
+
 def rank_picks(tagged, weights, n=N_PICKS, min_tags=MIN_TAGS):
     """Top n names with at least min_tags signals, by summed tag weight."""
     ranked = []
@@ -791,6 +805,13 @@ SCHEMA = [
         end_price REAL, ret REAL, market_ret REAL, bandar_share REAL,
         foreign_share REAL, trading_ratio REAL, worst_day REAL, why TEXT,
         recorded_utc TEXT NOT NULL, PRIMARY KEY (source, ticker, started))""",
+    # Limit-down risks from the weekly ARB model. arb_veto.py writes these
+    # (it needs pandas and the inventory panel); this side only reads them,
+    # which is what keeps daily_picks standard library only.
+    """CREATE TABLE IF NOT EXISTS arb_veto (
+        as_of TEXT NOT NULL, ticker TEXT NOT NULL, p REAL NOT NULL,
+        rank INTEGER NOT NULL, valid_until TEXT NOT NULL,
+        recorded_utc TEXT NOT NULL, PRIMARY KEY (as_of, ticker))""",
 ]
 
 
@@ -1040,7 +1061,17 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         # A stock the machine is already holding isn't picked again (no double counting).
         holding = {t for d, t, _ in pick_rows if d in index and k - index[d] < HORIZON}
         tagged = tag_snapshot(snaps, k)
-        picks = rank_picks({t: c for t, c in tagged.items() if t not in holding}, weights)
+        # A name the ARB model flags is not bought, however good its buy tags
+        # look. Log the ones it actually cost us, so the veto can be judged
+        # later rather than sitting there unmeasurable.
+        vetoed = arb_veto(conn, snaps[k].date)
+        blocked = sorted(t for t, c in tagged.items()
+                         if t in vetoed and t not in holding
+                         and len(c["tags"]) >= MIN_TAGS)
+        if blocked:
+            print(f"ARB veto dropped {len(blocked)} candidate(s): {', '.join(blocked)}")
+        picks = rank_picks({t: c for t, c in tagged.items()
+                            if t not in holding and t not in vetoed}, weights)
         events = load_follows(follows_json).get("events", [])
         follows = active_follows(events, ended_follows(conn))
         sent_at = dict(conn.execute(
