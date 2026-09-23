@@ -180,7 +180,7 @@ def walk_forward(data, tgt, feats, horizon, min_train=140, step=20, embargo=1):
             continue
         clf = model()
         clf.fit(X.loc[tr.index], tr[tgt].astype(int))
-        preds.append(ted.assign(p=clf.predict_proba(X.loc[ted.index])[:, 1]))
+        preds.append(ted.assign(p=clf.predict_proba(X.loc[ted.index])[:, 1], cycle=i))
     return pd.concat(preds) if preds else pd.DataFrame()
 
 
@@ -302,6 +302,74 @@ def section_trade(preds, h):
           "  the five-day version dies of something else -- read 'miss ret' for it.")
 
 
+def section_robust(preds, cut=0.999):
+    """The top bucket is ~36 rows. Before anyone sizes a trade on it, ask the
+    four questions that separate an edge from a lucky corner of the data."""
+    print("\n" + "=" * 96)
+    print("5. IS THE TOP BUCKET REAL? -- cut sensitivity, concentration, outliers, stability")
+    print("=" * 96)
+    o = preds.get("price")
+    if o is None or len(o) == 0:
+        print("  no model output")
+        return
+    o = o.dropna(subset=["ret_ara_exit"]).copy()
+
+    print("\n  (a) CUT SENSITIVITY -- a real edge decays smoothly across neighbouring")
+    print("      cuts. One cut that pays while its neighbours do not is the shape of")
+    print("      noise landing on the threshold we happened to pick.")
+    print(f"\n      {'cut':>9s} {'n':>6s} {'P(ARA)':>8s} {'win ret':>9s} "
+          f"{'miss ret':>9s} {'implied':>9s}")
+    print("      " + "-" * 56)
+    for q in [0.9995, 0.999, 0.9985, 0.998, 0.997, 0.995, 0.99]:
+        s = o[o.p >= o.p.quantile(q)]
+        win, miss = s[s.y_ara_h > 0].ret_ara_exit, s[s.y_ara_h == 0].ret_ara_exit
+        if len(s) < 5 or not len(win) or not len(miss):
+            continue
+        print(f"      {_tag(q):>9s} {len(s):6d} {s.y_ara_h.mean()*100:7.2f}% "
+              f"{win.mean()*100:+8.2f}% {miss.mean()*100:+8.2f}% "
+              f"{s.ret_ara_exit.mean()*100:+8.2f}%")
+
+    sel = o[o.p >= o.p.quantile(cut)].copy()
+    if len(sel) < 5:
+        return
+
+    print(f"\n  (b) CONCENTRATION of the {len(sel)} names in {_tag(cut)}")
+    tk = sel.ticker.value_counts()
+    mo = sel.date.dt.to_period("M").value_counts().sort_index()
+    share = tk.head(3).sum() / len(sel)
+    print(f"      distinct tickers {sel.ticker.nunique():3d} | most frequent: "
+          + ", ".join(f"{t}x{c}" for t, c in tk.head(5).items()))
+    print(f"      distinct months  {len(mo):3d} | " + ", ".join(f"{m}:{c}" for m, c in mo.items()))
+    print(f"      top-3 tickers hold {tk.head(3).sum()}/{len(sel)} rows ({share*100:.0f}%)"
+          + ("   <- one episode, not a strategy" if share > 0.5 else ""))
+
+    win = sel[sel.y_ara_h > 0].ret_ara_exit.sort_values(ascending=False)
+    if len(win):
+        print(f"\n  (c) THE {len(win)} WINNERS -- mean far above median means one name carries it")
+        print(f"      mean {win.mean()*100:+.2f}%   median {win.median()*100:+.2f}%")
+        print("      each: " + ", ".join(f"{v*100:+.1f}%" for v in win))
+        print(f"      drop the single best -> bucket implied "
+              f"{sel.drop(win.index[:1]).ret_ara_exit.mean()*100:+.2f}%")
+
+    if "cycle" in sel.columns:
+        print("\n  (d) PER-FOLD STABILITY -- how much of the edge is one lucky block?")
+        g = sel.groupby("cycle").ret_ara_exit.agg(["size", "mean"])
+        pos = int((g["mean"] > 0).sum())
+        print(f"      {len(g)} walk-forward folds carry rows: {pos} positive, "
+              f"{len(g) - pos} negative")
+        best = g["mean"].idxmax()
+        rest = sel[sel.cycle != best]
+        print(f"      best fold alone : n={int(g.loc[best, 'size']):3d} "
+              f"mean {g.loc[best, 'mean']*100:+.2f}%")
+        if len(rest):
+            print(f"      excluding it    : n={len(rest):3d} "
+                  f"mean {rest.ret_ara_exit.mean()*100:+.2f}%")
+
+    print("\n  Sizing a trade needs all four to hold: a smooth decay in (a), names and\n"
+          "  months spread in (b), a median near the mean in (c), and an edge in (d)\n"
+          "  that survives dropping its best fold.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon", type=int, default=5)
@@ -314,6 +382,7 @@ def main():
     section_vol(d, a.horizon)
     preds = section_model(d, a.horizon)
     section_trade(preds, a.horizon)
+    section_robust(preds)
 
 
 if __name__ == "__main__":
