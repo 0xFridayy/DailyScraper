@@ -193,7 +193,7 @@ def report(o, tgt, tag):
     print(f"  {tag:28s} n={len(o):6,d} ev={int(y.sum()):4d} "
           f"AUC={roc_auc_score(y, o.p):.3f} AP={average_precision_score(y, o.p):.4f} "
           f"(base {base*100:.3f}%)")
-    for q in [0.99, 0.95, 0.90]:
+    for q in [0.999, 0.99, 0.95, 0.90]:
         sel = o[o.p >= o.p.quantile(q)]
         if len(sel) == 0:
             continue
@@ -221,6 +221,12 @@ def section_model(d, h):
             if r is not None and tgt == "y_ara_h":
                 out[name] = r
     return out
+
+
+def _tag(q):
+    """'top0.1%' / 'top1%' / 'top5%' -- a plain %.0f prints the 0.1% bucket as 0%."""
+    pct = (1 - q) * 100
+    return f"top{pct:g}%" if pct < 1 else f"top{pct:.0f}%"
 
 
 def boot_mean_diff(sel, rest, col, n=1500):
@@ -253,14 +259,14 @@ def section_trade(preds, h):
     print(f"\n  {'bucket':>12s} {'n':>6s} {'gap@open':>10s} {'ara-exit':>10s} "
           f"{'hold':>9s} {'hit ARA':>9s} {'95% CI vs rest':>22s}")
     print("  " + "-" * 82)
-    for q in [0.99, 0.95, 0.90]:
+    for q in [0.999, 0.99, 0.95, 0.90]:
         thr = o.p.quantile(q)
         sel, rest = o[o.p >= thr], o[o.p < thr]
         if len(sel) < 10:
             continue
         lo, hi = boot_mean_diff(sel, rest, "ret_ara_exit")
         sig = "sig" if lo > 0 or hi < 0 else "ns"
-        print(f"  {'top'+f'{(1-q)*100:.0f}%':>12s} {len(sel):6d} "
+        print(f"  {_tag(q):>12s} {len(sel):6d} "
               f"{sel.gap_open.mean()*100:+9.2f}% {sel.ret_ara_exit.mean()*100:+9.2f}% "
               f"{sel.ret_hold.mean()*100:+8.2f}% {sel.y_ara_h.mean()*100:8.2f}% "
               f"  [{lo*100:+.2f},{hi*100:+.2f}] {sig}")
@@ -269,9 +275,9 @@ def section_trade(preds, h):
           "  can mean the winners are small or that the misses bleed; only this\n"
           "  table says which, and it is the number a stop-loss would act on.")
     print(f"\n  {'bucket':>12s} {'n':>6s} {'P(ARA)':>8s} {'win ret':>9s} "
-          f"{'miss ret':>9s} {'implied':>9s}")
-    print("  " + "-" * 60)
-    for q, tag in [(0.99, "top1%"), (0.95, "top5%"), (0.90, "top10%"), (0.0, "all")]:
+          f"{'miss ret':>9s} {'implied':>9s} {'need':>8s} {'short by':>10s}")
+    print("  " + "-" * 80)
+    for q in [0.999, 0.99, 0.95, 0.90, 0.0]:
         sel = o[o.p >= o.p.quantile(q)] if q else o
         if len(sel) < 10:
             continue
@@ -279,10 +285,17 @@ def section_trade(preds, h):
         miss = sel[sel.y_ara_h == 0].ret_ara_exit
         if not len(win) or not len(miss):
             continue
-        p = sel.y_ara_h.mean()
-        implied = p * win.mean() + (1 - p) * miss.mean()
-        print(f"  {tag:>12s} {len(sel):6d} {p*100:7.2f}% {win.mean()*100:+8.2f}% "
-              f"{miss.mean()*100:+8.2f}% {implied*100:+8.2f}%")
+        p, w, m = sel.y_ara_h.mean(), win.mean(), miss.mean()
+        implied = p * w + (1 - p) * m
+        need = -m / (w - m) if w > m else np.nan
+        print(f"  {(_tag(q) if q else 'all'):>12s} {len(sel):6d} {p*100:7.2f}% "
+              f"{w*100:+8.2f}% {m*100:+8.2f}% {implied*100:+8.2f}% "
+              f"{need*100:7.2f}% {(p - need)*100:+9.2f}pp")
+
+    print("\n  'need' is the hit rate at which this bucket's own win/miss pair breaks\n"
+          "  even: |miss| / (win - miss). 'short by' is P(ARA) minus that. A bucket\n"
+          "  only pays when it is positive, and the two ways to get there are a\n"
+          "  higher hit rate (rank harder) or a smaller miss (cut the losers).")
 
     print("\n  The one-day scan died on the gap: ARA names opened +7.13% and lost 5.07%\n"
           "  into the close. If the gap here is small but 'ara-exit' is still negative,\n"
