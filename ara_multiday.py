@@ -157,15 +157,25 @@ def section_vol(d, h):
           "  tracking volatility, not direction.")
 
 
-def walk_forward(data, tgt, feats, min_train=140, step=20, embargo=2):
+def walk_forward(data, tgt, feats, horizon, min_train=140, step=20, embargo=1):
+    """Expanding walk-forward, cut in sessions rather than calendar days.
+
+    The label spans `horizon` trading days forward, so a training row dated
+    within `horizon` sessions of a test block already knows part of that
+    block's outcome. The first version of this offset the cut by 2 calendar
+    days, which left roughly a full horizon of overlapping labels in training
+    -- and on exactly the rows most similar to the test set, so it inflated
+    AUC and lift. Dropping `horizon + embargo` sessions closes the overlap.
+    """
     dates = np.sort(data.date.unique())
     X = data[feats].replace([np.inf, -np.inf], np.nan)
     preds = []
     for i in range(min_train, len(dates), step):
-        tr_end, te = dates[i - 1], dates[i:i + step]
-        # embargo must clear the label horizon, not just 2 days
-        tr = data[data.date <= tr_end - np.timedelta64(embargo, "D")]
-        ted = data[data.date.isin(te)]
+        cut = i - 1 - horizon - embargo
+        if cut < 20:
+            continue
+        tr = data[data.date <= dates[cut]]
+        ted = data[data.date.isin(dates[i:i + step])]
         if tr[tgt].sum() < 25 or len(ted) == 0:
             continue
         clf = model()
@@ -205,7 +215,7 @@ def section_model(d, h):
     for tgt in ["y_ara_h", "y_arb_h"]:
         sub = u.dropna(subset=[tgt]).copy()
         for name, feats in [("price", px), ("price+inv", px + inv)]:
-            o = walk_forward(sub, tgt, feats)
+            o = walk_forward(sub, tgt, feats, h)
             lbl = f"{'ARA' if tgt=='y_ara_h' else 'ARB'} · {name}"
             r = report(o, tgt, lbl)
             if r is not None and tgt == "y_ara_h":
@@ -254,9 +264,29 @@ def section_trade(preds, h):
               f"{sel.gap_open.mean()*100:+9.2f}% {sel.ret_ara_exit.mean()*100:+9.2f}% "
               f"{sel.ret_hold.mean()*100:+8.2f}% {sel.y_ara_h.mean()*100:8.2f}% "
               f"  [{lo*100:+.2f},{hi*100:+.2f}] {sig}")
-    print("\n  The one-day scan died here: ARA names gapped +7.13% and lost 5.07% into\n"
-          "  the close. If 'ara-exit' is not clearly positive and significant, the\n"
-          "  five-day version dies the same way and the ranking is not a strategy.")
+
+    print("\n  Decomposition -- where the money actually goes. A negative 'ara-exit'\n"
+          "  can mean the winners are small or that the misses bleed; only this\n"
+          "  table says which, and it is the number a stop-loss would act on.")
+    print(f"\n  {'bucket':>12s} {'n':>6s} {'P(ARA)':>8s} {'win ret':>9s} "
+          f"{'miss ret':>9s} {'implied':>9s}")
+    print("  " + "-" * 60)
+    for q, tag in [(0.99, "top1%"), (0.95, "top5%"), (0.90, "top10%"), (0.0, "all")]:
+        sel = o[o.p >= o.p.quantile(q)] if q else o
+        if len(sel) < 10:
+            continue
+        win = sel[sel.y_ara_h > 0].ret_ara_exit
+        miss = sel[sel.y_ara_h == 0].ret_ara_exit
+        if not len(win) or not len(miss):
+            continue
+        p = sel.y_ara_h.mean()
+        implied = p * win.mean() + (1 - p) * miss.mean()
+        print(f"  {tag:>12s} {len(sel):6d} {p*100:7.2f}% {win.mean()*100:+8.2f}% "
+              f"{miss.mean()*100:+8.2f}% {implied*100:+8.2f}%")
+
+    print("\n  The one-day scan died on the gap: ARA names opened +7.13% and lost 5.07%\n"
+          "  into the close. If the gap here is small but 'ara-exit' is still negative,\n"
+          "  the five-day version dies of something else -- read 'miss ret' for it.")
 
 
 def main():
