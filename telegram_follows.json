@@ -17,7 +17,16 @@
    "reason": "Broker-level absorption, Inventory migration from common beneficial owner LG RF thesis jason = same guy.",
    "ticker": "MGLV",
    "update_id": 353954002
+  },
+  {
+   "action": "yes",
+   "at": "2026-09-24T09:43:17+00:00",
+   "days": 10,
+   "new": true,
+   "reason": "di pompom waterfront",
+   "ticker": "VKTR",
+   "update_id": 353954004
   }
  ],
- "last_update_id": 353954003
+ "last_update_id": 353954004
 }
