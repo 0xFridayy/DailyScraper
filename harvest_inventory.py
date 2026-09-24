@@ -41,7 +41,8 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
-START_DATE = "2025-08-22"          # the API's min_date_allowed
+LOOKBACK_DAYS = 360     # the API serves a ROLLING year; see start_date()
+MIN_SESSIONS = 100      # a year is ~240 sessions; inventory_features needs 70
 PACE = 1.0                         # seconds between requests, before jitter
 JITTER = 0.5
 REST_EVERY = 50                    # tickers
@@ -52,6 +53,25 @@ NOT_A_TICKER = {"IHSG", "ISSI"}    # indices that share the 4-letter shape
 
 def end_date():
     return time.strftime("%Y-%m-%d")
+
+
+def start_date():
+    """The API's min_date_allowed is a rolling one-year window, not a fixed
+    date. This was hardcoded to 2025-08-22 -- the value observed on the
+    2026-08-22 discovery run, which was exactly a year old that day. A month
+    later it sat a month OUTSIDE the window, and the API answered those
+    requests with success and about a month of data instead of a year, so the
+    2026-09-23 harvest fetched 1,040 tickers cleanly and still built an empty
+    panel. Asking from just inside the window is what keeps that from ageing
+    out again.
+    """
+    return time.strftime("%Y-%m-%d",
+                         time.gmtime(time.time() - LOOKBACK_DAYS * 86400))
+
+
+def session_count(d):
+    """How many sessions a response actually carried."""
+    return len(d.get("date") or [])
 
 
 def load_universe():
@@ -68,12 +88,12 @@ def cached(t):
     return os.path.join(RAW, f"{t}.json.gz")
 
 
-def fetch(req, ticker, codes, ed):
+def fetch(req, ticker, codes, sd, ed):
     # brokers MUST be repeated query params (brokers=AK&brokers=BK&...).
     # A comma-joined list is accepted with HTTP 200 but returns empty series.
     bq = "&".join(f"brokers={c}" for c in codes)
     qs = (f"symbol={ticker}&{bq}"
-          f"&start_date={START_DATE}&end_date={ed}&investor_type=A")
+          f"&start_date={sd}&end_date={ed}&investor_type=A")
     r = req.get(f"{API_BASE}/inventory?{qs}", timeout=120000)
     txt = r.text()
     j = json.loads(txt)
@@ -97,9 +117,9 @@ def main():
         syms = [s for s in syms if not os.path.exists(cached(s))]
     if a.limit:
         syms = syms[:a.limit]
-    ed = end_date()
+    sd, ed = start_date(), end_date()
     log.info(f"harvest: {len(syms)} tickers to fetch, {len(codes)} broker codes, "
-             f"{START_DATE}..{ed}")
+             f"{sd}..{ed}")
     if not syms:
         log.info("nothing to do - cache is complete")
         return
@@ -119,7 +139,14 @@ def main():
             delay = 1.0
             for attempt in range(MAX_RETRY):
                 try:
-                    d = fetch(req, t, codes, ed)
+                    d = fetch(req, t, codes, sd, ed)
+                    n = session_count(d)
+                    if ok == 0 and n < MIN_SESSIONS:
+                        raise SystemExit(
+                            f"{t} came back with {n} sessions for {sd}..{ed}, "
+                            f"under the {MIN_SESSIONS} this expects. The API's "
+                            f"rolling window has probably moved again -- check "
+                            f"LOOKBACK_DAYS before spending a full harvest.")
                     with gzip.open(cached(t), "wt", encoding="utf-8") as f:
                         json.dump(d, f)
                     ok += 1
