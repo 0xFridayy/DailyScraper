@@ -5,19 +5,17 @@ name: Weekly ARB Veto
 # anywhere in T+1..T+5", so a list stays meaningful for about a trading week,
 # and one inventory harvest a week keeps well clear of the abnormal-usage
 # throttle neobdm_scraper.py documents (~1,000 calls per harvest).
-# SCHEDULE DISABLED 2026-09-24. The first full run harvested all 1,040 tickers
-# with zero failures and still came back with 18,571 ticker-days across 889
-# names -- 21 sessions each, where the 2026-08-22 harvest got 199. The API now
-# serves about a month of history for the same 2025-08-22..today request, so
-# inventory_features.py skips every ticker on its `nd < 70` guard and builds an
-# empty panel. Until that is resolved the job cannot produce a veto list, and
-# running it weekly would spend ~1,000 calls against NeoBDM's throttle for a
-# guaranteed failure. workflow_dispatch stays, so it can be re-tried by hand.
+# The schedule was off between 2026-09-24 and this commit. A harvest pinned to
+# a start date a year older than the API's rolling window came back with a
+# month of data per ticker and an empty panel, so a weekly run would have spent
+# ~1,000 calls on a guaranteed failure. harvest_inventory.start_date() now
+# tracks that window, and the 2026-09-24 manual run trained on 108,846 rows and
+# wrote a five-name list -- so this is on again, on evidence rather than hope.
 on:
-  # schedule:
-  #   # 21:00 UTC Sunday == 05:00 Monday Asia/Kuala_Lumpur, before the 23:00 UTC
-  #   # daily scrape that consumes the list.
-  #   - cron: "0 21 * * 0"
+  schedule:
+    # 21:00 UTC Sunday == 05:00 Monday Asia/Kuala_Lumpur, before the 23:00 UTC
+    # daily scrape that consumes the list.
+    - cron: "0 21 * * 0"
   workflow_dispatch:
 
 permissions:
