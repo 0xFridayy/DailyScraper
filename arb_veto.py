@@ -9,8 +9,9 @@ base rate (lift 10.9x, AUC 0.788), and the top-0.1% Wilson interval starts at
 which IDX retail access does not reliably allow. Refusing to buy costs
 nothing and needs no borrow.
 
-Why price features and not price+inv. At the cut this writes (top 1%) the
-price-only model measured better, 39.00% against 35.38%; price+inv only wins
+Why price features and not price+inv. Around the depth this writes, top-1% on
+the walk-forward, price-only measured better: 39.00% against 35.38%. price+inv
+only wins
 further out at top-0.1%, on 36 rows. The simpler model also keeps this script
 independent of how well the inventory harvest went.
 
@@ -33,7 +34,7 @@ Pipeline (the first three are the same ones scan_ara_arb.py drives):
 Usage:
     python arb_veto.py                 # score and write
     python arb_veto.py --dry-run       # print the list, write nothing
-    python arb_veto.py --top-pct 0.02
+    python arb_veto.py --top-n 8
 """
 import argparse
 import os
@@ -52,9 +53,18 @@ from test_inventory_signal import PX_FEATS  # noqa: E402
 PANEL = os.path.join(HERE, "panel.parquet")
 PICKS_DB = os.path.join(HERE, "daily_picks.db")
 
-MIN_TURN = 0.5      # Rp bn 20d turnover, same liquidity floor as scan_ara_arb
+# Rp bn 20d turnover. This tracks daily_picks.MIN_VALUE_BN, not the Rp0.5bn
+# scan_ara_arb uses: a veto only earns its keep over names that could be
+# picked. The first real run floored at 0.5 and its five names -- one of them
+# priced at Rp11 -- were all far too thin to clear the picks filter, so the
+# list could never have bitten anything.
+MIN_TURN = 2.0
 HORIZON = 5         # an ARB close anywhere in T+1..T+5
-TOP_PCT = 0.01      # top 1% of the scored universe
+# A count, not a share. The universe this scores swings with the liquidity
+# floor (524 names at 0.5, far fewer at 2.0), and a percentage silently turns
+# into a different number of vetoes when it moves. What matters is how many
+# names get blocked, so say that.
+TOP_N = 5
 VALID_DAYS = 7      # calendar days covering those five sessions
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS arb_veto (
@@ -69,7 +79,7 @@ def model():
         l2_regularization=1.0, class_weight="balanced", random_state=0)
 
 
-def score(panel_path=PANEL, top_pct=TOP_PCT, min_turn=MIN_TURN, horizon=HORIZON):
+def score(panel_path=PANEL, top_n=TOP_N, min_turn=MIN_TURN, horizon=HORIZON):
     """(as_of date, DataFrame of the veto list) from the latest panel session."""
     d = pd.read_parquet(panel_path)
     d["date"] = pd.to_datetime(d["date"])
@@ -89,7 +99,7 @@ def score(panel_path=PANEL, top_pct=TOP_PCT, min_turn=MIN_TURN, horizon=HORIZON)
     clf.fit(train[feats], train.y_arb_h.astype(int))
     latest["p"] = clf.predict_proba(latest[feats])[:, 1]
 
-    n = max(1, round(len(latest) * top_pct))
+    n = min(top_n, len(latest))
     top = latest.nlargest(n, "p")[["ticker", "p", "close", "rv20"]].reset_index(drop=True)
     top["rank"] = top.index + 1
     print(f"trained on {len(train):,} rows ({int(train.y_arb_h.sum())} ARB windows), "
@@ -118,7 +128,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--panel", default=PANEL)
     ap.add_argument("--picks-db", default=PICKS_DB)
-    ap.add_argument("--top-pct", type=float, default=TOP_PCT)
+    ap.add_argument("--top-n", type=int, default=TOP_N)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -126,7 +136,7 @@ def main():
         sys.exit(f"{a.panel} not found -- run harvest_inventory.py -> "
                  f"build_inventory_db.py -> inventory_features.py first")
 
-    as_of, top = score(a.panel, a.top_pct)
+    as_of, top = score(a.panel, a.top_n)
     for r in top.itertuples():
         print(f"  {r.rank:2d}. {r.ticker:<6s} p={r.p:.3f}  close={r.close:,.0f}  "
               f"rv20={r.rv20:.3f}" if pd.notna(r.rv20) else
