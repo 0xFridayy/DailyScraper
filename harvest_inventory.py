@@ -43,6 +43,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
 LOOKBACK_DAYS = 360     # the API serves a ROLLING year; see start_date()
 MIN_SESSIONS = 100      # a year is ~240 sessions; inventory_features needs 70
+# Consecutive give-ups that mean the run is over, not unlucky. The
+# 2026-09-24 harvest lost its session partway and then spent ~85 minutes
+# retrying every remaining ticker four times each -- ~17s apiece against an
+# API answering nothing but a non-JSON body -- until the job timed out. A
+# broken session does not heal, so stop and say so.
+MAX_CONSEC_FAIL = 15
 PACE = 1.0                         # seconds between requests, before jitter
 JITTER = 0.5
 REST_EVERY = 50                    # tickers
@@ -96,7 +102,17 @@ def fetch(req, ticker, codes, sd, ed):
           f"&start_date={sd}&end_date={ed}&investor_type=A")
     r = req.get(f"{API_BASE}/inventory?{qs}", timeout=120000)
     txt = r.text()
-    j = json.loads(txt)
+    try:
+        j = json.loads(txt)
+    except json.JSONDecodeError:
+        # Say what actually came back. A bare "Expecting value: line 2
+        # column 1" reads like a parser quirk; it is usually the login page
+        # or a block page, which means the session died or we are refused,
+        # and no amount of retrying will change it.
+        raise RuntimeError(
+            f"{ticker}: HTTP {r.status} but the body is not JSON "
+            f"({len(txt)} chars, starts {txt.strip()[:60]!r}) -- session "
+            f"expired or the API is refusing us") from None
     if not j.get("success"):
         raise RuntimeError(f"{ticker}: {str(j.get('message'))[:120]}")
     return j["data"]
@@ -124,7 +140,7 @@ def main():
         log.info("nothing to do - cache is complete")
         return
 
-    ok = fail = 0
+    ok = fail = consec = 0
     t_start = time.time()
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True)
@@ -150,12 +166,20 @@ def main():
                     with gzip.open(cached(t), "wt", encoding="utf-8") as f:
                         json.dump(d, f)
                     ok += 1
+                    consec = 0
                     break
                 except Exception as e:
                     msg = str(e)[:130]
                     if attempt == MAX_RETRY - 1:
                         log.warning(f"[{i}/{len(syms)}] {t} GIVE UP: {msg}")
                         fail += 1
+                        consec += 1
+                        if consec >= MAX_CONSEC_FAIL:
+                            raise SystemExit(
+                                f"{consec} tickers failed in a row, last: {msg}. "
+                                f"Stopping at {i}/{len(syms)} ({ok} cached) rather "
+                                f"than retrying the rest -- re-run to resume, the "
+                                f"cache keeps what succeeded.")
                     else:
                         log.info(f"[{i}/{len(syms)}] {t} retry {attempt+1}: {msg}")
                         time.sleep(delay)
