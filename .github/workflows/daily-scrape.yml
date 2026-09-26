@@ -10,9 +10,13 @@ on:
 permissions:
   contents: write
 
-# Never let a manual run overlap the scheduled one: both push neobdm.db.
+# Never let two runs that push the same database overlap. Shared with
+# arb-veto.yml (both push daily_picks.db), and still keeps a manual run off the
+# scheduled one (both push neobdm.db). Groups are repository-wide, so only the
+# shared name makes one workflow wait for the other. At most one run waits: a
+# third one queued meanwhile cancels the waiting one.
 concurrency:
-  group: daily-scrape
+  group: picks-db
   cancel-in-progress: false
 
 jobs:
@@ -25,7 +29,12 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
+      # The branch tip, not the triggering commit: a run that waited on the
+      # concurrency group was triggered before the other run pushed, and its
+      # daily_picks.db commit could never rebase onto that push (binary file).
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-python@v6
         with:
