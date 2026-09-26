@@ -21,7 +21,9 @@ on:
 permissions:
   contents: write
 
-# daily-scrape also pushes daily_picks.db; never let the two overlap.
+# daily-scrape also pushes daily_picks.db; never let the two overlap. The group
+# must match daily-scrape.yml's: groups are repository-wide, and only a shared
+# name makes one workflow wait for the other.
 concurrency:
   group: picks-db
   cancel-in-progress: false
@@ -40,7 +42,12 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
+      # The branch tip, not the triggering commit: a run that waited on the
+      # concurrency group was triggered before the other run pushed, and its
+      # daily_picks.db commit could never rebase onto that push (binary file).
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-python@v6
         with:
