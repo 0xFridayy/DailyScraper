@@ -18,6 +18,11 @@ Pipeline riset trading IDX: scrape data broker/harga saban hari dari NeoBDM, sim
 > itu diukur di atas data rusak. `HANDOFF.md` memuat urutan kerja 5 tahap,
 > daftar yang jangan dikerjakan dulu, dan alasannya.
 
+> **Kontrak data:** semantik tiap produk data (satuan, `session_date` vs
+> `captured_at`, cakupan broker, status legacy `broker_flow`) ada di
+> [`docs/DATA_PRODUCTS.md`](docs/DATA_PRODUCTS.md). Keputusannya dicatat di
+> [`docs/DECISION_LOG.md`](docs/DECISION_LOG.md).
+
 ## Alur pipeline
 
 ```

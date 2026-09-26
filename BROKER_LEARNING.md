@@ -113,6 +113,21 @@ It fails closed and drops all-zero rows, so a missing row means **zero trades
 that day as asserted by the source**. That holds because every code was
 requested.
 
+> **Data-contract note (2026-09-26).** This paragraph describes what the v1 code
+> does. Under the data contract ([`docs/DATA_PRODUCTS.md`](docs/DATA_PRODUCTS.md)
+> §4, DS-D04), a missing row means zero only for a broker the source actually
+> **returned** with explicit zero lots (`OBSERVED_ZERO`). Requesting every code
+> does not guarantee that it is returned. A requested broker the source omits is
+> `REQUESTED_NOT_RETURNED`, not zero.
+> - All 21 inspected captures with explicit request metadata returned every
+>   requested broker.
+> - Omissions do appear in legacy `inventory_raw/`, whose request set can only be
+>   inferred.
+>
+> `strict_ticker_frame` drops all-zero rows without recording the returned
+> broker set, so its frame alone cannot tell the two cases apart. This note
+> changes neither ruleset v1 nor its code.
+
 1 lot = 100 shares.
 - BAVG = `bval/(blot·100)`
 - SAVG = `sval/(slot·100)`
@@ -152,7 +167,7 @@ For each ticker, a date is **basis-flagged** if either of these holds:
   (inclusive `regime_first_date..regime_last_date`, any classification);
 - **(b)** the runtime containment check fails. It is evaluated only on days with
   Σblot > 0 and a valid `low`/`high`:
-  - the day's market VWAP is `Σ_b bval / (Σ_b blot · 100)`, summing `bval` only over broker-days with `blot > 0` (A3: odd-lot rupiah has no lot to divide by);
+  - the day's market VWAP is `Σ_b bval / (Σ_b blot · 100)`, summing `bval` only over broker-days with `blot > 0` (A3: odd-lot rupiah has no lot to divide by; "odd-lot" is an unverified explanation, see the A3 clarification);
   - the check fails when that VWAP is outside `[low·0.99, high·1.01]`.
 
 Consequences:
@@ -708,6 +723,15 @@ touches a rule threshold.
   the odd-lot rupiah. UFOE lost 46 eligible rows and its anchor moved. This
   corrects a measurement error and does not widen the band: a real basis break
   still flags (test `test_odd_lot_rupiah_does_not_fake_a_basis_break`).
+
+  > **Clarification (2026-09-26).** "Odd-lot fills" is the historical
+  > explanation behind this amendment. It is a hypothesis, not an established
+  > fact. The 2026-09-26 cache inspection
+  > ([`docs/DATA_PRODUCTS.md`](docs/DATA_PRODUCTS.md) §3.8, §10) did not verify
+  > the cause. It verified only the field inconsistency: 556 inspected
+  > broker-session cells had `bval > 0` while `blot = 0`. These cells need
+  > future validation and annotation. The VWAP-numerator exclusion above and
+  > its results are unchanged.
 - **Broker lift (§4.6): the base is eligible rows with a known `hold_60`.** A
   case can only come from those rows, so comparing against all eligible rows
   would mix in rows whose outcome is unknowable (the last 60 sessions and

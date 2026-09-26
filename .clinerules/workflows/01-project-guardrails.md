@@ -19,7 +19,7 @@
 
 ## Broker / Ownership Research State
 
-- `observable_inventory` was rejected by Experiment #1. Do not reintroduce it unless explicitly requested.
+- `observable_inventory` V1 (cumulative net lots from legacy `broker_flow`, as an ML feature at a one-session horizon) was rejected by Experiment #1. Do not reintroduce it unless explicitly requested. The rejection does not cover inventory reconstruction, `broker_book`, or deterministic inventory math (DS-D10 in `docs/DECISION_LOG.md`).
 - `broker_identity` remains a research-grade feature and is not production-approved.
 - Owner-broker mapping is outside the current scope unless explicitly authorized.
 - Do not infer beneficial ownership, controllers, custodians, or owner-broker relationships from fuzzy name similarity.

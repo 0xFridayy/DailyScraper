@@ -879,6 +879,12 @@ disesuaikan (artifact `topup-failure.json`, timeout 45→20).
    supaya cakupan terlihat. **Keputusan user:** apakah cukup, atau perlebar
    (`TOP_8_*_ALL`), atau uji apakah kode broker eksplisit (`brokers=AK`) diterima
    endpoint (satu tes URL 30 detik) untuk memulihkan semantik kurasi lama.
+   **Dilampaui 2026-09-26:** `broker_flow` kini ditetapkan sebagai legacy
+   (DS-D06, `docs/DATA_PRODUCTS.md` §6): dibekukan untuk pengembangan baru,
+   walau writer runtime-nya masih jalan sementara sebagai utang migrasi.
+   Cakupan broker-nya tidak diperlebar. Pekerjaan broker baru memakai
+   `broker_inventory_daily` dengan cakupan koleksi yang netral dan berversi
+   (DS-D05).
 2. ~~**`get_inventory_bagholders` (neobdm_scraper.py:740) MASIH pakai `/inventory/`
    Plotly yang pensiun** — fitur broker-stalker Telegram (bag-holder) juga rusak,
    perlu migrasi API yang sama. Di luar cakupan rewrite backfill ini.~~
@@ -886,6 +892,11 @@ disesuaikan (artifact `topup-failure.json`, timeout 45→20).
 3. **`bval/sval` kini tersedia dari API** tapi dibiarkan NULL sampai konvensi
    satuan live-vs-backfill direkonsiliasi (live simpan angka page-derived via
    `parse_num`, backfill simpan miliar). Mengisinya jadi perubahan satu baris.
+   **Dilampaui 2026-09-26:** jangan isi `bval/sval` di `broker_flow`; riwayatnya
+   tidak ditulis ulang atau dimigrasikan hanya agar sesuai kontrak baru
+   (DS-D06). Satuan `bval/sval/nval` dari
+   API (Rupiah penuh) kini dikontrakkan di `docs/DATA_PRODUCTS.md` §3 untuk
+   `broker_inventory_daily`.
 
 ## Lampiran O — gerbang kontaminasi membekukan `price_history` (2026-08-26)
 
