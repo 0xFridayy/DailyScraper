@@ -29,7 +29,7 @@ import time
 import types
 import zoneinfo
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode
 
@@ -223,6 +223,32 @@ def run_backfill(root, script, tickers):
         (bf.sync_playwright, bf.login, bf.time, bf.DB_PATH, bf.FAILURE_SNAPSHOT,
          ic.NO_CACHE_ROOT) = saved
     return out.getvalue(), exit_message, request
+
+
+def run_collect(root, responses):
+    """broker_collect.collect() over AAAA, offline: its injected request
+    function serves `responses` in order."""
+    queue = list(responses)
+
+    def get(qs):
+        item = queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    return bc.collect(["AAAA"], "daily", raw_dir=root, sleep=lambda s: None,
+                      now=datetime(2026, 9, 24, 10, 30, tzinfo=timezone.utc),
+                      request_get=get, relogin=lambda: None)
+
+
+def db_counts(root):
+    """{ticker: rows} of price_history and of broker_flow in root/neobdm.db."""
+    conn = sqlite3.connect(os.path.join(root, "neobdm.db"))
+    try:
+        prices = dict(conn.execute("SELECT ticker, COUNT(*) FROM price_history GROUP BY ticker"))
+        flows = dict(conn.execute("SELECT ticker, COUNT(*) FROM broker_flow GROUP BY ticker"))
+    finally:
+        conn.close()
+    return prices, flows
 
 
 @contextmanager
@@ -616,6 +642,80 @@ def test_backfill_records_selector_captures_and_behaves_as_before():
     print("  ok test_backfill_records_selector_captures_and_behaves_as_before")
 
 
+def test_backfill_rolls_back_a_rejected_ticker_before_the_next_commit():
+    """Review blocker: insert_inventory writes before the stale-series check can
+    reject the ticker, and nothing rolled the rejected rows back, so the NEXT
+    ticker's commit() stored them after all while the manifest said REJECTED.
+    On master BBBB's rows end up in neobdm.db; here they must not."""
+    a, c = payload(base=1000.0), payload(base=3000.0)
+    script = {"AAAA": [ok(a, "AAAA")],
+              "BBBB": [ok(a, "BBBB")],             # AAAA's series again: stale, rejected
+              "CCCC": [ok(c, "CCCC")]}             # commits right after the rejection
+    with tempfile.TemporaryDirectory() as tmp:
+        out, exit_message, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
+        prices, flows = db_counts(tmp)
+        caps = ic.read_captures(only_manifest(tmp))
+    assert [(x["ticker"], x["status"]) for x in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.REJECTED), ("CCCC", ic.OK)]
+    assert prices == {"AAAA": 120, "CCCC": 120}, prices          # BBBB gone; AAAA, CCCC kept
+    assert flows == {"AAAA": 240, "CCCC": 240}, flows
+    assert "FAILED: series identical to AAAA" in out and "Failed tickers: ['BBBB']" in out
+    assert exit_message.startswith("ABORT: 1/3 tickers failed (33%"), exit_message   # as before
+    print("  ok test_backfill_rolls_back_a_rejected_ticker_before_the_next_commit")
+
+
+def test_backfill_rolls_back_a_ticker_that_fails_part_way_through_its_writes():
+    """The same leak through any other failure: BBBB's price_history rows are
+    written, then building its broker_flow rows raises. A later commit must
+    not store them either; the manifest says ERROR and nothing of BBBB is kept."""
+    broken = payload(base=2000.0)
+    broken["nlot"]["AK"][5] = "x"
+    script = {"AAAA": [ok(payload(base=1000.0), "AAAA")], "BBBB": [ok(broken, "BBBB")],
+              "CCCC": [ok(payload(base=3000.0), "CCCC")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
+        prices, flows = db_counts(tmp)
+        caps = ic.read_captures(only_manifest(tmp))
+    assert [(x["ticker"], x["status"]) for x in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.ERROR), ("CCCC", ic.OK)]
+    assert caps[1]["reason"].startswith("TypeError"), caps[1]["reason"]
+    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 240, "CCCC": 240}
+    assert "Failed tickers: ['BBBB']" in out
+    print("  ok test_backfill_rolls_back_a_ticker_that_fails_part_way_through_its_writes")
+
+
+def test_backfill_rolls_back_a_ticker_whose_commit_fails():
+    """And through a failed commit(): 'database is locked' leaves the
+    transaction open, so on master the next ticker's commit stored BBBB after
+    all, although BBBB was reported FAILED. Now the manifest's ERROR and the DB
+    agree: none of BBBB is kept."""
+    class CommitFailsOnce(sqlite3.Connection):
+        commits = 0
+
+        def commit(self):
+            CommitFailsOnce.commits += 1
+            if CommitFailsOnce.commits == 2:                # BBBB's commit
+                raise sqlite3.OperationalError("database is locked")
+            return super().commit()
+
+    script = {t: [ok(payload(base=1000.0 * k), t)] for k, t in enumerate(("AAAA", "BBBB", "CCCC"), 1)}
+    saved = bf.sqlite3
+    bf.sqlite3 = SimpleNamespace(connect=lambda path: sqlite3.connect(path, factory=CommitFailsOnce))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
+            prices, flows = db_counts(tmp)
+            caps = ic.read_captures(only_manifest(tmp))
+    finally:
+        bf.sqlite3 = saved
+    assert [(x["ticker"], x["status"]) for x in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.ERROR), ("CCCC", ic.OK)]
+    assert caps[1]["reason"] == "OperationalError: database is locked"
+    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 240, "CCCC": 240}
+    assert "Failed tickers: ['BBBB']" in out
+    print("  ok test_backfill_rolls_back_a_ticker_whose_commit_fails")
+
+
 # ── neobdm_scraper bag holders (selectors, no cache) ───────────────────────
 
 def test_bagholders_record_every_block_and_rank_as_before():
@@ -722,6 +822,185 @@ def test_broker_stalker_shares_one_manifest_and_reports_as_before():
     assert len({x["run_id"] for x in caps}) == 1
     assert all(x["mode"] == "bagholders" and x["cache_ref"] is None for x in caps)
     print("  ok test_broker_stalker_shares_one_manifest_and_reports_as_before")
+
+
+# ── HTTP status classification (review blocker) ────────────────────────────
+
+HTTP_ERRORS = [   # (label, response, vendor_success the body carries)
+    ("HTTP 500 + HTML", Resp(500, text="<html><body>Internal Server Error</body></html>"), None),
+    ("HTTP 500 + JSON success=false", Resp(500, {"success": False, "message": "server error"}), False),
+    ("HTTP 429 + JSON throttle", Resp(429, {"success": False, "message": "Abnormal usage detected"}),
+     False),
+]
+
+
+def test_http_error_outranks_every_refusal_but_not_what_was_kept():
+    """The rule itself, over every status and code: a refusal of an HTTP >= 400
+    answer is HTTP_ERROR; an outcome about kept or used data is left alone, and
+    without a response there is no code to go by."""
+    cases = []
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "t", writes_cache=True)
+        for code in (None, 200, 399, 400, 429, 500):
+            for status in ic.STATUSES:
+                cap = log.begin("symbol=AAAA")
+                if code is not None:
+                    cap.response(code, '{"success": false}', {"success": False}, b'{"success": false}')
+                cap.finish(status, "the check that fired")
+                cases.append((code, status))
+        caps = ic.read_captures(log.path)
+    assert set(ic.HTTP_ERROR_OUTRANKS) == {ic.NON_JSON, ic.VENDOR_ERROR, ic.REJECTED, ic.ERROR}
+    for (code, sent), cap in zip(cases, caps):
+        want = (ic.HTTP_ERROR if sent in ic.HTTP_ERROR_OUTRANKS and code is not None and code >= 400
+                else sent)
+        assert cap["status"] == want, (code, sent, cap["status"])
+        assert cap["reason"] == "the check that fired" and cap["http_status"] == code
+    print("  ok test_http_error_outranks_every_refusal_but_not_what_was_kept")
+
+
+def test_an_http_error_is_http_error_on_every_collector():
+    """HTTP 500 + HTML, HTTP 500 + JSON success=false and HTTP 429 + a JSON
+    throttle answer, through each of the four collectors. Every collector
+    refuses these attempts, so every one is HTTP_ERROR,
+    with the status code, the digest, vendor_success and the reason each check
+    gave kept; and each collector reacts exactly as it did before."""
+    for label, bad, vendor_success in HTTP_ERRORS:
+        code, text = bad.status, bad.text()
+        msg = None if vendor_success is None else json.loads(text)["message"]
+        expected = {
+            "broker_collect": f"HTTP {code}",
+            "harvest_inventory": (f"HTTP {code}, body is not JSON ({len(text)} chars)" if msg is None
+                                  else f"RuntimeError: AAAA: {msg}"),
+            "backfill_inventory": (f"InventoryError: AAAA: inventory API status={code} "
+                                   f"success={vendor_success} message={msg!r}"),
+            "neobdm_scraper": f"RuntimeError: AAAA: inventory API status={code} success={vendor_success}",
+        }
+        got = {}
+        # broker_collect refuses it and retries, as before
+        with tempfile.TemporaryDirectory() as tmp:
+            res = run_collect(tmp, [bad, ok(payload(), "AAAA")])
+            got["broker_collect"] = ic.read_captures(only_manifest(tmp))
+        assert res["ok"] == ["AAAA"] and res["failed"] == {}, (label, res)
+        # harvest_inventory refuses it and retries, as before
+        with tempfile.TemporaryDirectory() as tmp:
+            request = run_harvest(tmp, {"AAAA": [bad, ok(payload(), "AAAA")]}, ["AAAA"])
+            assert len(request.urls) == 2 and os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+            got["harvest_inventory"] = ic.read_captures(only_manifest(tmp))
+        # backfill_inventory fails that ticker and stores the rest, as before
+        with tempfile.TemporaryDirectory() as tmp:
+            script = {"AAAA": [bad]}
+            script.update({t: [ok(payload(base=1000.0 * k), t)]
+                           for k, t in enumerate(("BBBB", "CCCC", "DDDD"), 1)})
+            out, exit_message, _ = run_backfill(tmp, script, sorted(script))
+            prices, _ = db_counts(tmp)
+            got["backfill_inventory"] = ic.read_captures(only_manifest(tmp))
+        assert "Failed tickers: ['AAAA']" in out and exit_message is None, (label, out, exit_message)
+        assert sorted(prices) == ["BBBB", "CCCC", "DDDD"], prices
+        # the bag-holder lookup raises, as before
+        with tempfile.TemporaryDirectory() as tmp:
+            log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+            page = SimpleNamespace(context=SimpleNamespace(request=FakeRequest(tmp, {"AAAA": [bad]})))
+            try:
+                ns.get_inventory_bagholders(page, "AAAA", captures=log)
+                raise AssertionError(f"{label}: the bag-holder lookup did not raise")
+            except RuntimeError as e:
+                assert str(e) == f"AAAA: inventory API status={code} success={vendor_success}", str(e)
+            got["neobdm_scraper"] = ic.read_captures(log.path)
+
+        for collector, caps in got.items():
+            first = caps[0]
+            assert first["status"] == ic.HTTP_ERROR, (label, collector, first["status"])
+            assert first["http_status"] == code and first["vendor_success"] is vendor_success
+            assert first["response_sha256"] == hashlib.sha256(bad.body()).hexdigest()
+            assert first["reason"] == expected[collector], (label, collector, first["reason"])
+            assert first["cache_ref"] is None
+    print("  ok test_an_http_error_is_http_error_on_every_collector")
+
+
+class UndecodableResp:
+    """Like Playwright's APIResponse, whose text() is body().decode(): an error
+    page that is not UTF-8 makes text() raise."""
+
+    def __init__(self, status, raw):
+        self.status, self._raw = status, raw
+
+    def body(self):
+        return self._raw
+
+    def text(self):
+        return self._raw.decode("utf-8")
+
+
+def test_an_undecodable_http_error_is_http_error_on_every_collector():
+    """Review follow-up: harvest read r.text() before putting the response on
+    record, so an HTTP 500 page that is not UTF-8 went down as ERROR with no
+    status code or digest, where the other collectors said HTTP_ERROR. The
+    status and bytes now go on record first; the runtime is unchanged."""
+    bad = UndecodableResp(500, "<html>Erreur interne du serveur: é</html>".encode("latin-1"))
+    digest = hashlib.sha256(bad.body()).hexdigest()
+    got = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        res = run_collect(tmp, [bad, ok(payload(), "AAAA")])
+        got["broker_collect"] = ic.read_captures(only_manifest(tmp))[0]
+    assert res["ok"] == ["AAAA"], res
+    with tempfile.TemporaryDirectory() as tmp:
+        request = run_harvest(tmp, {"AAAA": [bad, ok(payload(), "AAAA")]}, ["AAAA"])
+        assert len(request.urls) == 2 and os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+        got["harvest_inventory"] = ic.read_captures(only_manifest(tmp))[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _, _ = run_backfill(tmp, {"AAAA": [bad], "BBBB": [ok(payload(), "BBBB")],
+                                       "CCCC": [ok(payload(base=2000.0), "CCCC")],
+                                       "DDDD": [ok(payload(base=3000.0), "DDDD")]},
+                                 ["AAAA", "BBBB", "CCCC", "DDDD"])
+        assert "Failed tickers: ['AAAA']" in out
+        got["backfill_inventory"] = ic.read_captures(only_manifest(tmp))[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+        page = SimpleNamespace(context=SimpleNamespace(request=FakeRequest(tmp, {"AAAA": [bad]})))
+        try:
+            ns.get_inventory_bagholders(page, "AAAA", captures=log)
+            raise AssertionError("the bag-holder lookup did not raise")
+        except RuntimeError as e:
+            assert str(e) == "AAAA: inventory API status=500 success=None", str(e)
+        got["neobdm_scraper"] = ic.read_captures(log.path)[0]
+    for collector, cap in got.items():
+        assert (cap["status"], cap["http_status"]) == (ic.HTTP_ERROR, 500), (collector, cap["status"])
+        assert cap["response_sha256"] == digest and cap["response_bytes"] == len(bad.body()), collector
+    assert got["harvest_inventory"]["reason"].startswith("UnicodeDecodeError"), got["harvest_inventory"]
+    print("  ok test_an_undecodable_http_error_is_http_error_on_every_collector")
+
+
+def test_a_payload_used_despite_an_http_error_keeps_its_outcome():
+    """status is the collector's outcome, http_status the transport fact.
+    harvest_inventory, backfill_inventory and the bag-holder lookup never look
+    at the status code, so a JSON success=true answer with HTTP 500 is cached,
+    stored or ranked, as it always was. Each capture is OK with http_status 500;
+    calling it HTTP_ERROR beside a cache_ref would contradict the cache."""
+    def odd(n=120, base=1000.0):
+        return Resp(500, {"success": True, "data": payload(n=n, base=base), "meta": {"symbol": "AAAA"}})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_harvest(tmp, {"AAAA": [odd()]}, ["AAAA"])
+        assert os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert (cap["status"], cap["http_status"], cap["cache_ref"]) == (ic.OK, 500, "AAAA.json.gz")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out, exit_message, _ = run_backfill(tmp, {"AAAA": [odd()]}, ["AAAA"])
+        prices, _ = db_counts(tmp)
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert prices == {"AAAA": 120} and exit_message is None          # stored, as before
+    assert (cap["status"], cap["http_status"], cap["cache_ref"]) == (ic.OK, 500, None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        served = [odd(n=80)] + [odd(n=20, base=1000.0 + k) for k in range(3)]
+        log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+        page = SimpleNamespace(context=SimpleNamespace(request=FakeRequest(tmp, {"AAAA": served})))
+        holders = ns.get_inventory_bagholders(page, "AAAA", captures=log)   # ranked, as before
+        caps = ic.read_captures(log.path)
+    assert holders == bagholders_from_payloads([json.loads(r.text()) for r in served[1:]], 2)
+    assert [(x["status"], x["http_status"], x["cache_ref"]) for x in caps] == [(ic.OK, 500, None)] * 4
+    print("  ok test_a_payload_used_despite_an_http_error_keeps_its_outcome")
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

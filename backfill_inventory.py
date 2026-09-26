@@ -308,6 +308,12 @@ def run_backfill(tickers):
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
                 print(f"  brokers returned={returned} kept(in BROKER_FLOW_CODES)={kept}")
             except Exception as e:
+                # Drop whatever this ticker wrote before it failed. insert_inventory
+                # writes before the stale-series check can reject it, and without
+                # this the next ticker's commit() stored the rejected rows after
+                # all. Every earlier ticker is already committed or rolled back,
+                # so only this ticker's writes are pending here.
+                conn.rollback()
                 if cap is not None:       # a failure fetch_inventory already recorded has no cap here
                     cap.finish(ic.REJECTED if isinstance(e, InventoryError) else ic.ERROR, e)
                 print(f"  FAILED: {e}")

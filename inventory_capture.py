@@ -61,6 +61,15 @@ Each attempt writes two JSON lines, joined by capture_id:
            root) and cache_sha256 (over the uncompressed JSON text written to
            that file).
 
+status and http_status answer different questions. http_status is the fact
+of the transport: the code the response came with, whatever happened next.
+status is the collector's outcome for the attempt. So a refused attempt whose
+response came with an HTTP status >= 400 is HTTP_ERROR (whichever check
+refused it), while a response a collector accepts despite such a code, as
+harvest_inventory and the no-cache collectors do with a JSON success=true
+answer, records what became of it: OK beside http_status 500 means the payload
+was cached or used although it came with a 500.
+
 A request line without a result line is an attempt that never finished (the
 process died mid-request); read_captures() reports it as INCOMPLETE.
 
@@ -106,11 +115,12 @@ ENDPOINT = "/api/inventory"
 # The manifest root of the collectors that keep no cache file (module docstring).
 NO_CACHE_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Attempt outcomes. Everything except OK and EMPTY is a source failure for the
-# attempt; the reason says which check fired.
+# Attempt outcomes: what the collector did with the attempt, not the transport
+# code, which is http_status (module docstring). Everything except OK and EMPTY
+# is a source failure for the attempt; the reason says which check fired.
 OK = "OK"                                  # accepted: cached (cache_ref), or used as is
 EMPTY = "EMPTY"                            # success, but the collector found nothing to keep
-HTTP_ERROR = "HTTP_ERROR"                  # HTTP status >= 400
+HTTP_ERROR = "HTTP_ERROR"                  # refused, and the response's HTTP status was >= 400
 NON_JSON = "NON_JSON"                      # body is not JSON (login page, proxy error)
 VENDOR_ERROR = "VENDOR_ERROR"              # JSON with success != true (the throttle too)
 REJECTED = "REJECTED"                      # JSON with success, refused by our checks
@@ -120,6 +130,14 @@ CACHE_WRITE_FAILED = "CACHE_WRITE_FAILED"  # accepted, but the cache write faile
 STATUSES = (OK, EMPTY, HTTP_ERROR, NON_JSON, VENDOR_ERROR, REJECTED, ERROR, ABORTED,
             CACHE_WRITE_FAILED)
 INCOMPLETE = "INCOMPLETE"                  # read side only: a request with no result
+# The refusals that become HTTP_ERROR when the response came with an HTTP status
+# >= 400, so every collector records a refused HTTP error as broker_collect
+# does, whether or not the body was JSON; the reason, http_status, digest and
+# vendor_success still say what came back. The outcomes of an accepted response
+# (OK, EMPTY, ABORTED, CACHE_WRITE_FAILED) are never rewritten: an attempt the
+# collector accepted despite the code says so, with the code in http_status,
+# and calling a cached payload an HTTP_ERROR would contradict its cache_ref.
+HTTP_ERROR_OUTRANKS = (NON_JSON, VENDOR_ERROR, REJECTED, ERROR)
 
 EXPLICIT_CODES = "EXPLICIT_CODES"
 SELECTOR = "SELECTOR"
@@ -316,12 +334,20 @@ class Capture:
         self.evidence = response_evidence(http_status, text, body, raw_bytes, self.log.clock)
 
     def finish(self, status, reason=None, cache_ref=None, cache_sha256=None):
-        """Write the result line; False (and nothing written) if already finished."""
+        """Write the result line; False (and nothing written) if already finished.
+
+        A refusal (HTTP_ERROR_OUTRANKS) of a response whose HTTP status is
+        >= 400 is recorded as HTTP_ERROR, whichever check refused it. Any other
+        status is written as given; http_status always carries the code."""
         if status not in STATUSES:
             raise ValueError(f"unknown capture status {status!r}")
         if self.finished:
             return False
         self.finished = True
+        code = self.evidence["http_status"]
+        if (status in HTTP_ERROR_OUTRANKS and isinstance(code, int)
+                and not isinstance(code, bool) and code >= 400):
+            status = HTTP_ERROR
         evidence = dict(self.evidence)
         if evidence["captured_at"] is None:
             evidence["captured_at"] = self.log.clock()

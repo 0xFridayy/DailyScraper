@@ -115,11 +115,15 @@ def fetch(req, ticker, qs, cap):
     attached to it, and a failure found here is recorded on it before it is
     raised."""
     r = req.get(f"{API_BASE}/inventory?{qs}", timeout=120000)
+    raw = ic.raw_body(r)
+    # The status and bytes go on record first: text() decodes the body and can
+    # raise (a non-UTF-8 error page), and the failure is still that response's.
+    cap.response(r.status, None, None, raw)
     txt = r.text()
     try:
         j = json.loads(txt)
     except json.JSONDecodeError:
-        cap.response(r.status, txt, None, ic.raw_body(r))
+        cap.response(r.status, txt, None, raw)
         cap.finish(ic.NON_JSON, f"HTTP {r.status}, body is not JSON ({len(txt)} chars)")
         # Say what actually came back. A bare "Expecting value: line 2
         # column 1" reads like a parser quirk; it is usually the login page
@@ -129,7 +133,7 @@ def fetch(req, ticker, qs, cap):
             f"{ticker}: HTTP {r.status} but the body is not JSON "
             f"({len(txt)} chars, starts {txt.strip()[:60]!r}) -- session "
             f"expired or the API is refusing us") from None
-    cap.response(r.status, txt, j, ic.raw_body(r))
+    cap.response(r.status, txt, j, raw)
     if not j.get("success"):
         err = RuntimeError(f"{ticker}: {str(j.get('message'))[:120]}")
         cap.finish(ic.VENDOR_ERROR, err)
