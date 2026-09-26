@@ -26,12 +26,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LEGACY = os.path.join(HERE, "inventory_raw")
 NOW = datetime(2026, 9, 24, 10, 30, tzinfo=timezone.utc)
 SECRET = "sessionid=TOPSECRET123"
-# CONTRACTS.md: the 45 price_history tickers plus BNGA.
-SEED_WATCHLIST = set(
-    "BBHI BNBR BREN BRMS BRPT BUKA BUVA CASS CBDK CDIA COIN CUAN DEWA DOOH ELTY "
-    "EMTK ENRG ERAA ERAL FAST INPC JARR JGLE JIHD KIOS MDIA MINA PADI PANI PDPP "
-    "PGUN PSKT PTRO RAJA RATU RSGK SAME SCMA SINI TEBE TPIA UANG VIVA VKTR WIFI "
-    "BNGA".split())
 
 # The GIVE UP / cache warnings below are expected. Without a handler, logging's
 # last-resort handler would print them between the "ok" lines.
@@ -77,7 +71,20 @@ def envelope(data, symbol=None, success=True):
     return env
 
 
+def has_legacy(ticker="SINI"):
+    return os.path.exists(os.path.join(LEGACY, f"{ticker}.json.gz"))
+
+
 def legacy(ticker):
+    """The ticker's real harvest payload, or a stand-in where the cache is absent.
+
+    inventory_raw/ is gitignored, so CI (ml-health.yml) never has it. The
+    stand-in is a full year with a ticker-specific price level, so two tickers
+    are never clones of each other; tests that need the REAL files check
+    has_legacy() themselves.
+    """
+    if not has_legacy(ticker):
+        return payload(n=240, base=float(sum(map(ord, ticker))), brokers=("AK", "BK", "XL"))
     with gzip.open(os.path.join(LEGACY, f"{ticker}.json.gz"), "rt", encoding="utf-8") as f:
         return json.load(f)
 
@@ -217,14 +224,18 @@ def test_load_codes_universe_and_seed_watchlist():
     uni = bc.load_universe()
     assert "IHSG" not in uni and "ISSI" not in uni and len(uni) > 1000
     wl = bc.load_watchlist()
-    assert set(wl) == SEED_WATCHLIST and len(wl) == 46, sorted(set(wl) ^ SEED_WATCHLIST)
-    assert set(wl) <= set(uni)
+    # The owner edits the watchlist freely, so check that it is usable, not
+    # that it still equals the seed it started from.
+    assert wl and len(wl) == len(set(wl)), wl
+    assert set(wl) <= set(uni), sorted(set(wl) - set(uni))
     with open(bc.WATCHLIST, encoding="utf-8") as f:
         assert "edit freely; watchlist is not part of the frozen ruleset" in json.load(f)["note"]
     # The note's promise: daily mode aborts when 3 of the first 5 are short, so
-    # the head of the list must be long-listed names (checked on the harvest cache).
-    for t in wl[:bc.DAILY_PROBE]:
-        assert bc.session_count(legacy(t)) >= bc.MIN_SESSIONS, t
+    # the head of the list must be long-listed names. Only the real harvest
+    # cache can say that; CI has none.
+    if all(has_legacy(t) for t in wl[:bc.DAILY_PROBE]):
+        for t in wl[:bc.DAILY_PROBE]:
+            assert bc.session_count(legacy(t)) >= bc.MIN_SESSIONS, t
     print("  ok test_load_codes_universe_and_seed_watchlist")
 
 
@@ -720,11 +731,20 @@ def test_cache_round_trip_envelope_and_legacy():
         assert list(bc.load_cached(None, "market", raw_dir=tmp)) == ["BREN"]
         assert dict(bc.iter_cached(["SINI"], "daily", raw_dir=tmp)) == {"SINI": sini}
 
-    before = os.stat(os.path.join(LEGACY, "SINI.json.gz")).st_mtime_ns
-    got = bc.load_cached(["SINI", "BREN", "NOPE"], "ignored", raw_dir=LEGACY, legacy=True)
-    assert list(got) == ["SINI", "BREN"]
-    assert got["SINI"] == sini and len(got["BREN"]["nlot"]) == 101
-    assert os.stat(os.path.join(LEGACY, "SINI.json.gz")).st_mtime_ns == before
+        # The legacy layout (<raw_dir>/<T>.json.gz holding a bare data dict).
+        legacy_dir = os.path.join(tmp, "legacy")
+        os.makedirs(legacy_dir)
+        with gzip.open(os.path.join(legacy_dir, "SINI.json.gz"), "wt", encoding="utf-8") as f:
+            json.dump(sini, f)
+        got = bc.load_cached(["SINI", "NOPE"], "ignored", raw_dir=legacy_dir, legacy=True)
+        assert got == {"SINI": sini}
+
+    if has_legacy("SINI") and has_legacy("BREN"):      # the real harvest cache, read-only
+        before = os.stat(os.path.join(LEGACY, "SINI.json.gz")).st_mtime_ns
+        got = bc.load_cached(["SINI", "BREN", "NOPE"], "ignored", raw_dir=LEGACY, legacy=True)
+        assert list(got) == ["SINI", "BREN"]
+        assert got["SINI"] == sini and len(got["BREN"]["nlot"]) == 101
+        assert os.stat(os.path.join(LEGACY, "SINI.json.gz")).st_mtime_ns == before
     print("  ok test_cache_round_trip_envelope_and_legacy")
 
 
