@@ -75,17 +75,20 @@ Mengukur sinyal produksi terhadap kenyataan, merangkum semuanya jadi laporan har
 
 ### 5. Otomasi & konfigurasi
 
-Lima GitHub Actions workflow yang menjalankan file-file di atas secara terjadwal, plus file konfigurasi pendukung.
+Sepuluh GitHub Actions workflow yang menjalankan file-file di atas secara terjadwal (atau manual), plus file konfigurasi pendukung.
 
 | Workflow | Jadwal (UTC) | Menjalankan |
 |---|---|---|
-| `daily-scrape.yml` | `0 23 * * *` | `neobdm_scraper.py --now` |
+| `daily-scrape.yml` | `0 23 * * *` | `morning.py` (scrape + picks pagi) |
 | `price-history-topup.yml` | `30 0 * * *` | `backfill_inventory.py` |
 | `capture-health.yml` | `15 1 * * *` | `check_capture_health.py --telegram` |
 | `signal-integrity.yml` | `45 1 * * *` | `check_signal_integrity.py --telegram` |
+| `ownership-capture.yml` | `30 2 * * *` | `ownership_capture.py` |
 | `ml-health.yml` | `30 12 * * *` + **tiap push & PR** | `check_ml_health.py` |
-| `ml-daily-report.yml` | `0 13 * * *` | `run_ml_reports.py` |
+| `ml-daily-report.yml` | manual saja (sejak 2026-09) | `run_ml_reports.py` |
 | `signal-eval.yml` | `0 2 * * 0` (mingguan) | `evaluate_signals.py --telegram` |
+| `arb-veto.yml` | `0 21 * * 0` (mingguan) | `harvest_inventory.py` → `build_inventory_db.py` → `inventory_features.py` → `arb_veto.py` |
+| `telegram-inbox.yml` | `17 */3 * * *` | `telegram_inbox.py` |
 
 | File | Fungsi |
 |---|---|

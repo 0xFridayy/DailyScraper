@@ -16,8 +16,9 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # 12:30 UTC — 30 minutes before ml-daily-report.yml (13:00 UTC), so a broken
-    # pipeline is known BEFORE the report runs on top of it.
+    # 12:30 UTC — chosen as 30 minutes before ml-daily-report.yml's old 13:00 UTC
+    # run. That report is manual-only since 2026-09, so this is now just the
+    # daily check for breakage that arrives without a commit.
     - cron: "30 12 * * *"
   workflow_dispatch:
 
