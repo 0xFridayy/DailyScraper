@@ -1,0 +1,10 @@
+{
+  "note": "Daily broker-learning watchlist (BROKER_LEARNING.md): edit freely; watchlist is not part of the frozen ruleset. Seeded 2026-09-24 with the 45 price_history tickers plus BNGA. Keep long-listed names first: daily mode aborts if 3 of the first 5 fetched come back short.",
+  "tickers": [
+    "BBHI", "BNBR", "BNGA", "BREN", "BRMS", "BRPT", "BUKA", "BUVA", "CASS", "CBDK",
+    "CDIA", "COIN", "CUAN", "DEWA", "DOOH", "ELTY", "EMTK", "ENRG", "ERAA", "ERAL",
+    "FAST", "INPC", "JARR", "JGLE", "JIHD", "KIOS", "MDIA", "MINA", "PADI", "PANI",
+    "PDPP", "PGUN", "PSKT", "PTRO", "RAJA", "RATU", "RSGK", "SAME", "SCMA", "SINI",
+    "TEBE", "TPIA", "UANG", "VIVA", "VKTR", "WIFI"
+  ]
+}

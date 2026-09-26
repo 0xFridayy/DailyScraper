@@ -1,0 +1,90 @@
+name: Broker Learning Daily
+
+# Research-grade broker-inventory dashboard for the watchlist (BROKER_LEARNING.md).
+# Fetches /api/inventory for broker_watchlist.json (all 101 broker codes),
+# records ruleset v1 for the latest session in the insert-only live ledger,
+# scores the live outcomes that have become known, and sends the HTML page to
+# the private Telegram chat as a document. The page is never committed: this
+# repo is public and the page shows paid NeoBDM data. Only broker_learning.db
+# (rule verdicts and outcomes, no raw inventory) is committed.
+on:
+  schedule:
+    # 10:30 UTC == 17:30 WIB, Monday-Friday: after the IDX close and
+    # post-trading (~16:15 WIB), so the day's session is in the API, and
+    # outside every other job's SCHEDULED NeoBDM window (daily-scrape
+    # ~23:00-01:45, top-up ~04:30-05:20, ownership ~07:00-08:25, arb-veto
+    # Sunday 21:00). GitHub can delay a schedule by hours (top-up has
+    # committed at 10:08 and 11:39) and a manual run can start at any time,
+    # so two jobs sharing one login's rate limit is unlikely, not impossible.
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# broker-learning-weekly.yml commits the same DB; never let the two overlap.
+concurrency:
+  group: broker-learning
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    # ~46 tickers at ~1.5 s pace plus login is a few minutes. The ceiling is
+    # for retries, backoff and the 120 s throttle cooldown; being killed
+    # mid-run is worse than a slow green.
+    timeout-minutes: 30
+    env:
+      # Python block-buffers stdout without a TTY; a killed run would lose its log.
+      PYTHONUNBUFFERED: "1"
+      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
+      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+      # Both Telegram secrets are needed twice over: the page is sent with
+      # them, and neobdm_scraper (imported by broker_collect.collect() for the
+      # login) calls _require_env() for all four at import time.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Deliberately NOT requirements.txt: that pulls xgboost, shap and torch,
+      # which nothing here imports. pyarrow is required (broker_book imports
+      # build_inventory_db, which imports it at module scope); schedule and
+      # pytz are required because neobdm_scraper imports them at module scope.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyarrow requests playwright schedule pytz
+
+      - name: Install Playwright Chromium (+ system deps)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch, record, render and send
+        run: python broker_learning_run.py daily
+
+      # Runs on failure too (not on cancel, which can kill a write midway).
+      # Every live row is valid on its own and can never be written on a later
+      # day, so a run that exits non-zero over a partial outage still keeps
+      # what it recorded; the run row says it failed.
+      - name: Commit the ledger
+        if: success() || failure()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # broker_learning.db only. broker_learning_raw/ and broker_dashboard_out/
+          # are paid data and a private page; both are gitignored and stay here.
+          if [ -f broker_learning.db ]; then
+            git add broker_learning.db
+          fi
+          git diff --staged --quiet || git commit -m "Broker learning ledger ($(date -u +%Y-%m-%d))"
+          for i in 1 2 3; do
+            if git pull --rebase && git push; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep 15
+          done
+          echo "::error::push failed 3 times - today's live ledger rows are NOT saved"
+          exit 1

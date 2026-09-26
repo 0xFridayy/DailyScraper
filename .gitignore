@@ -49,6 +49,15 @@ scratch_ownership_panes*.json
 inventory_raw/
 *.parquet
 
+# Broker learning dashboard (BROKER_LEARNING.md): the /api/inventory cache is
+# re-fetchable like inventory_raw/, and the rendered HTML goes to a private
+# Telegram chat only -- this repo is public. broker_learning.db IS committed.
+# broker_history/ is paid NeoBDM data too: it leaves only as release assets,
+# and only when the owner sets BROKER_HISTORY_UPLOAD (spec 4.7).
+broker_learning_raw/
+broker_dashboard_out/
+broker_history/
+
 # Local research DB, intentionally separate from neobdm.db so the nightly CI
 # commit of neobdm.db never collides with it (see txchart_history_pull.py)
 txchart_history.db

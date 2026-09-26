@@ -191,3 +191,40 @@ def format_signal_stats(s, label=""):
             f"n={s['n_top']} hit {s['hit_rate']:.1%} vs base {s['base_rate']:.1%} "
             f"(edge {s['hit_edge']:+.1%}) | ret {s['top_mean']:+.2%} vs "
             f"{s['all_mean']:+.2%} (edge {s['edge']:+.2%})")
+
+
+def date_balanced_hit_edge(signal_returns, signal_dates, universe_returns, universe_dates):
+    """Hit edge with every date weighted once, each against its own base rate.
+
+    The pooled hit_edge (hit rate over all signal rows minus base rate over all
+    universe rows) has the same flaw as the pooled hit rate it corrects: rows
+    on one date share one market move. A signal that happens to fire twenty
+    times on a broad up-day and twice on a down-day shows a large pooled edge
+    while calling nothing, because its rows are simply concentrated where the
+    whole universe went up. Differencing inside each date first removes that:
+    a day contributes hit_d - base_d, and the days are then averaged equally.
+
+    A date counts only when it has at least one non-NaN signal return AND at
+    least one non-NaN universe return; a date with no base rate cannot be
+    differenced, and a NaN return is missing data, never a miss.
+
+    Returns {"daily_hit_edge": mean over dates of (hit_d - base_d), or NaN when
+    no date qualifies, "n_dates": the number of dates that did}.
+    """
+    def _frame(returns, dates):
+        r = np.asarray(returns, dtype=float)
+        d = np.asarray(dates, dtype=object)
+        if len(r) != len(d):
+            raise ValueError("returns and dates must have the same length")
+        f = pd.DataFrame({"r": r, "d": d})
+        return f[f["r"].notna() & f["d"].notna()]
+
+    sig = _frame(signal_returns, signal_dates)
+    uni = _frame(universe_returns, universe_dates)
+    hit = (sig["r"] > 0).groupby(sig["d"]).mean()
+    base = (uni["r"] > 0).groupby(uni["d"]).mean()
+    both = hit.index.intersection(base.index)
+    if len(both) == 0:
+        return {"daily_hit_edge": np.nan, "n_dates": 0}
+    diff = hit.loc[both] - base.loc[both]
+    return {"daily_hit_edge": float(diff.mean()), "n_dates": int(len(both))}
