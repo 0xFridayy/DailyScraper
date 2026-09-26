@@ -23,7 +23,7 @@ The replacement UI, /inventory-chart/, is backed by a clean JSON endpoint:
         &brokers=TOP_5_NS_LOT_C20
 
     -> { success, data: {
-             date:  ["2026-08-04", ...],            # currently capped at 20 sessions
+             date:  ["2025-09-29", ...],            # trading days, parallel to ohlc
              blot/slot/nlot: { "AK": [...], ... },  # buy/sell/NET LOT per broker
              bval/sval/nval: { "AK": [...], ... },  # buy/sell/net VALUE in full Rp
              ohlc:  [ {date, open, high, low, close, volume, volume_sma20}, ... ]
@@ -53,8 +53,8 @@ deliberate on two counts:
 
   2. It matches the unit of the rows already stored by the old backfill, so a
      recent-window re-fetch heals existing rows in place rather than mixing two
-     conventions. Older contamination is reconciled from the archived full-
-     market parquet; the live endpoint no longer serves enough history.
+     conventions. Contamination older than the endpoint's rolling year is
+     reconciled from the archived full-market parquet instead.
      bval/sval/bavg/savg are left NULL for the same reason — the live path
      (neobdm_scraper.save_broker_flow) stores those in a different, page-derived
      unit, and reconciling the two conventions is a separate task, not this one.
@@ -69,12 +69,13 @@ import sys
 import json
 import sqlite3
 import time
-from datetime import date, timedelta
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
-from price_audit import series_signature, should_fail_run
+from price_audit import (series_signature, should_fail_run, inventory_window,
+                         inventory_window_is_short)
 
 # Priming this page first sets the csrftoken/sessionid cookies for the inventory
 # path. The data GET is authenticated by the sessionid cookie alone (no CSRF).
@@ -89,19 +90,24 @@ BACKFILL_END = "2026-07-04"  # never overwrite live-scraped broker_flow rows fro
 MAX_FAILURE_RATE = 0.30
 FAILURE_SNAPSHOT = "topup-failure.json"   # raw first-failure response, a CI artifact
 
-# Ask for the longest window the endpoint historically allowed. As of 2026-09-03
-# the live service caps every tested request shape to 20 sessions despite these
-# dates; this remains useful for nightly top-ups but cannot heal older history.
-WINDOW_DAYS = 365
+# The endpoint serves a ROLLING one-year window, and answers a start_date before
+# it with success and only the last ~20 sessions (see
+# price_audit.inventory_window). 365 sat exactly on that edge; 360 keeps the same
+# margin as harvest_inventory.LOOKBACK_DAYS. From 2026-08-31 to 09-09 the API
+# also gave every request, this one included, only ~20 sessions; since 09-10 it
+# has served the full year again (~239 sessions a night).
+WINDOW_DAYS = 360
+MIN_SESSIONS = 100    # a year is ~239 sessions; the short fallback is <= 20
 INVESTOR_TYPE = "A"   # A = All (foreign + domestic); matches the site default
 
-# The site's own selector grammar. Live verification on 2026-09-03 established
-# that both these selectors AND 30/101 repeated explicit broker codes now return
-# only 10 brokers and 20 sessions. Keep the dashboard selectors here because they
-# at least choose the current dominant buyers/sellers for top-ups. Historical
-# cleanup uses the previously harvested authoritative ohlc.parquet through
-# price_audit.py reconcile-cross-dups instead of pretending this endpoint can
-# still re-fetch a year.
+# The site's own selector grammar, and the pair /inventory-chart/ itself sends:
+# the 5 largest net buyers + 5 largest net sellers by lot over the last 20
+# candles. On 2026-09-03 both these AND 30/101 explicit broker codes came back
+# with only 10 brokers and 20 sessions -- that was the 08-31..09-09 short-answer
+# period, not a lasting limit; the 2026-09-24 harvest got a full year for all
+# 101 explicit codes. History older than the rolling year still cannot be
+# re-fetched here; that cleanup uses the harvested ohlc.parquet through
+# price_audit.py reconcile-cross-dups.
 INVENTORY_BROKERS = ["TOP_5_NB_LOT_C20", "TOP_5_NS_LOT_C20"]
 
 
@@ -121,9 +127,8 @@ def _json_or_none(resp):
 
 
 def _date_window(window_days=WINDOW_DAYS):
-    """Requested date bounds; the service may return a shorter capped window."""
-    end = date.today()
-    return (end - timedelta(days=window_days)).isoformat(), end.isoformat()
+    """Requested date bounds, inside the API's rolling year (see WINDOW_DAYS)."""
+    return inventory_window(datetime.now(timezone.utc), window_days)
 
 
 def fetch_inventory(req, ticker, start_date, end_date):
@@ -232,6 +237,7 @@ def run_backfill(tickers):
           f"(brokers={INVENTORY_BROKERS}, investor_type={INVESTOR_TYPE})")
 
     failed = []
+    sessions = []   # sessions each stored ticker actually got back
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -272,6 +278,7 @@ def run_backfill(tickers):
                 prev_signature, prev_ticker = signature, ticker
                 kept = [c for c in returned if c in BROKER_FLOW_CODES]
                 dates = payload["data"].get("date") or []
+                sessions.append(len(dates))
                 rng = f"{dates[0]} to {dates[-1]}" if dates else "n/a"
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
                 print(f"  brokers returned={returned} kept(in BROKER_FLOW_CODES)={kept}")
@@ -296,6 +303,16 @@ def run_backfill(tickers):
 
     conn.close()
     print(f"\nFailed tickers: {failed}")
+
+    # A warning, not an exit: the short fallback still ends at the latest
+    # session, so price_history WAS topped up. Failing here would have blocked
+    # every top-up from 2026-08-31 to 09-09 and saved nothing.
+    if inventory_window_is_short(sessions, MIN_SESSIONS):
+        print(f"::warning::the longest inventory series was {max(sessions)} "
+              f"sessions for {start_date}..{end_date}, under {MIN_SESSIONS}: the "
+              f"API answered with its short fallback, not the year asked for. "
+              f"price_history is current but nothing older was refreshed -- check "
+              f"WINDOW_DAYS against the API's rolling window.")
 
     if should_fail_run(len(failed), len(tickers), MAX_FAILURE_RATE):
         rate = len(failed) / len(tickers) if tickers else 1.0

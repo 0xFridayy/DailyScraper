@@ -62,7 +62,7 @@ import os
 import re
 import sys
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
@@ -294,6 +294,35 @@ def should_fail_run(n_failed, n_total, max_failure_rate=0.30):
     if n_total <= 0:
         return True                       # nothing attempted is itself a failure
     return (n_failed / n_total) > max_failure_rate
+
+
+def inventory_window(now_utc, window_days):
+    """(start_date, end_date) as YYYY-MM-DD for an /api/inventory request.
+
+    The endpoint serves a ROLLING one-year window, and a start_date before it is
+    not an error: it answers success with only the last ~20 sessions. 365 days
+    back sat exactly ON that edge -- the 2026-09-24 top-up asked from 2025-09-24,
+    the first day the chart's own picker offered -- so it had no margin at all.
+    Which calendar the API counts in is unknown, and a runner in a UTC evening
+    is already a day behind Jakarta, so the caller keeps a few days of margin
+    and both bounds come from one UTC clock. Lives here so it is testable
+    without playwright.
+    """
+    end = now_utc.astimezone(timezone.utc).date()
+    return (end - timedelta(days=window_days)).isoformat(), end.isoformat()
+
+
+def inventory_window_is_short(session_counts, min_sessions):
+    """Did /api/inventory hand back its short fallback instead of the window?
+
+    The fallback answers success, so a green run proves nothing: from 2026-08-31
+    to 09-09 every tracked ticker came back with 20 sessions or fewer and every
+    run went green. Judged on the LONGEST series in the run, not on each ticker
+    or the first one, because a recent listing legitimately has less than a
+    year (RSGK had 121 on 2026-09-24). Nothing stored at all is not a short
+    window -- that is should_fail_run's case.
+    """
+    return bool(session_counts) and max(session_counts) < min_sessions
 
 
 # ─────────────────────────────────────────────
