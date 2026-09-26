@@ -29,6 +29,7 @@ from strategy_variants import get_walk_forward_predictions, simulate_trade, _ind
 from kelly_sizing import kelly_fraction, kelly_from_trades
 from price_audit import (add_forward_returns, add_lagged_returns,
                          series_signature, ticker_from_title, should_fail_run,
+                         inventory_window, inventory_window_is_short,
                          detect, bagholders_from_payload, bagholders_from_payloads,
                          inventory_date_blocks, date_offset_holds,
                          authoritative_duplicate_deletions, cmd_quarantine,
@@ -1994,6 +1995,69 @@ def test_should_fail_run_catches_a_broken_scrape():
     print("test_should_fail_run_catches_a_broken_scrape passed")
 
 
+def _module_constant(filename, name):
+    """A top-level constant read from source, for scripts this file cannot
+    import (backfill_inventory and harvest_inventory pull in playwright and the
+    NeoBDM secrets at import time, and ml-health installs neither)."""
+    import ast as _ast
+    here = os.path.dirname(os.path.abspath(__file__))
+    tree = _ast.parse(open(os.path.join(here, filename), encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, _ast.Assign) and any(
+                getattr(t, "id", None) == name for t in node.targets):
+            return _ast.literal_eval(node.value)
+    raise AssertionError(f"{filename} has no top-level {name}")
+
+
+def test_inventory_requests_stay_inside_the_rolling_year():
+    # /api/inventory serves a rolling year and answers a start_date before it
+    # with success and ~20 sessions. backfill's 365 days landed exactly ON the
+    # edge (2026-09-24 asked from 2025-09-24, the first day the chart allowed);
+    # harvest's fixed 2025-08-22 aged out and built an empty panel.
+    from datetime import date as _date, datetime as _dt, timedelta as _td, timezone as _tz
+
+    def year_before(d):
+        try:
+            return d.replace(year=d.year - 1)
+        except ValueError:                        # Feb 29
+            return d.replace(year=d.year - 1, day=28)
+
+    for filename, name in (("backfill_inventory.py", "WINDOW_DAYS"),
+                           ("harvest_inventory.py", "LOOKBACK_DAYS")):
+        days = _module_constant(filename, name)
+        # Every nightly slot for three years, 2028's leap day included.
+        for i in range(3 * 366):
+            now = _dt(2027, 1, 1, 5, 8, tzinfo=_tz.utc) + _td(days=i)
+            start, end = inventory_window(now, days)
+            margin = _date.fromisoformat(start) - year_before(now.date())
+            # One day for a UTC-evening runner trailing Jakarta's calendar, one
+            # for not knowing whether the API's edge is inclusive.
+            assert margin >= _td(days=2), (
+                f"{filename} {name}={days} asks from {start} on {end}, only "
+                f"{margin.days} day(s) inside the API's rolling year")
+
+    # Both bounds from ONE UTC clock: 01:00 in Jakarta on the 25th is still the
+    # 24th in UTC, so the width is exactly the lookback, never a day more.
+    wib = _tz(_td(hours=7))
+    start, end = inventory_window(_dt(2026, 9, 25, 1, 0, tzinfo=wib), 360)
+    assert (start, end) == ("2025-09-29", "2026-09-24"), (start, end)
+    print("test_inventory_requests_stay_inside_the_rolling_year passed")
+
+
+def test_short_inventory_window_is_judged_on_the_longest_series():
+    min_sessions = _module_constant("backfill_inventory.py", "MIN_SESSIONS")
+    # 2026-09-24: ~239 sessions for most names, RSGK (listed 2026-03-25) 121.
+    assert not inventory_window_is_short([239, 230, 121, 239], min_sessions)
+    # A brand-new listing in an otherwise healthy run is not the fallback.
+    assert not inventory_window_is_short([239, 6], min_sessions)
+    # 2026-08-31..09-09: every ticker came back with 20 sessions or fewer, and
+    # every one of those runs went green without a word.
+    assert inventory_window_is_short([20, 19, 20, 7], min_sessions)
+    # Nothing stored is should_fail_run's case, not a short window.
+    assert not inventory_window_is_short([], min_sessions)
+    print("test_short_inventory_window_is_judged_on_the_longest_series passed")
+
+
 # ---------------------------------------------------------------------------
 # Experiment #1F Phase 2 -- lossless ingest + the normalized market-data layer
 # ---------------------------------------------------------------------------
@@ -2696,6 +2760,8 @@ if __name__ == "__main__":
     test_old_accumulator_remains_visible_across_sixty_session_inventory()
     test_should_fail_run_tolerates_a_few_failures()
     test_should_fail_run_catches_a_broken_scrape()
+    test_inventory_requests_stay_inside_the_rolling_year()
+    test_short_inventory_window_is_judged_on_the_longest_series()
     test_series_signature_distinguishes_two_stocks()
     test_series_signature_none_when_empty()
     test_ticker_from_title_only_asserts_when_it_can()
