@@ -61,6 +61,11 @@ deliberate on two counts:
      The API now provides real bval/sval, so populating them later is a one-line
      change once that convention is settled.
 
+Every request is recorded in the capture manifest (inventory_capture), under
+the repository root's _capture_manifest/ because this keeps no cache file: the
+exact query before it is sent, with the two selectors recorded as selectors,
+then the outcome and the brokers they resolved to. cache_ref is always null.
+
 Usage: py backfill_inventory.py TICKER1 TICKER2 ...
 (no args = all of TRACKED_TICKERS from neobdm_scraper)
 """
@@ -73,6 +78,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
+import inventory_capture as ic
 from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 from price_audit import (series_signature, should_fail_run, inventory_window,
                          inventory_window_is_short)
@@ -131,27 +137,41 @@ def _date_window(window_days=WINDOW_DAYS):
     return inventory_window(datetime.now(timezone.utc), window_days)
 
 
-def fetch_inventory(req, ticker, start_date, end_date):
-    """Authenticated GET of the inventory endpoint. Raises InventoryError with the
-    raw response text attached, so the first failure can be snapshotted."""
+def fetch_inventory(req, ticker, start_date, end_date, captures):
+    """Authenticated GET of the inventory endpoint; (payload, the Capture that
+    records it). Raises InventoryError with the raw response text attached, so
+    the first failure can be snapshotted.
+
+    The request goes into `captures` (inventory_capture.CaptureLog) before it
+    is sent, and a failure found here is recorded before it is raised. What
+    became of a returned payload is for the caller to record."""
     query = [("symbol", ticker), ("start_date", start_date),
              ("end_date", end_date), ("investor_type", INVESTOR_TYPE)]
     query += [("brokers", b) for b in INVENTORY_BROKERS]
-    url = f"{INVENTORY_API}?{urlencode(query)}"
+    qs = urlencode(query)
+    url = f"{INVENTORY_API}?{qs}"
 
-    resp = req.get(url, timeout=60000)
-    raw = None
+    cap = captures.begin(qs)
     try:
-        raw = resp.text()
-    except Exception:
-        pass
-    payload = _json_or_none(resp)
-    if not payload or not payload.get("success"):
-        msg = (payload or {}).get("message")
-        raise InventoryError(
-            f"{ticker}: inventory API status={resp.status} success="
-            f"{(payload or {}).get('success')} message={msg!r}", raw=raw)
-    return payload
+        resp = req.get(url, timeout=60000)
+        raw = None
+        try:
+            raw = resp.text()
+        except Exception:
+            pass
+        payload = _json_or_none(resp)
+        cap.response(resp.status, raw, payload, ic.raw_body(resp))
+        if not payload or not payload.get("success"):
+            msg = (payload or {}).get("message")
+            err = InventoryError(
+                f"{ticker}: inventory API status={resp.status} success="
+                f"{(payload or {}).get('success')} message={msg!r}", raw=raw)
+            cap.finish(ic.NON_JSON if payload is None else ic.VENDOR_ERROR, err)
+            raise err
+    except Exception as e:
+        cap.finish(ic.ERROR, e)          # only if nothing above recorded it
+        raise
+    return payload, cap
 
 
 def insert_inventory(conn, ticker, payload):
@@ -238,6 +258,8 @@ def run_backfill(tickers):
 
     failed = []
     sessions = []   # sessions each stored ticker actually got back
+    captures = ic.CaptureLog(ic.NO_CACHE_ROOT, "backfill_inventory", writes_cache=False,
+                             broker_list_source="backfill_inventory.INVENTORY_BROKERS")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -259,12 +281,14 @@ def run_backfill(tickers):
 
         for ticker in tickers:
             print(f"=== {ticker} ===")
+            cap = None      # this ticker's capture, once fetch_inventory returns it
             try:
-                payload = fetch_inventory(req, ticker, start_date, end_date)
+                payload, cap = fetch_inventory(req, ticker, start_date, end_date, captures)
                 broker_n, price_n, returned, signature = insert_inventory(
                     conn, ticker, payload)
 
                 if price_n == 0:
+                    cap.finish(ic.EMPTY, "no ohlc rows: nothing stored")
                     print("  no inventory data")
                     continue
 
@@ -275,6 +299,7 @@ def run_backfill(tickers):
                         f"series identical to {prev_ticker} — stale response, not stored")
 
                 conn.commit()
+                cap.finish(ic.OK)
                 prev_signature, prev_ticker = signature, ticker
                 kept = [c for c in returned if c in BROKER_FLOW_CODES]
                 dates = payload["data"].get("date") or []
@@ -283,6 +308,8 @@ def run_backfill(tickers):
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
                 print(f"  brokers returned={returned} kept(in BROKER_FLOW_CODES)={kept}")
             except Exception as e:
+                if cap is not None:       # a failure fetch_inventory already recorded has no cap here
+                    cap.finish(ic.REJECTED if isinstance(e, InventoryError) else ic.ERROR, e)
                 print(f"  FAILED: {e}")
                 raw = getattr(e, "raw", None)
                 if not failed and raw is not None:

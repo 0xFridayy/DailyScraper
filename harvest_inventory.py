@@ -22,6 +22,12 @@ NeoBDM rate-limits aggressive clients ("abnormal usage" at ~50 rapid requests),
 so this paces itself, jitters, pauses every REST_EVERY tickers, and backs off
 exponentially on failure. It is resumable: cached tickers are skipped.
 
+Every request attempt is recorded in inventory_raw/_capture_manifest/
+(inventory_capture): the exact query before it is sent, then the outcome, the
+brokers the payload actually returned and the cache file written. The cache
+files stay bare data dicts; the manifest sits beside them, where no reader
+of inventory_raw/*.json.gz looks.
+
 Usage:
     python harvest_inventory.py                 # all tickers
     python harvest_inventory.py --limit 50      # smoke test
@@ -36,6 +42,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import inventory_capture as ic  # noqa: E402
 from neobdm_scraper import API_BASE, INVENTORY_CHART_URL, login, log  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
@@ -94,17 +101,26 @@ def cached(t):
     return os.path.join(RAW, f"{t}.json.gz")
 
 
-def fetch(req, ticker, codes, sd, ed):
+def build_query(ticker, codes, sd, ed):
     # brokers MUST be repeated query params (brokers=AK&brokers=BK&...).
     # A comma-joined list is accepted with HTTP 200 but returns empty series.
     bq = "&".join(f"brokers={c}" for c in codes)
-    qs = (f"symbol={ticker}&{bq}"
-          f"&start_date={sd}&end_date={ed}&investor_type=A")
+    return (f"symbol={ticker}&{bq}"
+            f"&start_date={sd}&end_date={ed}&investor_type=A")
+
+
+def fetch(req, ticker, qs, cap):
+    """The `data` dict for the query `qs`, or RuntimeError. `cap` is the
+    inventory_capture.Capture already begun for `qs`; the response evidence is
+    attached to it, and a failure found here is recorded on it before it is
+    raised."""
     r = req.get(f"{API_BASE}/inventory?{qs}", timeout=120000)
     txt = r.text()
     try:
         j = json.loads(txt)
     except json.JSONDecodeError:
+        cap.response(r.status, txt, None, ic.raw_body(r))
+        cap.finish(ic.NON_JSON, f"HTTP {r.status}, body is not JSON ({len(txt)} chars)")
         # Say what actually came back. A bare "Expecting value: line 2
         # column 1" reads like a parser quirk; it is usually the login page
         # or a block page, which means the session died or we are refused,
@@ -113,9 +129,46 @@ def fetch(req, ticker, codes, sd, ed):
             f"{ticker}: HTTP {r.status} but the body is not JSON "
             f"({len(txt)} chars, starts {txt.strip()[:60]!r}) -- session "
             f"expired or the API is refusing us") from None
+    cap.response(r.status, txt, j, ic.raw_body(r))
     if not j.get("success"):
-        raise RuntimeError(f"{ticker}: {str(j.get('message'))[:120]}")
+        err = RuntimeError(f"{ticker}: {str(j.get('message'))[:120]}")
+        cap.finish(ic.VENDOR_ERROR, err)
+        raise err
     return j["data"]
+
+
+def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
+    """One attempt at one ticker: fetch, check, cache. Returns nothing; raises
+    on failure, and SystemExit when `first` (no ticker cached yet this run)
+    comes back short.
+
+    The attempt is recorded in `captures` (an inventory_capture.CaptureLog):
+    the request before it is sent, then exactly one outcome. The most specific
+    one wins; the catch-all below only records what nothing else did."""
+    qs = build_query(t, codes, sd, ed)
+    cap = captures.begin(qs, attempt)
+    try:
+        d = fetch(req, t, qs, cap)
+        n = session_count(d)
+        if first and n < MIN_SESSIONS:
+            msg = (f"{t} came back with {n} sessions for {sd}..{ed}, "
+                   f"under the {MIN_SESSIONS} this expects. The API's "
+                   f"rolling window has probably moved again -- check "
+                   f"LOOKBACK_DAYS before spending a full harvest.")
+            cap.finish(ic.ABORTED, msg)
+            raise SystemExit(msg)
+        text = json.dumps(d)
+        try:
+            with gzip.open(cached(t), "wt", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            cap.finish(ic.CACHE_WRITE_FAILED, e)
+            raise
+        cap.finish(ic.OK, cache_ref=os.path.basename(cached(t)),
+                   cache_sha256=ic.sha256_text(text))
+    except Exception as e:
+        cap.finish(ic.ERROR, e)
+        raise
 
 
 def main():
@@ -142,6 +195,8 @@ def main():
 
     ok = fail = consec = 0
     t_start = time.time()
+    captures = ic.CaptureLog(RAW, "harvest_inventory", writes_cache=True,
+                             broker_list_source="broker_codes.json")
     with sync_playwright() as p:
         b = p.chromium.launch(headless=True)
         ctx = b.new_context(viewport={"width": 1400, "height": 900})
@@ -155,16 +210,8 @@ def main():
             delay = 1.0
             for attempt in range(MAX_RETRY):
                 try:
-                    d = fetch(req, t, codes, sd, ed)
-                    n = session_count(d)
-                    if ok == 0 and n < MIN_SESSIONS:
-                        raise SystemExit(
-                            f"{t} came back with {n} sessions for {sd}..{ed}, "
-                            f"under the {MIN_SESSIONS} this expects. The API's "
-                            f"rolling window has probably moved again -- check "
-                            f"LOOKBACK_DAYS before spending a full harvest.")
-                    with gzip.open(cached(t), "wt", encoding="utf-8") as f:
-                        json.dump(d, f)
+                    fetch_and_cache(req, t, codes, sd, ed, captures, attempt + 1,
+                                    first=ok == 0)
                     ok += 1
                     consec = 0
                     break

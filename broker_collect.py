@@ -1,7 +1,8 @@
 """Fetch NeoBDM's /api/inventory for the broker learning dashboard.
 
-One authenticated GET per ticker returns a rolling year of daily per-broker
-buy/sell lots and values for ALL 101 broker codes, plus OHLCV. The payload
+One authenticated GET per ticker asks for a rolling year of daily per-broker
+buy/sell lots and values for all 101 broker codes, plus OHLCV; which brokers
+come back is the vendor's answer, not the request (see below). The payload
 shape is documented in harvest_inventory.py; what the rest of the pipeline
 assumes about it is BROKER_LEARNING.md section 2.
 
@@ -19,9 +20,13 @@ a dashboard and an insert-only ledger that is never recomputed. So a ticker
 is rejected at fetch time (spec 2.2) when:
 
   - success is false, or meta.symbol names a different ticker;
-  - build_inventory_db.strict_ticker_frame refuses the payload. A missing
-    broker row can only be read as "no trades that day" because every code was
-    requested AND the frame fails closed on anything it cannot read;
+  - build_inventory_db.strict_ticker_frame refuses the payload. The frame
+    fails closed on anything it cannot read. It does not check coverage, and
+    requesting every code does not mean every code comes back: on 2026-09-26
+    the API returned the first 10 of the 101 requested. Request scope and
+    returned scope are distinct, so a broker absent from a payload must not
+    be read as zero without coverage evidence (the capture manifest below
+    records both sets);
   - its OHLC signature equals another ticker's from the same run. Two IDX
     names cannot share a year of dates and closes; a stale response stored
     under the wrong name is exactly how price_history got contaminated (see
@@ -68,6 +73,15 @@ Logs carry counts, tickers and short reasons only. A failed Playwright request
 appends a 'Call log:' listing every request header, the session cookie among
 them, and the Actions logs are public. So exceptions are printed through
 neobdm_scraper._safe_error, which cuts that part off.
+
+CAPTURE MANIFEST
+----------------
+Every request attempt is also recorded in <raw_dir>/_capture_manifest/
+(inventory_capture): the exact query before it is sent, then the attempt's
+outcome, the brokers the payload actually returned and the cache file it
+produced. The cache files keep their format; the manifest sits beside them,
+where no cache reader looks. pipeline_run_id ties a run's captures to the
+caller's run log (broker_learning.db's runs row).
 """
 import glob
 import gzip
@@ -79,6 +93,8 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
+
+import inventory_capture as ic
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR = os.path.join(HERE, "broker_learning_raw")
@@ -120,18 +136,25 @@ class FetchRejected(Exception):
     also how the throttle answers. A verdict covers a wrong symbol, an
     unreadable frame or a clone; a retry would fetch the same thing again and
     spend the request budget. `throttled` asks the caller to cool down first.
+    `category` is the inventory_capture status the attempt is recorded under.
     """
 
-    def __init__(self, msg, retryable=False, throttled=False):
+    category = ic.REJECTED
+
+    def __init__(self, msg, retryable=False, throttled=False, category=None):
         super().__init__(msg)
         self.retryable = retryable
         self.throttled = throttled
+        if category is not None:
+            self.category = category
 
 
 class EmptyResponse(FetchRejected):
     """A successful answer for the right ticker with zero sessions: delisted
     or suspended for the whole window. Counted as `empty`, not as a failure
     (module docstring). Never retried: asking again returns the same nothing."""
+
+    category = ic.EMPTY
 
 
 # ── dates ─────────────────────────────────────
@@ -184,9 +207,10 @@ def _read_json(path):
 def load_codes():
     """broker_codes.json, checked.
 
-    Spec 2.1 reads a missing broker row as "zero trades that day" only because
-    every code was requested. A malformed or duplicated list must stop the run
-    rather than quietly narrow it.
+    Every code is requested, so a malformed or duplicated list must stop the
+    run rather than quietly narrow the request. Requesting a code does not make
+    it come back (module docstring): an absent broker is not a zero without
+    coverage evidence.
     """
     codes = _read_json(os.path.join(HERE, "broker_codes.json"))
     if not isinstance(codes, list) or not codes:
@@ -264,7 +288,8 @@ def validate_envelope(env, ticker):
     if not env.get("success"):
         msg = str(env.get("message"))[:120]
         raise FetchRejected(f"success={env.get('success')!r} message={msg!r}",
-                            retryable=True, throttled=_looks_throttled(msg))
+                            retryable=True, throttled=_looks_throttled(msg),
+                            category=ic.VENDOR_ERROR)
     meta = env.get("meta")
     if meta is not None and not isinstance(meta, dict):
         raise FetchRejected(f"meta is {type(meta).__name__}, not an object")
@@ -324,7 +349,8 @@ def cache_path(raw_dir, mode, ticker):
 
 
 def save_cached(raw_dir, mode, ticker, env):
-    """Write {"fetched_utc", "meta", "data"} for one ticker.
+    """Write {"fetched_utc", "meta", "data"} for one ticker; the SHA-256 of the
+    JSON text written, which the capture manifest records as cache_sha256.
 
     Written to a temp file and renamed, so an interrupted run cannot leave a
     truncated gzip behind for the next render to trip over.
@@ -333,10 +359,12 @@ def save_cached(raw_dir, mode, ticker, env):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     doc = {"fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "meta": env.get("meta"), "data": env["data"]}
+    text = json.dumps(doc, separators=(",", ":"))
     tmp = path + ".tmp"
     with gzip.open(tmp, "wt", encoding="utf-8") as f:
-        json.dump(doc, f, separators=(",", ":"))
+        f.write(text)
     os.replace(tmp, path)
+    return ic.sha256_text(text)
 
 
 def _data_of(obj, ticker):
@@ -410,12 +438,14 @@ def _safe_error_local(e, limit=120):
 
 
 def _status_and_json(resp):
-    """(HTTP status, parsed body, whether the body was JSON)."""
+    """(HTTP status, parsed body, whether the body was JSON, body text or None)."""
     status = int(resp.status)
+    text = None
     try:
-        return status, json.loads(resp.text()), True
+        text = resp.text()
+        return status, json.loads(text), True, text
     except Exception:
-        return status, None, False
+        return status, None, False, text
 
 
 def _short_window_message(accepted, mode, sd, ed):
@@ -432,8 +462,13 @@ def _short_window_message(accepted, mode, sd, ed):
             f"check LOOKBACK_DAYS before spending a full run.")
 
 
-def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error):
-    """The fetch loop, independent of how requests are made (see collect)."""
+def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures):
+    """The fetch loop, independent of how requests are made (see collect).
+
+    Each attempt is recorded in `captures` (an inventory_capture.CaptureLog):
+    its request before get() is called, its outcome once that is known. An
+    attempt that returned a usable payload has its outcome only after the
+    clone check, the short-window probe and the cache write."""
     codes = load_codes()
     sd, ed = start_date(now), end_date(now)
     ok, failed, sessions, empty = [], {}, {}, {}
@@ -448,13 +483,16 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error):
 
     for i, t in enumerate(tickers, 1):
         qs = build_query(t, codes, sd, ed)
-        env = data = reason = None
+        env = data = reason = cap = None
         is_empty = False
         delay = 1.0
         for attempt in range(MAX_RETRY):
             throttled = False
+            cap = captures.begin(qs, attempt + 1)
             try:
-                status, body, is_json = _status_and_json(get(qs))
+                resp = get(qs)
+                status, body, is_json, text = _status_and_json(resp)
+                cap.response(status, text, body, ic.raw_body(resp))
                 if is_json:
                     non_json = 0
                 else:
@@ -472,20 +510,23 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error):
                     raise FetchRejected(
                         f"HTTP {status}", retryable=True,
                         throttled=status == 429 or (
-                            isinstance(body, dict) and _looks_throttled(body.get("message"))))
+                            isinstance(body, dict) and _looks_throttled(body.get("message"))),
+                        category=ic.HTTP_ERROR)
                 if not is_json:
-                    raise FetchRejected("non-JSON body", retryable=True)
+                    raise FetchRejected("non-JSON body", retryable=True, category=ic.NON_JSON)
                 data = validate_envelope(body, t)
                 env = body
                 break
             except FetchRejected as e:
                 reason, throttled = str(e), e.throttled
                 is_empty = isinstance(e, EmptyResponse)
+                cap.finish(e.category, reason)
                 if not e.retryable:
                     break
             except Exception as e:
                 reason = safe_error(e)
                 throttled = _looks_throttled(reason)
+                cap.finish(ic.ERROR, reason)
             if attempt < MAX_RETRY - 1:
                 log.info(f"[{i}/{total}] {t} retry {attempt + 1}: {reason}")
                 sleep(delay)
@@ -499,16 +540,23 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error):
             sig = ohlc_signature(data)
             if sig is not None and sig in seen:
                 data, reason = None, f"OHLC identical to {seen[sig]} (cross-ticker clone)"
+                cap.finish(ic.REJECTED, reason)
             elif sig is not None:
                 seen[sig] = t
         if data is not None:
             accepted.append((t, n))
             if short_window_abort([c for _, c in accepted], mode):
-                raise SystemExit(_short_window_message(accepted, mode, sd, ed))
+                message = _short_window_message(accepted, mode, sd, ed)
+                cap.finish(ic.ABORTED, message)
+                raise SystemExit(message)
             try:
-                save_cached(raw_dir, mode, t, env)
+                digest = save_cached(raw_dir, mode, t, env)
             except Exception as e:
                 data, reason = None, f"cache write failed: {safe_error(e)}"
+                cap.finish(ic.CACHE_WRITE_FAILED, reason)
+            else:
+                ref = os.path.relpath(cache_path(raw_dir, mode, t), raw_dir)
+                cap.finish(ic.OK, cache_ref=ref.replace(os.sep, "/"), cache_sha256=digest)
         if data is not None:
             ok.append(t)
             sessions[t] = n
@@ -536,7 +584,7 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error):
 
 
 def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
-            request_get=None, relogin=None):
+            request_get=None, relogin=None, pipeline_run_id=None):
     """Fetch, validate and cache each ticker; {"ok", "failed", "sessions", "empty"}.
 
     "failed" maps each failed ticker to a short, log-safe reason, and "empty"
@@ -544,6 +592,9 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
     SystemExit when short_window_abort() fires. The failure-rate exit is
     separate (should_fail / exit_if_failed), so a caller can record the run
     before it exits.
+
+    Every request attempt is recorded in <raw_dir>/_capture_manifest/ (module
+    docstring, "CAPTURE MANIFEST"), with pipeline_run_id when one is given.
 
     request_get and relogin exist for the offline tests only. request_get(qs)
     takes the query string and returns an object with .status and .text(), like
@@ -556,9 +607,12 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
     if not tickers:
         log.warning(f"broker collect ({mode}): no tickers requested, nothing fetched")
         return {"ok": [], "failed": {}, "sessions": {}, "empty": {}}
+    captures = ic.CaptureLog(raw_dir, "broker_collect", writes_cache=True, mode=mode,
+                             pipeline_run_id=pipeline_run_id,
+                             broker_list_source="broker_codes.json")
     if request_get is not None:
         return _run(tickers, mode, raw_dir, sleep, now, request_get,
-                    relogin or (lambda: None), _safe_error_local)
+                    relogin or (lambda: None), _safe_error_local, captures)
 
     # Imported here, never at module scope: neobdm_scraper raises on import
     # without all four secrets, and nothing else in this module needs a browser.
@@ -591,7 +645,8 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
                 sign_in()
             except Exception as e:
                 raise RuntimeError(f"NeoBDM login failed: {_safe_error(e)}") from None
-            return _run(tickers, mode, raw_dir, sleep, now, get, sign_in, _safe_error)
+            return _run(tickers, mode, raw_dir, sleep, now, get, sign_in, _safe_error,
+                        captures)
         finally:
             browser.close()
 

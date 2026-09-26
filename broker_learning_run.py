@@ -543,9 +543,10 @@ class _LedgerDb:
 def _fetch(tickers, mode, raw_dir, failed, conn, run_id, empty):
     """collect() -> the tickers that fetched cleanly; failures go to `failed`
     and zero-session tickers to `empty`. A window abort is recorded before the
-    SystemExit propagates."""
+    SystemExit propagates. run_id goes into the capture manifest, so each
+    capture can be traced to this run's row in `runs`."""
     try:
-        result = bc.collect(tickers, mode, raw_dir=raw_dir)
+        result = bc.collect(tickers, mode, raw_dir=raw_dir, pipeline_run_id=run_id)
     except SystemExit:
         bdb.finish_run(conn, run_id, finished_utc=_stamp(_now()), status="aborted",
                        note="short-window abort: the API's rolling window moved")
