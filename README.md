@@ -73,9 +73,13 @@ Mengukur sinyal produksi terhadap kenyataan, merangkum semuanya jadi laporan har
 | `check_ml_health.py` | live | Gerbang **kode** ML (pasangan dari `check_signal_integrity.py` yang menjaga datanya). Mengimpor tiap modul (menangkap drift versi pandas/xgboost — `requirements.txt` tidak mem-pin apa pun), menjalankan `test_pipeline.py`, membangun panel asli dan menguji invariannya, lalu satu siklus walk-forward nyata. Memakai **budget cacat**: cacat yang sudah diketahui dan terjadwal dilaporkan sebagai peringatan dengan jumlah ter-pin, dan hanya gagal kalau jumlahnya bertambah — supaya bisa mendeteksi regresi tanpa merah permanen. Juga selalu melaporkan base rate di samping hit_rate. |
 | `test_pipeline.py` | tes | Tes regresi ringan (assert-based, tanpa framework) untuk `walk_forward_backtest.py`, `kelly_sizing.py`, dan gap guard di `price_audit.py` — fokus khusus mendeteksi kebocoran data (leakage) dan kebenaran formula. |
 
+#### Dashboard broker learning (riset)
+
+`broker_learning_run.py` membuat dashboard HTML harian untuk `broker_watchlist.json` dari `/api/inventory`: posisi, modal rata-rata, dan untung/rugi tiap broker, plus enam aturan ruleset v1 yang dibekukan, dicatat tiap hari dan dinilai 5/10/20/60 sesi kemudian. Halaman dikirim ke Telegram dan tidak pernah di-commit; hanya `broker_learning.db` yang di-commit. Research-grade: inventory broker yang terlihat, bukan kepemilikan sebenarnya, dan tidak memengaruhi `daily_picks.py`. Spesifikasi, cara menjalankan lokal, dan batasannya ada di [`BROKER_LEARNING.md`](BROKER_LEARNING.md).
+
 ### 5. Otomasi & konfigurasi
 
-Sepuluh GitHub Actions workflow yang menjalankan file-file di atas secara terjadwal (atau manual), plus file konfigurasi pendukung.
+Dua belas GitHub Actions workflow yang menjalankan file-file di atas secara terjadwal (atau manual), plus file konfigurasi pendukung.
 
 | Workflow | Jadwal (UTC) | Menjalankan |
 |---|---|---|
@@ -89,6 +93,8 @@ Sepuluh GitHub Actions workflow yang menjalankan file-file di atas secara terjad
 | `signal-eval.yml` | `0 2 * * 0` (mingguan) | `evaluate_signals.py --telegram` |
 | `arb-veto.yml` | `0 21 * * 0` (mingguan) | `harvest_inventory.py` → `build_inventory_db.py` → `inventory_features.py` → `arb_veto.py` |
 | `telegram-inbox.yml` | `17 */3 * * *` | `telegram_inbox.py` |
+| `broker-learning-daily.yml` | `30 10 * * 1-5` (hari kerja) | `broker_learning_run.py daily` |
+| `broker-learning-weekly.yml` | `0 11 * * 6` (Sabtu) | `broker_learning_run.py weekly` |
 
 | File | Fungsi |
 |---|---|

@@ -1,0 +1,121 @@
+name: Broker Learning Weekly
+
+# Retrospective, market-wide evaluation of the frozen ruleset v1
+# (BROKER_LEARNING.md §4.5-4.6): fetches /api/inventory for the whole universe
+# (all_tickers.json, all 101 broker codes), recomputes every rule on every
+# session of the rolling year, and stores rule stats, rule weights, broker
+# track-record scores, broker trading profitability, alpha cases and broker
+# lift in broker_learning.db, keyed by as_of (the last session fetched). The
+# numbers are labelled retrospective everywhere: the vendor can restate
+# history, so only the daily live ledger is point-in-time.
+on:
+  schedule:
+    # 11:00 UTC Saturday == 18:00 WIB, after Friday's session has settled.
+    # ~1,040 paced fetches take ~45 min. Outside every other job's SCHEDULED
+    # NeoBDM window (daily-scrape ~23:00-01:45, top-up ~04:30-05:20,
+    # ownership ~07:00-08:25 every day, Saturday included, arb-veto Sunday
+    # 21:00), with ~2.5 h of margin after ownership; at 09:00 a delayed
+    # ownership run left ~35 min. GitHub can still delay any schedule by hours
+    # (top-up has committed at 11:39) and a manual run can start at any time,
+    # so an overlap is unlikely, not impossible.
+    # Load: this is the SECOND full-universe /api/inventory harvest of the
+    # week (arb-veto.yml runs harvest_inventory.py on Sunday, ~1,000 calls),
+    # so the week carries ~2 x 1,000 calls plus ~5 x 46 daily ones against the
+    # abnormal-usage throttle neobdm_scraper.py documents. One harvest feeding
+    # both jobs would halve that (follow-up, BROKER_LEARNING.md §7).
+    - cron: "0 11 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# broker-learning-daily.yml commits the same DB; never let the two overlap.
+concurrency:
+  group: broker-learning
+  cancel-in-progress: false
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    # The fetch is ~45 min; the evaluation itself took ~1 min locally over the
+    # 1,040-file cache. The rest is headroom for backoff and throttle cooldowns.
+    timeout-minutes: 110
+    env:
+      # Python block-buffers stdout without a TTY; a killed run would lose its log.
+      PYTHONUNBUFFERED: "1"
+      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
+      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
+      # Nothing here sends a message, but broker_collect.collect() imports
+      # neobdm_scraper for the login, and it calls _require_env() for all four
+      # secrets at import time -- so the fetch cannot start without these.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Deliberately NOT requirements.txt: that pulls xgboost, shap and torch,
+      # which nothing here imports. pyarrow is required (build_inventory_db
+      # imports it at module scope, and the history export writes parquet);
+      # schedule and pytz are required because neobdm_scraper imports them.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyarrow requests playwright schedule pytz
+
+      - name: Install Playwright Chromium (+ system deps)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Fetch the market and learn
+        run: python broker_learning_run.py weekly
+
+      # OFF unless the owner sets the repository variable
+      # BROKER_HISTORY_UPLOAD to 'true' (spec §4.7). broker_history/ holds paid
+      # NeoBDM broker rows and is gitignored. Assets of a PUBLISHED release on a
+      # public repo are publicly downloadable, so the release is a DRAFT
+      # (Amendment A2): draft releases and their assets are visible only to repo
+      # collaborators, so the paid data never becomes public even though the
+      # repo is. A broker-history release that exists but is NOT a draft (made
+      # by hand, or published by mistake) stops the upload instead of adding
+      # paid files to a public release.
+      # Each week's files overlap the last ~4 weeks, so --clobber on a re-run
+      # of the same week only replaces that week's own two files.
+      - name: Upload the history export to the broker-history draft release
+        if: vars.BROKER_HISTORY_UPLOAD == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view broker-history >/dev/null 2>&1; then
+            gh release create broker-history --draft --title "broker-history" \
+              --notes "Weekly broker/OHLC parquet exports (BROKER_LEARNING.md 4.7). Paid data: keep this release a draft. Observable broker inventory, not beneficial ownership. Research-grade."
+          fi
+          if [ "$(gh release view broker-history --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "::error::release broker-history is published, not a draft - refusing to upload paid data to it"
+            exit 1
+          fi
+          gh release upload broker-history broker_history/*.parquet --clobber
+
+      # Runs on failure too (not on cancel, which can kill a write midway). A
+      # failed run writes no weekly table (see broker_learning_run.py), only
+      # its run row, so what gets committed is the record that it failed.
+      - name: Commit the weekly stats
+        if: success() || failure()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # broker_learning.db only. broker_learning_raw/ and broker_history/
+          # are paid data; both are gitignored and never leave the runner here.
+          if [ -f broker_learning.db ]; then
+            git add broker_learning.db
+          fi
+          git diff --staged --quiet || git commit -m "Broker learning weekly stats ($(date -u +%Y-%m-%d))"
+          for i in 1 2 3; do
+            if git pull --rebase && git push; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            sleep 15
+          done
+          echo "::error::push failed 3 times - this week's stats are NOT saved"
+          exit 1
