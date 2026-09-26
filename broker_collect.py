@@ -468,7 +468,8 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures)
     Each attempt is recorded in `captures` (an inventory_capture.CaptureLog):
     its request before get() is called, its outcome once that is known. An
     attempt that returned a usable payload has its outcome only after the
-    clone check, the short-window probe and the cache write."""
+    clone check, the short-window probe and the cache write, which a
+    persisting line announces first (inventory_capture: PERSIST_UNCONFIRMED)."""
     codes = load_codes()
     sd, ed = start_date(now), end_date(now)
     ok, failed, sessions, empty = [], {}, {}, {}
@@ -549,14 +550,15 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures)
                 message = _short_window_message(accepted, mode, sd, ed)
                 cap.finish(ic.ABORTED, message)
                 raise SystemExit(message)
+            ref = os.path.relpath(cache_path(raw_dir, mode, t), raw_dir).replace(os.sep, "/")
+            cap.persisting("cache", cache_ref=ref)    # on record before the file can exist
             try:
                 digest = save_cached(raw_dir, mode, t, env)
             except Exception as e:
                 data, reason = None, f"cache write failed: {safe_error(e)}"
                 cap.finish(ic.CACHE_WRITE_FAILED, reason)
             else:
-                ref = os.path.relpath(cache_path(raw_dir, mode, t), raw_dir)
-                cap.finish(ic.OK, cache_ref=ref.replace(os.sep, "/"), cache_sha256=digest)
+                cap.finish(ic.OK, cache_ref=ref, cache_sha256=digest)
         if data is not None:
             ok.append(t)
             sessions[t] = n

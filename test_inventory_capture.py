@@ -15,6 +15,7 @@ manifest is tested in test_broker_collect.py.
 """
 
 import contextlib
+import gc
 import glob
 import gzip
 import hashlib
@@ -81,6 +82,7 @@ import harvest_inventory as hi       # noqa: E402
 import inventory_capture as ic       # noqa: E402
 
 hi.sync_playwright = bf.sync_playwright = _refuse("start a browser")
+bc.log.disabled = True                          # its progress lines, through neobdm_scraper's root handler
 bf.DB_PATH = bf.FAILURE_SNAPSHOT = None         # never the real neobdm.db or CWD
 ic.NO_CACHE_ROOT = None                         # never the repository's own manifest
 
@@ -225,12 +227,14 @@ def run_backfill(root, script, tickers):
     return out.getvalue(), exit_message, request
 
 
-def run_collect(root, responses):
+def run_collect(root, responses, calls=None):
     """broker_collect.collect() over AAAA, offline: its injected request
     function serves `responses` in order."""
     queue = list(responses)
 
     def get(qs):
+        if calls is not None:
+            calls.append(qs)
         item = queue.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -249,6 +253,128 @@ def db_counts(root):
     finally:
         conn.close()
     return prices, flows
+
+
+@contextmanager
+def failing_appends(should_fail):
+    """Every manifest append whose event should_fail(event) picks raises
+    OSError (disk full) instead of writing; the rest are written."""
+    real = ic.CaptureLog._append
+
+    def append(self, event):
+        if should_fail(event):
+            raise OSError(28, "No space left on device")
+        return real(self, event)
+    ic.CaptureLog._append = append
+    try:
+        yield
+    finally:
+        ic.CaptureLog._append = real
+
+
+@contextmanager
+def torn_append_with_failed_rollback(should_fail):
+    """Once, write half an event and make both that append and its rollback fail."""
+    real_append, real_open, real_truncate = ic.CaptureLog._append, open, os.truncate
+    state = {"injected": False, "log": None, "events": []}
+
+    class HalfWrite:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+            return False
+
+        def write(self, line):
+            self.fh.write(line[:len(line) // 2])
+            self.fh.flush()
+            raise OSError(28, "No space left on device")
+
+    def fail_truncate(*args):
+        raise OSError(5, "simulated truncate failure")
+
+    def append(self, event):
+        state["events"].append((event["event"], event["ticker"]))
+        if not state["injected"] and should_fail(event):
+            state["injected"], state["log"] = True, self
+            ic.open = lambda *a, **k: HalfWrite(real_open(*a, **k))
+            os.truncate = fail_truncate
+            try:
+                return real_append(self, event)
+            finally:
+                del ic.open
+                os.truncate = real_truncate
+        return real_append(self, event)
+
+    ic.CaptureLog._append = append
+    try:
+        yield state
+    finally:
+        ic.CaptureLog._append = real_append
+        os.truncate = real_truncate
+
+
+def disk_full_after_persisting():
+    """The persisting line lands, every append after it fails."""
+    state = {"full": False}
+
+    def should_fail(event):
+        if state["full"]:
+            return True
+        state["full"] = event["event"] == "persisting"
+        return False
+    return should_fail
+
+
+def disk_full_from_persisting():
+    """The persisting line and every append after it fail."""
+    state = {"full": False}
+
+    def should_fail(event):
+        state["full"] = state["full"] or event["event"] == "persisting"
+        return state["full"]
+    return should_fail
+
+
+def ok_line_fails_once():
+    """The first OK result line fails; everything else, its retry included, lands."""
+    state = {"done": False}
+
+    def should_fail(event):
+        if not state["done"] and event["event"] == "result" and event["status"] == ic.OK:
+            state["done"] = True
+            return True
+        return False
+    return should_fail
+
+
+@contextmanager
+def commit_fails_on(n):
+    """backfill_inventory's n-th conn.commit() raises 'database is locked', as
+    SQLite does when another connection holds the lock (the transaction stays
+    open)."""
+    class CommitFails(sqlite3.Connection):
+        commits = 0
+
+        def commit(self):
+            CommitFails.commits += 1
+            if CommitFails.commits == n:
+                raise sqlite3.OperationalError("database is locked")
+            return super().commit()
+    saved = bf.sqlite3
+    bf.sqlite3 = SimpleNamespace(connect=lambda path: sqlite3.connect(path, factory=CommitFails))
+    try:
+        yield
+    finally:
+        bf.sqlite3 = saved
+
+
+def result_lines(root):
+    return sum(1 for line in manifest_text(root).splitlines() if '"event":"result"' in line)
 
 
 @contextmanager
@@ -689,25 +815,11 @@ def test_backfill_rolls_back_a_ticker_whose_commit_fails():
     transaction open, so on master the next ticker's commit stored BBBB after
     all, although BBBB was reported FAILED. Now the manifest's ERROR and the DB
     agree: none of BBBB is kept."""
-    class CommitFailsOnce(sqlite3.Connection):
-        commits = 0
-
-        def commit(self):
-            CommitFailsOnce.commits += 1
-            if CommitFailsOnce.commits == 2:                # BBBB's commit
-                raise sqlite3.OperationalError("database is locked")
-            return super().commit()
-
     script = {t: [ok(payload(base=1000.0 * k), t)] for k, t in enumerate(("AAAA", "BBBB", "CCCC"), 1)}
-    saved = bf.sqlite3
-    bf.sqlite3 = SimpleNamespace(connect=lambda path: sqlite3.connect(path, factory=CommitFailsOnce))
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
-            prices, flows = db_counts(tmp)
-            caps = ic.read_captures(only_manifest(tmp))
-    finally:
-        bf.sqlite3 = saved
+    with commit_fails_on(2), tempfile.TemporaryDirectory() as tmp:      # BBBB's commit
+        out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
+        prices, flows = db_counts(tmp)
+        caps = ic.read_captures(only_manifest(tmp))
     assert [(x["ticker"], x["status"]) for x in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.ERROR), ("CCCC", ic.OK)]
     assert caps[1]["reason"] == "OperationalError: database is locked"
@@ -766,7 +878,7 @@ def test_bagholder_failures_are_recorded_and_raised_as_before():
              ("DDDD", ok(payload(), "ZZZZ"), ic.REJECTED,
               "inventory API returned ZZZZ for requested DDDD"),
              ("EEEE", boom, ic.ERROR, "APIRequestContext.get: Timeout 60000ms exceeded."),
-             ("FFFF", ok(empty, "FFFF"), ic.OK,                 # fetched fine; nothing to rank
+             ("FFFF", ok(empty, "FFFF"), ic.EMPTY,              # fetched fine; no dates to use
               "FFFF: inventory API returned no trading dates")]
     with tempfile.TemporaryDirectory() as tmp:
         log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders",
@@ -834,10 +946,11 @@ HTTP_ERRORS = [   # (label, response, vendor_success the body carries)
 ]
 
 
-def test_http_error_outranks_every_refusal_but_not_what_was_kept():
-    """The rule itself, over every status and code: a refusal of an HTTP >= 400
-    answer is HTTP_ERROR; an outcome about kept or used data is left alone, and
-    without a response there is no code to go by."""
+def test_the_status_is_never_inferred_from_the_code():
+    """Codex blocker 3: finish() writes every status exactly as the collector
+    decided it, at every code (an ERROR under a 500 stays ERROR). The one place a
+    code decides is source_refusal(), for a response refused because the source
+    answered with an error."""
     cases = []
     with tempfile.TemporaryDirectory() as tmp:
         log = ic.CaptureLog(tmp, "t", writes_cache=True)
@@ -849,13 +962,17 @@ def test_http_error_outranks_every_refusal_but_not_what_was_kept():
                 cap.finish(status, "the check that fired")
                 cases.append((code, status))
         caps = ic.read_captures(log.path)
-    assert set(ic.HTTP_ERROR_OUTRANKS) == {ic.NON_JSON, ic.VENDOR_ERROR, ic.REJECTED, ic.ERROR}
+    assert not hasattr(ic, "HTTP_ERROR_OUTRANKS")               # no central coercion left
     for (code, sent), cap in zip(cases, caps):
-        want = (ic.HTTP_ERROR if sent in ic.HTTP_ERROR_OUTRANKS and code is not None and code >= 400
-                else sent)
-        assert cap["status"] == want, (code, sent, cap["status"])
-        assert cap["reason"] == "the check that fired" and cap["http_status"] == code
-    print("  ok test_http_error_outranks_every_refusal_but_not_what_was_kept")
+        assert (cap["status"], cap["http_status"]) == (sent, code), (code, sent, cap["status"])
+        assert cap["reason"] == "the check that fired"
+    for code in (None, 200, 399, 400, 404, 429, 500, 503, True, "500", 500.0):
+        error_code = isinstance(code, int) and not isinstance(code, bool) and code >= 400
+        assert ic.is_http_error(code) is error_code, code
+        for body in (None, {"success": False}, {}):
+            want = ic.HTTP_ERROR if error_code else (ic.NON_JSON if body is None else ic.VENDOR_ERROR)
+            assert ic.source_refusal(code, body) == want, (code, body)
+    print("  ok test_the_status_is_never_inferred_from_the_code")
 
 
 def test_an_http_error_is_http_error_on_every_collector():
@@ -1001,6 +1118,505 @@ def test_a_payload_used_despite_an_http_error_keeps_its_outcome():
     assert holders == bagholders_from_payloads([json.loads(r.text()) for r in served[1:]], 2)
     assert [(x["status"], x["http_status"], x["cache_ref"]) for x in caps] == [(ic.OK, 500, None)] * 4
     print("  ok test_a_payload_used_despite_an_http_error_keeps_its_outcome")
+
+
+def test_a_local_failure_after_an_accepted_http_500_keeps_its_own_status():
+    """Codex blocker 3: HTTP 500 + success=true is accepted by these collectors,
+    so what fails afterwards is local, and the code does not change that. A
+    failed commit is ERROR, a failed cache write CACHE_WRITE_FAILED, and a
+    refusal for the content REJECTED, each with http_status 500."""
+    def accepted_500(base=1000.0, symbol="AAAA"):
+        return Resp(500, {"success": True, "data": payload(base=base), "meta": {"symbol": symbol}})
+
+    # the commit fails ('database is locked'): ERROR, nothing stored
+    with commit_fails_on(1), tempfile.TemporaryDirectory() as tmp:
+        _, exit_message, _ = run_backfill(tmp, {"AAAA": [accepted_500()]}, ["AAAA"])
+        prices, _ = db_counts(tmp)
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert (cap["status"], cap["http_status"]) == (ic.ERROR, 500), cap["status"]
+    assert cap["reason"] == "OperationalError: database is locked" and cap["persisting_at"]
+    assert prices == {} and exit_message.startswith("ABORT: 1/1 tickers failed")   # as before
+
+    # the cache write fails: CACHE_WRITE_FAILED, retried as before
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "AAAA.json.gz"))
+        request = run_harvest(tmp, {"AAAA": [accepted_500() for _ in range(hi.MAX_RETRY)]}, ["AAAA"],
+                              refresh=True)
+        caps = ic.read_captures(only_manifest(tmp))
+    assert len(request.urls) == hi.MAX_RETRY
+    assert [(x["status"], x["http_status"]) for x in caps] == [(ic.CACHE_WRITE_FAILED, 500)] * hi.MAX_RETRY
+
+    # refused for the content, not for the code: REJECTED
+    with tempfile.TemporaryDirectory() as tmp:
+        run_backfill(tmp, {"AAAA": [ok(payload(base=1000.0), "AAAA")],
+                           "BBBB": [accepted_500(1000.0, "BBBB")],         # AAAA's series: stale
+                           "CCCC": [accepted_500(3000.0, "ZZZZ")],         # wrong symbol
+                           "DDDD": [ok(payload(base=4000.0), "DDDD")],
+                           "EEEE": [ok(payload(base=5000.0), "EEEE")],
+                           "FFFF": [ok(payload(base=6000.0), "FFFF")],
+                           "GGGG": [ok(payload(base=7000.0), "GGGG")]},
+                     ["AAAA", "BBBB", "CCCC", "DDDD", "EEEE", "FFFF", "GGGG"])
+        caps = ic.read_captures(only_manifest(tmp))
+    assert [(x["ticker"], x["status"], x["http_status"]) for x in caps[:3]] == [
+        ("AAAA", ic.OK, 200), ("BBBB", ic.REJECTED, 500), ("CCCC", ic.REJECTED, 500)]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+        page = SimpleNamespace(context=SimpleNamespace(
+            request=FakeRequest(tmp, {"AAAA": [accepted_500(symbol="ZZZZ")]})))
+        try:
+            ns.get_inventory_bagholders(page, "AAAA", captures=log)
+            raise AssertionError("the bag-holder lookup did not raise")
+        except RuntimeError as e:
+            assert str(e) == "inventory API returned ZZZZ for requested AAAA"
+        (cap,) = ic.read_captures(log.path)
+    assert (cap["status"], cap["http_status"]) == (ic.REJECTED, 500)
+    print("  ok test_a_local_failure_after_an_accepted_http_500_keeps_its_own_status")
+
+
+# ── manifest write failures around persistence (Codex blocker 1) ───────────
+
+def test_finish_is_finished_only_once_its_line_is_on_disk():
+    """A failed append leaves the outcome decided but not finished; a later
+    finish() writes that same decided line, whatever status it is called with,
+    and exactly once."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "t", writes_cache=True)
+        cap = log.begin("symbol=AAAA")
+        with failing_appends(lambda ev: ev["event"] == "result"):
+            try:
+                cap.finish(ic.OK, cache_ref="AAAA.json.gz", cache_sha256="0" * 64)
+                raise AssertionError("the failed append was swallowed")
+            except OSError:
+                pass
+        assert cap.finished is False and cap.decided["status"] == ic.OK
+        assert cap.finish(ic.ERROR, "a catch-all after the failure") is True   # retries the OK
+        assert cap.finish(ic.ERROR, "and again") is False                      # on disk: no-op
+        (c,) = ic.read_captures(log.path)
+        assert result_lines(tmp) == 1
+    assert (c["status"], c["cache_ref"], c["reason"]) == (ic.OK, "AAAA.json.gz", None)
+    print("  ok test_finish_is_finished_only_once_its_line_is_on_disk")
+
+
+def test_a_torn_append_is_cut_back_so_the_retry_lands_cleanly():
+    """A write that fails part-way (disk full mid-line) is truncated back off:
+    the retried line follows a well-formed file, and the manifest stays readable."""
+    real_open = open
+
+    class HalfWrite:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+            return False
+
+        def write(self, text):
+            self.fh.write(text[: len(text) // 2])
+            self.fh.flush()
+            raise OSError(28, "No space left on device")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "t", writes_cache=True)
+        cap = log.begin("symbol=AAAA")
+        before = os.path.getsize(log.path)
+        ic.open = lambda *a, **k: HalfWrite(real_open(*a, **k))     # shadows the builtin in ic
+        try:
+            try:
+                cap.finish(ic.ERROR, "x")
+                raise AssertionError("the torn write was swallowed")
+            except ic.ManifestAppendError:
+                pass
+        finally:
+            del ic.open
+        assert os.path.getsize(log.path) == before                  # the torn half is gone
+        assert log.poisoned is False and cap.finished is False
+        assert cap.finish(ic.ERROR, "x") is True
+        assert result_lines(tmp) == 1
+        assert [c["status"] for c in ic.read_captures(log.path)] == [ic.ERROR]
+    print("  ok test_a_torn_append_is_cut_back_so_the_retry_lands_cleanly")
+
+
+def test_a_failed_rollback_poisons_the_log_and_leaves_the_torn_line_last():
+    """A retry cannot move a torn line into the middle of the manifest."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "t", writes_cache=True)
+        cap = log.begin("symbol=AAAA")
+        cap.response(200, "{}", {"success": True, "data": payload(n=5)}, b"{}")
+        cap.persisting("cache", cache_ref="AAAA.json.gz")
+        with torn_append_with_failed_rollback(lambda ev: ev["event"] == "result") as fault:
+            try:
+                cap.finish(ic.OK, cache_ref="AAAA.json.gz")
+                raise AssertionError("the failed rollback was swallowed")
+            except ic.ManifestPoisonedError:
+                pass
+            with open(log.path, "rb") as fh:
+                torn = fh.read()
+            assert log.poisoned and not cap.finished and cap.decided["status"] == ic.OK
+            assert torn.count(b"\n") == 2 and not torn.endswith(b"\n")
+
+            # Both an outcome retry and a new request are refused before open().
+            ic.open = lambda *a, **k: _refuse("open a poisoned manifest")()
+            try:
+                for write in (lambda: cap.finish(ic.ERROR),
+                              lambda: log.begin("symbol=BBBB")):
+                    try:
+                        write()
+                        raise AssertionError("a poisoned log accepted another write")
+                    except ic.ManifestPoisonedError:
+                        pass
+            finally:
+                del ic.open
+            with open(log.path, "rb") as fh:
+                assert fh.read() == torn
+            assert fault["events"] == [("result", "AAAA"), ("result", "AAAA"),
+                                       ("request", "BBBB")]
+        (read,) = ic.read_captures(log.path)
+    assert (read["status"], read["target"], read["intended_cache_ref"]) == (
+        ic.PERSIST_UNCONFIRMED, "cache", "AAAA.json.gz")
+    print("  ok test_a_failed_rollback_poisons_the_log_and_leaves_the_torn_line_last")
+
+
+def test_a_poisoned_backfill_result_stops_with_committed_rows():
+    """The B commit survives, but C is not fetched and B stays unconfirmed."""
+    names = ["AAAA", "BBBB", "CCCC", "DDDD"]
+    script = {name: [ok(payload(base=base), name)] for name, base in
+              zip(names, (1000.0, 2000.0, 2000.0, 4000.0))}
+    calls, real_get = [], FakeRequest.get
+
+    def counted_get(self, *args, **kwargs):
+        calls.append(args[0])
+        return real_get(self, *args, **kwargs)
+
+    FakeRequest.get = counted_get
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with torn_append_with_failed_rollback(
+                    lambda ev: ev["event"] == "result" and ev["ticker"] == "BBBB") as fault:
+                try:
+                    run_backfill(tmp, script, names)
+                    raise AssertionError("backfill continued after manifest poison")
+                except ic.ManifestPoisonedError:
+                    pass
+            gc.collect()                # the aborted run's connection is not returned
+            prices, flows = db_counts(tmp)
+            caps = ic.read_captures(only_manifest(tmp))
+            with open(only_manifest(tmp), "rb") as fh:
+                assert not fh.read().endswith(b"\n")
+    finally:
+        FakeRequest.get = real_get
+    assert fault["injected"] and fault["log"].poisoned
+    assert len(calls) == 2 and fault["events"][-1] == ("result", "BBBB")
+    assert prices == {"AAAA": 120, "BBBB": 120}
+    assert flows == {"AAAA": 240, "BBBB": 240}
+    assert [(c["ticker"], c["status"]) for c in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.PERSIST_UNCONFIRMED)]
+    print("  ok test_a_poisoned_backfill_result_stops_with_committed_rows")
+
+
+def test_a_poisoned_cache_result_stops_harvest_and_broker_collect():
+    calls, real_get = [], FakeRequest.get
+
+    def counted_get(self, *args, **kwargs):
+        calls.append(args[0])
+        return real_get(self, *args, **kwargs)
+
+    FakeRequest.get = counted_get
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with torn_append_with_failed_rollback(
+                    lambda ev: ev["event"] == "result" and ev["status"] == ic.OK) as fault:
+                try:
+                    run_harvest(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+                    raise AssertionError("harvest continued after manifest poison")
+                except ic.ManifestPoisonedError:
+                    pass
+            assert len(calls) == 1 and os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+            assert fault["events"][-1] == ("result", "AAAA")
+            (cap,) = ic.read_captures(only_manifest(tmp))
+            assert (cap["status"], cap["intended_cache_ref"]) == (
+                ic.PERSIST_UNCONFIRMED, "AAAA.json.gz")
+    finally:
+        FakeRequest.get = real_get
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker_calls = []
+        with torn_append_with_failed_rollback(
+                lambda ev: ev["event"] == "result" and ev["status"] == ic.OK) as fault:
+            try:
+                run_collect(tmp, [ok(payload(), "AAAA")], calls=broker_calls)
+                raise AssertionError("broker collect continued after manifest poison")
+            except ic.ManifestPoisonedError:
+                pass
+        assert len(broker_calls) == 1 and os.path.exists(bc.cache_path(tmp, "daily", "AAAA"))
+        assert fault["events"][-1] == ("result", "AAAA")
+        (cap,) = ic.read_captures(only_manifest(tmp))
+        assert (cap["status"], cap["intended_cache_ref"]) == (
+            ic.PERSIST_UNCONFIRMED, "daily/AAAA.json.gz")
+    print("  ok test_a_poisoned_cache_result_stops_harvest_and_broker_collect")
+
+
+def test_poisoned_request_and_persisting_events_prevent_the_next_side_effect():
+    # A torn request line is final; get() must never run.
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = []
+        with torn_append_with_failed_rollback(lambda ev: ev["event"] == "request") as fault:
+            try:
+                run_collect(tmp, [ok(payload(), "AAAA")], calls=calls)
+                raise AssertionError("request was sent after manifest poison")
+            except ic.ManifestPoisonedError:
+                pass
+        assert calls == [] and fault["log"].poisoned
+        assert ic.read_captures(only_manifest(tmp)) == []
+
+    # A torn persisting line is final; neither cache write nor DB commit starts.
+    with tempfile.TemporaryDirectory() as tmp:
+        with torn_append_with_failed_rollback(lambda ev: ev["event"] == "persisting") as fault:
+            try:
+                run_harvest(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+                raise AssertionError("cache write started after manifest poison")
+            except ic.ManifestPoisonedError:
+                pass
+        assert fault["log"].poisoned and not os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+        assert [c["status"] for c in ic.read_captures(only_manifest(tmp))] == [ic.INCOMPLETE]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with torn_append_with_failed_rollback(lambda ev: ev["event"] == "persisting") as fault:
+            try:
+                run_backfill(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+                raise AssertionError("DB commit started after manifest poison")
+            except ic.ManifestPoisonedError:
+                pass
+        gc.collect()
+        assert fault["log"].poisoned and db_counts(tmp) == ({}, {})
+        assert [c["status"] for c in ic.read_captures(only_manifest(tmp))] == [ic.INCOMPLETE]
+    print("  ok test_poisoned_request_and_persisting_events_prevent_the_next_side_effect")
+
+
+def test_the_reader_tells_an_unconfirmed_persist_from_an_incomplete_request():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "t", writes_cache=True)
+        log.begin("symbol=AAAA")                                        # died mid-request
+        b = log.begin("symbol=BBBB")
+        b.response(200, "{}", {"success": True, "data": payload(n=5)}, b"{}")
+        b.persisting("cache", cache_ref="BBBB.json.gz")                 # died mid-write
+        c = log.begin("symbol=CCCC")
+        c.response(200, "{}", {"success": True, "data": payload(n=5)}, b"{}")
+        c.persisting("cache", cache_ref="CCCC.json.gz")
+        c.finish(ic.OK, cache_ref="CCCC.json.gz", cache_sha256="0" * 64)
+        a, b, c = ic.read_captures(log.path)
+        with open(log.path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for name, text in (("orphan.jsonl", lines[2] + "\n"),                     # no request
+                           ("after.jsonl", "\n".join(lines[3:5] + [lines[5], lines[4]]) + "\n")):
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            try:
+                ic.read_captures(path)
+                raise AssertionError(f"{name} was read without complaint")
+            except ValueError:
+                pass
+    assert a["status"] == ic.INCOMPLETE and "persisting_at" not in a
+    assert (b["status"], b["intended_cache_ref"], b["target"]) == (
+        ic.PERSIST_UNCONFIRMED, "BBBB.json.gz", "cache")
+    assert b["returned_brokers"] == ["AK", "BK"] and "cache_ref" not in b    # evidence kept, no false ref
+    assert (c["status"], c["cache_ref"]) == (ic.OK, "CCCC.json.gz") and c["persisting_at"]
+    print("  ok test_the_reader_tells_an_unconfirmed_persist_from_an_incomplete_request")
+
+
+def test_broker_collect_result_line_fails_after_the_cache_write():
+    """The cache file is written and its OK line cannot be: the failure raises
+    (the run stops, observably) and the reader says PERSIST_UNCONFIRMED, not OK
+    and not an ordinary INCOMPLETE request."""
+    with tempfile.TemporaryDirectory() as tmp:
+        calls = []
+        with failing_appends(disk_full_after_persisting()):
+            try:
+                run_collect(tmp, [ok(payload(), "AAAA")], calls=calls)
+                raise AssertionError("the manifest failure was swallowed")
+            except OSError:
+                pass
+        assert os.path.exists(bc.cache_path(tmp, "daily", "AAAA"))     # the artifact exists
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert len(calls) == 1                               # no retry of the persisted cache
+    assert (cap["status"], cap["intended_cache_ref"]) == (ic.PERSIST_UNCONFIRMED, "daily/AAAA.json.gz")
+    assert cap["returned_brokers"] == ["AK", "BK"] and "cache_sha256" not in cap
+    print("  ok test_broker_collect_result_line_fails_after_the_cache_write")
+
+
+def test_harvest_result_line_fails_after_the_cache_write():
+    """Disk full once the persisting line is down: the cache is written, its OK
+    cannot be, and the run stops without fetching the ticker again. The reader
+    says PERSIST_UNCONFIRMED; nothing claims OK or ERROR."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(disk_full_after_persisting()):
+            try:
+                run_harvest(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+                raise AssertionError("the audit failure was swallowed")
+            except SystemExit as e:
+                assert "manifest result failed after cache write" in str(e)
+        assert os.path.exists(os.path.join(tmp, "AAAA.json.gz"))
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert (cap["status"], cap["intended_cache_ref"]) == (ic.PERSIST_UNCONFIRMED, "AAAA.json.gz")
+
+    # The OK line fails once: retry only its manifest append, not the fetch.
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(ok_line_fails_once()):
+            request = run_harvest(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+        caps = ic.read_captures(only_manifest(tmp))
+        assert result_lines(tmp) == len(caps) == 1
+    assert [c["status"] for c in caps] == [ic.OK] and len(request.urls) == 1
+    print("  ok test_harvest_result_line_fails_after_the_cache_write")
+
+
+def test_backfill_result_line_fails_around_the_commit():
+    """backfill_inventory, whose artifact is a commit to neobdm.db. Disk full
+    after the persisting line: the rows are committed, the OK line cannot be
+    written, the run stops, and the reader says PERSIST_UNCONFIRMED. Disk full
+    from the persisting line on: nothing is committed (rolled back), and the
+    reader says INCOMPLETE, which is true. Either way no false OK."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(disk_full_after_persisting()):
+            out, exit_message, _ = run_backfill(
+                tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+        gc.collect()                                        # the aborted run's connection
+        prices, _ = db_counts(tmp)
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert prices == {"AAAA": 120}                          # committed
+    assert "manifest result failed after DB commit" in exit_message
+    assert "FAILED" not in out
+    assert (cap["status"], cap["target"], cap["intended_cache_ref"]) == (
+        ic.PERSIST_UNCONFIRMED, "neobdm.db", None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(disk_full_from_persisting()):
+            try:
+                run_backfill(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+                raise AssertionError("the manifest failure was swallowed")
+            except OSError:
+                pass
+        gc.collect()
+        prices, _ = db_counts(tmp)
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert prices == {} and cap["status"] == ic.INCOMPLETE  # rolled back: nothing to confirm
+
+    # The OK line fails once: the rows stay committed and the retried line says OK.
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(ok_line_fails_once()):
+            out, exit_message, _ = run_backfill(tmp, {"AAAA": [ok(payload(), "AAAA")]}, ["AAAA"])
+        prices, _ = db_counts(tmp)
+        (cap,) = ic.read_captures(only_manifest(tmp))
+    assert prices == {"AAAA": 120} and cap["status"] == ic.OK
+    assert exit_message is None and "Failed tickers: []" in out
+    print("  ok test_backfill_result_line_fails_around_the_commit")
+
+
+def test_backfill_transient_audit_failure_keeps_the_committed_clone_guard():
+    """A committed B remains the previous signature when its OK result append
+    fails once. The manifest append alone is retried, then C's clone is refused."""
+    names = ["AAAA", "BBBB", "CCCC", "DDDD"]
+    script = {name: [ok(payload(base=base), name)] for name, base in
+              zip(names, (1000.0, 2000.0, 2000.0, 4000.0))}
+    failed_once = {"value": False}
+
+    def fail_b_result_once(event):
+        if (event["event"] == "result" and event["ticker"] == "BBBB"
+                and event["status"] == ic.OK and not failed_once["value"]):
+            failed_once["value"] = True
+            return True
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(fail_b_result_once):
+            out, exit_message, request = run_backfill(tmp, script, names)
+        prices, flows = db_counts(tmp)
+        caps = ic.read_captures(only_manifest(tmp))
+        assert result_lines(tmp) == len(caps) == 4
+    assert failed_once["value"] and len(request.urls) == 4  # no retry of B
+    assert prices == {"AAAA": 120, "BBBB": 120, "DDDD": 120}, prices
+    assert flows == {"AAAA": 240, "BBBB": 240, "DDDD": 240}, flows
+    assert [(c["ticker"], c["status"]) for c in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.OK), ("CCCC", ic.REJECTED), ("DDDD", ic.OK)]
+    assert "series identical to BBBB" in out and "Failed tickers: ['CCCC']" in out
+    assert exit_message is None
+    print("  ok test_backfill_transient_audit_failure_keeps_the_committed_clone_guard")
+
+
+def test_backfill_persistent_audit_failure_stops_before_the_next_ticker():
+    """If B's OK result cannot be appended, B stays committed and its capture
+    stays PERSIST_UNCONFIRMED. C is never requested under uncertain audit state."""
+    names = ["AAAA", "BBBB", "CCCC"]
+    script = {name: [ok(payload(base=base), name)] for name, base in
+              zip(names, (1000.0, 2000.0, 2000.0))}
+    with tempfile.TemporaryDirectory() as tmp:
+        with failing_appends(lambda event: event["event"] == "result"
+                             and event["ticker"] == "BBBB"):
+            out, exit_message, request = run_backfill(tmp, script, names)
+        gc.collect()                                        # the aborted run's connection
+        prices, flows = db_counts(tmp)
+        caps = ic.read_captures(only_manifest(tmp))
+    assert "manifest result failed after DB commit" in exit_message
+    assert "FAILED" not in out and len(request.urls) == 2
+    assert prices == {"AAAA": 120, "BBBB": 120}
+    assert flows == {"AAAA": 240, "BBBB": 240}
+    assert [(c["ticker"], c["status"]) for c in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.PERSIST_UNCONFIRMED)]
+    print("  ok test_backfill_persistent_audit_failure_stops_before_the_next_ticker")
+
+
+# ── bag-holder finalisation (Codex blocker 2) ──────────────────────────────
+
+def test_the_bagholder_discovery_is_ok_only_once_it_defined_the_blocks():
+    malformed = Resp(200, {"success": True, "data": [1, 2], "meta": {"symbol": "AAAA"}})
+    with tempfile.TemporaryDirectory() as tmp:
+        log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+        page = SimpleNamespace(context=SimpleNamespace(request=FakeRequest(tmp, {"AAAA": [malformed]})))
+        try:
+            ns.get_inventory_bagholders(page, "AAAA", captures=log)    # raised before, too
+            raise AssertionError("did not raise")
+        except AttributeError:
+            pass
+        (cap,) = ic.read_captures(log.path)
+        assert result_lines(tmp) == 1
+    assert cap["status"] == ic.ERROR and cap["reason"].startswith("AttributeError"), cap
+    print("  ok test_the_bagholder_discovery_is_ok_only_once_it_defined_the_blocks")
+
+
+def test_bagholder_blocks_are_ok_only_once_the_ranking_used_them():
+    def block(k, **data_edits):
+        data = payload(n=20, base=1000.0 * (k + 1))
+        data.update(data_edits)
+        return ok(data, "AAAA")
+    discovery = ok(payload(n=80), "AAAA")
+    cases = [  # (label, blocks served, expected statuses [discovery, block1..3], exception)
+        ("the ranking fails", [block(0), block(1, nlot=[1]), block(2)],
+         [ic.OK, ic.ERROR, ic.ERROR, ic.ERROR], AttributeError),
+        ("a later block is refused", [block(0), block(1), Resp(200, text=LOGIN_PAGE)],
+         [ic.OK, ic.ABORTED, ic.ABORTED, ic.NON_JSON], RuntimeError),
+        ("the lookup succeeds", [block(0), block(1), block(2)],
+         [ic.OK, ic.OK, ic.OK, ic.OK], None),
+    ]
+    for label, blocks, statuses, raised in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = ic.CaptureLog(tmp, "neobdm_scraper", writes_cache=False, mode="bagholders")
+            page = SimpleNamespace(context=SimpleNamespace(
+                request=FakeRequest(tmp, {"AAAA": [discovery] + blocks})))
+            try:
+                holders = ns.get_inventory_bagholders(page, "AAAA", captures=log)
+                assert raised is None, f"{label}: did not raise"
+                assert holders == bagholders_from_payloads(
+                    [json.loads(r.text()) for r in blocks], 2)
+            except (AttributeError, RuntimeError) as e:
+                assert raised is not None and isinstance(e, raised), (label, e)
+            caps = ic.read_captures(log.path)
+            assert result_lines(tmp) == len(caps) == 4, label          # one outcome each
+        assert [c["status"] for c in caps] == statuses, (label, [c["status"] for c in caps])
+        if raised is AttributeError:
+            assert all(c["reason"].startswith("AttributeError") for c in caps[1:]), label
+    print("  ok test_bagholder_blocks_are_ok_only_once_the_ranking_used_them")
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

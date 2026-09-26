@@ -166,7 +166,7 @@ def fetch_inventory(req, ticker, start_date, end_date, captures):
             err = InventoryError(
                 f"{ticker}: inventory API status={resp.status} success="
                 f"{(payload or {}).get('success')} message={msg!r}", raw=raw)
-            cap.finish(ic.NON_JSON if payload is None else ic.VENDOR_ERROR, err)
+            cap.finish(ic.source_refusal(resp.status, payload), err)
             raise err
     except Exception as e:
         cap.finish(ic.ERROR, e)          # only if nothing above recorded it
@@ -298,13 +298,29 @@ def run_backfill(tickers):
                     raise InventoryError(
                         f"series identical to {prev_ticker} — stale response, not stored")
 
-                conn.commit()
-                cap.finish(ic.OK)
-                prev_signature, prev_ticker = signature, ticker
-                kept = [c for c in returned if c in BROKER_FLOW_CODES]
                 dates = payload["data"].get("date") or []
-                sessions.append(len(dates))
+                session_count = len(dates)
+                kept = [c for c in returned if c in BROKER_FLOW_CODES]
                 rng = f"{dates[0]} to {dates[-1]}" if dates else "n/a"
+                # On record before the commit makes the rows durable: if the OK
+                # line below never lands, the reader says PERSIST_UNCONFIRMED.
+                cap.persisting("neobdm.db")
+                conn.commit()
+                prev_signature, prev_ticker = signature, ticker
+                sessions.append(session_count)
+                # The rows are committed and the clone guard must reflect them
+                # before writing the separate audit result. Retry only that
+                # result line; an audit failure must stop the run, not enter the
+                # ticker-failure handler or permit a stale clone check.
+                try:
+                    cap.finish(ic.OK)
+                except Exception:
+                    try:
+                        cap.finish(ic.OK)
+                    except Exception as audit_error:
+                        raise SystemExit(
+                            f"{ticker}: capture manifest result failed after DB commit"
+                        ) from audit_error
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
                 print(f"  brokers returned={returned} kept(in BROKER_FLOW_CODES)={kept}")
             except Exception as e:
@@ -314,7 +330,8 @@ def run_backfill(tickers):
                 # all. Every earlier ticker is already committed or rolled back,
                 # so only this ticker's writes are pending here.
                 conn.rollback()
-                if cap is not None:       # a failure fetch_inventory already recorded has no cap here
+                # A failure fetch_inventory already recorded has no cap here.
+                if cap is not None:
                     cap.finish(ic.REJECTED if isinstance(e, InventoryError) else ic.ERROR, e)
                 print(f"  FAILED: {e}")
                 raw = getattr(e, "raw", None)

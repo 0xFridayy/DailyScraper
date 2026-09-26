@@ -119,12 +119,18 @@ def fetch(req, ticker, qs, cap):
     # The status and bytes go on record first: text() decodes the body and can
     # raise (a non-UTF-8 error page), and the failure is still that response's.
     cap.response(r.status, None, None, raw)
-    txt = r.text()
+    try:
+        txt = r.text()
+    except Exception as e:
+        if ic.is_http_error(r.status):       # an error page that cannot even be read
+            cap.finish(ic.HTTP_ERROR, e)
+        raise
     try:
         j = json.loads(txt)
     except json.JSONDecodeError:
         cap.response(r.status, txt, None, raw)
-        cap.finish(ic.NON_JSON, f"HTTP {r.status}, body is not JSON ({len(txt)} chars)")
+        cap.finish(ic.source_refusal(r.status, None),
+                   f"HTTP {r.status}, body is not JSON ({len(txt)} chars)")
         # Say what actually came back. A bare "Expecting value: line 2
         # column 1" reads like a parser quirk; it is usually the login page
         # or a block page, which means the session died or we are refused,
@@ -136,7 +142,7 @@ def fetch(req, ticker, qs, cap):
     cap.response(r.status, txt, j, raw)
     if not j.get("success"):
         err = RuntimeError(f"{ticker}: {str(j.get('message'))[:120]}")
-        cap.finish(ic.VENDOR_ERROR, err)
+        cap.finish(ic.source_refusal(r.status, j), err)
         raise err
     return j["data"]
 
@@ -147,8 +153,10 @@ def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
     comes back short.
 
     The attempt is recorded in `captures` (an inventory_capture.CaptureLog):
-    the request before it is sent, then exactly one outcome. The most specific
-    one wins; the catch-all below only records what nothing else did."""
+    the request before it is sent, a persisting line before the cache file is
+    written, then exactly one outcome. The most specific one wins; the
+    catch-all below only records ERROR when nothing was decided. A failed OK
+    append is retried as an audit write, without another fetch."""
     qs = build_query(t, codes, sd, ed)
     cap = captures.begin(qs, attempt)
     try:
@@ -162,14 +170,27 @@ def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
             cap.finish(ic.ABORTED, msg)
             raise SystemExit(msg)
         text = json.dumps(d)
+        ref = os.path.basename(cached(t))
+        cap.persisting("cache", cache_ref=ref)    # on record before the file can exist
         try:
             with gzip.open(cached(t), "wt", encoding="utf-8") as f:
                 f.write(text)
         except Exception as e:
             cap.finish(ic.CACHE_WRITE_FAILED, e)
             raise
-        cap.finish(ic.OK, cache_ref=os.path.basename(cached(t)),
-                   cache_sha256=ic.sha256_text(text))
+        digest = ic.sha256_text(text)
+        try:
+            cap.finish(ic.OK, cache_ref=ref, cache_sha256=digest)
+        except Exception:
+            # Retry the decided OK line only. The cache already exists, so a
+            # second network fetch would turn an audit failure into a retry of
+            # a persisted ticker. A second append failure stops the run.
+            try:
+                cap.finish(ic.OK, cache_ref=ref, cache_sha256=digest)
+            except Exception as audit_error:
+                raise SystemExit(
+                    f"{t}: capture manifest result failed after cache write"
+                ) from audit_error
     except Exception as e:
         cap.finish(ic.ERROR, e)
         raise

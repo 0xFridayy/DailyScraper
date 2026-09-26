@@ -34,7 +34,7 @@ out on purpose.
 
 EVENTS (schema inventory_capture_v1)
 ------------------------------------
-Each attempt writes two JSON lines, joined by capture_id:
+Each attempt writes two or three JSON lines, joined by capture_id:
 
   request  written BEFORE the request is sent, from the exact query string sent:
            ticker (the `symbol` param), start_date, end_date, investor_type;
@@ -46,6 +46,13 @@ Each attempt writes two JSON lines, joined by capture_id:
            as a broker set); other_params, names only, never values; and
            query_sha256 over the exact query. Plus provenance: collector,
            mode, pipeline_run_id, broker_list_source, writes_cache, attempt.
+  persisting  written after the response was accepted and just BEFORE the
+           collector makes its artifact durable (the cache file write, or
+           backfill_inventory's commit to neobdm.db): persisting_at, target
+           ("cache" or "neobdm.db"), intended_cache_ref (null for neobdm.db)
+           and the response evidence listed under result. The artifact and
+           this file are separate resources and cannot be written atomically;
+           this line is the write-ahead half that keeps the gap visible.
   result   written once the attempt's outcome is known: status (below),
            a short log-safe reason, captured_at (when the response arrived,
            or when the failure was seen), http_status; response_bytes and
@@ -63,15 +70,27 @@ Each attempt writes two JSON lines, joined by capture_id:
 
 status and http_status answer different questions. http_status is the fact
 of the transport: the code the response came with, whatever happened next.
-status is the collector's outcome for the attempt. So a refused attempt whose
-response came with an HTTP status >= 400 is HTTP_ERROR (whichever check
-refused it), while a response a collector accepts despite such a code, as
-harvest_inventory and the no-cache collectors do with a JSON success=true
-answer, records what became of it: OK beside http_status 500 means the payload
-was cached or used although it came with a 500.
+status is the collector's outcome for the attempt, set where the collector
+decides it, never inferred from the code alone. HTTP_ERROR means the collector
+refused the response because the source answered with an error (a page that is
+not JSON, success != true, a body it cannot read) under an HTTP status >= 400
+(source_refusal()); broker_collect refuses every HTTP >= 400 outright. A
+refusal for the content (REJECTED: wrong symbol, stale series, strict frame)
+and a local failure after an accepted response (ERROR, e.g. a failed commit;
+CACHE_WRITE_FAILED) keep their own status whatever the code. A response a
+collector accepts despite such a code, as harvest_inventory and the no-cache
+collectors do with a JSON success=true answer, records what became of it: OK
+beside http_status 500 means the payload was cached or used although it came
+with a 500.
 
-A request line without a result line is an attempt that never finished (the
-process died mid-request); read_captures() reports it as INCOMPLETE.
+OK is written only after the artifact is durable, and CACHE_WRITE_FAILED or
+ERROR only when it is known not to be (the write raised; the commit was
+rolled back). read_captures() reports an attempt with no result line by what
+reached the file: INCOMPLETE when there is no persisting line either (it
+stopped before persisting anything, so it left no artifact), and
+PERSIST_UNCONFIRMED when there is (the collector began writing its artifact and
+its outcome was never recorded: the artifact may or may not exist, and for a
+cache the intended_cache_ref says where to look).
 
 The manifest states requested vs returned and nothing more. It writes no
 per-broker rows and never turns an omitted broker into a zero: a broker in
@@ -118,26 +137,20 @@ NO_CACHE_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Attempt outcomes: what the collector did with the attempt, not the transport
 # code, which is http_status (module docstring). Everything except OK and EMPTY
 # is a source failure for the attempt; the reason says which check fired.
-OK = "OK"                                  # accepted: cached (cache_ref), or used as is
+OK = "OK"                                  # accepted, and cached (cache_ref) or used, durably
 EMPTY = "EMPTY"                            # success, but the collector found nothing to keep
-HTTP_ERROR = "HTTP_ERROR"                  # refused, and the response's HTTP status was >= 400
-NON_JSON = "NON_JSON"                      # body is not JSON (login page, proxy error)
-VENDOR_ERROR = "VENDOR_ERROR"              # JSON with success != true (the throttle too)
-REJECTED = "REJECTED"                      # JSON with success, refused by our checks
-ERROR = "ERROR"                            # an exception ended the attempt
-ABORTED = "ABORTED"                        # accepted, then the run stopped on it
+HTTP_ERROR = "HTTP_ERROR"                  # refused: the source answered with an HTTP error
+NON_JSON = "NON_JSON"                      # refused: body not JSON (login page), HTTP < 400
+VENDOR_ERROR = "VENDOR_ERROR"              # refused: JSON success != true, HTTP < 400
+REJECTED = "REJECTED"                      # refused for its content by our checks
+ERROR = "ERROR"                            # a local failure or an exception ended the attempt
+ABORTED = "ABORTED"                        # accepted, then the run or lookup stopped before using it
 CACHE_WRITE_FAILED = "CACHE_WRITE_FAILED"  # accepted, but the cache write failed
 STATUSES = (OK, EMPTY, HTTP_ERROR, NON_JSON, VENDOR_ERROR, REJECTED, ERROR, ABORTED,
             CACHE_WRITE_FAILED)
-INCOMPLETE = "INCOMPLETE"                  # read side only: a request with no result
-# The refusals that become HTTP_ERROR when the response came with an HTTP status
-# >= 400, so every collector records a refused HTTP error as broker_collect
-# does, whether or not the body was JSON; the reason, http_status, digest and
-# vendor_success still say what came back. The outcomes of an accepted response
-# (OK, EMPTY, ABORTED, CACHE_WRITE_FAILED) are never rewritten: an attempt the
-# collector accepted despite the code says so, with the code in http_status,
-# and calling a cached payload an HTTP_ERROR would contradict its cache_ref.
-HTTP_ERROR_OUTRANKS = (NON_JSON, VENDOR_ERROR, REJECTED, ERROR)
+# Read side only: an attempt with no result line (module docstring).
+INCOMPLETE = "INCOMPLETE"                  # nothing was being persisted: no artifact
+PERSIST_UNCONFIRMED = "PERSIST_UNCONFIRMED"  # persisting began; the artifact may exist
 
 EXPLICIT_CODES = "EXPLICIT_CODES"
 SELECTOR = "SELECTOR"
@@ -309,53 +322,105 @@ def response_evidence(http_status, text, body, raw_bytes=None, clock=utc_now):
     }
 
 
+def is_http_error(code):
+    """An HTTP status of 400 or more (an int, not a bool)."""
+    return isinstance(code, int) and not isinstance(code, bool) and code >= 400
+
+
+def source_refusal(http_status, body):
+    """The status of a response a collector refuses because the source answered
+    with an error instead of data: HTTP_ERROR under an HTTP status >= 400,
+    whatever the body; otherwise NON_JSON for a body that is not JSON (`body`
+    None) and VENDOR_ERROR for JSON whose success is not true.
+
+    Only for that refusal. A response refused for its content is REJECTED, and
+    a local failure after an accepted response ERROR or CACHE_WRITE_FAILED,
+    whatever its code: the cause decides the status, not http_status."""
+    if is_http_error(http_status):
+        return HTTP_ERROR
+    return NON_JSON if body is None else VENDOR_ERROR
+
+
 _NO_RESPONSE = {"captured_at": None, "http_status": None, "response_bytes": None,
                 "response_sha256": None, "response_text_sha256": None, "vendor_success": None,
                 "vendor_meta": None, "vendor_meta_unrecorded_keys": [], "returned_brokers": None,
                 "session_count": None, "first_session": None, "last_session": None}
 
 
+class ManifestAppendError(OSError):
+    """An append failed, but the manifest was restored and may be retried."""
+
+
+class ManifestPoisonedError(BaseException):
+    """Rollback failed: this manifest may end in a torn line and cannot be appended.
+
+    This bypasses collectors' ordinary ``except Exception`` retry/failure paths.
+    The run must stop before it can issue another request or write another event.
+    """
+
+
 # ── the log ───────────────────────────────────
 
 class Capture:
     """One request attempt. Its request line is already on disk when the caller
-    gets this; response() attaches the evidence and finish() writes the outcome.
-    Only the first finish() writes, so the handler that knows the most specific
-    outcome records it and a catch-all behind it cannot overwrite that."""
+    gets this; response() attaches the evidence, persisting() records that the
+    collector is about to make its artifact durable, and finish() records the
+    outcome.
+
+    The first finish() call decides the outcome, so the handler that knows the
+    most specific one records it and a catch-all behind it cannot replace it.
+    The outcome counts as recorded (`finished`) only once its line is on disk.
+    If the append fails, the error propagates, and a later finish() call writes
+    that same decided line again, never a different one: after a durable write,
+    a catch-all's ERROR must not stand in for an OK whose line did not land."""
 
     def __init__(self, log, capture_id, ticker):
         self.log, self.capture_id, self.ticker = log, capture_id, ticker
         self.evidence = dict(_NO_RESPONSE)
-        self.finished = False
+        self.decided = None          # the outcome line, once decided
+        self.finished = False        # ...and on disk
+
+    def _evidence(self):
+        evidence = dict(self.evidence)
+        if evidence["captured_at"] is None:
+            evidence["captured_at"] = self.log.clock()
+        return evidence
 
     def response(self, http_status, text, body, raw_bytes=None):
         """Attach the response: its status, text, parsed JSON and, where
         available, exact bytes (see response_evidence)."""
         self.evidence = response_evidence(http_status, text, body, raw_bytes, self.log.clock)
 
-    def finish(self, status, reason=None, cache_ref=None, cache_sha256=None):
-        """Write the result line; False (and nothing written) if already finished.
+    def persisting(self, target, cache_ref=None):
+        """Record, just before the collector makes its artifact durable, that
+        it is about to (target "cache" or "neobdm.db"; cache_ref where a cache
+        file goes). If no outcome line follows, read_captures() reports
+        PERSIST_UNCONFIRMED instead of INCOMPLETE: the artifact may exist.
+        Raises if the line cannot be written, before anything is persisted."""
+        self.log._append({
+            "schema": SCHEMA_VERSION, "event": "persisting", "capture_id": self.capture_id,
+            "run_id": self.log.run_id, "ticker": self.ticker, "persisting_at": self.log.clock(),
+            "target": target, "intended_cache_ref": cache_ref, **self._evidence()})
 
-        A refusal (HTTP_ERROR_OUTRANKS) of a response whose HTTP status is
-        >= 400 is recorded as HTTP_ERROR, whichever check refused it. Any other
-        status is written as given; http_status always carries the code."""
+    def finish(self, status, reason=None, cache_ref=None, cache_sha256=None):
+        """Decide the outcome (the first call only) and write its line: True
+        when this call put the line on disk, False when it already was. Raises
+        when the append fails, leaving `finished` False for a later call.
+
+        The status is written as given; it is never inferred from http_status
+        (see source_refusal for the refusals where the code decides)."""
         if status not in STATUSES:
             raise ValueError(f"unknown capture status {status!r}")
         if self.finished:
             return False
+        if self.decided is None:
+            self.decided = {
+                "schema": SCHEMA_VERSION, "event": "result", "capture_id": self.capture_id,
+                "run_id": self.log.run_id, "ticker": self.ticker, "status": status,
+                "reason": safe_reason(reason), **self._evidence(),
+                "cache_ref": cache_ref, "cache_sha256": cache_sha256}
+        self.log._append(self.decided)
         self.finished = True
-        code = self.evidence["http_status"]
-        if (status in HTTP_ERROR_OUTRANKS and isinstance(code, int)
-                and not isinstance(code, bool) and code >= 400):
-            status = HTTP_ERROR
-        evidence = dict(self.evidence)
-        if evidence["captured_at"] is None:
-            evidence["captured_at"] = self.log.clock()
-        self.log._append({
-            "schema": SCHEMA_VERSION, "event": "result", "capture_id": self.capture_id,
-            "run_id": self.log.run_id, "ticker": self.ticker, "status": status,
-            "reason": safe_reason(reason), **evidence,
-            "cache_ref": cache_ref, "cache_sha256": cache_sha256})
         return True
 
 
@@ -376,6 +441,7 @@ class CaptureLog:
         self.run_id = "inv-" + re.sub(r"[^0-9T]", "", clock()) + "Z"
         self.path = None
         self.seq = 0
+        self.poisoned = False
 
     def _open(self):
         folder = os.path.join(self.root, MANIFEST_DIR)
@@ -394,10 +460,33 @@ class CaptureLog:
         raise RuntimeError(f"no free capture manifest name for {base} in {folder}")
 
     def _append(self, event):
+        """Append one line. Retry only if a failed write was fully rolled back.
+
+        If rollback fails, the possible torn line must remain the final line:
+        read_captures() can then recover the preceding lifecycle events.
+        """
+        if self.poisoned:
+            raise ManifestPoisonedError("capture manifest is poisoned; refusing another append")
         if self.path is None:
             self._open()
-        with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(event, separators=(",", ":")) + "\n")
+        line = json.dumps(event, separators=(",", ":")) + "\n"
+        size = os.path.getsize(self.path)
+        try:
+            with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(line)
+        except BaseException as append_error:
+            try:
+                os.truncate(self.path, size)
+                if os.path.getsize(self.path) != size:
+                    raise OSError("capture manifest was not restored to its pre-append size")
+            except BaseException as rollback_error:
+                self.poisoned = True
+                raise ManifestPoisonedError(
+                    "capture manifest append and rollback failed; refusing further writes"
+                ) from rollback_error
+            if isinstance(append_error, Exception):
+                raise ManifestAppendError("capture manifest append failed; file restored") from append_error
+            raise
 
     def begin(self, query, attempt=1):
         """Record the request `query` is about to make; its Capture.
@@ -423,9 +512,12 @@ class CaptureLog:
 
 def read_captures(path):
     """[capture] from one manifest file, in request order: the request fields
-    with the result fields merged in, and status INCOMPLETE where no result was
-    written. A torn last line (the process died mid-write) is ignored; any
-    other malformed line, or a result without its request, raises ValueError."""
+    with the persisting and result fields merged in. An attempt without a
+    result is INCOMPLETE, or PERSIST_UNCONFIRMED when a persisting line shows
+    its collector had begun writing the artifact (module docstring). A torn last
+    line (the process died mid-write) is ignored; any other malformed line, an
+    event without its request or out of order, or a repeated one raises
+    ValueError."""
     with open(path, encoding="utf-8") as fh:
         lines = fh.read().split("\n")
     captures = {}
@@ -443,10 +535,16 @@ def read_captures(path):
             if cid in captures:
                 raise ValueError(f"{path}:{i}: second request for {cid}")
             captures[cid] = dict(event, status=INCOMPLETE)
+        elif kind == "persisting":
+            if cid not in captures:
+                raise ValueError(f"{path}:{i}: persisting for {cid} without its request")
+            if captures[cid]["status"] != INCOMPLETE:
+                raise ValueError(f"{path}:{i}: persisting for {cid} after its result or twice")
+            captures[cid].update(event, status=PERSIST_UNCONFIRMED)
         elif kind == "result":
             if cid not in captures:
                 raise ValueError(f"{path}:{i}: result for {cid} without its request")
-            if captures[cid]["status"] != INCOMPLETE:
+            if captures[cid]["status"] not in (INCOMPLETE, PERSIST_UNCONFIRMED):
                 raise ValueError(f"{path}:{i}: second result for {cid}")
             captures[cid].update(event)
         else:

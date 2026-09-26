@@ -1016,9 +1016,14 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS, captures=None):
 
     Every request (the discovery window, then each block) is recorded in
     `captures` (inventory_capture.CaptureLog; a new one when None) before it
-    is sent, with its outcome: the two selectors as selectors, the brokers
-    they resolved to, the session range. Recording changes nothing that is
-    fetched or ranked.
+    is sent: the two selectors as selectors, the brokers they resolved to, the
+    session range. A refused response is recorded as refused where it is
+    refused. An accepted one is recorded only once it has been used: the
+    discovery is OK once it defined the blocks (EMPTY when it held no trading
+    dates, ERROR when deriving them failed), and each block is OK once the
+    ranking used it (ERROR when the ranking failed, ABORTED when a later block
+    failed, so it was never ranked). Recording changes nothing that is fetched
+    or ranked.
 
     REWRITTEN OFF THE RETIRED PAGE. This used to drive /inventory/ — a
     react-select dropdown, a #submit-button and a Plotly chart read out of the
@@ -1036,6 +1041,9 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS, captures=None):
         captures = _bagholder_captures()
 
     def fetch(start_date, end_date):
+        """(payload, the Capture recording it). A refusal is recorded here
+        before it is raised; an accepted payload's capture is left for the
+        caller to finish once the payload has been used."""
         query = [("symbol", ticker), ("start_date", start_date),
                  ("end_date", end_date), ("investor_type", "A")]
         query += [("brokers", b) for b in BAGHOLDER_BROKERS]
@@ -1049,30 +1057,49 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS, captures=None):
                 err = RuntimeError(
                     f"{ticker}: inventory API status={resp.status} "
                     f"success={(payload or {}).get('success')}")
-                cap.finish(ic.NON_JSON if payload is None else ic.VENDOR_ERROR, err)
+                cap.finish(ic.source_refusal(resp.status, payload), err)
                 raise err
             shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
             if shown and shown != ticker.upper():
                 err = RuntimeError(f"inventory API returned {shown} for requested {ticker}")
                 cap.finish(ic.REJECTED, err)
                 raise err
-            cap.finish(ic.OK)            # handed back; session_count says if it was empty
         except Exception as e:
             cap.finish(ic.ERROR, e)      # only if nothing above recorded it
             raise
-        return payload
+        return payload, cap
 
     # Discover actual exchange sessions first. Each exact 20-session block uses
     # the verified C20 selector, then the observed flows are aggregated across
     # the latest ~60 trading days.
     start_date, end_date = _inventory_window()
-    discovery = fetch(start_date, end_date)
-    blocks = inventory_date_blocks(
-        discovery, BAGHOLDER_TRADING_DAYS, BAGHOLDER_BLOCK_TRADING_DAYS)
+    discovery, found = fetch(start_date, end_date)
+    try:
+        blocks = inventory_date_blocks(
+            discovery, BAGHOLDER_TRADING_DAYS, BAGHOLDER_BLOCK_TRADING_DAYS)
+    except Exception as e:
+        found.finish(ic.ERROR, e)
+        raise
     if not blocks:
+        found.finish(ic.EMPTY, "no trading dates")
         raise RuntimeError(f"{ticker}: inventory API returned no trading dates")
-    payloads = [fetch(start, end) for start, end in blocks]
-    return bagholders_from_payloads(payloads, n)
+    found.finish(ic.OK)                  # used: it defined the blocks
+    fetched, ranking = [], False         # (payload, capture) per block, finished once ranked
+    try:
+        for start, end in blocks:
+            fetched.append(fetch(start, end))
+        ranking = True
+        holders = bagholders_from_payloads([p for p, _ in fetched], n)
+    except Exception as e:
+        for _, cap in fetched:
+            if ranking:
+                cap.finish(ic.ERROR, e)
+            else:
+                cap.finish(ic.ABORTED, "lookup abandoned: a later block failed")
+        raise
+    for _, cap in fetched:
+        cap.finish(ic.OK)                # used: ranked
+    return holders
 
 
 def _fmt_lot(v):
