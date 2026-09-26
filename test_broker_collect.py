@@ -6,7 +6,9 @@ Playwright are blocked from importing below, so a test that forgot to inject
 fails with ImportError instead of logging in with the local .env credentials.
 """
 
+import glob
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +23,7 @@ for _blocked in ("neobdm_scraper", "playwright", "playwright.sync_api"):
     sys.modules.setdefault(_blocked, None)
 
 import broker_collect as bc
+import inventory_capture as ic
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEGACY = os.path.join(HERE, "inventory_raw")
@@ -134,9 +137,34 @@ class FakeApi:
         return [e for e in self.events if e != "RELOGIN" and (t is None or e == t)]
 
 
+class RecordingApi(FakeApi):
+    """A FakeApi that notes, at each request, whether the capture manifest
+    already holds that exact request as its last line, i.e. whether it was
+    recorded before it was sent. Asserting inside get() would not do: collect()
+    catches the AssertionError as a failed attempt and retries."""
+
+    def __init__(self, script, raw_dir):
+        super().__init__(script)
+        self.raw_dir, self.recorded_first = raw_dir, []
+
+    def get(self, qs):
+        paths = glob.glob(os.path.join(self.raw_dir, ic.MANIFEST_DIR, "*.jsonl"))
+        with open(paths[-1], encoding="utf-8") as fh:
+            last = json.loads(fh.read().splitlines()[-1])
+        self.recorded_first.append(last["event"] == "request"
+                                   and last["query_sha256"] == ic.sha256_text(qs))
+        return super().get(qs)
+
+
 def run(api, tickers, mode="daily", raw_dir=None, sleeps=None):
     return bc.collect(tickers, mode, raw_dir=raw_dir, sleep=(sleeps if sleeps is not None else []).append,
                       now=NOW, request_get=api.get, relogin=api.relogin)
+
+
+def manifest(raw_dir):
+    """Every capture recorded under raw_dir, oldest run first."""
+    paths = sorted(glob.glob(os.path.join(raw_dir, ic.MANIFEST_DIR, "*.jsonl")))
+    return [c for p in paths for c in ic.read_captures(p)]
 
 
 class Captured(logging.Handler):
@@ -521,7 +549,9 @@ def test_payload_verdicts_are_not_retried():
     sleeps = []
     with tempfile.TemporaryDirectory() as tmp:
         res = run(api, ["AAAA", "CCCC", "DDDD"], raw_dir=tmp, sleeps=sleeps)
-        assert os.listdir(tmp) == [] or os.listdir(os.path.join(tmp, "daily")) == []
+        # Nothing cached. The one thing written is the evidence of the verdicts.
+        assert os.listdir(tmp) == [ic.MANIFEST_DIR], os.listdir(tmp)
+        assert [c["status"] for c in manifest(tmp)] == [ic.REJECTED] * 3
     assert res["ok"] == [] and api.calls() == ["AAAA", "CCCC", "DDDD"], api.events
     assert "meta.symbol BBBB" in res["failed"]["AAAA"]
     assert res["failed"]["CCCC"].startswith("strict frame: StrictSourceError")
@@ -759,6 +789,172 @@ def test_collect_cache_matches_what_load_cached_returns():
         with gzip.open(bc.cache_path(tmp, "market", "AAAA"), "rt", encoding="utf-8") as f:
             assert json.load(f)["meta"]["brokers"] == ["AK", "BK"]
     print("  ok test_collect_cache_matches_what_load_cached_returns")
+
+
+# ── capture manifest (inventory_capture) ───────────────────────────────────
+
+def test_collect_records_every_attempt_and_its_outcome():
+    """Each attempt is on disk before it is sent and ends with one outcome;
+    a failure is evidence, not an absence. The collect() result is unchanged."""
+    a = payload(base=1000.0)
+    boom = RuntimeError(f"APIRequestContext.get: Timeout 120000ms exceeded.\nCall log:\n"
+                        f"  - GET /api/inventory\n  - cookie: {SECRET}; csrftoken=abc")
+    names = ["AAAA", "BBBB", "CCCC", "DDDD", "EEEE", "FFFF"]
+    with tempfile.TemporaryDirectory() as tmp:
+        api = RecordingApi({
+            "AAAA": [Resp(503, {"success": False, "message": "busy"}), HTML, ok(a, "AAAA")],
+            "BBBB": [Resp(200, {"success": False, "message": "bad symbol"}),
+                     ok(payload(base=2000.0), "BBBB")],
+            "CCCC": [ok(payload(base=3000.0), "ZZZZ")],        # another ticker's answer
+            "DDDD": [ok(payload(n=0), "DDDD")],                # zero sessions
+            "EEEE": [boom] * bc.MAX_RETRY,                     # never answers
+            "FFFF": [ok(a, "FFFF")]}, tmp)                     # AAAA's series again
+        res = bc.collect(names, "daily", raw_dir=tmp, sleep=[].append, now=NOW,
+                         request_get=api.get, relogin=api.relogin,
+                         pipeline_run_id="daily-2026-09-24T10:30:00Z")
+        caps = manifest(tmp)
+        with open(glob.glob(os.path.join(tmp, ic.MANIFEST_DIR, "*.jsonl"))[0], encoding="utf-8") as fh:
+            text = fh.read()
+        cached = {t: bc.cache_path(tmp, "daily", t) for t in ("AAAA", "BBBB")}
+        digests = {}
+        for t, path in cached.items():
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                digests[t] = hashlib.sha256(fh.read().encode("utf-8")).hexdigest()
+
+    assert res["ok"] == ["AAAA", "BBBB"] and list(res["empty"]) == ["DDDD"], res
+    assert sorted(res["failed"]) == ["CCCC", "EEEE", "FFFF"], res
+    assert api.recorded_first and all(api.recorded_first), api.recorded_first
+    assert len(api.recorded_first) == len(caps) == 3 + 2 + 1 + 1 + bc.MAX_RETRY + 1
+    assert [(c["ticker"], c["attempt"], c["status"]) for c in caps] == [
+        ("AAAA", 1, ic.HTTP_ERROR), ("AAAA", 2, ic.NON_JSON), ("AAAA", 3, ic.OK),
+        ("BBBB", 1, ic.VENDOR_ERROR), ("BBBB", 2, ic.OK),
+        ("CCCC", 1, ic.REJECTED), ("DDDD", 1, ic.EMPTY)] + [
+        ("EEEE", k, ic.ERROR) for k in range(1, bc.MAX_RETRY + 1)] + [("FFFF", 1, ic.REJECTED)]
+
+    run_ids = {c["run_id"] for c in caps}
+    assert len(run_ids) == 1 and len({c["capture_id"] for c in caps}) == len(caps)
+    for c in caps:
+        assert c["capture_id"].startswith(c["run_id"] + "-") and c["captured_at"].endswith("Z")
+        assert (c["collector"], c["mode"], c["writes_cache"]) == ("broker_collect", "daily", True)
+        assert c["pipeline_run_id"] == "daily-2026-09-24T10:30:00Z"
+        assert c["broker_list_source"] == "broker_codes.json"
+        assert c["response_sha256"] is None      # these fakes have no .body(): text digest only
+    by = {(c["ticker"], c["attempt"]): c for c in caps}
+    for t, attempt in (("AAAA", 3), ("BBBB", 2)):
+        good = by[(t, attempt)]
+        assert good["cache_ref"] == f"daily/{t}.json.gz" and good["cache_sha256"] == digests[t]
+        assert good["returned_brokers"] == ["AK", "BK"] and good["session_count"] == 120
+        assert good["reason"] is None and good["http_status"] == 200
+    assert by[("AAAA", 1)]["http_status"] == 503 and by[("AAAA", 1)]["reason"] == "HTTP 503"
+    assert by[("AAAA", 2)]["returned_brokers"] is None
+    assert by[("AAAA", 2)]["response_text_sha256"] == ic.sha256_text(HTML.text())
+    assert "bad symbol" in by[("BBBB", 1)]["reason"] and by[("BBBB", 1)]["vendor_success"] is False
+    assert by[("CCCC", 1)]["reason"] == "meta.symbol ZZZZ != requested CCCC"
+    assert by[("DDDD", 1)]["session_count"] == 0 and by[("DDDD", 1)]["cache_ref"] is None
+    assert by[("EEEE", 1)]["reason"] == "RuntimeError: APIRequestContext.get: Timeout 120000ms exceeded."
+    assert by[("EEEE", 1)]["http_status"] is None and by[("EEEE", 1)]["response_text_sha256"] is None
+    assert by[("FFFF", 1)]["reason"] == "OHLC identical to AAAA (cross-ticker clone)"
+    assert "TOPSECRET" not in text and "csrftoken" not in text and "cookie" not in text.lower()
+    print("  ok test_collect_records_every_attempt_and_its_outcome")
+
+
+def test_collect_manifest_keeps_requested_returned_and_echo_apart():
+    """The request set is ours, the returned set is the payload's, the echo is
+    the vendor's. A broker returned at zero stays distinguishable from one
+    requested and never returned, and nothing is invented for the latter."""
+    data = payload(brokers=("AK", "BK"))
+    for f in ("blot", "bval", "slot", "sval", "nlot", "nval"):
+        data[f]["BK"] = [0] * len(data["date"])              # returned, explicitly zero
+    echo = ["AD", "AF", "AK", "BK"]                          # the vendor's account of the request
+    api = FakeApi({"AAAA": [Resp(200, {"success": True, "data": data,
+                                       "meta": {"symbol": "AAAA", "brokers": echo}})]})
+    codes = bc.load_codes()
+    omitted = next(c for c in codes if c not in ("AK", "BK"))
+    with tempfile.TemporaryDirectory() as tmp:
+        res = run(api, ["AAAA"], raw_dir=tmp)
+        (cap,) = manifest(tmp)
+        loaded = bc.load_cached(None, "daily", raw_dir=tmp)
+        with gzip.open(bc.cache_path(tmp, "daily", "AAAA"), "rt", encoding="utf-8") as f:
+            doc_text = f.read()
+    assert res["ok"] == ["AAAA"], res
+    assert cap["brokers_param"] == codes and cap["requested_brokers"] == sorted(codes)
+    assert cap["broker_request_kind"] == ic.EXPLICIT_CODES
+    assert cap["returned_brokers"] == ["AK", "BK"]
+    assert cap["vendor_meta"] == {"symbol": "AAAA", "brokers": echo}
+    assert omitted in cap["requested_brokers"] and omitted not in cap["returned_brokers"]
+    assert all(v == 0 for v in data["nlot"]["BK"]) and "BK" in cap["returned_brokers"]
+    # The cache is the envelope it always was, with no row made up for `omitted`.
+    assert loaded == {"AAAA": data} and omitted not in loaded["AAAA"]["nlot"]
+    assert set(json.loads(doc_text)) == {"fetched_utc", "meta", "data"}
+    assert cap["cache_sha256"] == hashlib.sha256(doc_text.encode("utf-8")).hexdigest()
+    assert (cap["ticker"], cap["start_date"], cap["end_date"], cap["investor_type"]) == (
+        "AAAA", "2025-09-29", "2026-09-24", "A")
+    print("  ok test_collect_manifest_keeps_requested_returned_and_echo_apart")
+
+
+def test_collect_records_the_window_abort_and_a_failed_cache_write():
+    api = FakeApi({"AAAA": [ok(payload(n=40), "AAAA")]})
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            run(api, ["AAAA"], mode="market", raw_dir=tmp)
+            raise AssertionError("no abort")
+        except SystemExit:
+            pass
+        (cap,) = manifest(tmp)
+    assert cap["status"] == ic.ABORTED and cap["session_count"] == 40, cap
+    assert cap["reason"].startswith("AAAA came back with 40 sessions") and cap["cache_ref"] is None
+
+    api = FakeApi({"AAAA": [ok(payload(), "AAAA")]})
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(bc.cache_path(tmp, "market", "AAAA") + ".tmp")   # the temp file cannot be made
+        res = run(api, ["AAAA"], mode="market", raw_dir=tmp)
+        (cap,) = manifest(tmp)
+    assert res["failed"]["AAAA"].startswith("cache write failed"), res
+    assert cap["status"] == ic.CACHE_WRITE_FAILED and cap["cache_ref"] is None, cap
+    assert cap["reason"].startswith("cache write failed") and cap["returned_brokers"] == ["AK", "BK"]
+    print("  ok test_collect_records_the_window_abort_and_a_failed_cache_write")
+
+
+def test_collect_digests_the_exact_body_bytes_when_the_response_has_them():
+    """Playwright's APIResponse has .body(); the digest is then over the bytes
+    as received, not over the decoded text, and the text digest stays empty."""
+    class BytesResp(Resp):
+        def body(self):
+            return b"\xef\xbb\xbf" + self._text.encode("utf-8")    # differs from the text
+
+    resp = BytesResp(200, envelope(payload(), "AAAA"))
+    with tempfile.TemporaryDirectory() as tmp:
+        res = run(FakeApi({"AAAA": [resp]}), ["AAAA"], raw_dir=tmp)
+        (cap,) = manifest(tmp)
+    assert res["ok"] == ["AAAA"] and cap["status"] == ic.OK, (res, cap)
+    assert cap["response_sha256"] == hashlib.sha256(resp.body()).hexdigest()
+    assert cap["response_bytes"] == len(resp.body()) and cap["response_text_sha256"] is None
+    print("  ok test_collect_digests_the_exact_body_bytes_when_the_response_has_them")
+
+
+def test_manifest_is_invisible_to_the_cache_readers():
+    """The manifest directory sits inside both cache layouts; no reader sees it."""
+    sini = payload(n=5)
+    api = FakeApi({"AAAA": [ok(payload(base=5.0), "AAAA")]})
+    with tempfile.TemporaryDirectory() as tmp:
+        run(api, ["AAAA"], raw_dir=tmp)
+        assert os.path.isdir(os.path.join(tmp, ic.MANIFEST_DIR))
+        bad = {}
+        assert list(dict(bc.iter_cached(None, "daily", raw_dir=tmp, unreadable=bad))) == ["AAAA"]
+        assert list(dict(bc.iter_cached(None, "ignored", raw_dir=tmp, legacy=True,
+                                        unreadable=bad))) == [] and bad == {}
+        # the legacy layout, with a manifest from a harvest beside the bare dicts
+        legacy_dir = os.path.join(tmp, "legacy")
+        log = ic.CaptureLog(legacy_dir, "harvest_inventory", writes_cache=True)
+        log.begin("symbol=SINI&brokers=AK").finish(ic.ERROR, "x")
+        with gzip.open(os.path.join(legacy_dir, "SINI.json.gz"), "wt", encoding="utf-8") as f:
+            json.dump(sini, f)
+        got = dict(bc.iter_cached(None, "ignored", raw_dir=legacy_dir, legacy=True, unreadable=bad))
+        assert got == {"SINI": sini} and bad == {}, (list(got), bad)
+        # the glob build_inventory_db and normalize_market_data use
+        assert [os.path.basename(p) for p in glob.glob(os.path.join(legacy_dir, "*.json.gz"))] == [
+            "SINI.json.gz"]
+    print("  ok test_manifest_is_invisible_to_the_cache_readers")
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

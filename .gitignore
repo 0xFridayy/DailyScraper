@@ -58,6 +58,11 @@ broker_learning_raw/
 broker_dashboard_out/
 broker_history/
 
+# /api/inventory capture manifests (inventory_capture.py). Beside each cache
+# they are ignored with it already; this covers the ones the cache-less
+# collectors (backfill_inventory, the bag-holder lookup) write at the repo root.
+_capture_manifest/
+
 # Local research DB, intentionally separate from neobdm.db so the nightly CI
 # commit of neobdm.db never collides with it (see txchart_history_pull.py)
 txchart_history.db

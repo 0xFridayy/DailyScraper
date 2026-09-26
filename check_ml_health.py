@@ -63,7 +63,8 @@ CORE_MODULES = ["price_audit", "walk_forward_backtest", "strategy_variants",
                 # BROKER_LEARNING.md: pure at import (broker_collect imports
                 # neobdm_scraper/playwright only inside collect()).
                 "broker_book", "broker_rules", "broker_learning", "broker_learning_db",
-                "broker_dashboard", "broker_collect", "broker_learning_run"]
+                "broker_dashboard", "broker_collect", "broker_learning_run",
+                "inventory_capture"]
 OPTIONAL_MODULES = ["ddqn_entry_exit"]
 
 # Panel shape. Wide bands - this catches "the panel collapsed", not drift.
@@ -184,7 +185,7 @@ def check_unit_tests(problems, stats):
     for name in ("test_pipeline.py", "test_experiment_1f_phase2.py", "test_daily_picks.py",
                  "test_broker_book.py", "test_broker_rules.py", "test_broker_learning.py",
                  "test_broker_dashboard.py", "test_broker_collect.py",
-                 "test_broker_learning_run.py"):
+                 "test_broker_learning_run.py", "test_inventory_capture.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
         passed += r.stdout.count(" passed") + r.stdout.count("  ok ")

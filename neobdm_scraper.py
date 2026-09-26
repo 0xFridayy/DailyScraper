@@ -20,6 +20,7 @@ import pytz
 # Pure, playwright-free helpers parked in price_audit so CI can test them.
 from price_audit import (bagholders_from_payloads, inventory_date_blocks,
                          date_offset_holds)
+import inventory_capture as ic
 import neobdm_source_contract as nsc
 
 
@@ -999,10 +1000,30 @@ def _inventory_window(days=BAGHOLDER_DISCOVERY_CALENDAR_DAYS):
     return (end - timedelta(days=days)).isoformat(), end.isoformat()
 
 
-def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
+def _bagholder_captures():
+    """The capture manifest of the bag-holder lookups (inventory_capture). They
+    keep no cache file, so it sits under the repository root's
+    _capture_manifest/, and every result carries cache_ref null."""
+    return ic.CaptureLog(ic.NO_CACHE_ROOT, "neobdm_scraper", writes_cache=False,
+                         mode="bagholders",
+                         broker_list_source="neobdm_scraper.BAGHOLDER_BROKERS")
+
+
+def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS, captures=None):
     """Top-n observable accumulators over ~60 trading sessions.
 
     This is broker-level observable inventory, not beneficial ownership.
+
+    Every request (the discovery window, then each block) is recorded in
+    `captures` (inventory_capture.CaptureLog; a new one when None) before it
+    is sent: the two selectors as selectors, the brokers they resolved to, the
+    session range. A refused response is recorded as refused where it is
+    refused. An accepted one is recorded only once it has been used: the
+    discovery is OK once it defined the blocks (EMPTY when it held no trading
+    dates, ERROR when deriving them failed), and each block is OK once the
+    ranking used it (ERROR when the ranking failed, ABORTED when a later block
+    failed, so it was never ranked). Recording changes nothing that is fetched
+    or ranked.
 
     REWRITTEN OFF THE RETIRED PAGE. This used to drive /inventory/ — a
     react-select dropdown, a #submit-button and a Plotly chart read out of the
@@ -1016,33 +1037,69 @@ def get_inventory_bagholders(page, ticker, n=STALKER_BUYERS):
     time and this caller was left as follow-up (Appendix N, item 2). This is that
     follow-up: authenticated JSON GETs, no DOM and no render race.
     """
+    if captures is None:
+        captures = _bagholder_captures()
+
     def fetch(start_date, end_date):
+        """(payload, the Capture recording it). A refusal is recorded here
+        before it is raised; an accepted payload's capture is left for the
+        caller to finish once the payload has been used."""
         query = [("symbol", ticker), ("start_date", start_date),
                  ("end_date", end_date), ("investor_type", "A")]
         query += [("brokers", b) for b in BAGHOLDER_BROKERS]
-        resp = page.context.request.get(
-            f"{INVENTORY_API}?{urlencode(query)}", timeout=60000)
-        payload = _api_json(resp)
-        if not payload or not payload.get("success"):
-            raise RuntimeError(
-                f"{ticker}: inventory API status={resp.status} "
-                f"success={(payload or {}).get('success')}")
-        shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
-        if shown and shown != ticker.upper():
-            raise RuntimeError(f"inventory API returned {shown} for requested {ticker}")
-        return payload
+        qs = urlencode(query)
+        cap = captures.begin(qs)
+        try:
+            resp = page.context.request.get(f"{INVENTORY_API}?{qs}", timeout=60000)
+            payload = _api_json(resp)
+            cap.response(resp.status, None, payload, ic.raw_body(resp))
+            if not payload or not payload.get("success"):
+                err = RuntimeError(
+                    f"{ticker}: inventory API status={resp.status} "
+                    f"success={(payload or {}).get('success')}")
+                cap.finish(ic.source_refusal(resp.status, payload), err)
+                raise err
+            shown = str((payload.get("meta") or {}).get("symbol") or "").upper()
+            if shown and shown != ticker.upper():
+                err = RuntimeError(f"inventory API returned {shown} for requested {ticker}")
+                cap.finish(ic.REJECTED, err)
+                raise err
+        except Exception as e:
+            cap.finish(ic.ERROR, e)      # only if nothing above recorded it
+            raise
+        return payload, cap
 
     # Discover actual exchange sessions first. Each exact 20-session block uses
     # the verified C20 selector, then the observed flows are aggregated across
     # the latest ~60 trading days.
     start_date, end_date = _inventory_window()
-    discovery = fetch(start_date, end_date)
-    blocks = inventory_date_blocks(
-        discovery, BAGHOLDER_TRADING_DAYS, BAGHOLDER_BLOCK_TRADING_DAYS)
+    discovery, found = fetch(start_date, end_date)
+    try:
+        blocks = inventory_date_blocks(
+            discovery, BAGHOLDER_TRADING_DAYS, BAGHOLDER_BLOCK_TRADING_DAYS)
+    except Exception as e:
+        found.finish(ic.ERROR, e)
+        raise
     if not blocks:
+        found.finish(ic.EMPTY, "no trading dates")
         raise RuntimeError(f"{ticker}: inventory API returned no trading dates")
-    payloads = [fetch(start, end) for start, end in blocks]
-    return bagholders_from_payloads(payloads, n)
+    found.finish(ic.OK)                  # used: it defined the blocks
+    fetched, ranking = [], False         # (payload, capture) per block, finished once ranked
+    try:
+        for start, end in blocks:
+            fetched.append(fetch(start, end))
+        ranking = True
+        holders = bagholders_from_payloads([p for p, _ in fetched], n)
+    except Exception as e:
+        for _, cap in fetched:
+            if ranking:
+                cap.finish(ic.ERROR, e)
+            else:
+                cap.finish(ic.ABORTED, "lookup abandoned: a later block failed")
+        raise
+    for _, cap in fetched:
+        cap.finish(ic.OK)                # used: ranked
+    return holders
 
 
 def _fmt_lot(v):
@@ -1082,6 +1139,7 @@ def scrape_broker_stalker(page):
         log.error(f"inventory-chart prime failed: {e}")
 
     results = []
+    captures = _bagholder_captures()      # one manifest for this run's lookups
     for r in top:
         symbol = r["symbol"]
         # One ticker failing must not kill the whole daily signal, but the failure
@@ -1089,7 +1147,7 @@ def scrape_broker_stalker(page):
         # feature stayed dead for weeks after /inventory/ was retired.
         failed = False
         try:
-            holders = get_inventory_bagholders(page, symbol)
+            holders = get_inventory_bagholders(page, symbol, captures=captures)
         except Exception as e:
             log.error(f"inventory bagholders {symbol} failed: {_safe_error(e, 300)}")
             holders, failed = [], True
