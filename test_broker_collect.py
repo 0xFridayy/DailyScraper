@@ -23,12 +23,19 @@ for _blocked in ("neobdm_scraper", "playwright", "playwright.sync_api"):
     sys.modules.setdefault(_blocked, None)
 
 import broker_collect as bc
+import coverage_guard as cg
 import inventory_capture as ic
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEGACY = os.path.join(HERE, "inventory_raw")
 NOW = datetime(2026, 9, 24, 10, 30, tzinfo=timezone.utc)
 SECRET = "sessionid=TOPSECRET123"
+
+# The explicit request every collect() below sends: at most 10 codes (the
+# server keeps only the first 10), and the payload() brokers exactly, since a
+# response must return exactly the codes requested.
+REQUEST = ("AK", "BK")
+LEGACY_REQUEST = ("AK", "BK", "XL")      # legacy() stand-ins carry these three
 
 # The GIVE UP / cache warnings below are expected. Without a handler, logging's
 # last-resort handler would print them between the "ok" lines.
@@ -65,6 +72,15 @@ def payload(n=120, base=1000.0, brokers=("AK", "BK"), start="2025-10-01"):
                      "low": base + i - 5, "close": base + i, "volume": 1000}
                     for i, d in enumerate(dates)]
     return data
+
+
+def restrict(data, codes):
+    """`data` with only the brokers in `codes`: what an explicit request for
+    `codes` returns from a payload that carries more (the real harvest has 101)."""
+    out = dict(data)
+    for f in ("blot", "bval", "slot", "sval", "nlot", "nval"):
+        out[f] = {b: s for b, s in data[f].items() if b in codes}
+    return out
 
 
 def envelope(data, symbol=None, success=True):
@@ -156,9 +172,9 @@ class RecordingApi(FakeApi):
         return super().get(qs)
 
 
-def run(api, tickers, mode="daily", raw_dir=None, sleeps=None):
+def run(api, tickers, mode="daily", raw_dir=None, sleeps=None, codes=REQUEST):
     return bc.collect(tickers, mode, raw_dir=raw_dir, sleep=(sleeps if sleeps is not None else []).append,
-                      now=NOW, request_get=api.get, relogin=api.relogin)
+                      now=NOW, request_get=api.get, relogin=api.relogin, codes=codes)
 
 
 def manifest(raw_dir):
@@ -215,7 +231,7 @@ def test_collect_imports_scraper_lazily_and_only_when_needed():
         except ValueError:
             pass
         try:
-            bc.collect(["BREN"], "daily", raw_dir=tmp)       # un-injected: the real path
+            bc.collect(["BREN"], "daily", raw_dir=tmp, codes=REQUEST)   # un-injected: the real path
             raise AssertionError("real path ran without importing neobdm_scraper")
         except ImportError as e:
             assert "neobdm_scraper" in str(e), e
@@ -322,7 +338,7 @@ def test_load_watchlist_drops_bad_codes_dedupes_and_keeps_order():
 
 
 def test_build_query_repeats_brokers_and_asks_for_all_investors():
-    codes = bc.load_codes()
+    codes = bc.load_codes()[:10]
     qs = bc.build_query("SINI", codes, "2025-09-29", "2026-09-24")
     pairs = parse_qsl(qs)
     assert pairs[0] == ("symbol", "SINI")
@@ -337,14 +353,20 @@ def test_build_query_repeats_brokers_and_asks_for_all_investors():
         raise AssertionError("empty broker list accepted")
     except ValueError:
         pass
+    for over in (bc.load_codes()[:11], bc.load_codes()):          # never built, never truncated
+        try:
+            bc.build_query("SINI", over, "2025-09-29", "2026-09-24")
+            raise AssertionError(f"{len(over)} codes built a query")
+        except cg.ExplicitRequestError:
+            pass
     print("  ok test_build_query_repeats_brokers_and_asks_for_all_investors")
 
 
 # ── validation ─────────────────────────────────────────────────────────────
 
-def _rejects(env, ticker="AAAA", retryable=None, contains=""):
+def _rejects(env, ticker="AAAA", retryable=None, contains="", requested=REQUEST):
     try:
-        bc.validate_envelope(env, ticker)
+        bc.validate_envelope(env, ticker, requested)
     except bc.FetchRejected as e:
         assert contains in str(e), (contains, str(e))
         if retryable is not None:
@@ -355,12 +377,13 @@ def _rejects(env, ticker="AAAA", retryable=None, contains=""):
 
 def test_validate_envelope_accepts_good_payloads():
     data = payload()
-    assert bc.validate_envelope(envelope(data, "AAAA"), "AAAA") is data
-    assert bc.validate_envelope(envelope(data, "aaaa"), "AAAA") is data   # case-insensitive
-    assert bc.validate_envelope(envelope(data), "AAAA") is data           # meta absent
-    assert bc.validate_envelope({"success": True, "data": data, "meta": {"symbol": ""}}, "AAAA") is data
-    sini = legacy("SINI")
-    assert bc.validate_envelope(envelope(sini, "SINI"), "SINI") is sini
+    assert bc.validate_envelope(envelope(data, "AAAA"), "AAAA", REQUEST) is data
+    assert bc.validate_envelope(envelope(data, "aaaa"), "AAAA", REQUEST) is data   # case-insensitive
+    assert bc.validate_envelope(envelope(data), "AAAA", REQUEST) is data           # meta absent
+    assert bc.validate_envelope({"success": True, "data": data, "meta": {"symbol": ""}}, "AAAA",
+                                REQUEST) is data
+    sini = restrict(legacy("SINI"), LEGACY_REQUEST)
+    assert bc.validate_envelope(envelope(sini, "SINI"), "SINI", LEGACY_REQUEST) is sini
     print("  ok test_validate_envelope_accepts_good_payloads")
 
 
@@ -393,6 +416,12 @@ def test_validate_envelope_rejects_per_spec():
     partial = payload()
     del partial["sval"]["BK"]                                     # partially present broker
     _rejects(envelope(partial, "AAAA"), retryable=False, contains="strict frame")
+    # a requested broker missing from the answer is a refusal, never a zero
+    e = _rejects(envelope(payload(), "AAAA"), retryable=False, contains="coverage",
+                 requested=("AK", "BK", "XL"))
+    assert "missing ['XL']" in str(e), e
+    _rejects(envelope(payload(brokers=("AK", "BK", "XL")), "AAAA"), retryable=False,
+             contains="not requested ['XL']")
     print("  ok test_validate_envelope_rejects_per_spec")
 
 
@@ -426,13 +455,14 @@ def test_ohlc_signature_and_short_window_rules():
 
 def test_collect_happy_path_real_payloads_query_cache_and_pacing():
     names = ["SINI", "BREN", "PANI"]
-    api = FakeApi({t: [ok(legacy(t), t)] for t in names})
+    api = FakeApi({t: [ok(restrict(legacy(t), LEGACY_REQUEST), t)] for t in names})
     sleeps = []
     old = bc.REST_EVERY
     bc.REST_EVERY = 2
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            res = run(api, [" sini", "BREN", "PANI", "SINI"], raw_dir=tmp, sleeps=sleeps)
+            res = run(api, [" sini", "BREN", "PANI", "SINI"], raw_dir=tmp, sleeps=sleeps,
+                      codes=LEGACY_REQUEST)
             assert res["ok"] == names and res["failed"] == {}, res
             assert res["sessions"] == {t: len(legacy(t)["date"]) for t in names}
             assert api.calls() == names                               # deduped, one GET each
@@ -440,10 +470,9 @@ def test_collect_happy_path_real_payloads_query_cache_and_pacing():
                 assert os.path.exists(bc.cache_path(tmp, "daily", t))
     finally:
         bc.REST_EVERY = old
-    codes = bc.load_codes()
     for qs in api.queries:
         q = parse_qs(qs)
-        assert q["brokers"] == codes and q["investor_type"] == ["A"]
+        assert q["brokers"] == list(LEGACY_REQUEST) and q["investor_type"] == ["A"]
         assert q["start_date"] == ["2025-09-29"] and q["end_date"] == ["2026-09-24"]
     # after ticker 1: pace; after 2: rest + pace; after the last: nothing
     assert sleeps.count(bc.REST_FOR) == 1 and len(sleeps) == 3, sleeps
@@ -561,19 +590,20 @@ def test_payload_verdicts_are_not_retried():
 
 
 def test_cross_ticker_clone_is_rejected_within_a_run():
-    bren = legacy("BREN")
+    bren = restrict(legacy("BREN"), LEGACY_REQUEST)
     api = FakeApi({"BREN": [ok(bren, "BREN")],
                    "PANI": [ok(bren, "PANI")],               # BREN's series under PANI
-                   "SINI": [ok(legacy("SINI"), "SINI")]})
+                   "SINI": [ok(restrict(legacy("SINI"), LEGACY_REQUEST), "SINI")]})
     with tempfile.TemporaryDirectory() as tmp:
-        res = run(api, ["BREN", "PANI", "SINI"], raw_dir=tmp)
+        res = run(api, ["BREN", "PANI", "SINI"], raw_dir=tmp, codes=LEGACY_REQUEST)
         assert not os.path.exists(bc.cache_path(tmp, "daily", "PANI"))
     assert res["ok"] == ["BREN", "SINI"], res
     assert res["failed"] == {"PANI": "OHLC identical to BREN (cross-ticker clone)"}, res
     assert api.calls("PANI") == ["PANI"]                       # a verdict, not retried
     # A different run has nothing to compare against.
     with tempfile.TemporaryDirectory() as tmp:
-        again = run(FakeApi({"PANI": [ok(bren, "PANI")]}), ["PANI"], raw_dir=tmp)
+        again = run(FakeApi({"PANI": [ok(bren, "PANI")]}), ["PANI"], raw_dir=tmp,
+                    codes=LEGACY_REQUEST)
     assert again["ok"] == ["PANI"], again
     print("  ok test_cross_ticker_clone_is_rejected_within_a_run")
 
@@ -811,7 +841,7 @@ def test_collect_records_every_attempt_and_its_outcome():
             "FFFF": [ok(a, "FFFF")]}, tmp)                     # AAAA's series again
         res = bc.collect(names, "daily", raw_dir=tmp, sleep=[].append, now=NOW,
                          request_get=api.get, relogin=api.relogin,
-                         pipeline_run_id="daily-2026-09-24T10:30:00Z")
+                         pipeline_run_id="daily-2026-09-24T10:30:00Z", codes=REQUEST)
         caps = manifest(tmp)
         with open(glob.glob(os.path.join(tmp, ic.MANIFEST_DIR, "*.jsonl"))[0], encoding="utf-8") as fh:
             text = fh.read()
@@ -837,7 +867,8 @@ def test_collect_records_every_attempt_and_its_outcome():
         assert c["capture_id"].startswith(c["run_id"] + "-") and c["captured_at"].endswith("Z")
         assert (c["collector"], c["mode"], c["writes_cache"]) == ("broker_collect", "daily", True)
         assert c["pipeline_run_id"] == "daily-2026-09-24T10:30:00Z"
-        assert c["broker_list_source"] == "broker_codes.json"
+        assert c["broker_list_source"] == "collect(codes=...)"   # the caller's list, not the file
+        assert c["collection_mode"] == ic.EXPLICIT_CODES
         assert c["response_sha256"] is None      # these fakes have no .body(): text digest only
     by = {(c["ticker"], c["attempt"]): c for c in caps}
     for t, attempt in (("AAAA", 3), ("BBBB", 2)):
@@ -860,16 +891,15 @@ def test_collect_records_every_attempt_and_its_outcome():
 
 def test_collect_manifest_keeps_requested_returned_and_echo_apart():
     """The request set is ours, the returned set is the payload's, the echo is
-    the vendor's. A broker returned at zero stays distinguishable from one
-    requested and never returned, and nothing is invented for the latter."""
+    the vendor's. A broker returned at zero is observed and kept; a broker
+    requested and never returned refuses the ticker, and nothing is invented
+    for it."""
     data = payload(brokers=("AK", "BK"))
     for f in ("blot", "bval", "slot", "sval", "nlot", "nval"):
         data[f]["BK"] = [0] * len(data["date"])              # returned, explicitly zero
-    echo = ["AD", "AF", "AK", "BK"]                          # the vendor's account of the request
+    echo = ["AK", "BK"]                                      # the vendor's account of the request
     api = FakeApi({"AAAA": [Resp(200, {"success": True, "data": data,
                                        "meta": {"symbol": "AAAA", "brokers": echo}})]})
-    codes = bc.load_codes()
-    omitted = next(c for c in codes if c not in ("AK", "BK"))
     with tempfile.TemporaryDirectory() as tmp:
         res = run(api, ["AAAA"], raw_dir=tmp)
         (cap,) = manifest(tmp)
@@ -877,19 +907,65 @@ def test_collect_manifest_keeps_requested_returned_and_echo_apart():
         with gzip.open(bc.cache_path(tmp, "daily", "AAAA"), "rt", encoding="utf-8") as f:
             doc_text = f.read()
     assert res["ok"] == ["AAAA"], res
-    assert cap["brokers_param"] == codes and cap["requested_brokers"] == sorted(codes)
-    assert cap["broker_request_kind"] == ic.EXPLICIT_CODES
-    assert cap["returned_brokers"] == ["AK", "BK"]
+    assert cap["brokers_param"] == list(REQUEST) and cap["requested_brokers"] == sorted(REQUEST)
+    assert cap["broker_request_kind"] == ic.EXPLICIT_CODES == cap["collection_mode"]
+    assert cap["returned_brokers"] == ["AK", "BK"] == cap["requested_brokers"]
     assert cap["vendor_meta"] == {"symbol": "AAAA", "brokers": echo}
-    assert omitted in cap["requested_brokers"] and omitted not in cap["returned_brokers"]
     assert all(v == 0 for v in data["nlot"]["BK"]) and "BK" in cap["returned_brokers"]
-    # The cache is the envelope it always was, with no row made up for `omitted`.
-    assert loaded == {"AAAA": data} and omitted not in loaded["AAAA"]["nlot"]
+    assert loaded == {"AAAA": data}
     assert set(json.loads(doc_text)) == {"fetched_utc", "meta", "data"}
     assert cap["cache_sha256"] == hashlib.sha256(doc_text.encode("utf-8")).hexdigest()
     assert (cap["ticker"], cap["start_date"], cap["end_date"], cap["investor_type"]) == (
         "AAAA", "2025-09-29", "2026-09-24", "A")
+
+    # XL requested, not returned: refused, not retried, nothing cached
+    api = FakeApi({"AAAA": [ok(payload(brokers=("AK", "BK")), "AAAA")]})
+    with tempfile.TemporaryDirectory() as tmp:
+        res = run(api, ["AAAA"], raw_dir=tmp, codes=("AK", "BK", "XL"))
+        (cap,) = manifest(tmp)
+        assert not os.path.exists(bc.cache_path(tmp, "daily", "AAAA"))
+    assert "coverage" in res["failed"]["AAAA"] and api.calls() == ["AAAA"], res
+    assert cap["status"] == ic.REJECTED and cap["cache_ref"] is None
+    assert cap["requested_brokers"] == ["AK", "BK", "XL"] and cap["returned_brokers"] == ["AK", "BK"]
     print("  ok test_collect_manifest_keeps_requested_returned_and_echo_apart")
+
+
+def test_explicit_requests_over_ten_codes_never_reach_the_network():
+    """The server keeps the first 10 raw `brokers` values. The configured
+    request (broker_codes.json, 101 codes) and any request of 11 are refused
+    before the manifest, the login or a single GET."""
+    for codes, label in ((None, "the configured 101"), (bc.load_codes()[:11], "11 codes")):
+        api = FakeApi({"AAAA": [ok(payload(), "AAAA")]})
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                bc.collect(["AAAA"], "daily", raw_dir=tmp, sleep=[].append, now=NOW,
+                           request_get=api.get, relogin=api.relogin, codes=codes)
+            except cg.ExplicitRequestError as e:
+                assert "never truncated" in str(e), e
+            else:
+                raise AssertionError(f"{label}: collect() ran")
+            assert os.listdir(tmp) == [], (label, os.listdir(tmp))     # no manifest, no cache
+        assert api.queries == [] and api.events == [], label             # zero network calls
+    assert len(bc.load_codes()) == 101
+    print("  ok test_explicit_requests_over_ten_codes_never_reach_the_network")
+
+
+def test_ten_exact_codes_are_accepted_and_nine_of_ten_are_refused():
+    ten = tuple(bc.load_codes()[:10])
+    with tempfile.TemporaryDirectory() as tmp:
+        api = FakeApi({"AAAA": [ok(payload(brokers=ten), "AAAA")],
+                       "BBBB": [ok(payload(base=2000.0, brokers=ten[:9]), "BBBB")]})
+        res = run(api, ["AAAA", "BBBB"], raw_dir=tmp, codes=ten)
+        caps = manifest(tmp)
+        assert os.path.exists(bc.cache_path(tmp, "daily", "AAAA"))
+        assert not os.path.exists(bc.cache_path(tmp, "daily", "BBBB"))
+    assert res["ok"] == ["AAAA"] and list(res["failed"]) == ["BBBB"], res
+    assert f"missing ['{ten[9]}']" in res["failed"]["BBBB"], res
+    assert api.calls("BBBB") == ["BBBB"]                                  # a verdict, not retried
+    assert [c["status"] for c in caps] == [ic.OK, ic.REJECTED]
+    assert caps[0]["requested_brokers"] == caps[0]["returned_brokers"] == sorted(ten)
+    assert caps[1]["returned_brokers"] == sorted(ten[:9])
+    print("  ok test_ten_exact_codes_are_accepted_and_nine_of_ten_are_refused")
 
 
 def test_collect_records_the_window_abort_and_a_failed_cache_write():

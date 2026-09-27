@@ -113,3 +113,12 @@ probe4.py
 probe_inventory_api.py
 scratch_check_ticker.py
 universe_tickers.json
+
+# Targeted broker actor panel (targeted_actor_db.py): per-broker selector-union
+# series and derived ranks, paid NeoBDM data like broker_history/. Local only
+# until a durable, non-public home is decided; its manifests go to
+# _capture_manifest/ above.
+targeted_actor_panel.db
+targeted_actor_panel.db-journal
+targeted_actor_panel.db-wal
+targeted_actor_panel.db-shm

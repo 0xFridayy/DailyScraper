@@ -78,6 +78,7 @@ ns.log.disabled = True                          # the GIVE UP lines below are ex
 
 import backfill_inventory as bf      # noqa: E402
 import broker_collect as bc          # noqa: E402
+import coverage_guard as cg          # noqa: E402
 import harvest_inventory as hi       # noqa: E402
 import inventory_capture as ic       # noqa: E402
 
@@ -86,7 +87,11 @@ bc.log.disabled = True                          # its progress lines, through ne
 bf.DB_PATH = bf.FAILURE_SNAPSHOT = None         # never the real neobdm.db or CWD
 ic.NO_CACHE_ROOT = None                         # never the repository's own manifest
 
-CODES = bc.load_codes()              # the real 101-code request list
+CODES = bc.load_codes()              # the real 101-code universe
+# What the collectors below are asked for: at most 10 codes (the server keeps
+# only the first 10, so more is refused before sending), and exactly the
+# brokers payload() returns, since a response must return exactly those.
+REQUEST = ("AK", "BK")
 SECRET = "TOPSECRET123"
 FIELDS = ("blot", "bval", "slot", "sval", "nlot", "nval")
 LOGIN_PAGE = "<!doctype html><title>Login</title>"
@@ -134,6 +139,14 @@ class Resp:
 
 def ok(data, symbol):
     return Resp(200, {"success": True, "data": data, "meta": {"symbol": symbol}})
+
+
+def explicit_query(ticker, codes, sd, ed):
+    """An explicit-code query spelled as the collectors spell it, for any
+    number of codes: what request_fields() must record as sent, even for a
+    request no collector would now send."""
+    return urlencode([("symbol", ticker)] + [("brokers", c) for c in codes] +
+                     [("start_date", sd), ("end_date", ed), ("investor_type", "A")])
 
 
 def only_manifest(root):
@@ -187,19 +200,34 @@ def fake_browser(request):
     return sync_playwright
 
 
-def run_harvest(root, script, tickers, refresh=False):
-    """harvest_inventory.main() over `tickers`, cached to `root`, offline."""
-    request = FakeRequest(root, script)
-    saved = (hi.RAW, hi.sync_playwright, hi.login, hi.time, sys.argv)
-    hi.RAW, hi.sync_playwright, hi.login = root, fake_browser(request), lambda page: None
+def run_harvest(root, script, tickers, refresh=False, codes=REQUEST, request=None,
+                entry_point=False):
+    """harvest_inventory.main() over `tickers`, cached to `root`, offline.
+    `codes` stands in for broker_codes.json (None: the real 101); `request`,
+    when given, is the FakeRequest to serve from, so a caller can inspect it
+    even when main() raises. Logins are counted on request.logins.
+    entry_point=True runs main() exactly as arb-veto.yml does, with no
+    arguments at all; `tickers` then stands in for the whole universe."""
+    request = request if request is not None else FakeRequest(root, script)
+    request.logins = []
+    saved = (hi.RAW, hi.sync_playwright, hi.login, hi.time, sys.argv, hi.load_codes,
+             hi.load_universe)
+    hi.RAW, hi.sync_playwright = root, fake_browser(request)
+    hi.login = lambda page: request.logins.append(page)
+    if codes is not None:
+        hi.load_codes = lambda: list(codes)
+    if entry_point:
+        hi.load_universe = lambda: list(tickers)
     hi.time = SimpleNamespace(time=time.time, strftime=time.strftime, gmtime=time.gmtime,
                               sleep=lambda s: None)
-    sys.argv = ["harvest_inventory.py", "--tickers", ",".join(tickers)] + (
-        ["--refresh"] if refresh else [])
+    sys.argv = (["harvest_inventory.py"] if entry_point else
+                ["harvest_inventory.py", "--tickers", ",".join(tickers)] + (
+                    ["--refresh"] if refresh else []))
     try:
         hi.main()
     finally:
-        hi.RAW, hi.sync_playwright, hi.login, hi.time, sys.argv = saved
+        (hi.RAW, hi.sync_playwright, hi.login, hi.time, sys.argv, hi.load_codes,
+         hi.load_universe) = saved
     return request
 
 
@@ -241,7 +269,7 @@ def run_collect(root, responses, calls=None):
         return item
     return bc.collect(["AAAA"], "daily", raw_dir=root, sleep=lambda s: None,
                       now=datetime(2026, 9, 24, 10, 30, tzinfo=timezone.utc),
-                      request_get=get, relogin=lambda: None)
+                      request_get=get, relogin=lambda: None, codes=REQUEST)
 
 
 def db_counts(root):
@@ -399,9 +427,24 @@ def assert_selector_request_without_cache(cap, collector, source, selectors, mod
 # ── the request side ───────────────────────────────────────────────────────
 
 def test_request_fields_keep_the_exact_explicit_list():
-    qs = bc.build_query("SINI", CODES, "2025-09-29", "2026-09-24")
-    # The two collectors spell the query differently and must send the same bytes.
-    assert hi.build_query("SINI", CODES, "2025-09-29", "2026-09-24") == qs
+    # The two collectors spell the query differently and must send the same
+    # bytes. broker_collect refuses more than 10 codes before building
+    # anything; harvest_inventory, the legacy ARB-veto input, still builds the
+    # whole 101-code query it always has (its coverage is checked afterwards).
+    ten = CODES[:10]
+    assert hi.build_query("SINI", ten, "2025-09-29", "2026-09-24") == \
+        bc.build_query("SINI", ten, "2025-09-29", "2026-09-24") == \
+        explicit_query("SINI", ten, "2025-09-29", "2026-09-24")
+    for over in (CODES[:11], CODES):
+        try:
+            bc.build_query("SINI", over, "2025-09-29", "2026-09-24")
+            raise AssertionError(f"broker_collect built {len(over)} codes")
+        except cg.ExplicitRequestError:
+            pass
+    assert hi.build_query("SINI", CODES, "2025-09-29", "2026-09-24") == \
+        explicit_query("SINI", CODES, "2025-09-29", "2026-09-24")
+    # The manifest records any query exactly as sent, 101 values included.
+    qs = explicit_query("SINI", CODES, "2025-09-29", "2026-09-24")
     f = ic.request_fields(qs)
     assert (f["ticker"], f["start_date"], f["end_date"], f["investor_type"]) == (
         "SINI", "2025-09-29", "2026-09-24", "A")
@@ -535,7 +578,7 @@ def test_request_is_on_disk_before_the_outcome_and_both_read_back():
         log = ic.CaptureLog(tmp, "test", writes_cache=True, mode="daily",
                             pipeline_run_id="daily-X", broker_list_source="broker_codes.json")
         assert not os.path.exists(os.path.join(tmp, ic.MANIFEST_DIR))   # nothing sent, nothing written
-        qs = bc.build_query("SINI", CODES, "2025-09-29", "2026-09-24")
+        qs = explicit_query("SINI", CODES, "2025-09-29", "2026-09-24")
         cap = log.begin(qs, attempt=2)
         lines = manifest_text(tmp).splitlines()
         assert len(lines) == 1 and json.loads(lines[0])["event"] == "request"
@@ -614,8 +657,9 @@ def test_the_repository_manifest_folder_is_gitignored():
 # ── harvest_inventory ──────────────────────────────────────────────────────
 
 def test_harvest_records_every_attempt_beside_an_unchanged_cache():
-    a = payload(base=1000.0)
-    c = payload(base=3000.0, brokers=("AK", "BK", "XL"), zero=("XL",))
+    three = ("AK", "BK", "XL")
+    a = payload(base=1000.0, brokers=three)
+    c = payload(base=3000.0, brokers=three, zero=("XL",))
     boom = RuntimeError(f"APIRequestContext.get: Timeout 120000ms exceeded.\nCall log:\n"
                         f"  - cookie: sessionid={SECRET}")
     script = {"AAAA": [Resp(200, text=LOGIN_PAGE),
@@ -624,7 +668,7 @@ def test_harvest_records_every_attempt_beside_an_unchanged_cache():
               "BBBB": [boom] * hi.MAX_RETRY,
               "CCCC": [ok(c, "CCCC")]}
     with tempfile.TemporaryDirectory() as tmp:
-        request = run_harvest(tmp, script, ["AAAA", "BBBB", "CCCC"])
+        request = run_harvest(tmp, script, ["AAAA", "BBBB", "CCCC"], codes=three)
         assert [parse_qs(u.split("?", 1)[1])["symbol"][0] for u in request.urls] == \
             ["AAAA"] * 3 + ["BBBB"] * hi.MAX_RETRY + ["CCCC"]
         assert set(request.timeouts) == {120000}
@@ -653,15 +697,15 @@ def test_harvest_records_every_attempt_beside_an_unchanged_cache():
     for x in caps:
         assert (x["collector"], x["mode"], x["broker_list_source"], x["writes_cache"]) == (
             "harvest_inventory", None, "broker_codes.json", True)
-        assert x["brokers_param"] == CODES and x["requested_brokers"] == sorted(CODES)
+        assert x["brokers_param"] == list(three) and x["requested_brokers"] == sorted(three)
+        assert "collection_mode" not in x      # the legacy ARB-veto path declares no mode
         assert x["captured_at"].endswith("Z") and x["capture_id"].startswith(x["run_id"])
     ok_a, ok_c = caps[2], caps[-1]
     assert ok_a["cache_ref"] == "AAAA.json.gz" and ok_a["cache_sha256"] == ic.sha256_text(texts["AAAA"])
     assert ok_c["cache_sha256"] == ic.sha256_text(texts["CCCC"])
     assert ok_a["response_sha256"] == hashlib.sha256(script["AAAA"][2].body()).hexdigest()
-    # XL came back at zero: returned. AD was asked for and never came back.
-    assert ok_c["returned_brokers"] == ["AK", "BK", "XL"]
-    assert "AD" in ok_c["requested_brokers"] and "AD" not in ok_c["returned_brokers"]
+    # XL came back at zero: returned, and exactly what was asked for.
+    assert ok_c["returned_brokers"] == ["AK", "BK", "XL"] == ok_c["requested_brokers"]
     assert caps[0]["reason"] == f"HTTP 200, body is not JSON ({len(LOGIN_PAGE)} chars)"
     assert caps[0]["response_bytes"] == len(LOGIN_PAGE) and caps[0]["returned_brokers"] is None
     assert caps[0]["response_sha256"] == hashlib.sha256(LOGIN_PAGE.encode()).hexdigest()
@@ -670,6 +714,52 @@ def test_harvest_records_every_attempt_beside_an_unchanged_cache():
     assert caps[3]["http_status"] is None
     assert SECRET not in text and "cookie" not in text.lower() and "<title>" not in text
     print("  ok test_harvest_records_every_attempt_beside_an_unchanged_cache")
+
+
+def test_arb_veto_harvest_entry_point_still_runs_and_never_claims_full_coverage():
+    """Regression: the weekly ARB veto's first step is `python
+    harvest_inventory.py`, no arguments, the configured 101 codes. The
+    explicit-code guard of this branch must not kill it (the veto model reads
+    price features only), and a silently truncated answer must still never pass
+    for full coverage: it is cached as before, recorded as coverage NOT
+    verified, and refused by every guarded full-universe reader."""
+    workflow = os.path.join(HERE, ".github", "workflows", "arb-veto.yml")
+    with open(workflow, encoding="utf-8") as fh:
+        steps = [line.strip() for line in fh]
+    assert "run: python harvest_inventory.py" in steps          # the exact entry point, no args
+    assert steps.index("run: python harvest_inventory.py") < steps.index(
+        "run: python build_inventory_db.py") < steps.index("run: python arb_veto.py")
+
+    complete = payload(base=1000.0, brokers=tuple(CODES))                  # all 101 came back
+    truncated = payload(base=2000.0, brokers=tuple(CODES[:10]))            # the server's first 10
+    with tempfile.TemporaryDirectory() as tmp:
+        request = run_harvest(tmp, {"AAAA": [ok(complete, "AAAA")], "BBBB": [ok(truncated, "BBBB")]},
+                              ["AAAA", "BBBB"], codes=None, entry_point=True)
+        caps = ic.read_captures(only_manifest(tmp))
+        cached = dict(bc.iter_cached(None, "ignored", raw_dir=tmp, legacy=True))
+    # the harvest ran exactly as before: one login, one 101-code GET per ticker,
+    # both answers cached for build_inventory_db -> inventory_features -> arb_veto
+    assert len(request.logins) == 1 and len(request.urls) == 2
+    assert all(request.params(k)["brokers"] == CODES for k in range(2))
+    assert cached == {"AAAA": complete, "BBBB": truncated}
+    assert [c["status"] for c in caps] == [ic.OK, ic.OK]
+    assert all("collection_mode" not in c for c in caps)          # undeclared: not EXPLICIT_CODES
+    assert all(c["requested_brokers"] == sorted(CODES) for c in caps)
+    # ...but the truncation is on record, not silent
+    good, short = caps
+    assert good["reason"] is None and good["returned_brokers"] == sorted(CODES)
+    assert short["returned_brokers"] == sorted(CODES[:10])
+    assert short["reason"].startswith("coverage NOT verified: ") and "missing" in short["reason"]
+    # ...and a guarded full-universe reader refuses it, while taking the complete one
+    import broker_book as bb
+    bb.frames_from_payload(cached["AAAA"], "AAAA")
+    try:
+        bb.frames_from_payload(cached["BBBB"], "BBBB")
+    except bb.CoveragePayloadError as e:
+        assert "10 of the 101" in str(e), e
+    else:
+        raise AssertionError("a 10-of-101 harvest cache passed for full coverage")
+    print("  ok test_arb_veto_harvest_entry_point_still_runs_and_never_claims_full_coverage")
 
 
 def test_harvest_records_the_short_window_abort_before_raising():

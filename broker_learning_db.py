@@ -97,6 +97,12 @@ LIVE_SUMMARY_COLS = ["rule_id", "n_signals", "n_scored", "mean_excess",
 # ── Schema ─────────────────────────────────────────────────────────────────
 
 def ensure_schema(conn):
+    # A targeted actor panel database (targeted_actor_db) is identified by its
+    # panel_meta table. Its selector-union rows must never sit beside, or be
+    # read as, this ledger's full-universe statistics (coverage_guard).
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'panel_meta'").fetchone():
+        raise ValueError("this is a targeted actor panel database, not broker_learning.db")
     for statement in SCHEMA:
         conn.execute(statement)
     conn.commit()

@@ -1,10 +1,23 @@
 """Fetch NeoBDM's /api/inventory for the broker learning dashboard.
 
 One authenticated GET per ticker asks for a rolling year of daily per-broker
-buy/sell lots and values for all 101 broker codes, plus OHLCV; which brokers
-come back is the vendor's answer, not the request (see below). The payload
+buy/sell lots and values for explicit broker codes, plus OHLCV. The payload
 shape is documented in harvest_inventory.py; what the rest of the pipeline
 assumes about it is BROKER_LEARNING.md section 2.
+
+AT MOST 10 CODES, AND EXACTLY THOSE BACK
+----------------------------------------
+The server keeps the first 10 raw `brokers` values of a request and drops the
+rest without an error (verified live 2026-09-27; the 2026-09 caches hold 10 of
+the 101 codes they asked for). So a request of more than 10 codes is refused
+BEFORE anything is sent (coverage_guard.check_explicit_codes): collect() raises
+ExplicitRequestError before its manifest, its login or any GET, and nothing is
+split into batches here. The configured request is broker_codes.json, all 101
+codes, so collect() now stops at once with it; that is deliberate. A response
+must return exactly the codes requested (coverage_guard.explicit_coverage_reason),
+or the ticker is refused and nothing is cached: a requested broker missing from
+the answer is not a zero. A cache of 10 or fewer codes is not full-universe
+data either, and broker_book refuses it (coverage_guard.full_universe_reason).
 
 This is the only network code in the broker learning pipeline, and the
 network stays inside collect(). neobdm_scraper refuses to import without all
@@ -21,12 +34,8 @@ is rejected at fetch time (spec 2.2) when:
 
   - success is false, or meta.symbol names a different ticker;
   - build_inventory_db.strict_ticker_frame refuses the payload. The frame
-    fails closed on anything it cannot read. It does not check coverage, and
-    requesting every code does not mean every code comes back: on 2026-09-26
-    the API returned the first 10 of the 101 requested. Request scope and
-    returned scope are distinct, so a broker absent from a payload must not
-    be read as zero without coverage evidence (the capture manifest below
-    records both sets);
+    fails closed on anything it cannot read. It does not check coverage;
+  - the brokers returned are not exactly the brokers requested (above);
   - its OHLC signature equals another ticker's from the same run. Two IDX
     names cannot share a year of dates and closes; a stale response stored
     under the wrong name is exactly how price_history got contaminated (see
@@ -94,6 +103,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
+import coverage_guard as cg
 import inventory_capture as ic
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -205,12 +215,10 @@ def _read_json(path):
 
 
 def load_codes():
-    """broker_codes.json, checked.
-
-    Every code is requested, so a malformed or duplicated list must stop the
-    run rather than quietly narrow the request. Requesting a code does not make
-    it come back (module docstring): an absent broker is not a zero without
-    coverage evidence.
+    """broker_codes.json, checked: the broker universe, and collect()'s default
+    request. At 101 codes that request is over the 10-code cap and is refused
+    before it is sent (module docstring). A malformed or duplicated list stops
+    the run rather than quietly narrowing anything.
     """
     codes = _read_json(os.path.join(HERE, "broker_codes.json"))
     if not isinstance(codes, list) or not codes:
@@ -263,9 +271,9 @@ def build_query(ticker, codes, sd, ed):
 
     brokers MUST be repeated params (brokers=AK&brokers=BK&...). A comma-joined
     list is accepted with HTTP 200 but returns empty series (harvest_inventory).
+    More than 10 codes is ExplicitRequestError: never built, never sent.
     """
-    if not codes:
-        raise ValueError("no broker codes: every code must be requested (spec 2.1)")
+    codes = cg.check_explicit_codes(codes)
     query = [("symbol", ticker)]
     query += [("brokers", c) for c in codes]
     query += [("start_date", sd), ("end_date", ed), ("investor_type", INVESTOR_TYPE)]
@@ -277,11 +285,12 @@ def _looks_throttled(text):
     return "abnormal" in text.lower() or "429" in text
 
 
-def validate_envelope(env, ticker):
+def validate_envelope(env, ticker, requested):
     """env["data"] if this response can be used for `ticker`, else FetchRejected.
 
     Spec 2.2, except the cross-ticker clone guard, which needs the whole run
-    and lives in collect().
+    and lives in collect(). `requested` is the codes the request sent; the
+    six broker maps must hold exactly those (module docstring).
     """
     if not isinstance(env, dict):
         raise FetchRejected(f"response is {type(env).__name__}, not an object")
@@ -310,6 +319,9 @@ def validate_envelope(env, ticker):
         strict_ticker_frame(data, ticker)
     except Exception as e:
         raise FetchRejected(f"strict frame: {type(e).__name__}: {str(e)[:160]}") from None
+    short = cg.explicit_coverage_reason(data, requested)
+    if short is not None:
+        raise FetchRejected(f"coverage: {short[:200]}")
     return data
 
 
@@ -369,7 +381,13 @@ def save_cached(raw_dir, mode, ticker, env):
 
 def _data_of(obj, ticker):
     """The data dict of a cache file: a bare data dict (the legacy
-    inventory_raw/ layout) or an envelope written by save_cached()."""
+    inventory_raw/ layout) or an envelope written by save_cached().
+
+    Targeted-selector data (a selector union, not every broker) is refused
+    here, before the envelope's meta is dropped, so it can reach none of the
+    broker learning metrics (coverage_guard). An unmarked file passes as
+    before."""
+    cg.refuse_targeted(obj, "the broker learning cache")
     if isinstance(obj, dict) and "date" in obj:
         return obj
     if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
@@ -462,15 +480,15 @@ def _short_window_message(accepted, mode, sd, ed):
             f"check LOOKBACK_DAYS before spending a full run.")
 
 
-def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures):
+def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures, codes):
     """The fetch loop, independent of how requests are made (see collect).
 
     Each attempt is recorded in `captures` (an inventory_capture.CaptureLog):
     its request before get() is called, its outcome once that is known. An
     attempt that returned a usable payload has its outcome only after the
     clone check, the short-window probe and the cache write, which a
-    persisting line announces first (inventory_capture: PERSIST_UNCONFIRMED)."""
-    codes = load_codes()
+    persisting line announces first (inventory_capture: PERSIST_UNCONFIRMED).
+    `codes` is the checked explicit request (collect)."""
     sd, ed = start_date(now), end_date(now)
     ok, failed, sessions, empty = [], {}, {}, {}
     accepted = []          # (ticker, sessions) of successful fetches, in order
@@ -515,7 +533,7 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures)
                         category=ic.HTTP_ERROR)
                 if not is_json:
                     raise FetchRejected("non-JSON body", retryable=True, category=ic.NON_JSON)
-                data = validate_envelope(body, t)
+                data = validate_envelope(body, t, codes)
                 env = body
                 break
             except FetchRejected as e:
@@ -586,8 +604,12 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures)
 
 
 def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
-            request_get=None, relogin=None, pipeline_run_id=None):
+            request_get=None, relogin=None, pipeline_run_id=None, codes=None):
     """Fetch, validate and cache each ticker; {"ok", "failed", "sessions", "empty"}.
+
+    `codes` is the explicit request, broker_codes.json when None. More than 10
+    codes raises coverage_guard.ExplicitRequestError before the manifest, the
+    login or any request (module docstring); so does the default today.
 
     "failed" maps each failed ticker to a short, log-safe reason, and "empty"
     each ticker that answered with zero sessions (module docstring). Raises
@@ -609,12 +631,14 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
     if not tickers:
         log.warning(f"broker collect ({mode}): no tickers requested, nothing fetched")
         return {"ok": [], "failed": {}, "sessions": {}, "empty": {}}
+    source = "broker_codes.json" if codes is None else "collect(codes=...)"
+    codes = list(cg.check_explicit_codes(load_codes() if codes is None else codes))
     captures = ic.CaptureLog(raw_dir, "broker_collect", writes_cache=True, mode=mode,
-                             pipeline_run_id=pipeline_run_id,
-                             broker_list_source="broker_codes.json")
+                             pipeline_run_id=pipeline_run_id, broker_list_source=source,
+                             collection_mode=ic.EXPLICIT_CODES)
     if request_get is not None:
         return _run(tickers, mode, raw_dir, sleep, now, request_get,
-                    relogin or (lambda: None), _safe_error_local, captures)
+                    relogin or (lambda: None), _safe_error_local, captures, codes)
 
     # Imported here, never at module scope: neobdm_scraper raises on import
     # without all four secrets, and nothing else in this module needs a browser.
@@ -648,7 +672,7 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
             except Exception as e:
                 raise RuntimeError(f"NeoBDM login failed: {_safe_error(e)}") from None
             return _run(tickers, mode, raw_dir, sleep, now, get, sign_in, _safe_error,
-                        captures)
+                        captures, codes)
         finally:
             browser.close()
 

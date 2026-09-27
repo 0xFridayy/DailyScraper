@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 import build_inventory_db as bidb
+import coverage_guard as cg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASIS_FILE = os.path.join(HERE, "observed_basis_factor.json")
@@ -82,6 +83,18 @@ ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 class PayloadError(ValueError):
     """A payload outside the strict source contract. The ticker fails; nothing is repaired."""
+
+
+class TargetedPayloadError(PayloadError, cg.TargetedCoverageError):
+    """A targeted-selector payload (a selector union, not every broker). Every
+    rolling total and rank here reads a missing broker as zero, so the ticker
+    fails like any other PayloadError (coverage_guard)."""
+
+
+class CoveragePayloadError(PayloadError, cg.CoverageError):
+    """A payload without positive evidence of full coverage: not every broker
+    of the universe came back (coverage_guard.full_universe_reason). The
+    ticker fails like any other PayloadError; nothing is zero-filled."""
 
 
 # ── Payload -> frames ──────────────────────────────────────────────────────
@@ -218,9 +231,14 @@ def frames_from_payload(data, ticker):
     `brokers` is row-for-row what build_inventory_db.strict_ticker_frame returns
     (broker-major, all-zero rows dropped), or an empty BROKER_COLS frame where
     strict mode returns None. `ohlc` is on the data.date axis, one bar per date.
+    The payload must return every broker of the universe (broker_codes.json)
+    in all six fields: CoveragePayloadError otherwise (coverage_guard).
     """
     if not isinstance(data, dict):
         raise PayloadError(f"{ticker}: payload is {type(data).__name__}, not a mapping")
+    targeted = cg.targeted_reason(data)
+    if targeted is not None:
+        raise TargetedPayloadError(f"{ticker}: broker_book needs every broker; {targeted}")
     dates = _dates(data, ticker)
     n = len(dates)
     ohlc = _ohlc_frame(data, dates, ticker)
@@ -230,12 +248,17 @@ def frames_from_payload(data, ticker):
         if src is not None and not isinstance(src, dict):
             raise PayloadError(f"{ticker}: {field} is {type(src).__name__}, not a mapping")
     brokers = sorted({b for src in present.values() if isinstance(src, dict) for b in src})
-    if not brokers:
-        return empty_brokers(), ohlc
     partial = bidb.partially_present_brokers(data)
     if partial:
         raise PayloadError(f"{ticker}: {len(partial)} broker(s) appear in some required fields "
                            f"but not all: {partial[:5]}. {bidb.ZERO_FILL_REFUSAL}")
+    # Every total and rank below reads a broker missing from the payload as
+    # zero, which is only true when every broker came back. That needs
+    # positive evidence, not the absence of a mark: the 10-of-101 caches and a
+    # stripped selector union carry no mark and are still refused here.
+    short = cg.full_universe_reason(data)
+    if short is not None:
+        raise CoveragePayloadError(f"{ticker}: broker_book needs every broker; {short}")
 
     mats = {f: _field_matrix(f, present.get(f) or {}, brokers, n, ticker) for f in ALL_FIELDS}
     bad = mats["nlot"] != mats["blot"] - mats["slot"]
