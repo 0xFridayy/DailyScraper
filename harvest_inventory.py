@@ -18,6 +18,30 @@ computable), 101 broker codes instead of 29, and no cross-ticker cloning.
 Raw responses are cached gzipped under inventory_raw/ so the expensive part is
 done once. build_inventory_db.py turns the cache into parquet.
 
+LEGACY ARB-VETO PATH: COVERAGE IS CHECKED, NOT ASSUMED
+------------------------------------------------------
+This is the input step of the weekly ARB veto (.github/workflows/arb-veto.yml
+runs it with no arguments). It still sends every code of broker_codes.json in
+one request, exactly as before. It stays outside the fail-closed explicit-code
+contract that broker_collect and the targeted actor panel follow
+(coverage_guard.check_explicit_codes), because failing here would stop the
+ARB veto, whose model reads price features only.
+
+The server keeps only the first 10 raw `brokers` values of a request (verified
+live 2026-09-27), so since the complete 2026-08-22 harvest these caches hold 10
+of the 101 codes. That is no longer silent. Every response is checked against
+the request (coverage_guard.explicit_coverage_reason), and a mismatch is
+recorded where the capture is recorded: an OK result with the reason
+"coverage NOT verified: ..." beside requested_brokers and returned_brokers.
+The run also ends with a warning that counts such tickers. The cache is
+written as before, and it is never evidence of full coverage.
+broker_book, the entry of every broker learning metric, refuses any payload
+without all 101 codes (coverage_guard.full_universe_reason).
+build_inventory_db.py and inventory_features.py still read these files as they
+did before this change. A coverage gate there is out of scope here:
+build_inventory_db is Experiment 1F pinned code, and inventory_features feeds
+the ARB veto. It needs a separate task.
+
 NeoBDM rate-limits aggressive clients ("abnormal usage" at ~50 rapid requests),
 so this paces itself, jitters, pauses every REST_EVERY tickers, and backs off
 exponentially on failure. It is resumable: cached tickers are skipped.
@@ -42,6 +66,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import coverage_guard as cg  # noqa: E402
 import inventory_capture as ic  # noqa: E402
 from neobdm_scraper import API_BASE, INVENTORY_CHART_URL, login, log  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
@@ -148,9 +173,11 @@ def fetch(req, ticker, qs, cap):
 
 
 def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
-    """One attempt at one ticker: fetch, check, cache. Returns nothing; raises
-    on failure, and SystemExit when `first` (no ticker cached yet this run)
-    comes back short.
+    """One attempt at one ticker: fetch, check, cache. Returns whether the
+    brokers returned were exactly the codes requested (module docstring: the
+    cache is written either way, and a mismatch is recorded, never silent);
+    raises on failure, and SystemExit when `first` (no ticker cached yet this
+    run) comes back short.
 
     The attempt is recorded in `captures` (an inventory_capture.CaptureLog):
     the request before it is sent, a persisting line before the cache file is
@@ -169,6 +196,8 @@ def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
                    f"LOOKBACK_DAYS before spending a full harvest.")
             cap.finish(ic.ABORTED, msg)
             raise SystemExit(msg)
+        short = cg.explicit_coverage_reason(d, codes)
+        unverified = None if short is None else f"coverage NOT verified: {short}"
         text = json.dumps(d)
         ref = os.path.basename(cached(t))
         cap.persisting("cache", cache_ref=ref)    # on record before the file can exist
@@ -180,17 +209,18 @@ def fetch_and_cache(req, t, codes, sd, ed, captures, attempt, first):
             raise
         digest = ic.sha256_text(text)
         try:
-            cap.finish(ic.OK, cache_ref=ref, cache_sha256=digest)
+            cap.finish(ic.OK, unverified, cache_ref=ref, cache_sha256=digest)
         except Exception:
             # Retry the decided OK line only. The cache already exists, so a
             # second network fetch would turn an audit failure into a retry of
             # a persisted ticker. A second append failure stops the run.
             try:
-                cap.finish(ic.OK, cache_ref=ref, cache_sha256=digest)
+                cap.finish(ic.OK, unverified, cache_ref=ref, cache_sha256=digest)
             except Exception as audit_error:
                 raise SystemExit(
                     f"{t}: capture manifest result failed after cache write"
                 ) from audit_error
+        return short is None
     except Exception as e:
         cap.finish(ic.ERROR, e)
         raise
@@ -218,7 +248,7 @@ def main():
         log.info("nothing to do - cache is complete")
         return
 
-    ok = fail = consec = 0
+    ok = fail = consec = unverified = 0
     t_start = time.time()
     captures = ic.CaptureLog(RAW, "harvest_inventory", writes_cache=True,
                              broker_list_source="broker_codes.json")
@@ -235,8 +265,9 @@ def main():
             delay = 1.0
             for attempt in range(MAX_RETRY):
                 try:
-                    fetch_and_cache(req, t, codes, sd, ed, captures, attempt + 1,
-                                    first=ok == 0)
+                    if not fetch_and_cache(req, t, codes, sd, ed, captures, attempt + 1,
+                                           first=ok == 0):
+                        unverified += 1
                     ok += 1
                     consec = 0
                     break
@@ -269,6 +300,11 @@ def main():
             time.sleep(PACE + random.random() * JITTER)
         b.close()
     log.info(f"DONE ok={ok} fail={fail} in {(time.time()-t_start)/60:.1f} min")
+    if unverified:
+        log.warning(f"coverage NOT verified for {unverified} of {ok} cached tickers: the "
+                    f"brokers returned are not the {len(codes)} requested (the server keeps "
+                    f"the first 10). inventory_raw/ is not full-universe evidence; see the "
+                    f"capture manifest.")
 
 
 if __name__ == "__main__":

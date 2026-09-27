@@ -19,6 +19,7 @@ import pandas as pd
 
 import broker_book as bb
 import broker_rules as br
+import coverage_guard as cg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
@@ -66,6 +67,12 @@ def scenario(trades, n=N, bg=BG, bars=None, default_bar=(P, P * 0.9, P * 1.1)):
     data.update(acc)
     data["nlot"] = {c: [b - s for b, s in zip(acc["blot"][c], acc["slot"][c])] for c in codes}
     data["nval"] = {c: [b - s for b, s in zip(acc["bval"][c], acc["sval"][c])] for c in codes}
+    # A full vendor answer: every other universe code at an explicit zero.
+    # broker_book requires them all (coverage_guard.full_universe_reason); the
+    # zero rows are dropped, so no rule input changes.
+    for f in FIELDS:
+        for code in sorted(cg.universe_codes()):
+            data[f].setdefault(code, [0.0] * n)
     return data
 
 

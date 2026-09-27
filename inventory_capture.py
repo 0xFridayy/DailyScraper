@@ -98,6 +98,45 @@ returned_brokers with all-zero series was observed at zero, a requested
 broker absent from returned_brokers was not returned, and deriving coverage
 from that is the reader's job.
 
+COLLECTION MODES (optional fields, still inventory_capture_v1)
+--------------------------------------------------------------
+A collector may declare how it asks for brokers. The fields below are written
+only by a collector that declares them, so every other line is byte for byte
+what it was, and a reader of v1 that does not know them loses nothing.
+
+  collection_mode   on every request line of the run:
+                    EXPLICIT_CODES      explicit broker codes, at most 10 per
+                                        request (broker_collect refuses more
+                                        before sending: the server keeps the
+                                        first 10 values). What it covers is
+                                        the requested set, and only once the
+                                        response returned exactly that set
+                                        (coverage_guard); never a claim of
+                                        full-universe coverage.
+                    TARGETED_SELECTORS  vendor selectors only
+                                        (targeted_actor_panel). The expanded
+                                        brokers are the UNION of the
+                                        selectors' picks and never full-
+                                        universe coverage: a broker outside
+                                        returned_brokers was not selected, so
+                                        it is unobserved, not zero.
+                    begin() refuses a query whose broker_request_kind does not
+                    fit the declared mode (EXPLICIT_CODES, SELECTOR), before
+                    it is sent. Callers that declare nothing keep no field:
+                    the TOP_5_NB/NS_LOT_C20 pair of backfill_inventory and the
+                    bag holders, and harvest_inventory, the legacy ARB-veto
+                    input, which still sends all 101 codes in one request and
+                    records "coverage NOT verified" on each result whose
+                    returned_brokers differ from its requested_brokers.
+  selector_plan     on every request line, with TARGETED_SELECTORS: the plan
+                    version (targeted_selectors.PLAN_ID).
+  request_group     on a request line, where the collector passes one: which
+                    request of the plan this is ("A", "B"). The exact ordered
+                    tokens are brokers_param, as for every capture.
+  discovery_as_of   on a result line, where the collector passes one: the last
+                    session of the accepted axis, which the selectors' Ck
+                    windows are anchored at.
+
 DURABILITY
 ----------
 The manifest is written wherever the collector runs. On a GitHub Actions runner
@@ -156,6 +195,11 @@ EXPLICIT_CODES = "EXPLICIT_CODES"
 SELECTOR = "SELECTOR"
 MIXED = "MIXED"
 NO_BROKERS = "NONE"
+
+# Declared collection modes (module docstring) and the request kind each allows.
+# EXPLICIT_CODES names both the mode and the only request kind it sends.
+TARGETED_SELECTORS = "TARGETED_SELECTORS"
+COLLECTION_MODES = {EXPLICIT_CODES: EXPLICIT_CODES, TARGETED_SELECTORS: SELECTOR}
 
 KNOWN_PARAMS = ("symbol", "brokers", "start_date", "end_date", "investor_type")
 SERIES_FIELDS = ("blot", "bval", "slot", "sval", "nlot", "nval")
@@ -402,13 +446,16 @@ class Capture:
             "run_id": self.log.run_id, "ticker": self.ticker, "persisting_at": self.log.clock(),
             "target": target, "intended_cache_ref": cache_ref, **self._evidence()})
 
-    def finish(self, status, reason=None, cache_ref=None, cache_sha256=None):
+    def finish(self, status, reason=None, cache_ref=None, cache_sha256=None,
+               discovery_as_of=None):
         """Decide the outcome (the first call only) and write its line: True
         when this call put the line on disk, False when it already was. Raises
         when the append fails, leaving `finished` False for a later call.
 
         The status is written as given; it is never inferred from http_status
-        (see source_refusal for the refusals where the code decides)."""
+        (see source_refusal for the refusals where the code decides).
+        discovery_as_of is an optional field (module docstring, COLLECTION
+        MODES), written only when given."""
         if status not in STATUSES:
             raise ValueError(f"unknown capture status {status!r}")
         if self.finished:
@@ -419,6 +466,8 @@ class Capture:
                 "run_id": self.log.run_id, "ticker": self.ticker, "status": status,
                 "reason": safe_reason(reason), **self._evidence(),
                 "cache_ref": cache_ref, "cache_sha256": cache_sha256}
+            if discovery_as_of is not None:
+                self.decided["discovery_as_of"] = discovery_as_of
         self.log._append(self.decided)
         self.finished = True
         return True
@@ -433,10 +482,16 @@ class CaptureLog:
     starts in the same instant gets "-2" rather than the first run's file."""
 
     def __init__(self, root, collector, *, writes_cache, mode=None, pipeline_run_id=None,
-                 broker_list_source=None, clock=utc_now):
+                 broker_list_source=None, collection_mode=None, selector_plan=None,
+                 clock=utc_now):
+        if collection_mode is not None and collection_mode not in COLLECTION_MODES:
+            raise ValueError(f"unknown collection mode {collection_mode!r}")
+        if (selector_plan is not None) != (collection_mode == TARGETED_SELECTORS):
+            raise ValueError("selector_plan goes with TARGETED_SELECTORS, and only with it")
         self.root, self.collector, self.mode = root, collector, mode
         self.writes_cache = bool(writes_cache)
         self.pipeline_run_id, self.broker_list_source = pipeline_run_id, broker_list_source
+        self.collection_mode, self.selector_plan = collection_mode, selector_plan
         self.clock = clock
         self.run_id = "inv-" + re.sub(r"[^0-9T]", "", clock()) + "Z"
         self.path = None
@@ -488,15 +543,28 @@ class CaptureLog:
                 raise ManifestAppendError("capture manifest append failed; file restored") from append_error
             raise
 
-    def begin(self, query, attempt=1):
+    def begin(self, query, attempt=1, request_group=None):
         """Record the request `query` is about to make; its Capture.
 
-        `query` must be the exact query string the request sends."""
+        `query` must be the exact query string the request sends. A query
+        whose broker_request_kind does not fit the log's collection_mode is
+        refused (ValueError) before anything is written or sent."""
+        fields = request_fields(query)
+        declared = {}
+        if self.collection_mode is not None:
+            if fields["broker_request_kind"] != COLLECTION_MODES[self.collection_mode]:
+                raise ValueError(
+                    f"{self.collection_mode} sends {COLLECTION_MODES[self.collection_mode]} "
+                    f"only; this query is {fields['broker_request_kind']}")
+            declared["collection_mode"] = self.collection_mode
+            if self.selector_plan is not None:
+                declared["selector_plan"] = self.selector_plan
+        if request_group is not None:
+            declared["request_group"] = request_group
         if self.path is None:
             self._open()             # settles run_id before the first capture_id
         self.seq += 1
         capture_id = f"{self.run_id}-{self.seq:05d}"
-        fields = request_fields(query)
         self._append({
             "schema": SCHEMA_VERSION, "event": "request", "capture_id": capture_id,
             "run_id": self.run_id, "seq": self.seq, "attempt": attempt,
@@ -504,7 +572,7 @@ class CaptureLog:
             "endpoint": ENDPOINT, "collector": self.collector, "mode": self.mode,
             "pipeline_run_id": self.pipeline_run_id,
             "broker_list_source": self.broker_list_source,
-            "writes_cache": self.writes_cache, **fields})
+            "writes_cache": self.writes_cache, **fields, **declared})
         return Capture(self, capture_id, fields["ticker"])
 
 

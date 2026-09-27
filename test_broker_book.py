@@ -17,6 +17,7 @@ import pandas as pd
 
 import broker_book as bb
 import build_inventory_db as bidb
+import coverage_guard as cg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
@@ -57,6 +58,19 @@ def _payload(flows, n, close=1000.0, start="2025-01-01"):
         data["bval"][b], data["sval"][b] = [float(x) for x in bval], [float(x) for x in sval]
         data["nlot"][b] = [float(x - y) for x, y in zip(blot, slot)]
         data["nval"][b] = [float(x - y) for x, y in zip(bval, sval)]
+    return _full_universe(data)
+
+
+def _full_universe(data):
+    """`data` with an explicit all-zero series for every universe code it does
+    not already carry: the shape of a full vendor answer, where a broker that
+    did nothing comes back at zero. broker_book requires every universe code
+    (coverage_guard.full_universe_reason); the zero rows are then dropped, so
+    no total or rank changes."""
+    n = len(data["date"])
+    for f in FIELDS:
+        for code in sorted(cg.universe_codes()):
+            data[f].setdefault(code, [0.0] * n)
     return data
 
 
