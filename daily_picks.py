@@ -14,6 +14,9 @@ snapshot k is bought at the close of snapshot k+1 (the session traded on the
 day the message arrives) and scored HORIZON sessions later. Scoring snapshot k
 never reads a snapshot newer than k.
 
+New machine picks use next_session_close_v1. Unversioned stored picks retain
+their explicitly labelled legacy signal-close clock; see DAILY_PICKS_TIMING.md.
+
 Run by morning.py inside the daily-scrape job. Local preview (no send, no
 writes):  py -3 daily_picks.py --preview
 """
@@ -40,6 +43,8 @@ MIN_VALUE_BN = 2.0      # skip names trading under Rp 2 bn a day
 MAX_RUNUP = 0.25        # skip names already up 25%+ over 5 sessions
 RUNUP_WARN = 0.12       # warn (don't skip) from +12%
 HORIZON = 5             # ~1 week holding idea
+MACHINE_TIMING = "next_session_close_v1"
+LEGACY_MACHINE_TIMING = "legacy_signal_close"
 MAX_FOLLOWS = 10        # protects message length and future NeoBDM requests
 COPY_SHARE = 0.95       # a snapshot this identical to the last one is a copy
 SPLIT_FACTORS = (2, 3, 4, 5, 10, 20, 25)
@@ -346,13 +351,33 @@ def session_returns(snaps, entry, exit_):
     return rets
 
 
+def machine_window(k, h=HORIZON, timing=MACHINE_TIMING):
+    """Signal k -> executable entry -> h close-to-close holding sessions.
+
+    Unversioned stored picks retain their old clock explicitly. Unknown
+    versions fail rather than silently acquiring a different interpretation.
+    """
+    offset = {MACHINE_TIMING: 1, LEGACY_MACHINE_TIMING: 0}[timing]
+    entry = k + offset
+    return entry, entry + h
+
+
+def machine_returns(snaps, k, h=HORIZON):
+    """Comparable returns for the executable machine window, or no returns.
+
+    Include signal -> entry in the gap check: a missing next session cannot
+    be replaced by the next available snapshot. Never postpone either anchor.
+    """
+    entry, exit_ = machine_window(k, h)
+    if exit_ >= len(snaps) or _gap_inside(snaps, k, exit_):
+        return {}
+    return session_returns(snaps, entry, exit_)
+
+
 def forward_excess(snaps, k, ticker, h=HORIZON):
     """(return, return minus the average name) for a pick made from snapshot
     k, or None while the exit session hasn't happened or data is missing."""
-    entry, exit_ = k + 1, k + 1 + h
-    if exit_ >= len(snaps):
-        return None
-    rets = session_returns(snaps, entry, exit_)
+    rets = machine_returns(snaps, k, h)
     if ticker not in rets:
         return None
     return rets[ticker], rets[ticker] - sum(rets.values()) / len(rets)
@@ -371,7 +396,7 @@ def learn_weights(snaps, h=HORIZON):
     Only uses snapshots inside `snaps`; pass exactly what was known then."""
     per_tag = {t: [] for t in TAG_ORDER}
     for k in range(len(snaps) - 1 - h):
-        rets = session_returns(snaps, k + 1, k + 1 + h)
+        rets = machine_returns(snaps, k, h)
         if not rets:
             continue
         avg = _mean(rets.values())
@@ -691,7 +716,7 @@ def fact_text(facts):
 
 def finish_pick(snaps, ticker, start, days, who, label=None):
     """Final result of a pick held `days` sessions from snapshot `start`,
-    measured from the price shown when it was picked: (lines, result)."""
+    where the caller supplies the reference/entry: (lines, result)."""
     end = min(start + days, len(snaps) - 1)
     result = {"end_snapshot": snaps[end].date, "start_price": None, "end_price": None,
               "ret": None, "market_ret": None, "why": None, "facts": None}
@@ -725,30 +750,70 @@ def finish_pick(snaps, ticker, start, days, who, label=None):
     return lines, result
 
 
+def machine_holding(snaps, pick_rows, recorded):
+    """Reserve pending and held tickers through their own versioned exit.
+
+    An unresolved signal or session gap has no reliable exit. Keep its slot
+    reserved until the source data is repaired instead of opening a duplicate.
+    """
+    index = {s.date: i for i, s in enumerate(snaps)}
+    k = len(snaps) - 1
+    holding = set()
+    for snap_date, ticker, _, timing in pick_rows:
+        if ("machine", ticker, snap_date) in recorded:
+            continue
+        j = index.get(snap_date)
+        if j is None:
+            holding.add(ticker)
+            continue
+        _, exit_ = machine_window(j, timing=timing)
+        if (k < exit_ or (timing == MACHINE_TIMING
+                         and _gap_inside(snaps, j, min(k, exit_)))):
+            holding.add(ticker)
+    return holding
+
+
 def machine_progress(snaps, pick_rows, recorded):
     """(running line texts, [(lines, result)] finished) for machine picks.
-    pick_rows: (snapshot_date, ticker, tags); recorded: {(source, ticker,
+    pick_rows: (signal snapshot_date, ticker, tags, timing); recorded: {(source, ticker,
     started)} already in pick_results."""
     index = {s.date: i for i, s in enumerate(snaps)}
     k = len(snaps) - 1
     running, finished = [], []
-    for snap_date, ticker, tags in pick_rows:
+    for snap_date, ticker, tags, timing in pick_rows:
         j = index.get(snap_date)
-        if j is None or ("machine", ticker, snap_date) in recorded:
+        if ("machine", ticker, snap_date) in recorded:
             continue
-        elapsed = k - j
+        legacy = timing == LEGACY_MACHINE_TIMING
+        name = f"{ticker} legacy signal-close" if legacy else ticker
+        if j is None:
+            running.append(f"{name} n/a (signal snapshot unavailable)")
+            continue
+        entry, exit_ = machine_window(j, timing=timing)
+        if not legacy and _gap_inside(snaps, j, min(k, exit_)):
+            running.append(f"{name} n/a (execution timing unavailable: missing trading session)")
+            continue
+        if k < entry:
+            running.append(f"{name} pending entry (next session close; day 0/{HORIZON})")
+            continue
+        elapsed = k - entry
         if elapsed >= HORIZON:
-            lines, result = finish_pick(snaps, ticker, j, HORIZON, "machine")
+            who = "machine legacy signal-close" if legacy else "machine"
+            lines, result = finish_pick(snaps, ticker, entry, HORIZON, who)
             lines.insert(1, f"   Picked for: {_labels(tags.split(','))}")
+            lines.insert(2, f"   {'Legacy reference' if legacy else 'Entry'}: "
+                         f"{session_label(snaps[entry].date)} close; "
+                         f"exit: {session_label(snaps[exit_].date)} close")
             finished.append((lines, {"source": "machine", "ticker": ticker, "started": snap_date,
                                      "days": HORIZON, "reason": "", "start_tags": tags,
-                                     "start_snapshot": snap_date, **result}))
-        elif elapsed >= 1:
-            first, now = _close(snaps, j, ticker), _close(snaps, k, ticker)
-            if first and now and not price_break(snaps, j, k, ticker):
-                running.append(f"{ticker} {(now / first - 1) * 100:+.1f}% (day {elapsed}/{HORIZON})")
+                                     "start_snapshot": snaps[entry].date, "timing": timing,
+                                     **result}))
+        elif elapsed >= 0 and (not legacy or elapsed >= 1):
+            first, now = _close(snaps, entry, ticker), _close(snaps, k, ticker)
+            if first and now and not price_break(snaps, entry, k, ticker):
+                running.append(f"{name} {(now / first - 1) * 100:+.1f}% (day {elapsed}/{HORIZON})")
             else:
-                running.append(f"{ticker} n/a (day {elapsed}/{HORIZON})")
+                running.append(f"{name} n/a (day {elapsed}/{HORIZON})")
     return running, finished
 
 
@@ -760,9 +825,13 @@ def record_results(conn, results, now_utc):
                      r["start_tags"], r["start_snapshot"], r["end_snapshot"],
                      r["start_price"], r["end_price"], r["ret"], r["market_ret"],
                      f.get("bandar_share"), f.get("foreign_share"), f.get("trading_ratio"),
-                     f.get("worst_day"), r["why"], now_utc.isoformat()))
-    conn.executemany("INSERT OR IGNORE INTO pick_results VALUES "
-                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                     f.get("worst_day"), r["why"], now_utc.isoformat(),
+                     r["timing"] if r["source"] == "machine" else "user_reference"))
+    conn.executemany("INSERT OR IGNORE INTO pick_results "
+                     "(source, ticker, started, days, reason, start_tags, start_snapshot, "
+                     "end_snapshot, start_price, end_price, ret, market_ret, bandar_share, "
+                     "foreign_share, trading_ratio, worst_day, why, recorded_utc, timing) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
 
 
 def warnings(snaps, k, ticker):
@@ -818,6 +887,13 @@ SCHEMA = [
 def ensure_schema(conn):
     for statement in SCHEMA:
         conn.execute(statement)
+    # Additive compatibility boundary. Never infer intent from timestamps or
+    # recompute historical prices/results. New writes explicitly opt into v1.
+    for table in ("picks", "pick_results"):
+        columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "timing" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN timing TEXT NOT NULL "
+                         f"DEFAULT '{LEGACY_MACHINE_TIMING}'")
     conn.commit()
 
 
@@ -856,12 +932,14 @@ def format_morning(today, snap, picks, tagged, weights, your_blocks, running,
                    finished_blocks, lists, n_sessions):
     lines = [f"📈 Morning report - {today:%a} {today.day} {today:%b}",
              f"Data: {session_label(snap.date)} close", "",
-             f"🤖 Machine picks - strong setups only ({MIN_TAGS}+ checks), hold about 1 week"]
+             f"🤖 Machine picks - strong setups only ({MIN_TAGS}+ checks), "
+             f"hold {HORIZON} sessions from next session close"]
     if picks:
         for i, (ticker, _) in enumerate(picks, 1):
             cand = tagged[ticker]
-            lines.append(f"{i}. {ticker}  Rp {_num(cand['row'], 'close'):,.0f}")
+            lines.append(f"{i}. {ticker}  Rp {_num(cand['row'], 'close'):,.0f} (signal close)")
             lines.append(f"   {pick_reason(cand, weights)}")
+        lines.append(f"   Entry pending: next trading-session close; entry is day 0/{HORIZON}.")
         for ticker, _ in picks:
             pct5 = _num(tagged[ticker]["row"], "pct_5")
             if pct5 is not None and pct5 >= RUNUP_WARN:
@@ -900,14 +978,19 @@ WHY_BUCKETS = (
 def format_scoreboard(snaps, conn, learned, previous):
     lines = ["📊 Weekly scoreboard (won = beat the market)"]
     rows = [dict(zip(("source", "ret", "market_ret", "bandar_share", "foreign_share",
-                      "trading_ratio", "start_tags"), r))
+                      "trading_ratio", "start_tags", "timing"), r))
             for r in conn.execute("SELECT source, ret, market_ret, bandar_share, foreign_share, "
-                                  "trading_ratio, start_tags FROM pick_results "
+                                  "trading_ratio, start_tags, timing FROM pick_results "
                                   "WHERE ret IS NOT NULL AND market_ret IS NOT NULL")]
     for r in rows:
         r["won"] = r["ret"] - r["market_ret"] > 0
-    for source, label in (("machine", "🤖 Machine"), ("you", "🙋 You")):
-        mine = [r for r in rows if r["source"] == source]
+    legacy = [r for r in rows if r["source"] == "machine" and r["timing"] != MACHINE_TIMING]
+    rows = [r for r in rows if r["source"] != "machine" or r["timing"] == MACHINE_TIMING]
+    groups = [("🤖 Machine (next-session close)", [r for r in rows if r["source"] == "machine"]),
+              ("🙋 You", [r for r in rows if r["source"] == "you"])]
+    if legacy:
+        groups.append(("🤖 Machine legacy/unversioned (signal-close history)", legacy))
+    for label, mine in groups:
         if mine:
             excess = [r["ret"] - r["market_ret"] for r in mine]
             lines.append(f"{label}: {len(mine)} finished, {sum(r['won'] for r in mine)} won, "
@@ -915,7 +998,7 @@ def format_scoreboard(snaps, conn, learned, previous):
         else:
             lines.append(f"{label}: nothing finished yet")
     if rows:
-        lines.append("What happened in winners vs losers (all finished picks):")
+        lines.append("What happened in winners vs losers (excludes legacy machine picks):")
         for name, field, test in WHY_BUCKETS:
             hit = [r for r in rows if r[field] is not None and test(r[field])]
             if hit:
@@ -932,8 +1015,9 @@ def format_scoreboard(snaps, conn, learned, previous):
         lines.append(f" • {TAG_LABEL[tag]}: {info['avg_excess_pct']:+.1f}% over "
                      f"{info['sessions']} days ({previous.get(tag, 1.0):.2f} → "
                      f"{info['weight']:.2f}){early}")
-    lines.append(f"{len(rows)} finished picks so far - patterns need about 30 before they "
-                 f"mean much. {len(snaps)} trading days of market data.")
+    lines.append(f"{len(rows)} finished picks excluding legacy machine history - "
+                 f"patterns need about 30 before they mean much. "
+                 f"{len(snaps)} trading days of market data.")
     return "\n".join(lines)
 
 
@@ -1026,7 +1110,9 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         saved.close()
     try:
         ensure_schema(conn)
-        fresh_unsent = bool(snaps) and not already_sent(conn, "morning", snaps[-1].date)
+        fresh_unsent = (bool(snaps)
+                        and _session_of(snaps[-1].date) == _session_of(today.isoformat())
+                        and not already_sent(conn, "morning", snaps[-1].date))
         if captured != today.isoformat() and not preview and not fresh_unsent:
             if already_sent(conn, "stale", today.isoformat()):
                 return "stale_already_warned", None
@@ -1055,11 +1141,11 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                               for t, v in learned.items()])
         weights = current_weights(conn)
 
-        pick_rows = conn.execute("SELECT snapshot_date, ticker, tags FROM picks "
+        pick_rows = conn.execute("SELECT snapshot_date, ticker, tags, timing FROM picks "
                                  "ORDER BY snapshot_date, rank").fetchall()
-        index = {s.date: i for i, s in enumerate(snaps)}
+        recorded = set(conn.execute("SELECT source, ticker, started FROM pick_results").fetchall())
         # A stock the machine is already holding isn't picked again (no double counting).
-        holding = {t for d, t, _ in pick_rows if d in index and k - index[d] < HORIZON}
+        holding = machine_holding(snaps, pick_rows, recorded)
         tagged = tag_snapshot(snaps, k)
         # A name the ARB model flags is not bought, however good its buy tags
         # look. Log the ones it actually cost us, so the veto can be judged
@@ -1076,7 +1162,6 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
         follows = active_follows(events, ended_follows(conn))
         sent_at = dict(conn.execute(
             "SELECT key, sent_utc FROM sent_messages WHERE kind = 'morning'").fetchall())
-        recorded = set(conn.execute("SELECT source, ticker, started FROM pick_results").fetchall())
         your_blocks, finished_blocks, results = [], [], []
         for ticker, follow in list(follows.items())[:MAX_FOLLOWS]:
             lines, result = follow_block(snaps, ticker, follow, sent_at)
@@ -1107,10 +1192,12 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
             conn.rollback()
             return "send_failed", text
         conn.executemany(
-            "INSERT OR IGNORE INTO picks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO picks "
+            "(snapshot_date, ticker, rank, score, tags, reason, close, recorded_utc, timing) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(snap.date, t, i, score, ",".join(tagged[t]["tags"]),
               pick_reason(tagged[t], weights), _num(tagged[t]["row"], "close"),
-              now_utc.isoformat()) for i, (t, score) in enumerate(picks, 1)])
+              now_utc.isoformat(), MACHINE_TIMING) for i, (t, score) in enumerate(picks, 1)])
         record_sent(conn, "morning", snap.date, text, now_utc)
         if weekly:
             record_sent(conn, "scoreboard", week, text, now_utc)
