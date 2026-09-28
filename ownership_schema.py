@@ -27,8 +27,12 @@ above record only the state as FIRST observed -- a natural key seen again with
 a different payload is discarded by INSERT OR IGNORE, so revisions, last_seen_at
 and the difference between "holder gone" and "pane failed" are all unavailable
 from them. The new layer records that history additively: no existing table's
-DDL, key, semantics or rows change, which is what keeps Experiment #2A0's
-frozen ownership_change cohort byte-for-byte intact.
+DDL, key or existing rows change, which is what keeps Experiment #2A0's frozen
+ownership_change cohort byte-for-byte intact. The one explicit exception is
+float_holder_snapshot, which is now FROZEN. Its DDL, key and rows are
+untouched, but no new rows are written, because its snapshot_date was never
+the badge's as-of date. Badge readings now live only in the bitemporal layer,
+under the undated key ["float_holder_badge", ticker].
 """
 
 SCHEMA_SQL = """
@@ -196,12 +200,19 @@ CREATE TABLE IF NOT EXISTS balance_position_summary_monthly (
     PRIMARY KEY (ticker, period_date)
 );
 
--- Free float / scripless / holder-count badges. snapshot_date is INFERRED
--- (= latest balance_position_monthly.period_date at capture time); the
--- page never timestamps these badges independently (still open per
--- STOCK_DETAIL_OWNERSHIP_DISCOVERY.md 5.8). holder_count is a parsed
--- approximation of an already-abbreviated display value ("101K") -- the
--- raw string is kept alongside it and dq_rounded_holder_count is always 1.
+-- Free float / scripless / holder-count badges. FROZEN: no longer written;
+-- existing rows are kept exactly as captured. snapshot_date was never a
+-- source date: it is the page chart's latest-month label (first of the
+-- month, not balance_position_monthly's month-end period_date), and live
+-- captures showed holder_count and free_float_pct changing mid-month while
+-- that label stayed fixed -- so it is NOT their as-of date (rejected, see
+-- STOCK_DETAIL_OWNERSHIP_DISCOVERY.md 5.8). First-write-wins on this key
+-- also froze each month's pre-update reading. Badge readings now live only
+-- in ownership_observation under the undated business key
+-- ["float_holder_badge", ticker], timed by observed_at / first_seen_at /
+-- last_seen_at. holder_count is a parsed approximation of an
+-- already-abbreviated display value ("101K") -- the raw string is kept
+-- alongside it and dq_rounded_holder_count is always 1.
 CREATE TABLE IF NOT EXISTS float_holder_snapshot (
     ticker             TEXT NOT NULL,
     snapshot_date      TEXT NOT NULL,
@@ -304,10 +315,12 @@ CREATE INDEX IF NOT EXISTS idx_entity_alias_status ON entity_alias (match_status
 -- tell a holder that genuinely disappeared from a pane that failed to load.
 --
 -- These four tables add that missing history ALONGSIDE the originals. Nothing
--- above changes: same DDL, same keys, same semantics, same rows. Experiment
--- #2A0's frozen cohort queries ownership_change and must keep returning
--- exactly what it returns today, which is why this layer is additive rather
--- than a widening of the existing keys.
+-- above changes: same DDL, same keys, same existing rows. Experiment #2A0's
+-- frozen cohort queries ownership_change and must keep returning exactly what
+-- it returns today, which is why this layer is additive rather than a
+-- widening of the existing keys. The one explicit exception is
+-- float_holder_snapshot, which is FROZEN (no longer written; see its comment
+-- above).
 -- ---------------------------------------------------------------------------
 
 -- Append-only capture manifest: one row per run x ticker x pane, written
@@ -379,7 +392,11 @@ CREATE TABLE IF NOT EXISTS capture_payload (
 -- legacy raw_hash).
 --
 -- business_key is the canonical serialisation of the SAME natural key the
--- corresponding legacy table uses, so the two layers stay joinable.
+-- corresponding legacy table uses, so the two layers stay joinable. The
+-- exception is the float/holder badge: the page gives it no as-of date, so
+-- it is keyed ["float_holder_badge", ticker] with no date and no legacy
+-- counterpart. Older badge observations keyed
+-- ["float_holder_snapshot", ticker, <chart month>] stay exactly as written.
 CREATE TABLE IF NOT EXISTS ownership_observation (
     obs_id             INTEGER PRIMARY KEY,
     run_id             TEXT NOT NULL,

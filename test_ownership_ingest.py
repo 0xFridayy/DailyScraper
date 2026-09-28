@@ -240,16 +240,21 @@ def test_kda5_two_holder_breakdown_stays_separated():
 
 # --- 4. holder-count approximation handling ---------------------------------
 
-def test_holder_count_parsed_and_flagged_approximate():
+def test_holder_count_kept_as_abbreviated_raw_string():
+    """The page only ever shows an abbreviated holder count ("101K"). The badge
+    observation keeps that string verbatim -- never an unrounded integer the
+    page never showed -- and parse_holder_count() is the one place it becomes
+    an approximate number."""
     conn = make_conn()
     capture = make_capture(traces=BP_TRACES, badge=BADGE_TPIA)
     ing.ingest_capture(conn, "TPIA", capture, "2026-08-30T10:00:00Z",
                         "https://neobdm.tech/stock_detail/TPIA/")
-    row = conn.execute(
-        "SELECT holder_count_raw, holder_count_approx, dq_rounded_holder_count "
-        "FROM float_holder_snapshot WHERE ticker='TPIA'"
-    ).fetchone()
-    assert row == ("101K", 101000.0, 1)
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM ownership_observation "
+        "WHERE source_family='float_holder_badge'"
+    ).fetchone()[0])
+    assert payload["holder_count_raw"] == "101K"
+    assert op.parse_holder_count(payload["holder_count_raw"]) == 101000.0
 
 
 def test_parse_holder_count_values():
@@ -891,6 +896,577 @@ def test_fragment_replay_fidelity():
     assert len(replayed_text.encode("utf-8")) == byte_len
     assert op.parse_kda1_current(replayed_text) == op.parse_kda1_current(TPIA_KDA1)
     conn.close()
+
+
+# =============================================================================
+# Balance Position badge temporal semantics.
+#
+# The badge ([Scripless] [Free Float] [Holder]) carries no as-of date of its
+# own. Live captures showed Holder and Free Float changing mid-month while the
+# page chart's latest month stayed fixed, so the chart month is NOT their
+# effective date. A badge reading is therefore observed under one UNDATED key
+# per ticker, and its only timing is the observation history itself.
+# =============================================================================
+
+# Byte-for-byte the retained ownership_raw_fragments/ badge fragments for BREN
+# on three real capture runs. 2026-08-31 -> 2026-09-05: the page chart rolled
+# from July to August while Holder stayed 43.6K. 2026-09-05 -> 2026-09-10:
+# Holder moved to 44.3K while the chart month stayed August.
+BADGE_BREN_2026_08_31 = (
+    "BREN Balance Position Chart [Scripless: 36.7%] [Free Float: 12.6%] "
+    "[Holder: 43.6K] ChartCombination chart with 22 data series.The chart has "
+    "1 X axis displaying Time. Data ranges from 2024-09-01 00:00:00 to "
+    "2026-07-01 00:00:00.The chart has 2 Y axes displaying Kepemilikan saham "
+    "(lot) and Persentase.Created with Highcharts 10.1.0Kepemilikan saham "
+    "(lot)PersentaseForeign LainnyaForeign YayasanForeign "
+)
+BADGE_BREN_2026_09_05 = (
+    "BREN Balance Position Chart [Scripless: 36.7%] [Free Float: 12.6%] "
+    "[Holder: 43.6K] ChartCombination chart with 22 data series.The chart has "
+    "1 X axis displaying Time. Data ranges from 2024-09-01 00:00:00 to "
+    "2026-08-01 00:00:00.The chart has 2 Y axes displaying Kepemilikan saham "
+    "(lot) and Persentase.Created with Highcharts 10.1.0Kepemilikan saham "
+    "(lot)PersentaseForeign LainnyaForeign YayasanForeign "
+)
+BADGE_BREN_2026_09_10 = (
+    "BREN Balance Position Chart [Scripless: 36.7%] [Free Float: 12.6%] "
+    "[Holder: 44.3K] ChartCombination chart with 22 data series.The chart has "
+    "1 X axis displaying Time. Data ranges from 2024-09-01 00:00:00 to "
+    "2026-08-01 00:00:00.The chart has 2 Y axes displaying Kepemilikan saham "
+    "(lot) and Persentase.Created with Highcharts 10.1.0Kepemilikan saham "
+    "(lot)PersentaseForeign LainnyaForeign YayasanForeign "
+)
+# The same 2026-09-05 reading with the chart's "Data ranges ..." sentence
+# missing, e.g. cut off by the capture's 400-character badge slice.
+BADGE_BREN_NO_RANGE = (
+    "BREN Balance Position Chart [Scripless: 36.7%] [Free Float: 12.6%] "
+    "[Holder: 43.6K]"
+)
+
+# Dash traces use month-END x values; the page chart labels the same month by
+# its first day.
+BREN_TRACES_TO_JUL = [
+    {"name": "Lokal individual", "x": ["2026-06-30", "2026-07-31"], "y": [100.0, 110.0]},
+    {"name": "scripless", "x": ["2026-06-30", "2026-07-31"],
+     "y": [0.36739264577472924, 0.36739264577472924]},
+]
+BREN_TRACES_TO_AUG = [
+    {"name": "Lokal individual", "x": ["2026-07-31", "2026-08-31"], "y": [110.0, 120.0]},
+    {"name": "scripless", "x": ["2026-07-31", "2026-08-31"],
+     "y": [0.36739264577472924, 0.36739264577472924]},
+]
+
+BREN_BADGE_KEY = '["float_holder_badge","BREN"]'
+BREN_43_6K = {"free_float_pct": 12.6, "holder_count_raw": "43.6K", "scripless_pct": 36.7}
+BREN_44_3K = {"free_float_pct": 12.6, "holder_count_raw": "44.3K", "scripless_pct": 36.7}
+BREN_URL = "https://neobdm.tech/stock_detail/BREN/"
+
+
+def badge_observations(conn):
+    return [(key, rev, observed_at, json.loads(payload)) for key, rev, observed_at, payload
+            in conn.execute(
+                "SELECT business_key, revision_number, observed_at, payload_json "
+                "FROM ownership_observation WHERE source_family='float_holder_badge' "
+                "ORDER BY obs_id")]
+
+
+def badge_state(conn):
+    return conn.execute(
+        "SELECT business_key, first_seen_at, last_seen_at, times_seen, revision_count "
+        "FROM observation_state WHERE source_family='float_holder_badge' "
+        "ORDER BY business_key").fetchall()
+
+
+def test_badge_month_rollover_unchanged_reading_keeps_one_undated_key():
+    """A. The chart rolling July -> August must not give an unchanged badge
+    reading a second, month-dated identity: same key, times_seen goes to 2."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_08_31, traces=BREN_TRACES_TO_JUL),
+                       "2026-08-31T14:27:20Z", BREN_URL)
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+
+    assert badge_state(conn) == [
+        (BREN_BADGE_KEY, "2026-08-31T14:27:20Z", "2026-09-05T07:04:14Z", 2, 0)]
+    assert badge_observations(conn) == [
+        (BREN_BADGE_KEY, 0, "2026-08-31T14:27:20Z", BREN_43_6K)]
+
+
+def test_badge_mid_month_update_is_one_revision_under_same_key():
+    """B. 43.6K -> 44.3K under an unchanged chart range is one revision of the
+    same key, stamped with the second capture's observed_at -- not dropped."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    c2 = ing.ingest_capture(conn, "BREN",
+                            make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                            "2026-09-10T07:27:31Z", BREN_URL)
+
+    assert badge_observations(conn) == [
+        (BREN_BADGE_KEY, 0, "2026-09-05T07:04:14Z", BREN_43_6K),
+        (BREN_BADGE_KEY, 1, "2026-09-10T07:27:31Z", BREN_44_3K),
+    ]
+    assert c2["ownership_revision"] == 1
+
+
+def test_badge_key_identical_with_or_without_data_ranges_sentence():
+    """C. The badge key must not depend on whether the chart's "Data ranges"
+    sentence was captured. Previously its absence silently switched the key's
+    date from the chart's month-start label to the Dash month-end date."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_NO_RANGE, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-06T07:15:31Z", BREN_URL)
+
+    assert badge_state(conn) == [
+        (BREN_BADGE_KEY, "2026-09-05T07:04:14Z", "2026-09-06T07:15:31Z", 2, 0)]
+
+
+def test_badge_capture_run_claims_no_snapshot_date():
+    """D. The page never dates the badge, so its manifest row claims no date."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    row = conn.execute(
+        "SELECT status, snapshot_date_seen, row_count FROM capture_run "
+        "WHERE ticker='BREN' AND pane='badge'"
+    ).fetchone()
+    assert row == ("ok", None, 1)
+
+
+def test_badge_replay_of_retained_bren_sequence():
+    """E. The retained BREN sequence 43.6K, 43.6K, 44.3K is one undated
+    history: revision 0 first seen 08-31, reconfirmed on 09-05 across the chart
+    rollover, revised to 44.3K on 09-10. No legacy dated row is written."""
+    conn = make_conn()
+    runs = [
+        (BADGE_BREN_2026_08_31, BREN_TRACES_TO_JUL, "2026-08-31T14:27:20Z"),
+        (BADGE_BREN_2026_09_05, BREN_TRACES_TO_AUG, "2026-09-05T07:04:14Z"),
+        (BADGE_BREN_2026_09_10, BREN_TRACES_TO_AUG, "2026-09-10T07:27:31Z"),
+    ]
+    revisions = []
+    for badge, traces, captured_at in runs:
+        c = ing.ingest_capture(conn, "BREN", make_capture(badge=badge, traces=traces),
+                               captured_at, BREN_URL)
+        revisions.append(c["ownership_revision"])
+        assert c["float_holder_snapshot"] == 0
+
+    assert revisions == [0, 0, 1]
+    assert badge_observations(conn) == [
+        (BREN_BADGE_KEY, 0, "2026-08-31T14:27:20Z", BREN_43_6K),
+        (BREN_BADGE_KEY, 1, "2026-09-10T07:27:31Z", BREN_44_3K),
+    ]
+    assert badge_state(conn) == [
+        (BREN_BADGE_KEY, "2026-08-31T14:27:20Z", "2026-09-10T07:27:31Z", 3, 1)]
+    assert conn.execute("SELECT COUNT(*) FROM float_holder_snapshot").fetchone()[0] == 0
+
+
+def test_legacy_float_holder_snapshot_is_frozen_existing_rows_untouched():
+    """Legacy float_holder_snapshot is no longer written: a pre-existing
+    historical row survives byte-for-byte and no new dated row is added."""
+    conn = make_conn()
+    legacy_row = (
+        "BREN", "2026-07-01", 12.6, 36.7, "43.6K", 43600.0, None,
+        "2026-08-31T14:27:20Z", "2026-08-31T14:27:20Z", BREN_URL,
+        "float_holder_badge", "stock_detail_v1", "3ca9cd4a78c0efd8", 1, 1,
+    )
+    conn.execute(
+        "INSERT INTO float_holder_snapshot (ticker, snapshot_date, free_float_pct, "
+        "scripless_pct, holder_count_raw, holder_count_approx, published_at, captured_at, "
+        "available_at, source_url, source_family, extraction_version, raw_hash, "
+        "dq_unknown_publication_time, dq_rounded_holder_count) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", legacy_row)
+
+    for badge, captured_at in [(BADGE_BREN_2026_09_05, "2026-09-05T07:04:14Z"),
+                               (BADGE_BREN_2026_09_10, "2026-09-10T07:27:31Z")]:
+        ing.ingest_capture(conn, "BREN",
+                           make_capture(badge=badge, traces=BREN_TRACES_TO_AUG),
+                           captured_at, BREN_URL)
+
+    rows = conn.execute(
+        "SELECT ticker, snapshot_date, free_float_pct, scripless_pct, holder_count_raw, "
+        "holder_count_approx, published_at, captured_at, available_at, source_url, "
+        "source_family, extraction_version, raw_hash, dq_unknown_publication_time, "
+        "dq_rounded_holder_count FROM float_holder_snapshot"
+    ).fetchall()
+    assert rows == [legacy_row]
+
+
+def test_badge_observed_without_balance_position_traces():
+    """The badge used to be skipped whenever the Dash traces were missing,
+    only because the traces supplied its inferred date. With no date to
+    anchor, a captured badge is observed on its own."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN", make_capture(badge=BADGE_BREN_2026_09_05),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    manifest = {pane: (status, seen) for pane, status, seen in conn.execute(
+        "SELECT pane, status, snapshot_date_seen FROM capture_run WHERE ticker='BREN' "
+        "AND pane IN ('badge', 'balance_position')")}
+    assert manifest == {"badge": ("ok", None), "balance_position": ("empty_pane", None)}
+    assert badge_observations(conn) == [
+        (BREN_BADGE_KEY, 0, "2026-09-05T07:04:14Z", BREN_43_6K)]
+
+
+def test_badge_present_but_empty_is_not_an_observation():
+    """An empty badge string is a rendered-but-empty pane: manifest says so,
+    and no reading is observed."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN", make_capture(badge="", traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    row = conn.execute(
+        "SELECT status, snapshot_date_seen, row_count, error_detail FROM capture_run "
+        "WHERE ticker='BREN' AND pane='badge'").fetchone()
+    assert row == ("empty_pane", None, None, "badge present but empty")
+    assert badge_observations(conn) == []
+
+
+def test_old_month_dated_badge_observations_are_left_untouched():
+    """History written under the old month-dated key is never rewritten or
+    bumped: a new capture of the very same pane lands on the undated key only."""
+    conn = make_conn()
+    old_key = '["float_holder_snapshot","BREN","2026-08-01"]'
+    ing.record_observation(conn, "2026-09-05", "BREN", "float_holder_badge", old_key,
+                           BREN_43_6K, "2026-09-05T07:04:14Z")
+
+    def old_rows():
+        return (conn.execute("SELECT * FROM ownership_observation WHERE business_key=?",
+                             (old_key,)).fetchall(),
+                conn.execute("SELECT * FROM observation_state WHERE business_key=?",
+                             (old_key,)).fetchall())
+
+    before = old_rows()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-29T08:00:00Z", BREN_URL)
+    assert old_rows() == before
+    assert [k for k, *_ in badge_state(conn)] == [BREN_BADGE_KEY, old_key]
+
+
+def test_source_dated_ownership_products_unchanged():
+    """F. Only the badge lost its inferred date. Every source-dated product
+    keeps its source-provided date in both its legacy key and its observation
+    business key, and its payload shape (so its payload_hash) is unchanged."""
+    conn = make_conn()
+    capture = make_capture(kda1=TPIA_KDA1, kda5=TPIA_KDA5, pkda1=BREN_PKDA1_FALSE_TURNOVER,
+                           pkda5=WIFI_PKDA5_SAME_DAY_OPPOSITE, traces=BP_TRACES,
+                           badge=BADGE_TPIA)
+    ing.ingest_capture(conn, "TPIA", capture, "2026-08-30T10:00:00Z",
+                       "https://neobdm.tech/stock_detail/TPIA/")
+
+    keys = {}
+    for family, key in conn.execute(
+            "SELECT source_family, business_key FROM ownership_observation "
+            "WHERE source_family != 'float_holder_badge'"):
+        keys.setdefault(family, set()).add(key)
+    assert keys == {
+        "stock_detail_kda1_current": {
+            '["ownership_snapshot","TPIA","1pct","2026-07-31","BARITO PACIFIC"]',
+            '["ownership_snapshot","TPIA","1pct","2026-07-31","SCG CHEMICALS PUBLIC"]',
+            '["ownership_snapshot","TPIA","1pct","2026-07-31","PRAJOGO PANGESTU"]',
+        },
+        "stock_detail_kda5_current": {
+            '["ownership_snapshot","TPIA","5pct","2026-08-27","PT BARITO PACIFIC TBK"]',
+            '["custody_breakdown_snapshot","TPIA","2026-08-27","PT BARITO PACIFIC TBK",0]',
+            '["custody_breakdown_snapshot","TPIA","2026-08-27","PT BARITO PACIFIC TBK",1]',
+            '["custody_breakdown_snapshot","TPIA","2026-08-27","PT BARITO PACIFIC TBK",2]',
+        },
+        "stock_detail_pkda1_moves": {
+            '["ownership_change","TPIA","1pct","2026-05-29","PRIME HILL FUND",0]',
+            '["ownership_change","TPIA","1pct","2026-05-29","ZHAOCAI PRIME HILL FUND",0]',
+        },
+        "stock_detail_pkda5_moves": {
+            '["ownership_change","TPIA","5pct","2026-05-20","INVESTASI SUKSES BERSAMA",0]',
+            '["ownership_change","TPIA","5pct","2026-05-20","INVESTASI SUKSES BERSAMA",1]',
+        },
+        "balance_position_chart": {
+            '["balance_position_monthly","TPIA","2023-08-31","local_individual"]',
+            '["balance_position_monthly","TPIA","2023-09-30","local_individual"]',
+            '["balance_position_monthly","TPIA","2023-08-31","foreign_korporat"]',
+            '["balance_position_monthly","TPIA","2023-09-30","foreign_korporat"]',
+            '["balance_position_summary_monthly","TPIA","2023-08-31"]',
+            '["balance_position_summary_monthly","TPIA","2023-09-30"]',
+        },
+    }
+
+    def payload(key):
+        return json.loads(conn.execute(
+            "SELECT payload_json FROM ownership_observation WHERE business_key=?",
+            (key,)).fetchone()[0])
+
+    # One row per source-dated family: a payload-shape change here would make
+    # every existing key look revised on the next production run.
+    assert payload('["ownership_snapshot","TPIA","1pct","2026-07-31","BARITO PACIFIC"]') == {
+        "investor_category": "Corporate", "is_foreign": 0,
+        "ownership_pct_raw": "34.6%", "ownership_pct": 34.6,
+        "scrip_lot": 181000000.0, "scrip_pct": 21.0, "scrip_raw": "181M lot 21.0%",
+        "scripless_lot": 118000000.0, "scripless_pct": 13.7,
+        "scripless_raw": "118M lot 13.7%",
+    }
+    assert payload('["ownership_snapshot","TPIA","5pct","2026-08-27","PT BARITO PACIFIC TBK"]') == {
+        "is_foreign": 0, "ownership_pct": 13.7}
+    assert payload('["custody_breakdown_snapshot","TPIA","2026-08-27","PT BARITO PACIFIC TBK",0]') == {
+        "investor_total_pct": 13.7, "is_foreign": 0,
+        "custodian_label": "AF", "custodian_pct_of_holder": 60.8}
+    assert payload('["ownership_change","TPIA","1pct","2026-05-29","PRIME HILL FUND",0]') == {
+        "investor_category": "Trustee Bank", "is_foreign": 1,
+        "resulting_ownership_pct_raw": "3.0%", "resulting_ownership_pct": 3.0,
+        "scrip_lot_change": None, "scripless_lot_change": 40600000.0,
+        "note": "Masuk PKDA 1%"}
+    assert payload('["ownership_change","TPIA","5pct","2026-05-20","INVESTASI SUKSES BERSAMA",0]') == {
+        "is_foreign": 0, "lot_change": -600000.0, "is_custodian_move": 0,
+        "custodian_or_code": "YB"}
+    assert payload('["balance_position_monthly","TPIA","2023-08-31","local_individual"]') == {
+        "lots": 1000.0}
+    assert payload('["balance_position_summary_monthly","TPIA","2023-08-31"]') == {
+        "pct_retail": 12.0, "pct_institusi": 50.0, "pct_foreign": 30.0, "pct_scripless": 47.0}
+
+    legacy_counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in (
+        "ownership_snapshot", "ownership_change", "custody_breakdown_snapshot",
+        "balance_position_monthly", "balance_position_summary_monthly")}
+    assert legacy_counts == {
+        "ownership_snapshot": 4, "ownership_change": 4, "custody_breakdown_snapshot": 3,
+        "balance_position_monthly": 4, "balance_position_summary_monthly": 2,
+    }
+    assert set(conn.execute(
+        "SELECT threshold, snapshot_date FROM ownership_snapshot").fetchall()) == {
+        ("1pct", "2026-07-31"), ("5pct", "2026-08-27")}
+    assert {pane: (status, seen) for pane, status, seen in conn.execute(
+        "SELECT pane, status, snapshot_date_seen FROM capture_run WHERE ticker='TPIA' "
+        "AND pane != 'badge'")} == {
+        "insider-current": ("ok", "2026-07-31"), "insider-moves": ("ok", None),
+        "insider5p-current": ("ok", "2026-08-27"), "insider5p-moves": ("ok", None),
+        "balance_position": ("ok", None)}
+
+
+# --- badge cutover / replay safety -------------------------------------------
+#
+# ownership_capture.py resumes from cached raw captures with their ORIGINAL
+# captured_at, run_id defaults to that date, and capture_run is INSERT OR
+# REPLACE. A replay must therefore never backfill the undated key, overwrite a
+# run's badge manifest row, or revise the badge state backwards.
+
+def seed_legacy_badge_run(conn, badge_text, captured_at, month, ticker="BREN"):
+    """Write exactly what the pre-fix ingest (b4fd79e) wrote for one badge
+    capture: a float_holder_snapshot row under the inferred month, an
+    observation under the month-dated key, and a manifest row naming that
+    month in snapshot_date_seen."""
+    run_id = captured_at[:10]
+    badge = op.parse_badge(badge_text)
+    conn.execute(
+        "INSERT OR IGNORE INTO float_holder_snapshot (ticker, snapshot_date, free_float_pct, "
+        "scripless_pct, holder_count_raw, holder_count_approx, published_at, captured_at, "
+        "available_at, source_url, source_family, extraction_version, raw_hash, "
+        "dq_unknown_publication_time, dq_rounded_holder_count) "
+        "VALUES (?,?,?,?,?,?,NULL,?,?,?,'float_holder_badge','stock_detail_v1','legacy',1,1)",
+        (ticker, month, badge["free_float_pct"], badge["scripless_pct"],
+         badge["holder_count_raw"], badge["holder_count_approx"],
+         captured_at, captured_at, f"https://neobdm.tech/stock_detail/{ticker}/"))
+    ing.record_observation(
+        conn, run_id, ticker, "float_holder_badge",
+        f'["float_holder_snapshot","{ticker}","{month}"]',
+        {"free_float_pct": badge["free_float_pct"], "scripless_pct": badge["scripless_pct"],
+         "holder_count_raw": badge["holder_count_raw"]},
+        captured_at)
+    ing.record_capture_run(conn, run_id, ticker, "badge", captured_at, "ok",
+                           snapshot_date_seen=month, row_count=1,
+                           pane_hash=ing.payload_hash_hex(badge_text))
+
+
+def badge_footprint(conn):
+    """Every row the badge can touch, in a stable order."""
+    return {
+        "capture_run": conn.execute(
+            "SELECT * FROM capture_run WHERE pane='badge' ORDER BY run_id, ticker").fetchall(),
+        "observation": conn.execute(
+            "SELECT * FROM ownership_observation WHERE source_family='float_holder_badge' "
+            "ORDER BY obs_id").fetchall(),
+        "state": conn.execute(
+            "SELECT * FROM observation_state WHERE source_family='float_holder_badge' "
+            "ORDER BY business_key").fetchall(),
+        "float_holder_snapshot": conn.execute(
+            "SELECT * FROM float_holder_snapshot ORDER BY ticker, snapshot_date").fetchall(),
+    }
+
+
+def test_replaying_legacy_recorded_badge_runs_touches_nothing():
+    """Blocker 1. Re-ingesting cached pre-fix captures -- runs the legacy
+    scheme already recorded, and a legacy-era run it never recorded -- must not
+    create the undated key, rewrite any badge manifest row (and its
+    snapshot_date_seen), touch the month-dated observations, or touch
+    float_holder_snapshot."""
+    conn = make_conn()
+    seed_legacy_badge_run(conn, BADGE_BREN_2026_08_31, "2026-08-31T14:27:20Z", "2026-07-01")
+    seed_legacy_badge_run(conn, BADGE_BREN_2026_09_05, "2026-09-05T07:04:14Z", "2026-08-01")
+    seed_legacy_badge_run(conn, BADGE_BREN_2026_09_10, "2026-09-10T07:27:31Z", "2026-08-01")
+    before = badge_footprint(conn)
+
+    for badge, traces, captured_at in [
+        (BADGE_BREN_2026_08_31, BREN_TRACES_TO_JUL, "2026-08-31T14:27:20Z"),
+        (BADGE_BREN_2026_09_05, BREN_TRACES_TO_AUG, "2026-09-05T07:04:14Z"),
+        (BADGE_BREN_2026_09_10, BREN_TRACES_TO_AUG, "2026-09-10T07:27:31Z"),
+        (BADGE_BREN_2026_09_05, BREN_TRACES_TO_AUG, "2026-09-03T07:19:05Z"),  # never recorded
+    ]:
+        ing.ingest_capture(conn, "BREN", make_capture(badge=badge, traces=traces),
+                           captured_at, BREN_URL)
+
+    assert badge_footprint(conn) == before
+    assert [k for k, *_ in badge_state(conn)] == [
+        '["float_holder_snapshot","BREN","2026-07-01"]',
+        '["float_holder_snapshot","BREN","2026-08-01"]']
+
+
+def test_replaying_an_older_capture_never_revises_undated_state_backwards():
+    """Blocker 2. Once 44.3K is the undated key's current state, replaying an
+    older 43.6K capture -- one already ingested, or one never ingested -- must
+    leave the state (and every badge row) exactly as it was."""
+    conn = make_conn()
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-05T07:04:14Z", BREN_URL)
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-10T07:27:31Z", BREN_URL)
+    before = badge_footprint(conn)
+
+    for captured_at in ("2026-09-05T07:04:14Z", "2026-09-07T07:28:40Z"):
+        ing.ingest_capture(conn, "BREN",
+                           make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                           captured_at, BREN_URL)
+
+    assert badge_footprint(conn) == before
+    assert badge_state(conn) == [
+        (BREN_BADGE_KEY, "2026-09-05T07:04:14Z", "2026-09-10T07:27:31Z", 2, 1)]
+    assert badge_observations(conn)[-1] == (
+        BREN_BADGE_KEY, 1, "2026-09-10T07:27:31Z", BREN_44_3K)
+
+
+def test_genuinely_later_capture_after_legacy_runs_creates_and_updates_undated_key():
+    """Blocker 3. A capture newer than every recorded badge run starts the
+    undated key normally and keeps revising it, while the legacy run's
+    manifest row and month-dated key stay exactly as they were."""
+    conn = make_conn()
+    seed_legacy_badge_run(conn, BADGE_BREN_2026_09_10, "2026-09-10T07:27:31Z", "2026-08-01")
+    legacy_manifest = conn.execute(
+        "SELECT * FROM capture_run WHERE run_id='2026-09-10' AND pane='badge'").fetchall()
+    old_state = conn.execute(
+        "SELECT * FROM observation_state WHERE business_key="
+        "'[\"float_holder_snapshot\",\"BREN\",\"2026-08-01\"]'").fetchall()
+
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-29T08:00:00Z", BREN_URL)
+    c2 = ing.ingest_capture(conn, "BREN",
+                            make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG),
+                            "2026-09-30T08:00:00Z", BREN_URL)
+
+    assert [o for o in badge_observations(conn) if o[0] == BREN_BADGE_KEY] == [
+        (BREN_BADGE_KEY, 0, "2026-09-29T08:00:00Z", BREN_44_3K),
+        (BREN_BADGE_KEY, 1, "2026-09-30T08:00:00Z", BREN_43_6K),
+    ]
+    assert c2["ownership_revision"] == 1
+    assert conn.execute(
+        "SELECT run_id, status, snapshot_date_seen FROM capture_run WHERE pane='badge' "
+        "ORDER BY run_id").fetchall() == [
+        ("2026-09-10", "ok", "2026-08-01"), ("2026-09-29", "ok", None),
+        ("2026-09-30", "ok", None)]
+    assert conn.execute(
+        "SELECT * FROM capture_run WHERE run_id='2026-09-10' AND pane='badge'"
+    ).fetchall() == legacy_manifest
+    assert conn.execute(
+        "SELECT * FROM observation_state WHERE business_key="
+        "'[\"float_holder_snapshot\",\"BREN\",\"2026-08-01\"]'").fetchall() == old_state
+
+
+def test_later_capture_in_a_run_the_legacy_scheme_recorded_leaves_that_run_legacy():
+    """A run the legacy scheme already recorded stays legacy for the badge: a
+    later capture that shares its run_id (same UTC day) must not overwrite that
+    run's manifest row. The next run is processed normally."""
+    conn = make_conn()
+    seed_legacy_badge_run(conn, BADGE_BREN_2026_09_10, "2026-09-28T08:53:21Z", "2026-08-01")
+    before = badge_footprint(conn)
+
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-28T15:00:00Z", BREN_URL)
+    assert badge_footprint(conn) == before
+
+    ing.ingest_capture(conn, "BREN",
+                       make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                       "2026-09-29T08:00:00Z", BREN_URL)
+    assert [o for o in badge_observations(conn) if o[0] == BREN_BADGE_KEY] == [
+        (BREN_BADGE_KEY, 0, "2026-09-29T08:00:00Z", BREN_44_3K)]
+
+
+def test_same_run_exact_resume_is_idempotent_for_badge():
+    """Blocker 4. Resuming a run re-ingests its cached capture with the same
+    captured_at: nothing about the badge may change, not even times_seen."""
+    conn = make_conn()
+    capture = make_capture(badge=BADGE_BREN_2026_09_05, traces=BREN_TRACES_TO_AUG)
+    ing.ingest_capture(conn, "BREN", capture, "2026-09-05T07:04:14Z", BREN_URL)
+    before = badge_footprint(conn)
+
+    counts = ing.ingest_capture(conn, "BREN", capture, "2026-09-05T07:04:14Z", BREN_URL)
+
+    assert badge_footprint(conn) == before
+    assert sum(counts.values()) == 0
+
+
+# --- rebuild_observation_state across the badge key change ---------------------
+
+def test_rebuild_does_not_cross_confirm_badge_keys_across_the_key_change():
+    """Rebuild A+B. The old month-dated key and the new undated key share one
+    pane and, here, byte-identical pane text. A run only reconfirms the key its
+    own scheme produced: the old key gains no post-cutover confirmations, the
+    new key counts no pre-cutover runs, and rebuild never exceeds the
+    incrementally tracked values."""
+    conn = make_conn()
+    for captured_at in ("2026-09-27T08:27:47Z", "2026-09-28T08:53:21Z"):
+        seed_legacy_badge_run(conn, BADGE_BREN_2026_09_10, captured_at, "2026-08-01")
+    for captured_at in ("2026-09-29T08:00:00Z", "2026-09-30T08:00:00Z"):
+        ing.ingest_capture(conn, "BREN",
+                           make_capture(badge=BADGE_BREN_2026_09_10, traces=BREN_TRACES_TO_AUG),
+                           captured_at, BREN_URL)
+    incremental = badge_state(conn)
+
+    ing.rebuild_observation_state(conn)
+
+    expected = [
+        (BREN_BADGE_KEY, "2026-09-29T08:00:00Z", "2026-09-30T08:00:00Z", 2, 0),
+        ('["float_holder_snapshot","BREN","2026-08-01"]',
+         "2026-09-27T08:27:47Z", "2026-09-28T08:53:21Z", 2, 0),
+    ]
+    assert incremental == expected
+    assert badge_state(conn) == expected
+
+
+def test_rebuild_unchanged_for_non_badge_families():
+    """Rebuild C. Every other source family still reconfirms on whole-pane hash
+    alone: an identical capture seen twice rebuilds to last_seen = second
+    capture, times_seen = 2, for every key of every family."""
+    conn = make_conn()
+    capture = make_capture(kda1=TPIA_KDA1, kda5=TPIA_KDA5, pkda1=BREN_PKDA1_FALSE_TURNOVER,
+                           pkda5=WIFI_PKDA5_SAME_DAY_OPPOSITE, traces=BP_TRACES,
+                           badge=BADGE_TPIA)
+    for captured_at in ("2026-08-30T10:00:00Z", "2026-08-31T10:00:00Z"):
+        ing.ingest_capture(conn, "TPIA", capture, captured_at,
+                           "https://neobdm.tech/stock_detail/TPIA/")
+
+    ing.rebuild_observation_state(conn)
+
+    rows = conn.execute(
+        "SELECT source_family, first_seen_at, last_seen_at, times_seen FROM observation_state"
+    ).fetchall()
+    assert {r[0] for r in rows} == {
+        "stock_detail_kda1_current", "stock_detail_kda5_current", "stock_detail_pkda1_moves",
+        "stock_detail_pkda5_moves", "balance_position_chart", "float_holder_badge"}
+    assert {r[1:] for r in rows} == {("2026-08-30T10:00:00Z", "2026-08-31T10:00:00Z", 2)}
 
 
 if __name__ == "__main__":
