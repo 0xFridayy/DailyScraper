@@ -4,7 +4,9 @@ One call to ingest_capture() takes the raw text/JSON captured for ONE
 ticker's page load (see ownership_capture.py) plus a single captured_at
 timestamp for that whole page load, parses it via ownership_parse, and
 writes rows into every table via INSERT OR IGNORE against each table's
-UNIQUE/PRIMARY KEY.
+UNIQUE/PRIMARY KEY -- except float_holder_snapshot, which is frozen: the
+float/holder badge has no as-of date, so it is observed only in the
+bitemporal layer under an undated key (see the badge block below).
 
 Idempotency + anti-leakage policy (deliberate, see STOCK_DETAIL_OWNERSHIP_
 DISCOVERY.md section 3 and this turn's instructions):
@@ -63,10 +65,11 @@ def resolve_available_at(published_at, captured_at):
 # ---------------------------------------------------------------------------
 # Bitemporal layer (capture_run / ownership_observation / observation_state).
 #
-# Everything below is ADDITIVE. The eight INSERT OR IGNORE statements further
+# Everything below is ADDITIVE. The legacy INSERT OR IGNORE statements further
 # down are untouched, so the legacy tables keep meaning exactly what they have
 # always meant -- the state as FIRST observed -- and Experiment #2A0's frozen
-# ownership_change cohort is unaffected.
+# ownership_change cohort is unaffected. The one exception is
+# float_holder_snapshot, which is no longer written at all (badge block).
 # ---------------------------------------------------------------------------
 
 PAYLOAD_HASH_VERSION = "payload_v1"
@@ -298,6 +301,15 @@ def rebuild_observation_state(conn):
     unchanged on most days). Recovering the exact value in the partial-change
     case would require re-parsing and diffing every later run's retained
     fragment (capture_payload) row by row; not implemented here.
+
+    The badge is the one family whose key scheme changed, from a month-dated
+    ["float_holder_snapshot", ticker, month] to the undated
+    ["float_holder_badge", ticker], while both keys share the 'badge' pane.
+    A byte-identical pane on both sides of that change must not reconfirm
+    both keys, so a badge run reconfirms only the key its own scheme
+    produced. The manifest records which scheme that was: a legacy run named
+    the inferred month in snapshot_date_seen, and an undated run leaves it
+    NULL. Every other family still reconfirms on the pane hash alone.
     """
     latest = {}       # business_key -> observation row (highest revision_number)
     first_seen = {}   # business_key -> earliest observed_at in the log
@@ -314,14 +326,15 @@ def rebuild_observation_state(conn):
         if cur is None or row[7] >= cur[7]:
             latest[key] = row
 
-    # (ticker, pane, pane_hash) -> sorted captured_at values of every 'ok' run
-    # that produced that exact hash, i.e. every run that reconfirmed it.
+    # (ticker, pane, pane_hash) -> (captured_at, snapshot_date_seen) of every
+    # 'ok' run that produced that exact hash, i.e. every run that reconfirmed it.
     confirmations = {}
-    for run_id, ticker, pane, pane_hash, captured_at in conn.execute(
-        "SELECT run_id, ticker, pane, pane_hash, captured_at "
+    for run_id, ticker, pane, pane_hash, captured_at, date_seen in conn.execute(
+        "SELECT run_id, ticker, pane, pane_hash, captured_at, snapshot_date_seen "
         "FROM capture_run WHERE status = 'ok' AND pane_hash IS NOT NULL"
     ):
-        confirmations.setdefault((ticker, pane, pane_hash), []).append(captured_at)
+        confirmations.setdefault((ticker, pane, pane_hash), []).append(
+            (captured_at, date_seen))
     # per-(run_id,ticker,pane) hash lookup, to find the hash tied to a key's
     # CURRENT revision specifically (not just any run of that pane)
     run_hash = {}
@@ -337,7 +350,11 @@ def rebuild_observation_state(conn):
          revision_number, evidence_class) = row
         pane = PANE_FOR_SOURCE_FAMILY.get(source_family)
         current_hash = run_hash.get((run_id, ticker, pane))
-        reconfirming = confirmations.get((ticker, pane, current_hash), []) if current_hash else []
+        runs = confirmations.get((ticker, pane, current_hash), []) if current_hash else []
+        if source_family == "float_holder_badge":
+            undated_key = key == business_key("float_holder_badge", ticker)
+            runs = [r for r in runs if (r[1] is None) == undated_key]
+        reconfirming = [captured_at for captured_at, _ in runs]
         last_seen_at = max([observed_at, *reconfirming])
         times_seen = len({observed_at, *reconfirming})
         conn.execute(
@@ -349,6 +366,32 @@ def rebuild_observation_state(conn):
             (key, ticker, source_family, first_seen[key], last_seen_at,
              times_seen, payload_hash, obs_id, revision_number, evidence_class),
         )
+
+
+def _badge_already_recorded(conn, ticker, run_id, captured_at):
+    """Replay / cutover guard for the float/holder badge.
+
+    ownership_capture.py resumes from cached raw captures with their ORIGINAL
+    captured_at, run_id defaults to that date, and capture_run is INSERT OR
+    REPLACE. So a capture that is not newer than this ticker's latest badge
+    manifest row -- under either key scheme -- is a replay of a run already
+    recorded, or an older cache. Processing it would backfill the undated key
+    with pre-cutover history, overwrite that run's manifest row (erasing a
+    legacy snapshot_date_seen), or append a stale revision after a newer one.
+
+    A run the legacy month-dated scheme already recorded (its badge row names
+    the inferred month in snapshot_date_seen) also stays legacy: a later
+    same-day capture sharing its run_id must not replace that row. The next
+    run is processed normally.
+
+    The boundary is the manifest itself -- no calendar cutover date.
+    """
+    last_at, legacy_run = conn.execute(
+        "SELECT MAX(captured_at), MAX(run_id = ? AND snapshot_date_seen IS NOT NULL) "
+        "FROM capture_run WHERE ticker = ? AND pane = 'badge'",
+        (run_id, ticker),
+    ).fetchone()
+    return bool(legacy_run) or (last_at is not None and captured_at <= last_at)
 
 
 def _observe(conn, counts, run_id, ticker, source_family, key, payload,
@@ -482,7 +525,8 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
         "ownership_snapshot": 0, "ownership_change": 0,
         "custody_breakdown_snapshot": 0, "custody_participants": 0,
         "balance_position_monthly": 0, "balance_position_summary_monthly": 0,
-        "float_holder_snapshot": 0, "entity_alias_candidate": 0,
+        "float_holder_snapshot": 0,  # frozen: never written, always 0
+        "entity_alias_candidate": 0,
         "ownership_observation": 0, "ownership_revision": 0,
     }
     panes = capture.get("panes") or {}
@@ -802,52 +846,41 @@ def ingest_capture(conn, ticker, capture, captured_at, source_url,
         record_capture_run(conn, run_id, ticker, "balance_position", captured_at,
                            "ok", row_count=len(parsed["monthly"]) + len(parsed["summary"]),
                            pane_hash=bp_hash, evidence_class=evidence_class)
-
-        # -- float/holder badge (snapshot_date inferred = latest bp month) --
-        badge_text = capture.get("balance_position_badge")
-        if badge_text and earliest:
-            badge = op.parse_badge(badge_text)
-            snap_date = badge["date_range_end"] or dates[-1]
-            raw_hash = sha256_hex(f"{ticker}|{snap_date}|{badge_text[:200]}")
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO float_holder_snapshot
-                   (ticker, snapshot_date, free_float_pct, scripless_pct,
-                    holder_count_raw, holder_count_approx, published_at, captured_at,
-                    available_at, source_url, source_family, extraction_version, raw_hash,
-                    dq_unknown_publication_time, dq_rounded_holder_count)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                (ticker, snap_date, badge["free_float_pct"], badge["scripless_pct"],
-                 badge["holder_count_raw"], badge["holder_count_approx"],
-                 published_at, captured_at, available_at,
-                 source_url, "float_holder_badge", EXTRACTION_VERSION, raw_hash,
-                 dq_unknown_pub),
-            )
-            counts["float_holder_snapshot"] += cur.rowcount if cur.rowcount > 0 else 0
-
-            _observe(conn, counts, run_id, ticker, "float_holder_badge",
-                     business_key("float_holder_snapshot", ticker, snap_date),
-                     {"free_float_pct": badge["free_float_pct"],
-                      "scripless_pct": badge["scripless_pct"],
-                      "holder_count_raw": badge["holder_count_raw"]},
-                     captured_at, evidence_class)
-
-            badge_hash = payload_hash_hex(badge_text)
-            store_pane_fragment(conn, badge_hash, badge_text, run_id, captured_at)
-            record_capture_run(conn, run_id, ticker, "badge", captured_at, "ok",
-                               snapshot_date_seen=snap_date, row_count=1,
-                               pane_hash=badge_hash, evidence_class=evidence_class)
-        else:
-            record_capture_run(conn, run_id, ticker, "badge", captured_at,
-                               "empty_pane", evidence_class=evidence_class,
-                               error_detail=("badge absent from DOM" if not badge_text
-                                             else "no balance-position dates to anchor snapshot_date"))
     else:
         record_capture_run(conn, run_id, ticker, "balance_position", captured_at,
                            "empty_pane", evidence_class=evidence_class,
                            error_detail="no balance_position_traces in this capture")
+
+    # -- float/holder badge (UNDATED) -----------------------------------
+    # The badge carries no as-of date of its own. It used to be keyed by the
+    # chart's latest month, but live captures showed Holder and Free Float
+    # changing mid-month while that month stayed fixed, so the chart month is
+    # not their effective date (STOCK_DETAIL_OWNERSHIP_DISCOVERY.md 5.8). One
+    # undated key per ticker; the only timing is the observation history
+    # (observed_at / first_seen_at / last_seen_at). float_holder_snapshot,
+    # whose key is that inferred month, is no longer written.
+    badge_text = capture.get("balance_position_badge")
+    if _badge_already_recorded(conn, ticker, run_id, captured_at):
+        pass  # replay / cutover guard: leave every badge row exactly as recorded
+    elif badge_text:
+        badge = op.parse_badge(badge_text)
+        _observe(conn, counts, run_id, ticker, "float_holder_badge",
+                 business_key("float_holder_badge", ticker),
+                 {"free_float_pct": badge["free_float_pct"],
+                  "scripless_pct": badge["scripless_pct"],
+                  "holder_count_raw": badge["holder_count_raw"]},
+                 captured_at, evidence_class)
+
+        badge_hash = payload_hash_hex(badge_text)
+        store_pane_fragment(conn, badge_hash, badge_text, run_id, captured_at)
+        record_capture_run(conn, run_id, ticker, "badge", captured_at, "ok",
+                           snapshot_date_seen=None, row_count=1,
+                           pane_hash=badge_hash, evidence_class=evidence_class)
+    else:
         record_capture_run(conn, run_id, ticker, "badge", captured_at,
-                           "skipped", evidence_class=evidence_class,
-                           error_detail="badge snapshot_date depends on balance_position_traces")
+                           "empty_pane", evidence_class=evidence_class,
+                           error_detail=("badge absent from DOM" if badge_text is None
+                                         else "badge present but empty"))
 
     # Execute alias candidate detection once across the complete ticker state
     counts["entity_alias_candidate"] = _detect_and_insert_alias_candidates(conn, ticker, captured_at)

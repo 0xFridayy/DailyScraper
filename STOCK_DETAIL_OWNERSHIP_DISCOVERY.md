@@ -215,6 +215,15 @@ confirmed** — no explicit timestamp sits next to the badges themselves.
 Holder count is pre-abbreviated by the page ("43.6K") — the true integer is
 not recoverable from the UI; only ~3 significant figures are available.
 
+> **Update (2026-09-28 audit): the shared-date inference is REJECTED for
+> Holder and Free Float.** Daily captures showed both changing mid-month while
+> the chart's latest month stayed fixed. The Scripless badge VALUE matched the
+> chart's latest-month `pct_scripless` in every capture checked. That is value
+> synchronization, not an independently proven as-of date for the badge. See
+> §5.8. The badge, including its Scripless copy, is therefore stored with no
+> as-of date at all. Source-dated Scripless remains available separately in
+> `balance_position_summary_monthly.pct_scripless`.
+
 ### 1.5 Balance Position Chart — now fully captured (both surfaces)
 
 Two ways to reach the same figure data:
@@ -403,7 +412,7 @@ CREATE TABLE balance_position_summary_monthly (
 -- Free float / holder count badges
 CREATE TABLE float_holder_snapshot (
     ticker           TEXT NOT NULL,
-    snapshot_date    TEXT NOT NULL,   -- INFERRED = latest balance_position_monthly.period_date; not independently timestamped on the page
+    snapshot_date    TEXT NOT NULL,   -- INFERRED = latest balance_position_monthly.period_date; not independently timestamped on the page. REJECTED for holder/free float (§5.8); table since frozen
     free_float_pct   REAL,
     scripless_pct    REAL,
     holder_count     REAL,            -- pre-abbreviated by the page (e.g. 43600 from "43.6K"); ~3 significant figures only
@@ -441,7 +450,8 @@ match the scrape date:
 | KDA 1% / PKDA 1% | monthly | ~1 month (`Data per 31 jul 2026`) |
 | KDA 5% / PKDA 5% current | near-daily, foreign holders only | ~3 days (`Data per 27 aug 2026`) |
 | PKDA 5% moves log | daily | rows dated day-by-day, e.g. `2026-04-08` |
-| Balance Position Chart / float / holder badges | monthly | ~1 month (chart's last x value `2026-07-01`) |
+| Balance Position Chart (incl. its `pct_scripless` series) | monthly | ~1 month (chart's last x value `2026-07-01`) |
+| Scripless / Free Float / Holder badges | no as-of date on the page. Scripless value synchronized with the chart's latest month (value only, not a proven date); Holder and Free Float change mid-month, independent of the chart month (§5.8) | unknown — see §5.8 |
 
 Consequences for any future modeling work:
 
@@ -510,10 +520,14 @@ Still open after pass 2:
 - **True holder count is unrecoverable.** The page only ever shows an
   abbreviated value ("43.6K"/"783K"); no endpoint returns the unrounded
   integer. Not addressed by pass 2 — no path found to recover it.
-- **Free-float/scripless/holder badges' own "as of" date is still not
+- ~~**Free-float/scripless/holder badges' own "as of" date is still not
   independently verified.** Pass 2 did not find a new way to confirm they
   share the Balance Position chart's month-end date rather than some other
-  cadence — still an inference, not a citation.
+  cadence — still an inference, not a citation.~~ → **resolved by live
+  daily captures (2026-09-28 audit):** the Scripless badge value was
+  synchronized with the chart's latest month (value only; the badge's own
+  as-of date is still unproven). Holder and Free Float were not synchronized.
+  See §5.8.
 - **The IDX XLSX link cannot be used for `published_at`.** Confirmed broken
   as a per-ticker source (§1.2) and blocked (HTTP 403) as a direct fetch
   target from this session. No alternative independently-verifiable
@@ -670,9 +684,59 @@ either a longer history window than the page exposes, or a ticker with a
 known recent (within-5-month) tender offer/block trade — not identified in
 this pass.
 
-### 5.8 Free-float/holder badge date — still unverified
+### 5.8 Free-float/holder badge date — shared-date assumption REJECTED for Holder and Free Float
 
-No new evidence either way. Not resolved by pass 2.
+No new evidence either way from pass 2. The daily capture that has run since
+2026-08-31 has now settled it. This comes from a read-only audit of
+`neobdm_ownership.db` on 2026-09-28, covering 45 tickers.
+
+- **The Scripless VALUE is synchronized with the chart.** In 186/186 observed
+  badge readings, the Scripless badge value equals the chart's latest-month
+  `pct_scripless × 100` (1 d.p.). It never changed mid-month. This is value
+  synchronization only. It does not independently prove an as-of date for
+  the badge, which the page never states, so the badge copy stays undated.
+  The source-dated Scripless series is `balance_position_summary_monthly.
+  pct_scripless`, keyed by the Dash month-end `period_date`. It is still
+  captured unchanged.
+- **Holder does not.** The chart's latest month was 2026-08 for every run
+  from 2026-09-05 to 2026-09-28. During that window Holder changed for 41/45
+  tickers: 2 on 09-08, 5 on 09-09, 12 on 09-10, 21 on 09-11 and 1 on 09-15.
+  One more ticker (PSKT) changed between 09-01 and 09-05, making 42/45.
+- **Free Float does not either.** In the same fixed-month window it changed
+  for 17/45 tickers, on irregular days between 09-09 and 09-16. BUKA, for
+  example, went 30.5 → 30.1 → 29.8 → 30.1.
+- **The chart itself rolled from July to August** between the 2026-08-31 and
+  2026-09-01 captures.
+- **The page chart and the Dash endpoint label the same month differently.**
+  The page chart's "Data ranges … to" sentence uses the first of the month
+  (`2026-08-01`). The Dash endpoint's `period_date` uses the month-end
+  (`2026-08-31`).
+
+Consequence for the old `float_holder_snapshot` design, which keyed the badge
+on `(ticker, chart month)` with first-write-wins:
+
+- Each month's first capture after the rollover restamped the not-yet-updated
+  Holder under the new month. The same Holder appears under 2026-07-01 and
+  2026-08-01 for 45/45 tickers.
+- The mid-month update was then silently dropped. Under 2026-08-01, 42/45
+  Holder values are stale against the latest capture.
+
+Resolution:
+
+- `float_holder_snapshot` is frozen. Its existing rows are kept untouched and
+  nothing new is written.
+- Badge readings are observed only in `ownership_observation`, under the
+  undated key `["float_holder_badge", ticker]`.
+- Timing comes only from the observation history: `observed_at`,
+  `first_seen_at` and `last_seen_at`. The badge's Scripless copy stays in the
+  same undated payload; no date is claimed for it. For a dated Scripless, use
+  `balance_position_summary_monthly.pct_scripless`.
+
+**Still open:** the actual as-of date of Holder and Free Float remains
+unknown. The page gives none. A plausible but **unverified** hypothesis is
+that Holder is the previous month-end register, published with a one- to
+two-week lag. The next chart rollover can test it: expect Holder unchanged at
+the rollover and a batch update about 1–2 weeks later.
 
 ### Evidence table
 
@@ -686,7 +750,8 @@ No new evidence either way. Not resolved by pass 2.
 | PKDA 1% window is a fixed ~5-month trailing log | 9 | 9/9 (never earlier than 2026-03-31) | 0 | **High** |
 | IDX XLSX link is a real, fetchable per-ticker source | 9 | 0 | 9/9 (identical URL; 403 on fetch) | **Rejected** |
 | Entity-name variation causes false Masuk/Keluar signals | 3 (BREN, PANI, GOTO) | 3/3 (Prime Hill Fund rename; Alpha Investment churn; UBS Hongkong/Hong Kong spelling oscillation) | 0 | **High** |
-| Free-float/holder badges share Balance Position's snapshot date | 0 independently tested | 0 | 0 | **Untested** (still pure inference from co-location on the page) |
+| Holder / Free Float badges share Balance Position's snapshot date | 45 (daily captures 2026-08-31 → 2026-09-28) | 0 | Holder 42/45, Free Float 17/45 changed mid-month with the chart month fixed (§5.8) | **Rejected** |
+| Scripless badge VALUE equals the chart's latest-month `pct_scripless` (value synchronization, not a proven as-of date for the badge) | 45 | 186/186 readings | 0 | **High** (value match only; badge copy stays undated) |
 | A genuine (non-artifact) corporate ownership-change event is observable in PKDA 1% | 1 (GOTO) | 1 partial (gradual multi-holder distribution, no sharp single event) | 0 | **Low / inconclusive** |
 
 ---
