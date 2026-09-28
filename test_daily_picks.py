@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
@@ -454,7 +454,9 @@ def test_machine_picks_are_tracked_and_finish_with_why():
                             "WHERE source = 'machine' ORDER BY started").fetchall()
         conn.close()
     assert "1. AAAA" in texts[0]                                 # picked from the 3rd snapshot
-    assert "Machine picks running: AAAA" in texts[1] and "(day 1/5)" in texts[1]
+    assert "Machine picks running: AAAA +0.0% (day 0/5)" in texts[1]
+    assert "(day 1/5)" in texts[2] and "(day 4/5)" in texts[5]
+    assert all("AAAA (machine, 5 days)" not in t for t in texts[:6])
     done = next(t for t in texts if "AAAA (machine, 5 days)" in t)
     assert "❌ AAAA (machine, 5 days)" in done and "bandar turned seller" in done, done
     assert "Picked for:" in done
@@ -585,8 +587,310 @@ def test_machine_does_not_repick_a_stock_it_holds():
         picked = conn.execute("SELECT snapshot_date FROM picks WHERE ticker='AAAA'").fetchall()
         conn.close()
     assert "1. AAAA" in texts[0] and "No strong setup today" in texts[1]
-    assert [d for (d,) in picked] == [days[2][0], days[7][0]], picked    # again only after 5 days
+    assert [d for (d,) in picked] == [days[2][0], days[8][0]], picked    # signal + entry + 5 days
+    assert all("1. AAAA" not in t for t in texts[1:6])
     print("  ok no re-pick while holding")
+
+
+# ── machine execution contract and historical compatibility ──────────────
+
+def execution_panel():
+    """Friday signal, Monday entry, following Monday exit. Capture dates
+    describe the PREVIOUS session. Signal -> entry jumps 20%; entry -> exit 10%.
+    Only AAAA passes broad_buying, making the learning comparison exact.
+    """
+    captures = ["2026-09-12", "2026-09-15", "2026-09-16", "2026-09-17",
+                "2026-09-18", "2026-09-19", "2026-09-22", "2026-09-23"]
+    prices = [1000, 1200, 1224, 1248, 1272, 1296, 1320, 1344]
+    return [(d, {"AAAA": row(close=p, m=0.1 + i / 100),
+                 "BBBB": row(close=1000, cs=0, nr=-0.1, m=-0.1 - i / 100)})
+            for i, (d, p) in enumerate(zip(captures, prices))]
+
+
+def execution_pick(snaps, timing=dp.MACHINE_TIMING):
+    return [(snaps[0].date, "AAAA", "broad_buying", timing)]
+
+
+def test_machine_signal_entry_exit_and_learning_use_the_same_window():
+    snaps = snaps_from(execution_panel())
+    picks = execution_pick(snaps)
+    assert dp.machine_window(0) == (1, 6)              # signal k / entry k+1 / exit k+6
+    for n in range(1, 7):
+        running, finished = dp.machine_progress(snaps[:n], picks, set())
+        assert not finished
+        assert dp.forward_excess(snaps[:n], 0, "AAAA") is None
+        assert dp.learn_weights(snaps[:n])["broad_buying"]["sessions"] == 0
+    assert "pending entry" in dp.machine_progress(snaps[:1], picks, set())[0][0]
+    assert "%" not in dp.machine_progress(snaps[:1], picks, set())[0][0]
+    assert dp.machine_progress(snaps[:2], picks, set())[0] == ["AAAA +0.0% (day 0/5)"]
+    assert dp.machine_progress(snaps[:3], picks, set())[0] == ["AAAA +2.0% (day 1/5)"]
+    assert dp.machine_progress(snaps[:6], picks, set())[0] == ["AAAA +8.0% (day 4/5)"]
+    running, finished = dp.machine_progress(snaps[:7], picks, set())
+    assert not running and len(finished) == 1
+    lines, result = finished[0]
+    assert result["started"] == snaps[0].date
+    assert result["start_snapshot"] == snaps[1].date and result["end_snapshot"] == snaps[6].date
+    assert result["start_price"] == 1200 and result["end_price"] == 1320
+    assert result["days"] == 5 and result["timing"] == dp.MACHINE_TIMING
+    assert "Entry: Mon 14 Sep close; exit: Mon 21 Sep close" in "\n".join(lines)
+    ret, excess = dp.forward_excess(snaps[:7], 0, "AAAA")
+    assert abs(ret - 0.10) < 1e-12 and abs(excess - 0.05) < 1e-12
+    assert result["ret"] == ret and result["ret"] - result["market_ret"] == excess
+    learned = dp.learn_weights(snaps[:7])["broad_buying"]
+    assert learned["sessions"] == 1 and abs(learned["avg_excess_pct"] - excess * 100) < 1e-12
+    assert result["facts"]["bandar_days"] == 5
+    # Late reporting pins the original exit, never the newest close.
+    assert dp.machine_progress(snaps, picks, set())[1][0][1] == result
+    later_gap = snaps[:-1] + [snaps[-1]._replace(gap_before=True)]
+    assert dp.machine_progress(later_gap, picks, set())[1][0][1] == result
+    assert dp.machine_holding(later_gap, picks, set()) == set()
+    assert dp.machine_progress(snaps, picks, {("machine", "AAAA", snaps[0].date)}) == ([], [])
+    print("  ok signal k, entry k+1, exit k+6 in live results and learning")
+
+
+def test_machine_missing_or_suspended_entry_is_never_postponed():
+    for missing in ("row", "close", "suspended"):
+        days = execution_panel()
+        if missing == "row":
+            del days[1][1]["AAAA"]
+        else:
+            days[1][1]["AAAA"]["close" if missing == "close" else "tval"] = (
+                None if missing == "close" else 0)
+        snaps = snaps_from(days)
+        picks = execution_pick(snaps)
+        for n in (2, 3, 6):
+            running, finished = dp.machine_progress(snaps[:n], picks, set())
+            assert "n/a" in running[0] and "%" not in running[0] and not finished
+        lines, result = dp.machine_progress(snaps, picks, set())[1][0]
+        assert "no trading on the first day" in lines[0]
+        assert result["start_snapshot"] == snaps[1].date and result["end_snapshot"] == snaps[6].date
+        assert result["ret"] is None and result["market_ret"] is None
+        assert dp.forward_excess(snaps, 0, "AAAA") is None
+        assert dp.learn_weights(snaps[:7])["broad_buying"]["sessions"] == 0
+    print("  ok unavailable entry never moves to a later price")
+
+
+def test_machine_missing_or_suspended_exit_is_never_postponed():
+    for missing in ("row", "close", "suspended"):
+        days = execution_panel()
+        if missing == "row":
+            del days[6][1]["AAAA"]
+        else:
+            days[6][1]["AAAA"]["close" if missing == "close" else "tval"] = (
+                None if missing == "close" else 0)
+        snaps = snaps_from(days)
+        lines, result = dp.machine_progress(snaps, execution_pick(snaps), set())[1][0]
+        assert "no trading on the last day" in lines[0]
+        assert result["ret"] is None and result["market_ret"] is None
+        assert result["end_snapshot"] == snaps[6].date
+        assert dp.forward_excess(snaps, 0, "AAAA") is None
+        assert dp.learn_weights(snaps[:7])["broad_buying"]["sessions"] == 0
+    print("  ok unavailable exit never moves to the recovery session")
+
+
+def test_machine_suspended_intermediate_session_does_not_shift_the_clock():
+    days = execution_panel()
+    days[3][1]["AAAA"] = row(close=1224, tval=0)
+    snaps = snaps_from(days)
+    picks = execution_pick(snaps)
+    assert dp.machine_progress(snaps[:4], picks, set())[0] == ["AAAA n/a (day 2/5)"]
+    assert dp.machine_progress(snaps[:5], picks, set())[0] == ["AAAA +6.0% (day 3/5)"]
+    result = dp.machine_progress(snaps[:7], picks, set())[1][0][1]
+    assert abs(result["ret"] - 0.10) < 1e-12
+    assert result["ret"] == dp.forward_excess(snaps, 0, "AAAA")[0]
+    print("  ok holding clock counts market sessions through a stock suspension")
+
+
+def test_machine_copy_sessions_do_not_advance_entry_or_holding():
+    days = execution_panel()
+    # Sunday/Monday both repeat Friday. Thursday's session is a holiday,
+    # captured as a copy on Friday, shifting real closes thereafter by a day.
+    raw = days[:1] + [(d, days[0][1]) for d in ("2026-09-13", "2026-09-14")]
+    raw += days[1:4] + [("2026-09-18", days[3][1])]
+    raw += [(d, rows) for d, (_, rows) in zip(
+        ("2026-09-19", "2026-09-22", "2026-09-23", "2026-09-24"), days[4:])]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "copies.db")
+        make_db(path, raw)
+        with closing(sqlite3.connect(path)) as conn:
+            snaps = dp.load_snapshots(conn)
+    assert len(snaps) == 8 and not any(s.gap_before for s in snaps)
+    picks = execution_pick(snaps)
+    assert dp.machine_progress(snaps[:1], picks, set())[1] == []
+    assert dp.machine_progress(snaps[:2], picks, set())[0] == ["AAAA +0.0% (day 0/5)"]
+    lines, result = dp.machine_progress(snaps, picks, set())[1][0]
+    assert result["start_snapshot"] == "2026-09-15" and result["end_snapshot"] == "2026-09-23"
+    assert "Entry: Mon 14 Sep close; exit: Tue 22 Sep close" in "\n".join(lines)
+    assert result["ret"] == dp.forward_excess(snaps, 0, "AAAA")[0]
+    print("  ok weekend and holiday copies do not consume holding sessions")
+
+
+def test_machine_missing_market_session_quarantines_timing_and_holding():
+    # Missing entry, intermediate or exit capture: never use a later stored
+    # snapshot as if it were the scheduled session. Backfills can repair it.
+    for missing in (1, 3, 6):
+        days = execution_panel()
+        del days[missing]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "gap.db")
+            make_db(path, days)
+            with closing(sqlite3.connect(path)) as conn:
+                snaps = dp.load_snapshots(conn)
+        assert any(s.gap_before for s in snaps)
+        picks = execution_pick(snaps)
+        running, finished = dp.machine_progress(snaps, picks, set())
+        assert not finished and "%" not in running[0] and "timing unavailable" in running[0]
+        assert dp.forward_excess(snaps, 0, "AAAA") is None
+        assert dp.learn_weights(snaps)["broad_buying"]["sessions"] == 0
+        assert dp.machine_holding(snaps, picks, set()) == {"AAAA"}
+    repaired = snaps_from(execution_panel())
+    assert dp.machine_progress(repaired, execution_pick(repaired), set())[1]
+    assert dp.machine_holding(repaired, execution_pick(repaired), set()) == set()
+    print("  ok unresolved market gaps block results and duplicate positions")
+
+
+def test_machine_entry_waits_through_a_holiday_copy():
+    days = execution_panel()
+    raw = [(d, days[0][1]) for d in ("2026-09-12", "2026-09-13", "2026-09-14", "2026-09-15")]
+    with tempfile.TemporaryDirectory() as tmp:
+        for entered in (False, True):
+            path = os.path.join(tmp, f"entry-{entered}.db")
+            make_db(path, raw + ([("2026-09-16", days[1][1])] if entered else []))
+            with closing(sqlite3.connect(path)) as conn:
+                snaps = dp.load_snapshots(conn)
+            assert not any(s.gap_before for s in snaps)
+            running, finished = dp.machine_progress(snaps, execution_pick(snaps), set())
+            assert not finished and dp.machine_holding(snaps, execution_pick(snaps), set()) == {"AAAA"}
+            if entered:
+                assert running == ["AAAA +0.0% (day 0/5)"]
+                assert dp.session_label(snaps[1].date) == "Tue 15 Sep"
+            else:
+                assert "pending entry" in running[0] and "%" not in running[0]
+    print("  ok a holiday before entry cannot create a tradable close")
+
+
+def test_machine_missing_signal_snapshot_reserves_the_ticker():
+    snaps = snaps_from(execution_panel())
+    picks = execution_pick(snaps)
+    running, finished = dp.machine_progress(snaps[1:], picks, set())
+    assert not finished and running == ["AAAA n/a (signal snapshot unavailable)"]
+    assert dp.machine_holding(snaps[1:], picks, set()) == {"AAAA"}
+    print("  ok missing signal cannot silently free a held ticker")
+
+
+def test_machine_price_break_checks_only_the_executed_window():
+    for split_at_entry in (True, False):
+        days = execution_panel()
+        for _, rows in days[1 if split_at_entry else 3:]:
+            rows["AAAA"]["close"] /= 5
+        snaps = snaps_from(days)
+        result = dp.machine_progress(snaps, execution_pick(snaps), set())[1][0][1]
+        outcome = dp.forward_excess(snaps, 0, "AAAA")
+        if split_at_entry:
+            assert result["ret"] == outcome[0] and abs(result["ret"] - 0.10) < 1e-12
+        else:
+            assert result["ret"] is None and outcome is None
+            assert "n/a" in dp.machine_progress(snaps[:4], execution_pick(snaps), set())[0][0]
+    print("  ok corporate-action comparability agrees with learning")
+
+
+def test_machine_legacy_migration_preserves_rows_and_their_original_clock():
+    snaps = snaps_from(execution_panel())
+    conn = sqlite3.connect(":memory:")
+    for statement in dp.SCHEMA:                 # exact pre-versioning schema
+        conn.execute(statement)
+    conn.execute("INSERT INTO picks VALUES (?, 'AAAA', 1, 3, 'broad_buying', 'old', 1000, 'old')",
+                 (snaps[0].date,))
+    conn.execute("INSERT INTO pick_results VALUES "
+                 "('machine', 'OLD', 'old', 5, '', 'broad_buying', 'old', 'end', "
+                 "1000, 900, -0.1, 0, 0, 0, 1, -0.1, 'historical', 'old')")
+    old_pick = conn.execute("SELECT * FROM picks").fetchone()
+    old_result = conn.execute("SELECT * FROM pick_results").fetchone()
+    dp.ensure_schema(conn)
+    dp.ensure_schema(conn)                     # migration is idempotent
+    assert conn.execute("SELECT * FROM picks").fetchone() == (*old_pick, dp.LEGACY_MACHINE_TIMING)
+    assert conn.execute("SELECT * FROM pick_results").fetchone() == (*old_result, dp.LEGACY_MACHINE_TIMING)
+    picks = conn.execute("SELECT snapshot_date, ticker, tags, timing FROM picks").fetchall()
+    running, finished = dp.machine_progress(snaps[:2], picks, set())
+    assert running == ["AAAA legacy signal-close +20.0% (day 1/5)"] and not finished
+    assert dp.machine_holding(snaps[:5], picks, set()) == {"AAAA"}
+    assert dp.machine_holding(snaps[:6], picks, set()) == set()
+    lines, result = dp.machine_progress(snaps[:6], picks, set())[1][0]
+    assert "legacy signal-close" in lines[0]
+    assert result["start_snapshot"] == snaps[0].date and result["end_snapshot"] == snaps[5].date
+    assert abs(result["ret"] - 0.296) < 1e-12
+    dp.record_results(conn, [result], utc_at_myt("2026-09-21"))
+    dp.record_results(conn, [dict(result, ret=99)], utc_at_myt("2026-09-22"))
+    assert conn.execute("SELECT ret FROM pick_results WHERE ticker='AAAA'").fetchone()[0] == result["ret"]
+    assert conn.execute("SELECT * FROM pick_results WHERE ticker='OLD'").fetchone() == (
+        *old_result, dp.LEGACY_MACHINE_TIMING)
+    conn.close()
+    print("  ok legacy rows and finished history retain their original interpretation")
+
+
+def test_machine_scoreboard_separates_legacy_from_executable_results():
+    snaps = snaps_from(execution_panel())
+    conn = sqlite3.connect(":memory:")
+    dp.ensure_schema(conn)
+    new = dp.machine_progress(snaps, execution_pick(snaps), set())[1][0][1]
+    old = dict(new, ticker="OLD", timing=dp.LEGACY_MACHINE_TIMING, ret=-0.10)
+    unscored = dict(new, ticker="MISSING", ret=None, market_ret=None)
+    dp.record_results(conn, [new, old, unscored], utc_at_myt("2026-09-22"))
+    text = dp.format_scoreboard(snaps, conn, dp.learn_weights(snaps), {})
+    assert "Machine (next-session close): 1 finished, 1 won, +5.0%" in text, text
+    assert "Machine legacy/unversioned (signal-close history): 1 finished, 0 won" in text
+    assert "Started with 'Clean score +3 or more': 1 of 1 won" in text
+    assert "1 finished picks excluding legacy machine history" in text
+    conn.close()
+    print("  ok weekly machine comparisons never pool the two timing definitions")
+
+
+def test_machine_morning_persists_signal_and_entry_separately_and_retries_finish():
+    days = execution_panel()
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days[:1])
+        # Make the Friday signal pass three unchanged production checks.
+        days[0][1]["AAAA"]["tval"] = 20
+        prior = [("2026-09-09", {"AAAA": row(990), "BBBB": row(1000, cs=0)}),
+                 ("2026-09-10", {"AAAA": row(995), "BBBB": row(1000, cs=0)}),
+                 ("2026-09-11", {"AAAA": row(998), "BBBB": row(1000, cs=0)})]
+        def advance(n, send):
+            env["neobdm_db"] = os.path.join(tmp, f"n{n}.db")
+            if not os.path.exists(env["neobdm_db"]):
+                make_db(env["neobdm_db"], prior + days[:n])
+            today = date.fromisoformat(days[n - 1][0])
+            while today.weekday() >= 5:
+                today += timedelta(days=1)
+            return dp.run_morning(utc_at_myt(today.isoformat()), send, **env)
+        status, text = advance(1, lambda _: True)
+        assert status == "sent" and "1. AAAA  Rp 1,000 (signal close)" in text
+        assert "Entry pending" in text
+        with closing(sqlite3.connect(env["picks_db"])) as conn:
+            assert conn.execute("SELECT snapshot_date, close, timing FROM picks WHERE ticker='AAAA'").fetchone() == (
+                days[0][0], 1000, dp.MACHINE_TIMING)
+            assert conn.execute("SELECT count(*) FROM pick_results").fetchone()[0] == 0
+        assert "AAAA +0.0% (day 0/5)" in advance(2, lambda _: True)[1]
+        assert "AAAA +8.0% (day 4/5)" in advance(6, lambda _: True)[1]
+        assert advance(7, lambda _: False)[0] == "send_failed"
+        with closing(sqlite3.connect(env["picks_db"])) as conn:
+            assert conn.execute("SELECT count(*) FROM pick_results").fetchone()[0] == 0
+        assert advance(7, lambda _: True)[0] == "sent"
+        assert advance(7, lambda _: True)[0] == "already_sent"
+        with closing(sqlite3.connect(env["picks_db"])) as conn:
+            result = conn.execute("SELECT started, start_snapshot, end_snapshot, start_price, "
+                                  "end_price, timing FROM pick_results WHERE ticker='AAAA'").fetchone()
+            assert result == (days[0][0], days[1][0], days[6][0], 1200, 1320, dp.MACHINE_TIMING)
+    print("  ok morning storage, pending entry, finished anchors and failed-send rollback")
+
+
+def test_machine_unsent_stale_snapshot_cannot_create_a_pick():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, panel(4, start="2026-09-07"))
+        status, text = dp.run_morning(utc_at_myt("2026-09-14"), lambda _: True, **env)
+        assert status == "stale" and "no new picks today" in text
+        with closing(sqlite3.connect(env["picks_db"])) as conn:
+            assert conn.execute("SELECT count(*) FROM picks").fetchone()[0] == 0
+    print("  ok unsent alone is not proof of current signal data")
 
 
 # ── sending ────────────────────────────────────────────────────────────────
