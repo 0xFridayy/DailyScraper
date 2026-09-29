@@ -960,24 +960,65 @@ def parse_stalker_table(page, side="dist"):
     return data
 
 
+# Strict refresh contract. No authoritative submit response is documented for
+# this page: other NeoBDM pages are django_plotly_dash apps whose callbacks POST
+# to .../_dash-update-component, but this page's app path and callback output
+# have never been captured, so no request is waited on. Instead the side table
+# must observably change after the submit click and then settle; a table that
+# is identical to the pre-submit one, or never settles, fails the scan. A false
+# SOURCE_UNAVAILABLE is preferred to presenting an old table as current.
+STALKER_REFRESH_TIMEOUT_MS = 15000
+STALKER_REFRESH_POLL_MS = 500
+
+
+def _stalker_table_state(page, side):
+    """Fingerprint of the side container: its inner HTML, or None if absent."""
+    el = page.query_selector(SIDE_CONTAINER[side])
+    return None if el is None else el.inner_html()
+
+
+def _wait_for_stalker_refresh(page, side, before, timeout_ms=STALKER_REFRESH_TIMEOUT_MS,
+                              poll_ms=STALKER_REFRESH_POLL_MS):
+    """Return once the `side` container holds a table that differs from `before`
+    (its pre-submit fingerprint) and is unchanged across two polls. Raises if
+    that is not seen within `timeout_ms` (counted in poll steps)."""
+    last, waited = None, 0
+    while waited < timeout_ms:
+        page.wait_for_timeout(poll_ms)
+        waited += poll_ms
+        now = _stalker_table_state(page, side)
+        if now is not None and now != before and "<table" in now.lower() and now == last:
+            return
+        last = now
+    raise RuntimeError(f"{side} table did not refresh within {timeout_ms // 1000}s of submit "
+                       f"(pre-submit table {'present' if before else 'absent'}; "
+                       f"no changed, settled table observed)")
+
+
 def get_netflow(page, codes, duration="Today", side="dist", strict=False):
     """symbol -> row of the broker_stalker `side` table for `codes` over `duration`.
 
     strict=False is the broker_flow path and is unchanged: a failed duration
-    switch or submit click is logged and ignored, and a failed table parse
-    returns {}. strict=True (Broker Stalker) raises on each of those instead,
-    so a technical failure can never be read as an empty table."""
+    switch or submit click is logged and ignored, a fixed 4s wait follows the
+    submit, and a failed table parse returns {}. strict=True (Broker Stalker)
+    raises on each of those instead, and replaces the fixed wait with the
+    refresh contract above, so neither a technical failure nor a table left
+    over from before the submit can be read as this query's result."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
     set_duration(page, duration, strict=strict)
+    before = _stalker_table_state(page, side) if strict else None
     try:
         page.click("#submit-button", timeout=5000)
     except Exception as e:
         log.warning(f"Could not click #submit-button: {e}")
         if strict:
             raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
-    page.wait_for_timeout(4000)
+    if strict:
+        _wait_for_stalker_refresh(page, side, before)
+    else:
+        page.wait_for_timeout(4000)
     try:
         rows = parse_stalker_table(page, side)
     except Exception as e:
@@ -1494,40 +1535,49 @@ def _dashboard_lines(data, in_window=True):
     return lines
 
 
-def _session_close_label(capture_day):
-    """The session a pre-open capture on `capture_day` holds: the previous
-    weekday. Same rule as daily_picks.session_label (parity is tested), kept
-    local so the scraper does not import the picks layer."""
-    d = capture_day - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return f"{d:%a} {d.day} {d:%b}"
+def report_is_pre_open(scrape_started_at, report_sources_completed_at):
+    """May the report claim the pre-open basis (the latest completed session)?
+    Only if every source it shows was read inside the safe morning window: the
+    scrape started AND the last report source finished before IDX open, on the
+    same day. A run that starts at 09:59 and finishes at 10:01 may have read
+    live-session data, so it is unverified."""
+    return (date_offset_holds(scrape_started_at)
+            and date_offset_holds(report_sources_completed_at)
+            and scrape_started_at.date() == report_sources_completed_at.date())
 
 
-def _basis_lines(captured_at, in_window):
-    """Header lines stating when the scrape ran and what session it describes.
-    `captured_at` is the run's capture time (MYT), taken once at the start of
-    run_all_jobs; `in_window` is date_offset_holds() for that same time."""
-    lines = [f"🕗 Captured {captured_at.strftime('%d %b %Y, %I:%M %p')} MYT"]
-    if in_window:
-        lines.append(f"📅 Basis: session close {_session_close_label(captured_at.date())} "
-                     f"(pre-open capture)")
+def _scrape_span(started, completed):
+    if started.date() == completed.date():
+        return f"{started:%d %b %Y, %I:%M %p} – {completed:%I:%M %p} MYT"
+    return f"{started:%d %b %Y, %I:%M %p} – {completed:%d %b %Y, %I:%M %p} MYT"
+
+
+def _basis_lines(scrape_started_at, report_sources_completed_at):
+    """Header lines stating when the report's sources were read and what session
+    they describe. No trading date is named: nothing NeoBDM returns here says
+    which session it served, and the previous weekday can be a holiday."""
+    lines = [f"🕗 Scraped {_scrape_span(scrape_started_at, report_sources_completed_at)}"]
+    if report_is_pre_open(scrape_started_at, report_sources_completed_at):
+        lines.append("📅 Basis: latest completed session served by NeoBDM (pre-open capture)")
     else:
-        lines.append(f"⚠️ Captured after the safe morning window (after IDX open, "
-                     f"{IDX_OPEN_HOUR_LOCAL:02d}:00 MYT): session UNVERIFIED — may be "
-                     f"intraday or today's close. Not an EOD report.")
+        lines.append(f"⚠️ Scrape ran (at least partly) after the safe morning window, after "
+                     f"IDX open ({IDX_OPEN_HOUR_LOCAL:02d}:00 MYT): session UNVERIFIED — may be "
+                     f"intraday or today's close; not a closing-session report.")
     return lines
 
 
-def format_combined_message(ms_data, dash_data, bs_data, captured_at, in_window):
-    """All sections in ONE Telegram message, headed by the run's capture time and
-    session basis. Off-window, no section claims EOD/Daily data."""
-    lines = ["📈 NeoBDM Daily Signal"]
-    lines += _basis_lines(captured_at, in_window)
+def format_combined_message(ms_data, dash_data, bs_data, scrape_started_at,
+                            report_sources_completed_at):
+    """All sections in ONE Telegram message, headed by when the report's sources
+    were read and the session basis that timing supports. Unless the whole read
+    was pre-open, nothing in the message claims a Daily/EOD/current session."""
+    pre_open = report_is_pre_open(scrape_started_at, report_sources_completed_at)
+    lines = ["📈 NeoBDM Daily Signal" if pre_open else "📈 NeoBDM Signal — Session Unverified"]
+    lines += _basis_lines(scrape_started_at, report_sources_completed_at)
     lines.append("═════════════════════")
-    lines += _market_summary_lines(ms_data, in_window)
+    lines += _market_summary_lines(ms_data, pre_open)
     lines.append("─────────────────────")
-    lines += _dashboard_lines(dash_data, in_window)
+    lines += _dashboard_lines(dash_data, pre_open)
     lines.append("─────────────────────")
     lines += _broker_stalker_lines(bs_data)
     lines.append("═════════════════════")
@@ -1555,11 +1605,12 @@ def send_telegram(message):
 
 def run_all_jobs():
     log.info("=== Daily job starting ===")
-    # One capture time for the whole report, taken before scraping starts: the
-    # header must describe when the data was read, not when the message is sent.
-    # The window is the same pre-open rule _offset_safe applies to persistence.
-    captured_at = datetime.now(pytz.timezone(TIMEZONE))
-    in_window = date_offset_holds(captured_at)
+    # The report's basis is when its sources were read, not when it is sent: from
+    # before scraping starts until the last report source (Broker Stalker) is
+    # done. broker_flow persistence runs later and feeds no report section, so
+    # it cannot move the basis. report_is_pre_open() applies the same pre-open
+    # rule _offset_safe uses for persistence, to BOTH ends.
+    scrape_started_at = datetime.now(pytz.timezone(TIMEZONE))
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, slow_mo=300)
@@ -1579,6 +1630,7 @@ def run_all_jobs():
             ms_data = scrape_market_summary(page, capture)
             dash_data = scrape_dashboard_presets(page, capture.get("rows"), capture.get("capture_id"))
             bs_data = scrape_broker_stalker(page)
+            report_sources_completed_at = datetime.now(pytz.timezone(TIMEZONE))
 
             backfill_progress = None
             try:
@@ -1599,7 +1651,8 @@ def run_all_jobs():
 
             browser.close()
 
-        message = format_combined_message(ms_data, dash_data, bs_data, captured_at, in_window)
+        message = format_combined_message(ms_data, dash_data, bs_data,
+                                          scrape_started_at, report_sources_completed_at)
         if backfill_progress:
             message = f"{message}\n\n{backfill_progress}"
         send_telegram(message)

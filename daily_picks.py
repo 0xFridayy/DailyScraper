@@ -1088,6 +1088,8 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
 
     Sends nothing on weekends, and at most one message per trading session
     (so the morning after a holiday, which has no new data, stays quiet).
+    With no fresh data it sends a stale warning instead: "stale" once that is
+    delivered, "stale_send_failed" (nothing recorded) when the send fails.
     preview=True ignores those checks and writes/sends nothing.
     """
     local = now_utc.astimezone(MYT)
@@ -1118,9 +1120,12 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 return "stale_already_warned", None
             text = ("⚠️ No fresh NeoBDM data this morning (the scrape ran late or "
                     "failed), so no new picks today.")
-            if send(text):
-                record_sent(conn, "stale", today.isoformat(), text, now_utc)
-                conn.commit()
+            if not send(text):
+                # Not recorded, and not "stale": the caller must know the
+                # warning never went out (it retries this text, never raw data).
+                return "stale_send_failed", text
+            record_sent(conn, "stale", today.isoformat(), text, now_utc)
+            conn.commit()
             return "stale", text
         if not snaps:
             return "no_data", None

@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -618,6 +619,9 @@ class FakeCell:
     def inner_text(self):
         return self.text
 
+    def inner_html(self):
+        return self.text
+
 
 class FakeTr:
     def __init__(self, cells):
@@ -628,19 +632,31 @@ class FakeTr:
         return FakeCell(self.cells[col]) if col in self.cells else None
 
 
+OLD_TABLE = "<table><tr><td>left over from before the submit</td></tr></table>"
+
+
 class FakeStalkerPage:
     """Just enough of the broker_stalker DOM for get_netflow. `fail` names the
-    one step that raises: "duration", "submit" or "parse"."""
-    def __init__(self, rows=(), fail=None):
+    one step that raises: "duration", "submit" or "parse".
+
+    The side container's HTML is `before` (None = no container) until the
+    submit click; `lag` polls later it becomes `after` (default: a fresh table
+    for `rows`). after=before models a submit that never refreshes the table."""
+    def __init__(self, rows=(), fail=None, before=None, after="fresh", lag=1):
         self.rows, self.fail = list(rows), fail
+        self.before = before
+        self.after = f"<table><tr><td>{len(self.rows)} fresh rows</td></tr></table>" if after == "fresh" else after
+        self.lag = lag
         self.keyboard = self
-        self.gotos = []
+        self.gotos, self.waits = [], []
+        self.fingerprints = 0
+        self.submitted_at = None     # len(self.waits) when submit was clicked
 
     def goto(self, url, **kw):
         self.gotos.append(url)
 
     def wait_for_timeout(self, ms):
-        pass
+        self.waits.append(ms)
 
     def type(self, text):
         pass
@@ -649,8 +665,16 @@ class FakeStalkerPage:
         pass
 
     def click(self, sel, timeout=None):
-        if sel == "#submit-button" and self.fail == "submit":
-            raise TimeoutError("page.click: Timeout 5000ms exceeded waiting for #submit-button")
+        if sel == "#submit-button":
+            if self.fail == "submit":
+                raise TimeoutError("page.click: Timeout 5000ms exceeded waiting for #submit-button")
+            self.submitted_at = len(self.waits)
+
+    def query_selector(self, sel):
+        self.fingerprints += 1
+        refreshed = self.submitted_at is not None and len(self.waits) - self.submitted_at >= self.lag
+        html = self.after if refreshed else self.before
+        return None if html is None else FakeCell(html)
 
     def locator(self, sel):
         page = self
@@ -747,6 +771,49 @@ def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
     assert ns._broker_stalker_lines(got) == ns._broker_stalker_lines(list(got.hits))
 
 
+@pytest.mark.parametrize("before, after", [(OLD_TABLE, OLD_TABLE),                 # never refreshes
+                                           (None, None),                           # table never appears
+                                           (OLD_TABLE, "<div>Loading...</div>")])  # never settles on a table
+def test_strict_scan_rejects_a_table_the_submit_never_refreshed(before, after):
+    page = FakeStalkerPage(SELL_ROWS, before=before, after=after)
+    with pytest.raises(RuntimeError, match="did not refresh"):
+        ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
+    got = ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, before=before, after=after))
+    assert got.status == nsc.SOURCE_UNAVAILABLE and got.hits == []
+    assert "dist table did not refresh within 15s of submit" in got.detail
+    assert "AAAA" not in stalker_text(got)                  # the old rows are never shown
+
+
+@pytest.mark.parametrize("before, lag", [(None, 1), (OLD_TABLE, 1), (OLD_TABLE, 6)])
+def test_strict_scan_accepts_a_proven_refresh(before, lag):
+    page = FakeStalkerPage(SELL_ROWS, before=before, lag=lag)
+    got = ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
+    assert sum(page.waits[page.submitted_at:]) <= ns.STALKER_REFRESH_TIMEOUT_MS
+    assert ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, before=before, lag=lag)).status == nsc.HITS
+
+
+def test_strict_refresh_fingerprint_is_taken_after_the_inputs_and_before_submit():
+    # A table that changed while chips/duration were set but not after the submit
+    # is still a pre-submit table: the fingerprint is taken right before the click.
+    page = FakeStalkerPage(SELL_ROWS, before=OLD_TABLE, after=OLD_TABLE)
+    real = page.query_selector
+    seen = []
+    page.query_selector = lambda sel: seen.append(page.submitted_at) or real(sel)
+    with pytest.raises(RuntimeError):
+        ns.get_netflow(page, ["XL", "XC"], "Today", side="dist", strict=True)
+    assert seen[0] is None and all(s is not None for s in seen[1:])
+
+
+@pytest.mark.parametrize("before, after", [(OLD_TABLE, OLD_TABLE), (None, "fresh")])
+def test_legacy_netflow_is_unchanged_by_the_refresh_contract(before, after):
+    page = FakeStalkerPage(SELL_ROWS, before=before, after=after)
+    got = ns.get_netflow(page, ["XL"], "Today", side="dist")
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]          # no refresh check, as before
+    assert page.fingerprints == 0
+    assert page.waits[page.submitted_at:] == [4000]         # the fixed post-submit wait
+
+
 @pytest.mark.parametrize("fail", ["duration", "submit"])
 def test_legacy_netflow_still_swallows_duration_and_submit_failures(fail):
     got = ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist")
@@ -823,72 +890,124 @@ def myt(*args):
     return pytz.timezone(ns.TIMEZONE).localize(dt.datetime(*args))
 
 
-def report(captured_at, in_window):
-    ms = nsc.SignalResult("top_akum_bandar", nsc.NO_HITS, [])
-    dash = [("Foreign", "f", nsc.SignalResult("dashboard_Foreign", nsc.HITS, [{"tick": "ABCD", "tx": "1.0%"}]))]
-    bs = nsc.SignalResult("broker_stalker", nsc.EMPTY_UNVERIFIED, [], "dist table parsed with no rows")
-    return ns.format_combined_message(ms, dash, bs, captured_at, in_window)
+PRE_OPEN_BASIS = "📅 Basis: latest completed session served by NeoBDM (pre-open capture)"
+WEEKDAY_OR_DATE = re.compile(r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\b|\d")
 
 
-def test_in_window_report_states_the_capture_time_and_session_close_basis():
-    text = report(myt(2026, 9, 29, 7, 2), True)            # Tuesday, pre-open
-    assert "🕗 Captured 29 Sep 2026, 07:02 AM MYT" in text
-    assert "📅 Basis: session close Mon 28 Sep (pre-open capture)" in text
+def report(started, completed, ms=None, bs=None):
+    ms = ms or nsc.SignalResult("top_akum_bandar", nsc.NO_HITS, [])
+    dash = [("Bandarmologi", "b", nsc.SignalResult("dashboard_Bandarmologi", nsc.HITS, [{"tick": "ABCD", "tx": "1.0%"}])),
+            ("NonRetail", "n", nsc.SignalResult("dashboard_NonRetail", nsc.EMPTY_UNVERIFIED, [], "")),
+            ("Foreign", "f", nsc.SignalResult("dashboard_Foreign", nsc.SOURCE_UNAVAILABLE, [], "request failed: x"))]
+    bs = bs or nsc.SignalResult("broker_stalker", nsc.EMPTY_UNVERIFIED, [], "dist table parsed with no rows")
+    return ns.format_combined_message(ms, dash, bs, started, completed)
+
+
+def test_pre_open_report_states_the_scrape_span_and_the_latest_completed_session_basis():
+    text = report(myt(2026, 9, 29, 7, 2), myt(2026, 9, 29, 7, 14))      # Tuesday, all pre-open
+    lines = text.splitlines()
+    assert lines[0] == "📈 NeoBDM Daily Signal"
+    assert lines[1] == "🕗 Scraped 29 Sep 2026, 07:02 AM – 07:14 AM MYT"
+    assert lines[2] == PRE_OPEN_BASIS
     assert "(Daily)" in text and "(EOD)" in text
     assert "UNVERIFIED" not in text
-    monday = report(myt(2026, 9, 28, 7, 0), True)
-    assert "session close Fri 25 Sep" in monday
 
 
-def test_off_window_report_says_the_session_is_unverified_and_claims_no_eod():
-    text = report(myt(2026, 9, 29, 14, 15), False)
-    assert "🕗 Captured 29 Sep 2026, 02:15 PM MYT" in text
-    assert "after the safe morning window" in text and "after IDX open" in text
-    assert "session UNVERIFIED" in text and "Not an EOD report" in text
-    for claim in ("(EOD)", "(Daily)", "Basis: session close", "candidates today", "hari ini"):
-        assert claim not in text, claim
+def test_the_basis_never_names_a_session_weekday_or_date():
+    # The previous weekday can be an IDX holiday; nothing here proves which session
+    # NeoBDM served, so the basis line names none (Monday after a Friday holiday).
+    for started, completed in ((myt(2026, 9, 29, 7, 2), myt(2026, 9, 29, 7, 14)),
+                               (myt(2026, 12, 28, 7, 0), myt(2026, 12, 28, 7, 9)),
+                               (myt(2026, 9, 29, 14, 15), myt(2026, 9, 29, 14, 30))):
+        basis = report(started, completed).splitlines()[2]
+        assert not WEEKDAY_OR_DATE.search(basis.replace(f"{ns.IDX_OPEN_HOUR_LOCAL:02d}:00", "")), basis
+        assert "session close" not in basis
+    assert not hasattr(ns, "_session_close_label")
 
 
-def test_session_close_label_matches_daily_picks_session_label():
-    import datetime as dt
-    import daily_picks
-    start = dt.date(2026, 1, 1)
-    for k in range(400):
-        d = start + dt.timedelta(days=k)
-        assert ns._session_close_label(d) == daily_picks.session_label(d.isoformat()), d
+@pytest.mark.parametrize("started, completed", [
+    ((2026, 9, 29, 9, 59), (2026, 9, 29, 10, 1)),        # crosses IDX open mid-run
+    ((2026, 9, 29, 10, 30), (2026, 9, 29, 10, 45)),      # starts after open
+    ((2026, 9, 29, 14, 15), (2026, 9, 29, 14, 30)),      # afternoon rerun
+    ((2026, 9, 28, 23, 50), (2026, 9, 29, 0, 20)),       # late-night run, crosses midnight
+    ((2026, 9, 28, 9, 30), (2026, 9, 29, 7, 0)),         # both pre-open, different days
+])
+def test_a_scrape_not_wholly_pre_open_is_session_unverified_with_no_daily_or_eod_claim(started, completed):
+    assert not ns.report_is_pre_open(myt(*started), myt(*completed))
+    for ms in (nsc.SignalResult("top_akum_bandar", nsc.NO_HITS, []),
+               nsc.SignalResult("top_akum_bandar", nsc.HITS,
+                                [{"symbol": "BBBB", "dn-0": -0.1, "price": 1, "_caution": True}]),
+               nsc.SignalResult("top_akum_bandar", nsc.RETIRED_SOURCE, [], "x")):
+        text = report(myt(*started), myt(*completed), ms=ms)
+        assert text.splitlines()[0] == "📈 NeoBDM Signal — Session Unverified"
+        assert "after the safe morning window" in text and "after IDX open" in text
+        assert "session UNVERIFIED" in text
+        assert "daily" not in text.lower() and "eod" not in text.lower(), text
+        for claim in ("Basis:", "pre-open capture", "candidates today", "hari ini"):
+            assert claim not in text, claim
 
 
-def test_report_capture_time_is_the_run_start_not_the_send_time(monkeypatch):
+def test_a_wholly_pre_open_scrape_is_verified():
+    assert ns.report_is_pre_open(myt(2026, 9, 29, 7, 0), myt(2026, 9, 29, 7, 20))
+    assert ns.report_is_pre_open(myt(2026, 9, 29, 9, 0), myt(2026, 9, 29, 9, 59))
+
+
+def run_jobs(monkeypatch, times):
+    """run_all_jobs with every source stubbed. `times` maps the step after which
+    the clock moves to that MYT time: "start" (the initial read), "stalker"
+    (Broker Stalker done) and "broker_flow" (persistence done)."""
     from unittest import mock
     import datetime as dt
-    # The first clock read is the run start (pre-open); every later read is after
-    # IDX open, as it would be for a run whose scrape or send runs long.
-    reads = []
+    clock = {"now": myt(*times["start"])}
 
     class Clock(dt.datetime):
         @classmethod
         def now(cls, tz=None):
-            reads.append(1)
-            return myt(2026, 9, 29, 7, 2) if len(reads) == 1 else myt(2026, 9, 29, 14, 40)
+            return clock["now"]
+
+    def step(name, result):
+        def run(*a, **k):
+            if name in times:
+                clock["now"] = myt(*times[name])
+            return result
+        return run
     sent = []
     monkeypatch.setattr(ns, "datetime", Clock)
     monkeypatch.setattr(ns, "sync_playwright", mock.MagicMock())
     for name, stub in {"login": lambda page: None,
-                       "scrape_market_summary": lambda page, capture: nsc.SignalResult(
-                           "top_akum_bandar", nsc.NO_HITS, []),
-                       "scrape_dashboard_presets": lambda page, rows=None, cid=None: [],
-                       "scrape_broker_stalker": lambda page: nsc.SignalResult(
-                           "broker_stalker", nsc.SOURCE_UNAVAILABLE, [], "retail net sell scan failed: x"),
-                       "save_daily_broker_flow": lambda page: None, "_offset_safe": lambda what: False,
+                       "scrape_market_summary": step("market", nsc.SignalResult("top_akum_bandar", nsc.NO_HITS, [])),
+                       "scrape_dashboard_presets": step("dashboard", []),
+                       "scrape_broker_stalker": step("stalker", nsc.SignalResult(
+                           "broker_stalker", nsc.SOURCE_UNAVAILABLE, [], "retail net sell scan failed: x")),
+                       "save_daily_broker_flow": step("broker_flow", None), "_offset_safe": lambda what: False,
                        "send_telegram": sent.append}.items():
         monkeypatch.setattr(ns, name, stub)
     ns.run_all_jobs()
     assert len(sent) == 1
-    assert "Captured 29 Sep 2026, 07:02 AM MYT" in sent[0]
-    assert "02:40 PM" not in sent[0]
-    assert "Basis: session close Mon 28 Sep" in sent[0]
-    assert "Source unavailable: retail net sell scan failed: x" in sent[0]
-    assert TOLD_NO_SELL not in sent[0]
+    return sent[0]
+
+
+def test_run_that_starts_and_finishes_its_report_sources_pre_open_is_verified(monkeypatch):
+    # broker_flow persistence finishing after open does not move the report basis.
+    text = run_jobs(monkeypatch, {"start": (2026, 9, 29, 7, 2), "stalker": (2026, 9, 29, 7, 14),
+                                  "broker_flow": (2026, 9, 29, 10, 40)})
+    assert "🕗 Scraped 29 Sep 2026, 07:02 AM – 07:14 AM MYT" in text
+    assert PRE_OPEN_BASIS in text and "10:40" not in text
+    assert "Source unavailable: retail net sell scan failed: x" in text
+    assert TOLD_NO_SELL not in text
+
+
+def test_run_crossing_idx_open_is_unverified(monkeypatch):
+    text = run_jobs(monkeypatch, {"start": (2026, 9, 29, 9, 59), "market": (2026, 9, 29, 10, 0),
+                                  "stalker": (2026, 9, 29, 10, 1)})
+    assert "🕗 Scraped 29 Sep 2026, 09:59 AM – 10:01 AM MYT" in text
+    assert "session UNVERIFIED" in text and PRE_OPEN_BASIS not in text
+    assert "daily" not in text.lower() and "eod" not in text.lower()
+
+
+def test_run_starting_after_idx_open_is_unverified(monkeypatch):
+    text = run_jobs(monkeypatch, {"start": (2026, 9, 29, 10, 5), "stalker": (2026, 9, 29, 10, 20)})
+    assert "session UNVERIFIED" in text and PRE_OPEN_BASIS not in text
 
 
 # ── integrity checker ─────────────────────────

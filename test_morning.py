@@ -52,11 +52,14 @@ RAW = "📈 NeoBDM Daily Signal\nraw report body"
 STALE_WARNING = "⚠️ No fresh NeoBDM data this morning (the scrape ran late or failed), so no new picks today."
 
 
-def run(status=None, raises=None, scrape_messages=(RAW,), picks_sent=None):
+def run(status=None, raises=None, scrape_messages=(RAW,), picks_sent=None, picks_results=()):
     """Run morning.main() with the scrape and daily_picks faked. Returns every
-    message that reached the real Telegram sender, in order."""
+    message that reached the real Telegram sender, in order. `picks_results`
+    scripts the picks sender's successive outcomes (True/False, or an
+    exception to raise); once exhausted it succeeds."""
     sent = []
     picks_sent = [] if picks_sent is None else picks_sent
+    outcomes = list(picks_results)
 
     def fake_run_all_jobs():
         for m in scrape_messages:
@@ -65,13 +68,17 @@ def run(status=None, raises=None, scrape_messages=(RAW,), picks_sent=None):
     def fake_run_morning(now_utc, send):
         if raises is not None:
             raise raises
-        if status == "stale":
+        if status in ("stale", "stale_send_failed"):
             send(STALE_WARNING)
+            return status, STALE_WARNING
         return status, None
 
     def picks_send(text):
         picks_sent.append(text)
-        return True
+        outcome = outcomes.pop(0) if outcomes else True
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     fake_picks = types.ModuleType("daily_picks")
     fake_picks.run_morning = fake_run_morning
@@ -98,6 +105,27 @@ def test_stale_sends_only_the_stale_warning_never_the_held_raw_report():
     assert picks_sent == [STALE_WARNING], picks_sent
 
 
+def test_stale_send_failed_retries_only_the_stale_warning():
+    picks_sent = []
+    sent = run(status="stale_send_failed", picks_sent=picks_sent, picks_results=[False, True])
+    assert sent == [], sent                                  # never the held raw report
+    assert picks_sent == [STALE_WARNING, STALE_WARNING], picks_sent
+
+
+def test_stale_send_failed_never_sends_raw_even_when_the_retry_fails():
+    for second in (False, RuntimeError("telegram down")):
+        picks_sent = []
+        sent = run(status="stale_send_failed", picks_sent=picks_sent, picks_results=[False, second])
+        assert sent == [], (second, sent)
+        assert picks_sent == [STALE_WARNING, STALE_WARNING], picks_sent
+
+
+def test_delivered_stale_warning_is_not_retried():
+    picks_sent = []
+    assert run(status="stale", picks_sent=picks_sent) == []
+    assert picks_sent == [STALE_WARNING]
+
+
 def test_send_failed_sends_the_held_raw_report():
     assert run(status="send_failed") == [RAW]
 
@@ -111,7 +139,7 @@ def test_picks_exception_sends_the_held_raw_report_with_the_failure_suffix():
 
 
 def test_neobdm_error_passes_through_immediately():
-    for status in ("sent", "stale", "send_failed"):
+    for status in ("sent", "stale", "stale_send_failed", "send_failed"):
         sent = run(status=status, scrape_messages=("NeoBDM error: RuntimeError: x",))
         assert sent == ["NeoBDM error: RuntimeError: x"], status
 

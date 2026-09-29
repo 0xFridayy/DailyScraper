@@ -1000,6 +1000,27 @@ def test_stale_data_warns_once_and_send_failure_saves_nothing():
     print("  ok stale and failed sends")
 
 
+def test_undelivered_stale_warning_is_reported_as_such_and_not_recorded():
+    days = panel(8, start="2026-09-07")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _morning_env(tmp, days)
+        assert dp.run_morning(utc_at_myt(days[-1][0]), lambda t: True, **env)[0] == "sent"
+        later = utc_at_myt("2026-09-17")                  # no capture for this day
+        status, text = dp.run_morning(later, lambda t: False, **env)
+        assert status == "stale_send_failed", status
+        assert "No fresh NeoBDM data" in text
+        conn = sqlite3.connect(env["picks_db"])
+        recorded = conn.execute("SELECT count(*) FROM sent_messages WHERE kind='stale'").fetchone()[0]
+        conn.close()
+        assert recorded == 0, recorded
+        sent = []
+        status, text2 = dp.run_morning(later, lambda t: sent.append(t) or True, **env)
+        assert status == "stale" and sent == [text2] and text2 == text, status
+        assert dp.run_morning(later, lambda t: sent.append(t) or True, **env)[0] == "stale_already_warned"
+        assert len(sent) == 1
+    print("  ok undelivered stale warning is stale_send_failed and unrecorded")
+
+
 def test_morning_includes_follow_ups():
     days = panel(10, start="2026-09-01")
     follows = {"last_update_id": 5, "events": [
