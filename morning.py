@@ -10,7 +10,9 @@ When the picks step finds no fresh data, its stale warning is the only
 message. The held raw report is never sent then, because it would present a
 late or failed scrape as if it were a fresh report: "stale" means the warning
 went out; "stale_send_failed" means it did not, and only that warning text is
-retried, once.
+retried, once. A retry that is delivered is recorded like run_morning's own
+(daily_picks.record_stale_warning), so the next run stays quiet; a failed
+retry records nothing.
 
 Nothing here may stop the workflow's commit step: picks code is imported only
 after the scrape, every send is guarded, and the script always exits 0 (as
@@ -25,14 +27,16 @@ import neobdm_scraper as scraper
 
 
 def retry_stale_warning(send, text):
-    """One more attempt at the stale warning, through the picks sender. Never
-    substitutes the raw report; a second failure is only printed."""
+    """One more attempt at the stale warning, through the picks sender. True
+    only if it was delivered. Never substitutes the raw report; a second
+    failure is only printed."""
     try:
-        ok = send(text)
+        ok = bool(send(text))
     except Exception as e:
         print(f"stale warning retry failed: {type(e).__name__}")
-        return
+        return False
     print(f"stale warning retry: {'sent' if ok else 'failed'}")
+    return ok
 
 
 def main():
@@ -60,12 +64,19 @@ def main():
     try:
         import daily_picks
         send = daily_picks.telegram_sender_from_env()
-        status, text = daily_picks.run_morning(datetime.now(timezone.utc), send=send)
+        run_utc = datetime.now(timezone.utc)
+        status, text = daily_picks.run_morning(run_utc, send=send)
         print(f"daily picks: {status}")
         if status == "send_failed" and held:
             safe_send(held[-1])
         elif status == "stale_send_failed" and text:
-            retry_stale_warning(send, text)
+            if retry_stale_warning(send, text):
+                # Guarded here: a recording error must not reach the handler
+                # below, which would send the raw report.
+                try:
+                    daily_picks.record_stale_warning(run_utc, text, datetime.now(timezone.utc))
+                except Exception as e:
+                    print(f"stale warning record failed: {type(e).__name__}")
     except Exception as e:
         print(f"daily picks failed: {type(e).__name__}")
         if held:

@@ -1082,6 +1082,21 @@ def telegram_sender_from_env():
 
 # ── Morning run ────────────────────────────────────────────────────────────
 
+def record_stale_warning(run_utc, text, sent_utc, picks_db=PICKS_DB):
+    """Record a stale warning that was delivered outside run_morning (morning.py's
+    retry after "stale_send_failed"), exactly as run_morning records one: kind
+    "stale", key = the MYT date of the run (`run_utc`, the instant run_morning
+    was given), sent at `sent_utc`. INSERT OR IGNORE, so it is idempotent."""
+    day = run_utc.astimezone(MYT).date().isoformat()
+    conn = sqlite3.connect(picks_db)
+    try:
+        ensure_schema(conn)
+        record_sent(conn, "stale", day, text, sent_utc)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 follows_json=FOLLOWS_JSON, preview=False):
     """Build and send the morning message. Returns (status, text).

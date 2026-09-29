@@ -633,24 +633,82 @@ class FakeTr:
 
 
 OLD_TABLE = "<table><tr><td>left over from before the submit</td></tr></table>"
+DASH_URL = "https://neobdm.tech/django_plotly_dash/app/some_app/_dash-update-component"
+
+
+UNSET = object()
+
+
+class FakeDashResponse:
+    """A Playwright Response as the submit-callback predicate and
+    _submit_and_confirm_callback read it. By default: a successful callback fired
+    by the submit button that outputs to broker-dist-stalker, declared both ways
+    Dash does ("output" string and "outputs" objects). output/outputs=UNSET
+    leaves that key out of the request body."""
+    def __init__(self, changed=("submit-button.n_clicks",), status=200, method="POST", url=DASH_URL,
+                 post_data="json", body='{"multi": true, "response": {"broker-dist-stalker": {}}}',
+                 output="..broker-dist-stalker.children..",
+                 outputs=({"id": "broker-dist-stalker", "property": "children"},)):
+        if post_data == "json":
+            payload = {"changedPropIds": list(changed), "inputs": []}
+            if output is not UNSET:
+                payload["output"] = output
+            if outputs is not UNSET:
+                payload["outputs"] = list(outputs) if isinstance(outputs, tuple) else outputs
+            post_data = json.dumps(payload)
+        self.url, self.status, self._body = url, status, body
+        self.request = type("Req", (), {"method": method, "post_data": post_data})()
+
+    def text(self):
+        return self._body
+
+
+SUBMIT_OK = FakeDashResponse()
 
 
 class FakeStalkerPage:
-    """Just enough of the broker_stalker DOM for get_netflow. `fail` names the
+    """Just enough of the broker_stalker page for get_netflow. `fail` names the
     one step that raises: "duration", "submit" or "parse".
 
     The side container's HTML is `before` (None = no container) until the
     submit click; `lag` polls later it becomes `after` (default: a fresh table
-    for `rows`). after=before models a submit that never refreshes the table."""
-    def __init__(self, rows=(), fail=None, before=None, after="fresh", lag=1):
+    for `rows`). The click emits `callbacks` (default: one successful submit
+    callback), which only a response waiter armed before the click can see."""
+    def __init__(self, rows=(), fail=None, before=None, after="fresh", lag=1, callbacks=None):
         self.rows, self.fail = list(rows), fail
         self.before = before
         self.after = f"<table><tr><td>{len(self.rows)} fresh rows</td></tr></table>" if after == "fresh" else after
         self.lag = lag
+        self.callbacks = [SUBMIT_OK] if callbacks is None else list(callbacks)
         self.keyboard = self
         self.gotos, self.waits = [], []
         self.fingerprints = 0
+        self.expect_calls = 0
+        self._armed = None           # responses seen by the armed waiter, if any
         self.submitted_at = None     # len(self.waits) when submit was clicked
+
+    def expect_response(self, predicate, timeout=None):
+        self.expect_calls += 1
+        page = self
+
+        class Info:
+            value = None
+
+        class Waiter:
+            def __enter__(self):
+                page._armed = []
+                return Info
+
+            def __exit__(self, exc_type, exc, tb):
+                seen, page._armed = page._armed, None
+                if exc is not None:
+                    return False
+                match = next((r for r in seen if predicate(r)), None)
+                if match is None:
+                    raise TimeoutError(f'Timeout {timeout}ms exceeded while waiting for event "response"')
+                Info.value = match
+                return False
+        return Waiter()
 
     def goto(self, url, **kw):
         self.gotos.append(url)
@@ -669,6 +727,8 @@ class FakeStalkerPage:
             if self.fail == "submit":
                 raise TimeoutError("page.click: Timeout 5000ms exceeded waiting for #submit-button")
             self.submitted_at = len(self.waits)
+            if self._armed is not None:
+                self._armed.extend(self.callbacks)
 
     def query_selector(self, sel):
         self.fingerprints += 1
@@ -771,46 +831,181 @@ def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
     assert ns._broker_stalker_lines(got) == ns._broker_stalker_lines(list(got.hits))
 
 
-@pytest.mark.parametrize("before, after", [(OLD_TABLE, OLD_TABLE),                 # never refreshes
-                                           (None, None),                           # table never appears
-                                           (OLD_TABLE, "<div>Loading...</div>")])  # never settles on a table
-def test_strict_scan_rejects_a_table_the_submit_never_refreshed(before, after):
-    page = FakeStalkerPage(SELL_ROWS, before=before, after=after)
-    with pytest.raises(RuntimeError, match="did not refresh"):
-        ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
-    got = ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, before=before, after=after))
-    assert got.status == nsc.SOURCE_UNAVAILABLE and got.hits == []
-    assert "dist table did not refresh within 15s of submit" in got.detail
-    assert "AAAA" not in stalker_text(got)                  # the old rows are never shown
+def strict_scan(**page_kw):
+    """(get_netflow strict result or the RuntimeError it raised, the scrape's SignalResult)."""
+    try:
+        got = ns.get_netflow(FakeStalkerPage(SELL_ROWS, **page_kw), ["XL"], "Today", side="dist", strict=True)
+    except RuntimeError as e:
+        got = e
+    return got, ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, **page_kw))
 
 
-@pytest.mark.parametrize("before, lag", [(None, 1), (OLD_TABLE, 1), (OLD_TABLE, 6)])
-def test_strict_scan_accepts_a_proven_refresh(before, lag):
-    page = FakeStalkerPage(SELL_ROWS, before=before, lag=lag)
-    got = ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
+NO_SUBMIT_CALLBACK = "no submit-button.n_clicks Dash callback for broker-dist-stalker within 20s of submit"
+
+
+def test_cosmetic_dom_change_without_a_submit_callback_is_unavailable():
+    # The table visibly changes and settles, but the server never answered a
+    # submit-triggered callback: the change proves nothing.
+    for after in ("<table><tr><td>re-rendered, same old rows</td></tr></table>", "fresh"):
+        got, result = strict_scan(before=OLD_TABLE, after=after, callbacks=[])
+        assert isinstance(got, RuntimeError) and NO_SUBMIT_CALLBACK in str(got)
+        assert result.status == nsc.SOURCE_UNAVAILABLE and result.hits == []
+        assert NO_SUBMIT_CALLBACK in result.detail
+        assert "AAAA" not in stalker_text(result)            # the table's rows are never shown
+
+
+def test_confirmed_callback_with_a_byte_identical_table_is_accepted():
+    identical = "<table><tr><td>the same rows before and after</td></tr></table>"
+    got, result = strict_scan(before=identical, after=identical)
     assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
-    assert sum(page.waits[page.submitted_at:]) <= ns.STALKER_REFRESH_TIMEOUT_MS
-    assert ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, before=before, lag=lag)).status == nsc.HITS
+    assert result.status == nsc.HITS and [r["symbol"] for r in result][:2] == ["AAAA", "BBBB"]
 
 
-def test_strict_refresh_fingerprint_is_taken_after_the_inputs_and_before_submit():
-    # A table that changed while chips/duration were set but not after the submit
-    # is still a pre-submit table: the fingerprint is taken right before the click.
-    page = FakeStalkerPage(SELL_ROWS, before=OLD_TABLE, after=OLD_TABLE)
-    real = page.query_selector
-    seen = []
-    page.query_selector = lambda sel: seen.append(page.submitted_at) or real(sel)
-    with pytest.raises(RuntimeError):
-        ns.get_netflow(page, ["XL", "XC"], "Today", side="dist", strict=True)
-    assert seen[0] is None and all(s is not None for s in seen[1:])
+@pytest.mark.parametrize("status, body, reason", [
+    (500, '{"message": "Internal Server Error"}', "HTTP 500"),
+    (204, "", "HTTP 204"),                                    # Dash PreventUpdate: nothing updated
+    (403, "<html>CSRF verification failed</html>", "HTTP 403"),
+    (200, "<html>login</html>", "returned no JSON object"),
+])
+def test_non_success_submit_callback_is_unavailable(status, body, reason):
+    got, result = strict_scan(callbacks=[FakeDashResponse(status=status, body=body)])
+    assert isinstance(got, RuntimeError) and reason in str(got)
+    assert result.status == nsc.SOURCE_UNAVAILABLE and reason in result.detail
 
 
-@pytest.mark.parametrize("before, after", [(OLD_TABLE, OLD_TABLE), (None, "fresh")])
-def test_legacy_netflow_is_unchanged_by_the_refresh_contract(before, after):
-    page = FakeStalkerPage(SELL_ROWS, before=before, after=after)
+@pytest.mark.parametrize("callback", [
+    FakeDashResponse(changed=("broker.value",)),                          # chip callback
+    FakeDashResponse(changed=("duration-picker.value",)),                 # duration callback
+    FakeDashResponse(changed=()),
+    FakeDashResponse(post_data='{"output": "x"}'),                        # no changedPropIds
+    FakeDashResponse(post_data="not json"),                               # unvalidatable payload
+    FakeDashResponse(post_data=None),
+    FakeDashResponse(method="GET"),
+    FakeDashResponse(url="https://neobdm.tech/api/screeners"),            # not a Dash callback
+])
+def test_callback_not_proven_submit_triggered_is_ignored_and_the_scan_fails(callback):
+    got, result = strict_scan(before=OLD_TABLE, callbacks=[callback])
+    assert isinstance(got, RuntimeError) and NO_SUBMIT_CALLBACK in str(got)
+    assert result.status == nsc.SOURCE_UNAVAILABLE
+
+
+def test_submit_callback_among_others_is_found_and_the_table_waited_for():
+    others = [FakeDashResponse(changed=("broker.value",)), SUBMIT_OK]
+    for before, lag in ((None, 1), (None, 6), (OLD_TABLE, 6)):
+        got, result = strict_scan(before=before, lag=lag, callbacks=others)
+        assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (before, lag)
+        assert result.status == nsc.HITS
+    page = FakeStalkerPage([stalker_row("CCCC", "1,000")], lag=4)
+    assert ns.scrape_broker_stalker(page).status == nsc.EMPTY_UNVERIFIED
+    assert page.expect_calls == 1
+
+
+@pytest.mark.parametrize("after", [None, "<div>Loading...</div>"])
+def test_confirmed_callback_but_the_table_never_settles_is_unavailable(after):
+    got, result = strict_scan(before=None, after=after)
+    assert isinstance(got, RuntimeError) and "dist table not present and settled within 15s" in str(got)
+    assert result.status == nsc.SOURCE_UNAVAILABLE
+
+
+def targeting(component, prop="children"):
+    """A successful submit-triggered callback whose outputs are `component` only."""
+    return FakeDashResponse(output=f"{component}.{prop}", outputs=({"id": component, "property": prop},))
+
+
+UNRELATED = targeting("stalker-summary-text")
+
+
+def test_submit_callback_for_an_unrelated_component_is_ignored_and_the_scan_fails():
+    for callbacks in ([UNRELATED], [UNRELATED, targeting("broker-akum-stalker")]):
+        got, result = strict_scan(before=OLD_TABLE, after=OLD_TABLE, callbacks=callbacks)
+        assert isinstance(got, RuntimeError) and NO_SUBMIT_CALLBACK in str(got)
+        assert result.status == nsc.SOURCE_UNAVAILABLE and result.hits == []
+        assert "AAAA" not in stalker_text(result)             # the stale dist table is never shown
+
+
+def test_a_later_callback_that_targets_the_dist_table_is_the_one_accepted():
+    targeted = targeting("broker-dist-stalker")
+    for callbacks in ([UNRELATED, targeted], [targeting("broker-akum-stalker"), UNRELATED, targeted]):
+        got, result = strict_scan(before=None, lag=3, callbacks=callbacks)
+        assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
+        assert result.status == nsc.HITS
+
+
+def test_targeted_callback_with_a_byte_identical_table_is_accepted():
+    identical = "<table><tr><td>the same rows before and after</td></tr></table>"
+    got, result = strict_scan(before=identical, after=identical,
+                              callbacks=[UNRELATED, targeting("broker-dist-stalker", "data")])
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
+    assert result.status == nsc.HITS
+
+
+DIST = "broker-dist-stalker"
+
+
+@pytest.mark.parametrize("output, outputs", [
+    (UNSET, {"id": DIST, "property": "children"}),                                  # single object
+    (UNSET, [{"id": "x", "property": "children"}, {"id": DIST, "property": "data"}]),
+    (UNSET, [[{"id": DIST, "property": "data"}], [{"id": "x", "property": "y"}]]),    # nested lists
+    (UNSET, {"group": [{"id": "x", "property": "y"}, {"inner": {"id": DIST, "property": "data"}}]}),
+    (f"{DIST}.children", UNSET),                                                     # single-output string
+    (f"..x.children...{DIST}.data..", UNSET),                                        # multi-output string
+    (f"..x.children...{DIST}.data..", [{"id": "x", "property": "children"}]),       # either declaration
+])
+def test_output_declared_in_any_dash_payload_shape_is_accepted(output, outputs):
+    got, result = strict_scan(callbacks=[FakeDashResponse(output=output, outputs=outputs)])
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (output, outputs)
+    assert result.status == nsc.HITS
+
+
+@pytest.mark.parametrize("output, outputs", [
+    (UNSET, UNSET),                                                                  # no output declared
+    (None, None),
+    ("", []),
+    (123, {"property": "children"}),                                                # no id anywhere
+    (DIST, UNSET),                                                                   # id without a property
+    (f"{DIST}-summary.children", [{"id": f"{DIST}-summary", "property": "children"}]),  # prefix, not the id
+    (f"x-{DIST}.children", UNSET),                                                   # suffix, not the id
+    (UNSET, [{"id": {"type": DIST, "index": 0}, "property": "data"}]),               # pattern id: unproven
+    (UNSET, [{"id": "x", "property": DIST}]),                                        # named only as a value
+    ("x.children", [{"id": "x", "property": "children", "note": DIST}]),
+])
+def test_missing_or_malformed_output_target_is_rejected(output, outputs):
+    got, result = strict_scan(callbacks=[FakeDashResponse(output=output, outputs=outputs)])
+    assert isinstance(got, RuntimeError) and NO_SUBMIT_CALLBACK in str(got), (output, outputs)
+    assert result.status == nsc.SOURCE_UNAVAILABLE
+
+
+def test_a_table_named_only_as_input_or_state_is_not_a_target():
+    payload = json.dumps({"changedPropIds": ["submit-button.n_clicks"], "output": "x.children",
+                          "inputs": [{"id": DIST, "property": "data"}],
+                          "state": [{"id": DIST, "property": "data"}]})
+    got, _ = strict_scan(callbacks=[FakeDashResponse(post_data=payload)])
+    assert isinstance(got, RuntimeError) and NO_SUBMIT_CALLBACK in str(got)
+
+
+def test_each_side_accepts_only_its_own_table_callback():
+    dist, akum = targeting("broker-dist-stalker"), targeting("broker-akum-stalker")
+    for side, own, other in (("dist", dist, akum), ("akum", akum, dist)):
+        component = ns.SIDE_CONTAINER[side].lstrip("#")
+        with pytest.raises(RuntimeError, match=f"Dash callback for {component} within"):
+            ns.get_netflow(FakeStalkerPage(SELL_ROWS, callbacks=[other]), ["XL"], "Today",
+                           side=side, strict=True)
+        got = ns.get_netflow(FakeStalkerPage(SELL_ROWS, callbacks=[other, own]), ["XL"], "Today",
+                             side=side, strict=True)
+        assert sorted(got) == ["AAAA", "BBBB", "CCCC"], side
+
+
+@pytest.mark.parametrize("before, after, callbacks", [
+    (OLD_TABLE, OLD_TABLE, []),                                           # no callback at all
+    (None, "fresh", [FakeDashResponse(status=500)]),                      # failed callback
+    (None, "fresh", [FakeDashResponse(changed=("broker.value",))]),       # not submit-triggered
+    (OLD_TABLE, OLD_TABLE, [UNRELATED]),                                  # not the side table
+])
+def test_legacy_netflow_is_unchanged_by_the_submit_contract(before, after, callbacks):
+    page = FakeStalkerPage(SELL_ROWS, before=before, after=after, callbacks=callbacks)
     got = ns.get_netflow(page, ["XL"], "Today", side="dist")
-    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]          # no refresh check, as before
-    assert page.fingerprints == 0
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]          # no callback/settle check, as before
+    assert page.expect_calls == 0 and page.fingerprints == 0
     assert page.waits[page.submitted_at:] == [4000]         # the fixed post-submit wait
 
 

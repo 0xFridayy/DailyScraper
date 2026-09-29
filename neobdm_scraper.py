@@ -960,39 +960,126 @@ def parse_stalker_table(page, side="dist"):
     return data
 
 
-# Strict refresh contract. No authoritative submit response is documented for
-# this page: other NeoBDM pages are django_plotly_dash apps whose callbacks POST
-# to .../_dash-update-component, but this page's app path and callback output
-# have never been captured, so no request is waited on. Instead the side table
-# must observably change after the submit click and then settle; a table that
-# is identical to the pre-submit one, or never settles, fails the scan. A false
-# SOURCE_UNAVAILABLE is preferred to presenting an old table as current.
-STALKER_REFRESH_TIMEOUT_MS = 15000
-STALKER_REFRESH_POLL_MS = 500
+# Strict submit contract (Broker Stalker only).
+#
+# What it proves: the server acknowledged and completed the Dash callback that
+# the #submit-button click triggered AND that declares the `side` table's
+# component as an output. The page's cells carry data-dash-column (a Dash
+# DataTable), and Dash sends every server callback as a POST to its standard
+# `_dash-update-component` endpoint with a JSON body naming the property that
+# fired it (changedPropIds) and the outputs it updates (output / outputs). So,
+# with a response waiter armed BEFORE the click, the scan accepts only a
+# response that is
+#   POST, URL containing "_dash-update-component",
+#   request body valid JSON with "submit-button.n_clicks" in changedPropIds,
+#   request body whose declared output(s) name the side component
+#     (SIDE_CONTAINER without the "#": broker-dist-stalker / broker-akum-stalker),
+#   HTTP 200 with a JSON object body (204 = Dash PreventUpdate = nothing updated),
+# and fails closed if none arrives within STALKER_CALLBACK_TIMEOUT_MS. A
+# submit-triggered callback for another component is ignored: it says nothing
+# about this table. No app path is assumed; this page's callback URL and output
+# ids have never been captured, so if the live callback writes to a different
+# component id than the container, the scan fails closed (SOURCE_UNAVAILABLE).
+#
+# After that callback, the side table only has to be present and settled across
+# polls; its HTML may be byte-identical to the pre-submit table (an unchanged
+# result is a valid result), and DOM changes before the callback never count.
+DASH_CALLBACK_ENDPOINT = "_dash-update-component"
+SUBMIT_TRIGGER = "submit-button.n_clicks"
+STALKER_CALLBACK_TIMEOUT_MS = 20000
+STALKER_SETTLE_TIMEOUT_MS = 15000
+STALKER_SETTLE_POLL_MS = 500
 
 
-def _stalker_table_state(page, side):
-    """Fingerprint of the side container: its inner HTML, or None if absent."""
-    el = page.query_selector(SIDE_CONTAINER[side])
-    return None if el is None else el.inner_html()
+def _dash_output_ids(value):
+    """Every string component id a Dash callback payload's output/outputs value
+    declares, whatever its shape: an "id.prop" or "..id.prop...id.prop.." string,
+    {"id": ..., "property": ...} objects, or lists / nested objects of those.
+    Pattern-matching (dict) ids and anything unrecognised declare nothing."""
+    if isinstance(value, str):
+        return {part.rsplit(".", 1)[0] for part in value.strip(".").split("...") if "." in part}
+    ids = set()
+    if isinstance(value, dict):
+        if isinstance(value.get("id"), str):
+            ids.add(value["id"])
+        for v in value.values():
+            if isinstance(v, (dict, list)):
+                ids |= _dash_output_ids(v)
+    elif isinstance(value, list):
+        for v in value:
+            ids |= _dash_output_ids(v)
+    return ids
 
 
-def _wait_for_stalker_refresh(page, side, before, timeout_ms=STALKER_REFRESH_TIMEOUT_MS,
-                              poll_ms=STALKER_REFRESH_POLL_MS):
-    """Return once the `side` container holds a table that differs from `before`
-    (its pre-submit fingerprint) and is unchanged across two polls. Raises if
-    that is not seen within `timeout_ms` (counted in poll steps)."""
+def _callback_targets(payload, component_id):
+    """Does this Dash callback payload declare `component_id` as an output?"""
+    return component_id in (_dash_output_ids(payload.get("output"))
+                            | _dash_output_ids(payload.get("outputs")))
+
+
+def _submit_callback_for(side):
+    """Predicate: is a response the submit-triggered Dash callback that outputs to
+    the `side` table's component? Never raises."""
+    component_id = SIDE_CONTAINER[side].lstrip("#")
+
+    def is_it(response):
+        import json as _json
+        try:
+            request = response.request
+            if request.method != "POST" or DASH_CALLBACK_ENDPOINT not in response.url:
+                return False
+            payload = _json.loads(request.post_data or "")
+            if not isinstance(payload, dict):
+                return False
+            changed = payload.get("changedPropIds")
+            return (isinstance(changed, list) and SUBMIT_TRIGGER in changed
+                    and _callback_targets(payload, component_id))
+        except Exception:
+            return False
+    return is_it
+
+
+def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
+    """Click #submit-button with a response waiter already armed, and require the
+    submit-triggered Dash callback that targets the `side` table to complete
+    successfully. Raises otherwise."""
+    component_id = SIDE_CONTAINER[side].lstrip("#")
+    try:
+        with page.expect_response(_submit_callback_for(side), timeout=timeout_ms) as info:
+            try:
+                page.click("#submit-button", timeout=5000)
+            except Exception as e:
+                log.warning(f"Could not click #submit-button: {e}")
+                raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
+        response = info.value
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"no {SUBMIT_TRIGGER} Dash callback for {component_id} within "
+                           f"{timeout_ms // 1000}s of submit: {_safe_error(e)}") from e
+    if response.status != 200:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
+    if not isinstance(_api_json(response), dict):
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback returned no JSON object")
+    return response
+
+
+def _wait_for_stalker_table_settled(page, side, timeout_ms=STALKER_SETTLE_TIMEOUT_MS,
+                                    poll_ms=STALKER_SETTLE_POLL_MS):
+    """After a confirmed submit callback: return once the `side` container holds a
+    table whose HTML is the same on two consecutive polls. This is not a freshness
+    proof (the callback is); it only avoids reading a table mid-render."""
     last, waited = None, 0
     while waited < timeout_ms:
         page.wait_for_timeout(poll_ms)
         waited += poll_ms
-        now = _stalker_table_state(page, side)
-        if now is not None and now != before and "<table" in now.lower() and now == last:
+        el = page.query_selector(SIDE_CONTAINER[side])
+        now = None if el is None else el.inner_html()
+        if now is not None and "<table" in now.lower() and now == last:
             return
         last = now
-    raise RuntimeError(f"{side} table did not refresh within {timeout_ms // 1000}s of submit "
-                       f"(pre-submit table {'present' if before else 'absent'}; "
-                       f"no changed, settled table observed)")
+    raise RuntimeError(f"{side} table not present and settled within {timeout_ms // 1000}s "
+                       f"of the submit callback")
 
 
 def get_netflow(page, codes, duration="Today", side="dist", strict=False):
@@ -1002,22 +1089,22 @@ def get_netflow(page, codes, duration="Today", side="dist", strict=False):
     switch or submit click is logged and ignored, a fixed 4s wait follows the
     submit, and a failed table parse returns {}. strict=True (Broker Stalker)
     raises on each of those instead, and replaces the fixed wait with the
-    refresh contract above, so neither a technical failure nor a table left
-    over from before the submit can be read as this query's result."""
+    submit contract above (a confirmed submit-button Dash callback that outputs
+    to the `side` table, then a settled table), so neither a technical failure
+    nor a submit the server never answered for this table can be read as this
+    query's result."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
     set_duration(page, duration, strict=strict)
-    before = _stalker_table_state(page, side) if strict else None
-    try:
-        page.click("#submit-button", timeout=5000)
-    except Exception as e:
-        log.warning(f"Could not click #submit-button: {e}")
-        if strict:
-            raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
     if strict:
-        _wait_for_stalker_refresh(page, side, before)
+        _submit_and_confirm_callback(page, side)
+        _wait_for_stalker_table_settled(page, side)
     else:
+        try:
+            page.click("#submit-button", timeout=5000)
+        except Exception as e:
+            log.warning(f"Could not click #submit-button: {e}")
         page.wait_for_timeout(4000)
     try:
         rows = parse_stalker_table(page, side)
