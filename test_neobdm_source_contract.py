@@ -563,7 +563,9 @@ def test_dashboard_status_reaches_the_record_and_the_telegram_line():
                    "dashboard_Foreign": (nsc.HITS, "d", "ms-1")}
     assert conn.execute("SELECT sources FROM konglo_signal_watch WHERE ticker='ABCD'").fetchone() == ("dashboard_Foreign",)
     lines = ns._dashboard_lines(dash)
-    assert lines[1:] == ["b Bandarmologi: ⚠️ unavailable", "n NonRetail: -", "f Foreign: ABCD(n/a)"]
+    assert lines[1:] == ["b Bandarmologi: ⚠️ unavailable: request failed: x",
+                         "n NonRetail: ⚠️ empty — unverified: screener returned no rows",
+                         "f Foreign: ABCD(n/a)"]
 
 
 def test_persisted_source_null_stays_null_and_true_zero_stays_zero(tmpdir_path, monkeypatch):
@@ -603,6 +605,290 @@ def test_signal_recording_preserves_source_availability_even_without_hits():
     assert dict(conn.execute("SELECT source, status FROM signal_source_status WHERE flag_date='2026-09-17'"))[
         "top_akum_bandar"] == nsc.NO_HITS
     assert conn.execute("SELECT COUNT(*) FROM konglo_signal_watch WHERE flag_date='2026-09-17'").fetchone()[0] == 0
+
+
+# ── Telegram report truthfulness ──────────────
+TOLD_NO_SELL = "Tidak ada retail net sell hari ini"
+
+
+class FakeCell:
+    def __init__(self, text):
+        self.text = text
+
+    def inner_text(self):
+        return self.text
+
+
+class FakeTr:
+    def __init__(self, cells):
+        self.cells = cells
+
+    def query_selector(self, sel):
+        col = sel.split('data-dash-column="')[1].split('"')[0]
+        return FakeCell(self.cells[col]) if col in self.cells else None
+
+
+class FakeStalkerPage:
+    """Just enough of the broker_stalker DOM for get_netflow. `fail` names the
+    one step that raises: "duration", "submit" or "parse"."""
+    def __init__(self, rows=(), fail=None):
+        self.rows, self.fail = list(rows), fail
+        self.keyboard = self
+        self.gotos = []
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def type(self, text):
+        pass
+
+    def press(self, key):
+        pass
+
+    def click(self, sel, timeout=None):
+        if sel == "#submit-button" and self.fail == "submit":
+            raise TimeoutError("page.click: Timeout 5000ms exceeded waiting for #submit-button")
+
+    def locator(self, sel):
+        page = self
+
+        class Loc:
+            first = property(lambda self: self)
+
+            def count(self):
+                return 0
+
+            def click(self, timeout=None):
+                if "duration-picker" in sel and page.fail == "duration":
+                    raise TimeoutError("locator.click: Timeout 5000ms exceeded")
+        return Loc()
+
+    def wait_for_selector(self, sel, timeout=None):
+        if self.fail == "parse":
+            raise TimeoutError(f"page.wait_for_selector: Timeout 15000ms waiting for {sel}")
+
+    def query_selector_all(self, sel):
+        return [FakeTr(r) for r in self.rows]
+
+
+def stalker_row(symbol, netval, savg="100"):
+    return {"symbol": symbol, "netval": netval, "bval": "1", "sval": "2", "bavg": "3", "savg": savg}
+
+
+SELL_ROWS = [stalker_row("AAAA", "-5,000"), stalker_row("BBBB", "-3,000"), stalker_row("CCCC", "1,000")]
+
+
+def stalker_text(result):
+    return "\n".join(ns._broker_stalker_lines(result))
+
+
+@pytest.mark.parametrize("fail, stage", [("duration", "duration 'Today' switch failed"),
+                                         ("submit", "submit failed"),
+                                         ("parse", "dist table parse failed")])
+def test_broker_stalker_strict_scan_failures_are_source_unavailable(fail, stage):
+    got = ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, fail=fail))
+    assert isinstance(got, nsc.SignalResult)
+    assert got.source == "broker_stalker"
+    assert got.status == nsc.SOURCE_UNAVAILABLE and got.hits == []
+    assert stage in got.detail and "TimeoutError" in got.detail
+    text = stalker_text(got)
+    assert TOLD_NO_SELL not in text
+    assert "Source unavailable" in text and stage in text
+
+
+def test_broker_stalker_other_scan_failure_is_source_unavailable():
+    page = FakeStalkerPage(SELL_ROWS)
+
+    def boom(url, **kw):
+        raise RuntimeError("net::ERR_CONNECTION_RESET")
+    page.goto = boom
+    got = ns.scrape_broker_stalker(page)
+    assert got.status == nsc.SOURCE_UNAVAILABLE and "ERR_CONNECTION_RESET" in got.detail
+
+
+@pytest.mark.parametrize("rows, detail", [([stalker_row("CCCC", "1,000"), stalker_row("DDDD", "0")],
+                                           "2 row(s) parsed, none with a negative netval"),
+                                          ([], "dist table parsed with no rows")])
+def test_broker_stalker_parsed_but_no_negative_rows_is_empty_unverified(rows, detail):
+    got = ns.scrape_broker_stalker(FakeStalkerPage(rows))
+    assert got.status == nsc.EMPTY_UNVERIFIED and got.status != nsc.NO_HITS
+    assert got.hits == [] and got.detail == detail
+    text = stalker_text(got)
+    assert TOLD_NO_SELL not in text
+    assert "Empty — unverified" in text and detail in text
+
+
+def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
+    def holders(page, symbol, captures=None):
+        if symbol == "BBBB":
+            raise RuntimeError("inventory API status=500")
+        return [{"code": "AK", "cum": 12345.0, "avg": 1500.0}] if symbol == "AAAA" else []
+    monkeypatch.setattr(ns, "get_inventory_bagholders", holders)
+    monkeypatch.setattr(ns, "_bagholder_captures", lambda: None)
+    rows = SELL_ROWS + [stalker_row("EEEE", "-1,000", savg="90")]
+    got = ns.scrape_broker_stalker(FakeStalkerPage(rows))
+    assert got.status == nsc.HITS
+    assert [(r["symbol"], r["holders_failed"]) for r in got] == [
+        ("AAAA", False), ("BBBB", True), ("EEEE", False)]
+    assert ns._broker_stalker_lines(got) == [
+        "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
+        "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
+        "1. AAAA | retail jual -5,000  savg: 100",
+        "   🎒 Bag holder: AK 12k lot @1500",
+        "2. BBBB | retail jual -3,000  savg: 100",
+        "   🎒 Bag holder: ⚠️ gagal ambil",
+        "3. EEEE | retail jual -1,000  savg: 90",
+        "   🎒 Bag holder: tidak ada akumulator",
+    ]
+    # the HITS rendering is the one the plain row list always had
+    assert ns._broker_stalker_lines(got) == ns._broker_stalker_lines(list(got.hits))
+
+
+@pytest.mark.parametrize("fail", ["duration", "submit"])
+def test_legacy_netflow_still_swallows_duration_and_submit_failures(fail):
+    got = ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist")
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
+
+
+def test_legacy_netflow_still_turns_a_parse_failure_into_an_empty_table():
+    assert ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail="parse"), ["XL"], "Today", side="dist") == {}
+    assert ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail="parse"), ["XL"], strict=False) == {}
+
+
+@pytest.mark.parametrize("fail", ["duration", "submit", "parse"])
+def test_strict_netflow_raises_on_every_scan_failure(fail):
+    with pytest.raises(RuntimeError):
+        ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist", strict=True)
+
+
+def test_broker_flow_path_keeps_its_non_strict_behaviour(monkeypatch):
+    monkeypatch.setattr(ns, "BROKER_FLOW_CODES", ["XL"])
+    for fail in ("duration", "submit"):
+        rows = ns.scrape_broker_flow_for_db(FakeStalkerPage(SELL_ROWS, fail=fail), ["AAAA", "CCCC"])
+        assert sorted((r["ticker"], r["netval"]) for r in rows) == [
+            ("AAAA", -5000.0), ("AAAA", -5000.0), ("CCCC", 1000.0), ("CCCC", 1000.0)]
+    assert ns.scrape_broker_flow_for_db(FakeStalkerPage(SELL_ROWS, fail="parse"), ["AAAA"]) == []
+
+
+def test_record_konglo_signals_keeps_the_broker_stalker_status_and_reason():
+    conn = sqlite3.connect(":memory:")
+    ms = nsc.SignalResult("top_akum_bandar", nsc.RETIRED_SOURCE)
+    cases = {
+        "2026-09-21": nsc.SignalResult("broker_stalker", nsc.SOURCE_UNAVAILABLE, [],
+                                       "retail net sell scan failed: RuntimeError: submit failed: x"),
+        "2026-09-22": nsc.SignalResult("broker_stalker", nsc.EMPTY_UNVERIFIED, [],
+                                       "3 row(s) parsed, none with a negative netval"),
+        "2026-09-23": nsc.SignalResult("broker_stalker", nsc.HITS,
+                                       [{"symbol": "AAAA", "netval": "-5", "holders": []}], ""),
+    }
+    for day, bs in cases.items():
+        ns.record_konglo_signals(conn, day, ms, [], bs)
+    got = {d: (st, det, h) for d, st, det, h in conn.execute(
+        "SELECT flag_date, status, detail, hits FROM signal_source_status WHERE source='broker_stalker'")}
+    assert got == {d: (bs.status, bs.detail, len(bs.hits)) for d, bs in cases.items()}
+    assert conn.execute("SELECT flag_date, ticker, sources FROM konglo_signal_watch").fetchall() == [
+        ("2026-09-23", "AAAA", "broker_stalker")]
+
+
+def test_market_summary_empty_unverified_is_explicit_and_never_a_zero_or_no_data_claim():
+    for detail in ("screener returned no rows", ""):
+        text = "\n".join(ns._market_summary_lines(nsc.SignalResult("top_akum_bandar", nsc.EMPTY_UNVERIFIED,
+                                                                   [], detail)))
+        assert "Empty — unverified" in text
+        assert (detail or "no rows returned") in text
+        assert "No data scraped today" not in text
+        assert "No unusual-volume candidates" not in text
+
+
+def test_dashboard_statuses_render_explicitly_and_never_as_a_bare_dash():
+    dash = [("Bandarmologi", "b", nsc.SignalResult("dashboard_Bandarmologi", nsc.HITS,
+                                                   [{"tick": "ABCD", "tx": "1.0%"}, {"tick": "EFGH", "tx": "n/a"}])),
+            ("NonRetail", "n", nsc.SignalResult("dashboard_NonRetail", nsc.EMPTY_UNVERIFIED, [], "")),
+            ("Foreign", "f", nsc.SignalResult("dashboard_Foreign", nsc.SOURCE_UNAVAILABLE, [],
+                                              "request failed: RuntimeError: HTTP 429"))]
+    lines = ns._dashboard_lines(dash)
+    assert lines[1:] == ["b Bandarmologi: ABCD(1.0%) EFGH(n/a)",
+                         "n NonRetail: ⚠️ empty — unverified",
+                         "f Foreign: ⚠️ unavailable: request failed: RuntimeError: HTTP 429"]
+    assert not any(line.rstrip().endswith(": -") for line in lines)
+    assert ns._dashboard_lines([("Foreign", "f", [])])[1] == "f Foreign: ⚠️ empty — unverified"
+
+
+def myt(*args):
+    import datetime as dt
+    import pytz
+    return pytz.timezone(ns.TIMEZONE).localize(dt.datetime(*args))
+
+
+def report(captured_at, in_window):
+    ms = nsc.SignalResult("top_akum_bandar", nsc.NO_HITS, [])
+    dash = [("Foreign", "f", nsc.SignalResult("dashboard_Foreign", nsc.HITS, [{"tick": "ABCD", "tx": "1.0%"}]))]
+    bs = nsc.SignalResult("broker_stalker", nsc.EMPTY_UNVERIFIED, [], "dist table parsed with no rows")
+    return ns.format_combined_message(ms, dash, bs, captured_at, in_window)
+
+
+def test_in_window_report_states_the_capture_time_and_session_close_basis():
+    text = report(myt(2026, 9, 29, 7, 2), True)            # Tuesday, pre-open
+    assert "🕗 Captured 29 Sep 2026, 07:02 AM MYT" in text
+    assert "📅 Basis: session close Mon 28 Sep (pre-open capture)" in text
+    assert "(Daily)" in text and "(EOD)" in text
+    assert "UNVERIFIED" not in text
+    monday = report(myt(2026, 9, 28, 7, 0), True)
+    assert "session close Fri 25 Sep" in monday
+
+
+def test_off_window_report_says_the_session_is_unverified_and_claims_no_eod():
+    text = report(myt(2026, 9, 29, 14, 15), False)
+    assert "🕗 Captured 29 Sep 2026, 02:15 PM MYT" in text
+    assert "after the safe morning window" in text and "after IDX open" in text
+    assert "session UNVERIFIED" in text and "Not an EOD report" in text
+    for claim in ("(EOD)", "(Daily)", "Basis: session close", "candidates today", "hari ini"):
+        assert claim not in text, claim
+
+
+def test_session_close_label_matches_daily_picks_session_label():
+    import datetime as dt
+    import daily_picks
+    start = dt.date(2026, 1, 1)
+    for k in range(400):
+        d = start + dt.timedelta(days=k)
+        assert ns._session_close_label(d) == daily_picks.session_label(d.isoformat()), d
+
+
+def test_report_capture_time_is_the_run_start_not_the_send_time(monkeypatch):
+    from unittest import mock
+    import datetime as dt
+    # The first clock read is the run start (pre-open); every later read is after
+    # IDX open, as it would be for a run whose scrape or send runs long.
+    reads = []
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            reads.append(1)
+            return myt(2026, 9, 29, 7, 2) if len(reads) == 1 else myt(2026, 9, 29, 14, 40)
+    sent = []
+    monkeypatch.setattr(ns, "datetime", Clock)
+    monkeypatch.setattr(ns, "sync_playwright", mock.MagicMock())
+    for name, stub in {"login": lambda page: None,
+                       "scrape_market_summary": lambda page, capture: nsc.SignalResult(
+                           "top_akum_bandar", nsc.NO_HITS, []),
+                       "scrape_dashboard_presets": lambda page, rows=None, cid=None: [],
+                       "scrape_broker_stalker": lambda page: nsc.SignalResult(
+                           "broker_stalker", nsc.SOURCE_UNAVAILABLE, [], "retail net sell scan failed: x"),
+                       "save_daily_broker_flow": lambda page: None, "_offset_safe": lambda what: False,
+                       "send_telegram": sent.append}.items():
+        monkeypatch.setattr(ns, name, stub)
+    ns.run_all_jobs()
+    assert len(sent) == 1
+    assert "Captured 29 Sep 2026, 07:02 AM MYT" in sent[0]
+    assert "02:40 PM" not in sent[0]
+    assert "Basis: session close Mon 28 Sep" in sent[0]
+    assert "Source unavailable: retail net sell scan failed: x" in sent[0]
+    assert TOLD_NO_SELL not in sent[0]
 
 
 # ── integrity checker ─────────────────────────

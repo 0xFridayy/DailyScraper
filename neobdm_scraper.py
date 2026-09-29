@@ -19,7 +19,7 @@ import pytz
 
 # Pure, playwright-free helpers parked in price_audit so CI can test them.
 from price_audit import (bagholders_from_payloads, inventory_date_blocks,
-                         date_offset_holds)
+                         date_offset_holds, IDX_OPEN_HOUR_LOCAL)
 import inventory_capture as ic
 import neobdm_source_contract as nsc
 
@@ -916,11 +916,16 @@ def set_broker_codes(page, codes):
         add_broker_chip(page, code)
 
 
-def set_duration(page, label="Today"):
+def set_duration(page, label="Today", strict=False):
+    """strict=False (broker_flow) logs a failed click and carries on, as it always
+    has. strict=True raises: the table would then show whatever duration the page
+    defaulted to, which the caller must not report as `label`."""
     try:
         page.locator(f"#duration-picker label:has-text('{label}')").first.click(timeout=5000)
     except Exception as e:
         log.warning(f"Could not click duration '{label}': {e}")
+        if strict:
+            raise RuntimeError(f"duration '{label}' switch failed: {_safe_error(e)}") from e
 
 
 # The broker_stalker page splits results into two tables:
@@ -955,20 +960,30 @@ def parse_stalker_table(page, side="dist"):
     return data
 
 
-def get_netflow(page, codes, duration="Today", side="dist"):
+def get_netflow(page, codes, duration="Today", side="dist", strict=False):
+    """symbol -> row of the broker_stalker `side` table for `codes` over `duration`.
+
+    strict=False is the broker_flow path and is unchanged: a failed duration
+    switch or submit click is logged and ignored, and a failed table parse
+    returns {}. strict=True (Broker Stalker) raises on each of those instead,
+    so a technical failure can never be read as an empty table."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
-    set_duration(page, duration)
+    set_duration(page, duration, strict=strict)
     try:
         page.click("#submit-button", timeout=5000)
     except Exception as e:
         log.warning(f"Could not click #submit-button: {e}")
+        if strict:
+            raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
     page.wait_for_timeout(4000)
     try:
         rows = parse_stalker_table(page, side)
     except Exception as e:
         log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
+        if strict:
+            raise RuntimeError(f"{side} table parse failed: {_safe_error(e)}") from e
         rows = []
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
@@ -1111,22 +1126,39 @@ def _fmt_lot(v):
     return f"{v:.0f} lot"
 
 
+BROKER_STALKER_SOURCE = "broker_stalker"
+
+
 def scrape_broker_stalker(page):
     """Retail (XL+XC) top net-sell tickers, then the top-2 'bag holders' of each
-    (highest cumulative net inventory) from the inventory chart."""
+    (highest cumulative net inventory) from the inventory chart, as a SignalResult.
+
+    The scan uses get_netflow's strict path, so the status is:
+      SOURCE_UNAVAILABLE  the duration switch, submit, table parse or any other
+                          part of the scan failed
+      EMPTY_UNVERIFIED    the table parsed but held no negative-netval row. Never
+                          NO_HITS: this DOM table cannot prove a genuine zero-sell
+                          session strongly enough
+      HITS                one or more retail net-sell rows"""
+    def result(status, hits=(), detail=""):
+        return nsc.SignalResult(BROKER_STALKER_SOURCE, status, list(hits), detail)
+
     # 1) retail net SELL (XL+XC, Foreign Only unchecked) -> top tickers
     log.info(f"Retail net sell scan ({'+'.join(STALKER_RETAIL)})...")
     try:
-        retail_sell = get_netflow(page, STALKER_RETAIL, "Today", side="dist")
+        retail_sell = get_netflow(page, STALKER_RETAIL, "Today", side="dist", strict=True)
     except Exception as e:
-        log.error(f"Retail net sell scan failed: {e}")
-        return []
+        err = _safe_error(e)
+        log.error(f"Retail net sell scan failed: {err}")
+        return result(nsc.SOURCE_UNAVAILABLE, detail=f"retail net sell scan failed: {err}")
 
     top = sorted(retail_sell.values(), key=lambda r: parse_num(r.get("netval", "")))
     top = [r for r in top if parse_num(r.get("netval", "")) < 0][:STALKER_TOP_N]
     log.info(f"Top retail net sell: {[(r['symbol'], r['netval']) for r in top]}")
     if not top:
-        return []
+        return result(nsc.EMPTY_UNVERIFIED, detail=(
+            f"{len(retail_sell)} row(s) parsed, none with a negative netval" if retail_sell
+            else "dist table parsed with no rows"))
 
     # 2) per ticker -> top bag holders from the inventory JSON API.
     # Prime the inventory path ONCE so its session cookies are set; the GETs below
@@ -1159,7 +1191,7 @@ def scrape_broker_stalker(page):
             "holders": holders,
             "holders_failed": failed,
         })
-    return results
+    return result(nsc.HITS, results)
 
 
 # ── 3b. PERSISTENCE (SQLite) ───────────────────
@@ -1285,7 +1317,10 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
     statuses += [rows if isinstance(rows, nsc.SignalResult)
                  else nsc.signal_status_from_rows(f"dashboard_{label}", rows)
                  for label, _emoji, rows in dash_data]
-    statuses.append(nsc.signal_status_from_rows("broker_stalker", list(bs_data)))
+    # Broker Stalker's own result carries SOURCE_UNAVAILABLE vs EMPTY_UNVERIFIED and
+    # the reason; recomputing it from its (empty) rows would erase both.
+    statuses.append(bs_data if isinstance(bs_data, nsc.SignalResult)
+                    else nsc.signal_status_from_rows(BROKER_STALKER_SOURCE, list(bs_data)))
     nsc.record_signal_source_status(conn, date_str, statuses)
 
     for r in ms_data:
@@ -1358,9 +1393,11 @@ def format_market_summary_message(data):
     return "\n".join(_market_summary_lines(data))
 
 
-def _market_summary_lines(data):
+def _market_summary_lines(data, in_window=True):
+    """Off-window (in_window=False) the session is unverified, so no "(Daily)" or
+    "today" claim is made about it."""
     lines = [
-        "📊 Top 2 Akum Bandar (Daily)",
+        "📊 Top 2 Akum Bandar (Daily)" if in_window else "📊 Top 2 Akum Bandar",
         "Universe: likuid, non-gorengan | Filter: unusual=v | Rank: dn-0 > dn-3",
     ]
     if isinstance(data, nsc.SignalResult):
@@ -1373,8 +1410,14 @@ def _market_summary_lines(data):
             lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a "
                          f"zero-candidate day.")
             return lines
+        if data.status == nsc.EMPTY_UNVERIFIED:
+            lines.append(f"⚠️ Empty — unverified: {data.detail or 'no rows returned'}. The source "
+                         f"cannot tell no candidates from a failed capture, so this is not "
+                         f"proven to be a zero-candidate day.")
+            return lines
         if data.status == nsc.NO_HITS:
-            lines.append("No unusual-volume candidates today (source healthy).")
+            lines.append("No unusual-volume candidates today (source healthy)." if in_window
+                         else "No unusual-volume candidates in this capture (source healthy).")
             return lines
         data = data.hits
     if not data:
@@ -1390,7 +1433,8 @@ def _market_summary_lines(data):
         flag = " ⚠️" if row.get("_caution") else ""
         lines.append(f"{i}. {symbol}{flag} | {details}")
         if row.get("_caution"):
-            lines.append(f"   ⚠️ caution: dn-0 < {MARKET_DN0_MIN}, akumulasi lemah hari ini")
+            lines.append(f"   ⚠️ caution: dn-0 < {MARKET_DN0_MIN}, akumulasi lemah"
+                         + (" hari ini" if in_window else ""))
     return lines
 
 
@@ -1403,8 +1447,16 @@ def _broker_stalker_lines(data):
         "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
         "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
     ]
+    status = getattr(data, "status", None)
+    if status == nsc.SOURCE_UNAVAILABLE:
+        lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a zero-sell day.")
+        return lines
     if not data:
-        lines.append("Tidak ada retail net sell hari ini.")
+        # EMPTY_UNVERIFIED, or a bare empty list: the DOM table cannot prove a
+        # genuine zero-sell session, so nothing here may claim one.
+        detail = getattr(data, "detail", "") or "no qualifying rows"
+        lines.append(f"⚠️ Empty — unverified: {detail}. Cannot be told apart from a "
+                     f"failed scan; not a confirmed zero-sell day.")
         return lines
     for i, row in enumerate(data, 1):
         holders = row.get("holders", [])
@@ -1416,32 +1468,66 @@ def _broker_stalker_lines(data):
     return lines
 
 
-def _dashboard_lines(data):
-    lines = ["📋 Dashboard Top Akum (EOD) — ticker (%M)"]
+def _dashboard_cell(rows):
+    if rows:
+        return " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
+    status, detail = getattr(rows, "status", None), getattr(rows, "detail", "")
+    if status == nsc.SOURCE_UNAVAILABLE:
+        return f"⚠️ unavailable: {detail}" if detail else "⚠️ unavailable"
+    if status == nsc.RETIRED_SOURCE:
+        return "⛔ source retired"
+    if status == nsc.NO_HITS:
+        return "no hits (source healthy)"
+    # EMPTY_UNVERIFIED, or a bare empty list: never a bare "-", which reads as a
+    # confirmed empty list.
+    return f"⚠️ empty — unverified: {detail}" if detail else "⚠️ empty — unverified"
+
+
+def _dashboard_lines(data, in_window=True):
+    lines = ["📋 Dashboard Top Akum (EOD) — ticker (%M)" if in_window
+             else "📋 Dashboard Top Akum — ticker (%M)"]
     if not data:
         lines.append("No dashboard data.")
         return lines
     for label, emoji, rows in data:
-        if rows:
-            tickers = " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
-        elif getattr(rows, "status", None) == nsc.SOURCE_UNAVAILABLE:
-            tickers = "⚠️ unavailable"
-        else:
-            tickers = "-"
-        lines.append(f"{emoji} {label}: {tickers}")
+        lines.append(f"{emoji} {label}: {_dashboard_cell(rows)}")
     return lines
 
 
-def format_combined_message(ms_data, dash_data, bs_data):
-    """All sections in ONE Telegram message with a single timestamp."""
-    lines = [
-        "📈 NeoBDM Daily Signal",
-        f"🕗 {now_str()}",
-        "═════════════════════",
-    ]
-    lines += _market_summary_lines(ms_data)
+def _session_close_label(capture_day):
+    """The session a pre-open capture on `capture_day` holds: the previous
+    weekday. Same rule as daily_picks.session_label (parity is tested), kept
+    local so the scraper does not import the picks layer."""
+    d = capture_day - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return f"{d:%a} {d.day} {d:%b}"
+
+
+def _basis_lines(captured_at, in_window):
+    """Header lines stating when the scrape ran and what session it describes.
+    `captured_at` is the run's capture time (MYT), taken once at the start of
+    run_all_jobs; `in_window` is date_offset_holds() for that same time."""
+    lines = [f"🕗 Captured {captured_at.strftime('%d %b %Y, %I:%M %p')} MYT"]
+    if in_window:
+        lines.append(f"📅 Basis: session close {_session_close_label(captured_at.date())} "
+                     f"(pre-open capture)")
+    else:
+        lines.append(f"⚠️ Captured after the safe morning window (after IDX open, "
+                     f"{IDX_OPEN_HOUR_LOCAL:02d}:00 MYT): session UNVERIFIED — may be "
+                     f"intraday or today's close. Not an EOD report.")
+    return lines
+
+
+def format_combined_message(ms_data, dash_data, bs_data, captured_at, in_window):
+    """All sections in ONE Telegram message, headed by the run's capture time and
+    session basis. Off-window, no section claims EOD/Daily data."""
+    lines = ["📈 NeoBDM Daily Signal"]
+    lines += _basis_lines(captured_at, in_window)
+    lines.append("═════════════════════")
+    lines += _market_summary_lines(ms_data, in_window)
     lines.append("─────────────────────")
-    lines += _dashboard_lines(dash_data)
+    lines += _dashboard_lines(dash_data, in_window)
     lines.append("─────────────────────")
     lines += _broker_stalker_lines(bs_data)
     lines.append("═════════════════════")
@@ -1469,6 +1555,11 @@ def send_telegram(message):
 
 def run_all_jobs():
     log.info("=== Daily job starting ===")
+    # One capture time for the whole report, taken before scraping starts: the
+    # header must describe when the data was read, not when the message is sent.
+    # The window is the same pre-open rule _offset_safe applies to persistence.
+    captured_at = datetime.now(pytz.timezone(TIMEZONE))
+    in_window = date_offset_holds(captured_at)
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, slow_mo=300)
@@ -1508,7 +1599,7 @@ def run_all_jobs():
 
             browser.close()
 
-        message = format_combined_message(ms_data, dash_data, bs_data)
+        message = format_combined_message(ms_data, dash_data, bs_data, captured_at, in_window)
         if backfill_progress:
             message = f"{message}\n\n{backfill_progress}"
         send_telegram(message)

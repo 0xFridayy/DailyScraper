@@ -3,8 +3,12 @@ send ONE message with picks and follow-ups instead of the raw NeoBDM list.
 
 neobdm_scraper.run_all_jobs() is not edited. Its send_telegram is swapped for
 a holder while it runs: "NeoBDM error" messages still go out immediately,
-the raw daily report is held. If the picks step fails, finds no fresh data,
-or can't send, the held raw report is sent instead.
+the raw daily report is held. If the picks step fails or can't send, the
+held raw report is sent instead.
+
+When the picks step finds no fresh data ("stale"), its stale warning is the
+only message: the held raw report is NOT sent, because it would present a
+late or failed scrape as if it were a fresh EOD/no-results report.
 
 Nothing here may stop the workflow's commit step: picks code is imported only
 after the scrape, every send is guarded, and the script always exits 0 (as
@@ -45,7 +49,7 @@ def main():
         status, _ = daily_picks.run_morning(datetime.now(timezone.utc),
                                             send=daily_picks.telegram_sender_from_env())
         print(f"daily picks: {status}")
-        if status in ("send_failed", "stale") and held:
+        if status == "send_failed" and held:
             safe_send(held[-1])
     except Exception as e:
         print(f"daily picks failed: {type(e).__name__}")
