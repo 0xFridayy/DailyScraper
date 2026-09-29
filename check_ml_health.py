@@ -190,7 +190,7 @@ def check_unit_tests(problems, stats):
                  "test_broker_book.py", "test_broker_rules.py", "test_broker_learning.py",
                  "test_broker_dashboard.py", "test_broker_collect.py",
                  "test_broker_learning_run.py", "test_inventory_capture.py",
-                 "test_targeted_actor_panel.py"):
+                 "test_targeted_actor_panel.py", "test_arb_veto.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
         passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
