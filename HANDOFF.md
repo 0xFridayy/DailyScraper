@@ -1244,7 +1244,45 @@ Provenance per kode per run di tabel baru `broker_flow_scan` (status OK /
 SOURCE_FAILURE, `snapshot` PERSISTED / REJECTED / SUPERSEDED, `session_date`,
 jumlah baris, alasan di `detail`). Tidak ada model yang membacanya.
 
+### Pemilihan broker terverifikasi (smoke live 2026-09-30)
+
+Mengetik kode di picker memicu callback `broker.search_value`, dan ~1,1 detik
+kemudian callback `debounce-interval.n_intervals` di server bisa **menulis
+`broker.value` sendiri**. `add_broker_chip` menekan Enter setelah jeda buta
+0,8 detik, jadi bisa berpacu dengan tulisan itu: pada smoke 30 kode, request KI
+terkirim dengan `broker.value` ≠ `["KI"]` (ditolak request proof, jadi tidak
+ada data salah yang tersimpan). `select_broker_for_flow` (khusus broker_flow;
+`add_broker_chip` bersama tidak diubah), maksimal 2 percobaan:
+
+1. kosongkan chip;
+2. ketik kode, lalu tunggu (maks 3 detik) sampai menu menampilkan **tepat satu**
+   opsi = kode itu dan opsi itu yang fokus — baru Enter;
+3. tunggu 1,5 detik (melewati debounce), chip harus tepat `[kode]`;
+4. tepat sebelum submit chip dicek sekali lagi.
+
+Opsi tidak pernah diklik: klik bisa ikut memilih opsi yang tergambar ulang di
+bawah pointer (terbukti live: `['KI', 'AD']`). Request yang terkirim tetap
+otoritas terakhir, dan kini dicek **sebelum** status HTTP: request salah broker
+dilaporkan sebagai mismatch request, bukan sekadar HTTP 500.
+
+### CS dikecualikan dari capture live
+
+CS tetap kode broker yang dikenal (`BROKER_FLOW_CODES`, `BANDAR_GROUPS`
+Sinarmas, backfill, ownership). Tapi Broker Stalker Today menjawab dua request
+yang terbukti tepat (`broker.value == ["CS"]`, Today, foreign-only `[]`), 60
+detik terpisah, pada 2026-09-30 dengan HTTP 500 text/html, dan tidak pernah ada
+satu pun baris CS di `broker_flow` (live 86 tanggal maupun backfill). Karena itu
+`BROKER_FLOW_LIVE_UNAVAILABLE = {"CS": ...}` dan capture default memakai
+`BROKER_FLOW_CAPTURE_CODES` (29 kode). Semua-atau-tidak-sama-sekali berlaku atas
+29 kode aktif itu; CS tidak diminta, tidak dicatat di `broker_flow_scan`, dan
+**ketiadaan baris CS bukan nol teramati**. Mengaktifkan kembali butuh bukti live
+baru dan perubahan kode eksplisit.
+
 ### Yang TIDAK dikerjakan di sini (tindak lanjut)
+
+- Baris live sebelum PR ini untuk KI, dan mungkin kode lain, bisa jadi milik
+  broker lain karena balapan ketik + jeda tetap + Enter di selector lama. Tidak
+  dihapus dan tidak diperbaiki di PR ini.
 
 - `broker_flow.date` live **tetap** berkunci tanggal scrape (= sesi selesai
   terakhir sebelum tanggal itu), berbeda dengan backfill yang berkunci tanggal

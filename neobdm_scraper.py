@@ -274,6 +274,19 @@ BROKER_FLOW_CODES = sorted(set(
     [WHALER_BROKER, SMOOTH_ACCUM_BROKER] +
     [c for codes in BANDAR_GROUPS.values() for c in codes]
 ))
+
+# Known broker codes the live Broker Stalker "Today" source cannot serve. They
+# stay in BROKER_FLOW_CODES (the intended taxonomy, also read by backfill and
+# ownership code) but the live capture does not request them, so its
+# all-or-nothing snapshot rule runs over BROKER_FLOW_CAPTURE_CODES. An excluded
+# code's missing rows are NOT an observed zero. Re-enabling one takes a new live
+# proof and an explicit change here.
+BROKER_FLOW_LIVE_UNAVAILABLE = {
+    "CS": ("2026-09-30: Broker Stalker Today answered two exact requests (broker.value "
+           "['CS'], Today, foreign-only []) 60s apart with HTTP 500 text/html; no CS "
+           "broker_flow row exists, live or backfill"),
+}
+BROKER_FLOW_CAPTURE_CODES = sorted(set(BROKER_FLOW_CODES) - set(BROKER_FLOW_LIVE_UNAVAILABLE))
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -1579,19 +1592,90 @@ def _side_session_date(body, side):
     return _flow_label_session((labels[0].get("props") or {}).get("children"), side)
 
 
+# The broker picker as a user sees it (dcc.Dropdown #broker, react-virtualized-select).
+FLOW_PICKER_OPTION = "#broker .Select-menu-outer .VirtualizedSelectOption"
+FLOW_PICKER_FOCUSED = "#broker .Select-menu-outer .VirtualizedSelectFocusedOption"
+FLOW_PICKER_CHIP = "#broker .Select-value-label"
+FLOW_SELECT_ATTEMPTS = 2
+FLOW_FILTER_TIMEOUT_MS = 3000
+FLOW_FILTER_POLL_MS = 100
+FLOW_SELECT_SETTLE_MS = 1500     # > the ~1.1s debounce after which the server may write broker.value
+
+
+def _picker_texts(page, selector):
+    return [t.strip() for t in page.locator(selector).all_inner_texts()]
+
+
+def _await_exact_filter(page, code):
+    """Poll the picker menu until it shows exactly one option, `code`, and that
+    option is focused, so Enter can only pick `code`. False if it has not within
+    FLOW_FILTER_TIMEOUT_MS."""
+    waited = 0
+    while not (_picker_texts(page, FLOW_PICKER_OPTION) == [code]
+               and _picker_texts(page, FLOW_PICKER_FOCUSED) == [code]):
+        if waited >= FLOW_FILTER_TIMEOUT_MS:
+            return False
+        page.wait_for_timeout(FLOW_FILTER_POLL_MS)
+        waited += FLOW_FILTER_POLL_MS
+    return True
+
+
+def select_broker_for_flow(page, code):
+    """Select exactly `code` in the broker picker, proving every step from what a
+    user sees. Raises RuntimeError after FLOW_SELECT_ATTEMPTS failed attempts.
+
+    Live 2026-09-30: typing fires broker.search_value callbacks and ~1.1s later a
+    debounce-interval callback may itself write broker.value, so add_broker_chip's
+    Enter after a blind 0.8s can race it (KI was once submitted as another
+    broker). Each attempt clears the chips, types `code`, waits until the menu
+    shows only `code`, focused, presses Enter, lets the debounce write settle and
+    requires the chips to read exactly [code]. Options are never clicked: a click
+    can also pick the option drawn under the pointer after the menu redraws. The
+    submitted request stays the final authority (_broker_flow_request_proof)."""
+    problems = []
+    for attempt in range(1, FLOW_SELECT_ATTEMPTS + 1):
+        if attempt > 1:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(FLOW_SELECT_SETTLE_MS)
+        clear_broker_chips(page)
+        leftover = _picker_texts(page, FLOW_PICKER_CHIP)
+        if leftover:
+            problems.append(f"try {attempt}: chips {leftover} left after clearing")
+            continue
+        page.click("#broker .Select-control")
+        page.wait_for_timeout(400)
+        page.keyboard.type(code)
+        if not _await_exact_filter(page, code):
+            problems.append(f"try {attempt}: the menu never showed only {code!r}, focused")
+            continue
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(FLOW_SELECT_SETTLE_MS)
+        chips = _picker_texts(page, FLOW_PICKER_CHIP)
+        if chips == [code]:
+            return
+        problems.append(f"try {attempt}: chips {chips} after Enter")
+    raise RuntimeError(f"broker picker never selected exactly [{code!r}]: {'; '.join(problems)}")
+
+
 def read_broker_flow_code(page, code, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
     """One broker_flow scan: one page load and ONE submit for `code`, Today.
     Returns {"session_date": date, "akum": rows, "dist": rows}, rows being every
     row of each side's props.data in parse_stalker_table's shape (validated by
-    _stalker_rows_from_response). Raises RuntimeError unless the matched callback
-    proves its request (_broker_flow_request_proof), supplies both side tables,
-    both Labels name the same single session, no ticker repeats within a side
-    and no ticker is in both sides (never deduped: a net flow has one sign)."""
+    _stalker_rows_from_response). Raises RuntimeError unless the picker shows
+    exactly [code] after selection (select_broker_for_flow) and again just before
+    the submit, the matched callback proves its request
+    (_broker_flow_request_proof, checked before its HTTP status so a failure says
+    whether the request itself was exact), answers 200, supplies both side
+    tables, both Labels name the same single session, no ticker repeats within a
+    side and no ticker is in both sides (never deduped: a net flow has one sign)."""
     import json as _json
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
-    set_broker_codes(page, [code])
+    select_broker_for_flow(page, code)
     set_duration(page, BROKER_FLOW_DURATION, strict=True)
+    chips = _picker_texts(page, FLOW_PICKER_CHIP)
+    if chips != [code]:
+        raise RuntimeError(f"broker picker changed before submit: chips {chips}, not [{code!r}]")
     try:
         with page.expect_response(_broker_flow_callback, timeout=timeout_ms) as info:
             try:
@@ -1604,14 +1688,19 @@ def read_broker_flow_code(page, code, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
     except Exception as e:
         raise RuntimeError(f"no {SUBMIT_TRIGGER} Dash callback for both sides within "
                            f"{timeout_ms // 1000}s of submit: {_safe_error(e)}") from e
-    if response.status != 200:
-        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
     try:
         try:
             payload = _json.loads(response.request.post_data or "")
         except ValueError:
             raise ValueError("request body is not JSON") from None
         _broker_flow_request_proof(payload, code)
+    except ValueError as e:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback {e}; its HTTP {response.status} "
+                           f"response was not used") from e
+    if response.status != 200:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status} "
+                           f"for the exact [{code!r}] request")
+    try:
         body = _api_json(response)
         sides = {side: _stalker_rows_from_response(_side_response_data(body, side), side)
                  for side in ("akum", "dist")}
@@ -1647,8 +1736,10 @@ def capture_broker_flow(page, tickers, codes=None):
     {"scrape_started_at", "scrape_date", "scans", "rows", "reason"}: one scan
     record per code, the `tickers` rows of every code that succeeded, and why the
     snapshot may NOT be persisted (None when it may). scrape_date is the MYT date
-    the capture started, the live broker_flow.date convention."""
-    codes = list(BROKER_FLOW_CODES if codes is None else codes)
+    the capture started, the live broker_flow.date convention. `codes` defaults to
+    BROKER_FLOW_CAPTURE_CODES: an excluded code (BROKER_FLOW_LIVE_UNAVAILABLE) is
+    neither requested nor recorded, and it gets no rows at all, never zeros."""
+    codes = list(BROKER_FLOW_CAPTURE_CODES if codes is None else codes)
     tickers = set(tickers)
     started = datetime.now(pytz.timezone(TIMEZONE))
     scans, rows = [], []

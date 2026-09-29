@@ -1525,16 +1525,92 @@ def flow_response(code, body=None, **request):
     return FakeDashResponse(post_data=flow_request(code, **request), body=flow_body() if body is None else body)
 
 
+class PickerLocator:
+    """A locator on a FlowPage's broker picker: menu options, the focused option,
+    the chips, or the clear zone (present while there are chips)."""
+    def __init__(self, page, sel):
+        self.page, self.sel = page, sel
+
+    first = property(lambda self: self)
+
+    def all_inner_texts(self):
+        rendered, focused = self.page.menu()
+        return list({ns.FLOW_PICKER_OPTION: rendered, ns.FLOW_PICKER_FOCUSED: focused,
+                     ns.FLOW_PICKER_CHIP: self.page.shown_chips()}[self.sel])
+
+    def count(self):
+        return 1 if self.page.shown_chips() else 0
+
+    def click(self, timeout=None):
+        self.page.chips, self.page.late = [], None
+
+
 class FlowPage(FakeStalkerPage):
-    """The broker_stalker page for read_broker_flow_code: the submit emits
+    """The broker_stalker page for read_broker_flow_code.
+
+    The broker picker is the DOM a user sees. After the n-th type() of a page
+    load, menu(code, n, ms) gives (rendered option texts, focused option texts)
+    `ms` of page waits later (default: just the typed code, focused). Enter adds
+    the focused option to the chips; late(code, n, ms) may then replace them `ms`
+    after that Enter (the server's debounced broker.value write), and
+    on_duration(chips) when the duration is clicked. The submit emits
     `responses[typed code]` (a FakeDashResponse, or None for no callback).
-    `rows` is only the DOM, which the broker_flow path must never read."""
-    def __init__(self, responses, rows=LEGACY_DOM_ROWS, fail=None):
+    `rows` is only the stalker table DOM, which the broker_flow path never reads."""
+    def __init__(self, responses, rows=LEGACY_DOM_ROWS, fail=None, menu=None, late=None, on_duration=None):
         super().__init__(rows, fail=fail, callbacks=[])
         self.responses, self.code, self.submits = responses, None, 0
+        self.menu_script, self.late_script, self.on_duration = menu, late, on_duration
+        self.typed, self.enters = [], []          # every type(); (n, rendered, focused) at each Enter
+        self._fresh()
+
+    def _fresh(self):
+        self.chips, self.n, self.typed_at, self.open, self.late = [], 0, None, False, None
+
+    def menu(self):
+        if not self.open:
+            return [], []
+        if self.menu_script:
+            return self.menu_script(self.code, self.n, sum(self.waits[self.typed_at:]))
+        return [self.code], [self.code]
+
+    def shown_chips(self):
+        if self.late is not None and self.late_script:
+            n, mark = self.late
+            chips = self.late_script(self.code, n, sum(self.waits[mark:]))
+            if chips is not None:
+                self.chips, self.late = list(chips), None
+        return list(self.chips)
+
+    def goto(self, url, **kw):
+        super().goto(url, **kw)
+        self._fresh()
 
     def type(self, text):
-        self.code = text
+        self.typed.append(text)
+        self.code, self.n, self.typed_at, self.open = text, self.n + 1, len(self.waits), True
+
+    def press(self, key):
+        if key == "Enter" and self.open:
+            rendered, focused = self.menu()
+            self.enters.append((self.n, rendered, focused))
+            self.chips = self.shown_chips() + focused[:1]
+            self.open, self.late = False, (self.n, len(self.waits))
+        elif key == "Escape":
+            self.open = False
+
+    def locator(self, sel):
+        if sel in (ns.FLOW_PICKER_OPTION, ns.FLOW_PICKER_FOCUSED, ns.FLOW_PICKER_CHIP,
+                   "#broker .Select-clear-zone"):
+            return PickerLocator(self, sel)
+        loc = super().locator(sel)
+        if "duration-picker" in sel and self.on_duration:
+            page, click = self, loc.click
+
+            def clicked(timeout=None):
+                click(timeout)
+                page.chips = list(page.on_duration(page.shown_chips()))
+            loc.click = clicked
+        return loc
 
     def click(self, sel, timeout=None):
         if sel == "#submit-button" and self.fail != "submit":
@@ -1841,7 +1917,7 @@ def test_scan_status_records_provenance_and_keeps_the_persisted_run(monkeypatch)
 
 def test_save_daily_broker_flow_persists_one_complete_snapshot(monkeypatch, tmpdir_path):
     monkeypatch.setattr(ns, "DB_PATH", os.path.join(tmpdir_path, "neobdm.db"))
-    monkeypatch.setattr(ns, "BROKER_FLOW_CODES", ["XL", "AK"])
+    monkeypatch.setattr(ns, "BROKER_FLOW_CAPTURE_CODES", ["XL", "AK"])
     monkeypatch.setattr(ns, "TRACKED_TICKERS", sorted(FLOW_TRACKED))
     flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
     page = FlowPage({"XL": flow_response("XL"), "AK": flow_response("AK")})
@@ -1855,12 +1931,128 @@ def test_save_daily_broker_flow_persists_one_complete_snapshot(monkeypatch, tmpd
 
 def test_save_daily_broker_flow_writes_nothing_on_a_partial_capture(monkeypatch, tmpdir_path):
     monkeypatch.setattr(ns, "DB_PATH", os.path.join(tmpdir_path, "neobdm.db"))
-    monkeypatch.setattr(ns, "BROKER_FLOW_CODES", ["XL", "AK"])
+    monkeypatch.setattr(ns, "BROKER_FLOW_CAPTURE_CODES", ["XL", "AK"])
     flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
     ns.save_daily_broker_flow(FlowPage({"XL": flow_response("XL")}))
     conn = sqlite3.connect(ns.DB_PATH)
     assert flow_rows(conn) == [] and {v[1] for v in scans(conn).values()} == {ns.SNAPSHOT_REJECTED}
     conn.close()
+
+
+# ── verified broker selection + the live capture universe ──
+# Live 2026-09-30: typing fires broker.search_value callbacks and ~1.1s later a
+# debounce callback may write broker.value itself, so a blind Enter can race it.
+HTML_500 = "<html><head><title>500 Internal Server Error</title></head><body></body></html>"
+
+
+def test_live_capture_universe_excludes_only_cs():
+    assert set(ns.BROKER_FLOW_LIVE_UNAVAILABLE) == {"CS"} and "HTTP 500" in ns.BROKER_FLOW_LIVE_UNAVAILABLE["CS"]
+    assert "CS" in ns.BROKER_FLOW_CODES and "CS" in ns.BANDAR_GROUPS["Sinarmas"]     # still a known code
+    assert "CS" not in ns.BROKER_FLOW_CAPTURE_CODES
+    assert set(ns.BROKER_FLOW_CAPTURE_CODES) == set(ns.BROKER_FLOW_CODES) - {"CS"}      # nothing else dropped
+    assert ns.BROKER_FLOW_CAPTURE_CODES == sorted(ns.BROKER_FLOW_CAPTURE_CODES)
+    assert (len(ns.BROKER_FLOW_CODES), len(ns.BROKER_FLOW_CAPTURE_CODES)) == (30, 29)
+
+
+@pytest.mark.parametrize("first", [
+    (["AK", "BK", "KI", "KK"], ["AK"]),     # filter not applied yet: several options, another one focused
+    (["KI", "KIX"], ["KI"]),               # the code is focused but not the only option
+    (["KI"], []),                          # the only option, not focused
+    ([], []),                              # nothing rendered
+])
+def test_flow_selection_presses_enter_only_on_one_exact_focused_option(monkeypatch, first):
+    page = FlowPage({"KI": flow_response("KI")}, menu=lambda code, n, ms: first if n == 1 else ([code], [code]))
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(2, ["KI"], ["KI"])]                  # never on attempt 1's menu
+    assert page.typed == ["KI", "KI"] and page.submits == 1
+    assert got["reason"] is None and got["scans"][0]["status"] == ns.FLOW_OK
+
+
+def test_flow_selection_waits_for_the_filter_instead_of_a_fixed_delay(monkeypatch):
+    # The old helper pressed Enter 800ms after typing; here the menu settles only at 1200ms.
+    page = FlowPage({"KI": flow_response("KI")},
+                    menu=lambda code, n, ms: (["AK", "BK", "KI"], ["AK"]) if ms < 1200 else ([code], [code]))
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.typed == ["KI"]
+    assert got["reason"] is None
+
+
+@pytest.mark.parametrize("wrong", [[], ["KI", "AD"], ["AK"], ["KI", "KI"]])
+def test_flow_selection_retries_once_when_the_settled_chips_are_wrong(monkeypatch, wrong):
+    # The debounced server write lands 1100ms after Enter: only a check after it sees it.
+    page = FlowPage({"KI": flow_response("KI")}, late=lambda code, n, ms: wrong if n == 1 and ms >= 1100 else None)
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert [n for n, _r, _f in page.enters] == [1, 2] and page.submits == 1
+    assert got["reason"] is None and got["scans"][0]["status"] == ns.FLOW_OK
+
+
+@pytest.mark.parametrize("script", [
+    {"menu": lambda code, n, ms: (["AK", "KI"], ["AK"]) if code == "KI" else ([code], [code])},
+    {"late": lambda code, n, ms: ["KI", "AD"] if code == "KI" and ms >= 1100 else None},
+])
+def test_flow_selection_gives_up_after_two_attempts_and_the_snapshot_is_rejected(monkeypatch, script):
+    page = FlowPage({"XL": flow_response("XL"), "KI": flow_response("KI")}, **script)
+    got, _ = capture(monkeypatch, None, codes=("XL", "KI"), page=page)
+    assert page.typed.count("KI") == 2 and page.submits == 1                  # XL only: KI never submitted
+    status = {s["broker_code"]: s for s in got["scans"]}
+    assert status["XL"]["status"] == ns.FLOW_OK and status["KI"]["status"] == ns.FLOW_SOURCE_FAILURE
+    assert "broker picker never selected exactly ['KI']" in status["KI"]["detail"]
+    assert got["reason"] == "1/2 code(s) failed: KI"
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0)])
+    before = flow_rows(conn)
+    assert not ns.persist_broker_flow_capture(conn, got) and flow_rows(conn) == before
+
+
+@pytest.mark.parametrize("change", [lambda chips: chips + ["AD"], lambda chips: [], lambda chips: ["AK"]])
+def test_flow_scan_fails_closed_when_the_chips_change_before_submit(monkeypatch, change):
+    page = FlowPage({"KI": flow_response("KI")}, on_duration=change)
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.submits == 0 and page.expect_calls == 0
+    assert "broker picker changed before submit" in got["scans"][0]["detail"] and got["rows"] == []
+
+
+def test_flow_request_stays_the_final_authority_over_the_picker(monkeypatch):
+    page = FlowPage({"KI": flow_response("KI", broker=["AK"])})
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.submits == 1       # the picker proved KI...
+    assert "request state broker.value is not ['KI']" in got["scans"][0]["detail"]   # ...the request did not
+    assert got["rows"] == [] and got["reason"] == "1/1 code(s) failed: KI"
+
+
+def test_flow_request_proof_is_checked_before_the_http_status():
+    wrong = FakeDashResponse(status=500, post_data=flow_request("KI", broker=["AK"]), body=HTML_500)
+    with pytest.raises(RuntimeError) as err:
+        ns.read_broker_flow_code(FlowPage({"KI": wrong}), "KI", timeout_ms=10)
+    assert "request state broker.value is not ['KI']" in str(err.value)
+    assert "its HTTP 500 response was not used" in str(err.value) and "failed: HTTP" not in str(err.value)
+    exact = FakeDashResponse(status=500, post_data=flow_request("CS"), body=HTML_500)
+    with pytest.raises(RuntimeError, match=r"failed: HTTP 500 for the exact \['CS'\] request"):
+        ns.read_broker_flow_code(FlowPage({"CS": exact}), "CS", timeout_ms=10)
+
+
+def test_default_capture_requests_the_active_codes_only_and_never_invents_cs(monkeypatch):
+    active = ns.BROKER_FLOW_CAPTURE_CODES
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    page = FlowPage({c: flow_response(c) for c in active + ["CS"]})      # CS would answer if asked
+    got = ns.capture_broker_flow(page, FLOW_TRACKED)
+    assert page.typed == active and "CS" not in page.typed               # every active code once, CS never
+    assert [s["broker_code"] for s in got["scans"]] == active and got["reason"] is None
+    assert not [r for r in got["rows"] if r["broker_code"] == "CS"]
+    conn = flow_db()
+    assert ns.persist_broker_flow_capture(conn, got)
+    assert conn.execute("SELECT COUNT(*) FROM broker_flow WHERE broker_code = 'CS'").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM broker_flow_scan WHERE broker_code = 'CS'").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(DISTINCT broker_code) FROM broker_flow").fetchone() == (len(active),)
+
+
+def test_one_failing_active_code_rejects_the_whole_default_snapshot(monkeypatch):
+    active = ns.BROKER_FLOW_CAPTURE_CODES
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    got = ns.capture_broker_flow(FlowPage({c: flow_response(c) for c in active[:-1]}), FLOW_TRACKED)
+    assert got["reason"] == f"1/{len(active)} code(s) failed: {active[-1]}"
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0)])
+    before = flow_rows(conn)
+    assert not ns.persist_broker_flow_capture(conn, got) and flow_rows(conn) == before
 
 
 def test_record_konglo_signals_keeps_the_broker_stalker_status_and_reason():
