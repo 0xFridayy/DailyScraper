@@ -633,22 +633,55 @@ class FakeTr:
 
 
 OLD_TABLE = "<table><tr><td>left over from before the submit</td></tr></table>"
-DASH_URL = "https://neobdm.tech/django_plotly_dash/app/some_app/_dash-update-component"
+DASH_URL = "https://neobdm.tech/django_plotly_dash/app/bs_app/_dash-update-component"
+DIST, AKUM = "broker-dist-stalker", "broker-akum-stalker"
 
 
 UNSET = object()
 
 
+# The live submit callback, as captured 2026-09-29: one request whose structured
+# outputs are both side containers' children, answered by a multi-output body
+# whose side children are a Label and that side's DataTable.
+LIVE_OUTPUT = f"..{AKUM}.children...{DIST}.children.."
+LIVE_OUTPUTS = ({"id": AKUM, "property": "children"}, {"id": DIST, "property": "children"})
+
+
+def dash_label(text):
+    return {"props": {"children": text}, "type": "Label", "namespace": "dash_html_components"}
+
+
+def dash_table(table_id, data=UNSET, type_="DataTable", namespace="dash_table"):
+    props = {"id": table_id, "columns": [{"name": "Symbol", "id": "symbol"}]}
+    if data is not UNSET:
+        props["data"] = data
+    return {"props": props, "type": type_, "namespace": namespace}
+
+
+def live_side(side, data=({"symbol": "AAAA", "netval": "-5,000"},)):
+    return {"children": [dash_label(f"{side} stalker"), dash_table(f"stalker-{side}-table", list(data))]}
+
+
+DROP = object()
+
+
+def live_body(akum=UNSET, dist=UNSET):
+    """The live response body; akum/dist replace that side's update (DROP leaves it out)."""
+    response = {}
+    for component, side, update in ((AKUM, "akum", akum), (DIST, "dist", dist)):
+        if update is not DROP:
+            response[component] = live_side(side) if update is UNSET else update
+    return {"multi": True, "response": response}
+
+
 class FakeDashResponse:
     """A Playwright Response as the submit-callback predicate and
-    _submit_and_confirm_callback read it. By default: a successful callback fired
-    by the submit button that outputs to broker-dist-stalker, declared both ways
-    Dash does ("output" string and "outputs" objects). output/outputs=UNSET
-    leaves that key out of the request body."""
+    _submit_and_confirm_callback read it. By default: the exact live submit
+    callback (LIVE_OUTPUT / LIVE_OUTPUTS request, live_body() response).
+    output/outputs=UNSET leaves that key out of the request body; a non-string
+    body is sent as its JSON."""
     def __init__(self, changed=("submit-button.n_clicks",), status=200, method="POST", url=DASH_URL,
-                 post_data="json", body='{"multi": true, "response": {"broker-dist-stalker": {}}}',
-                 output="..broker-dist-stalker.children..",
-                 outputs=({"id": "broker-dist-stalker", "property": "children"},)):
+                 post_data="json", body=UNSET, output=LIVE_OUTPUT, outputs=LIVE_OUTPUTS):
         if post_data == "json":
             payload = {"changedPropIds": list(changed), "inputs": []}
             if output is not UNSET:
@@ -656,7 +689,9 @@ class FakeDashResponse:
             if outputs is not UNSET:
                 payload["outputs"] = list(outputs) if isinstance(outputs, tuple) else outputs
             post_data = json.dumps(payload)
-        self.url, self.status, self._body = url, status, body
+        body = live_body() if body is UNSET else body
+        self.url, self.status = url, status
+        self._body = body if isinstance(body, str) else json.dumps(body)
         self.request = type("Req", (), {"method": method, "post_data": post_data})()
 
     def text(self):
@@ -934,38 +969,42 @@ def test_a_later_callback_that_targets_the_dist_table_is_the_one_accepted():
 def test_targeted_callback_with_a_byte_identical_table_is_accepted():
     identical = "<table><tr><td>the same rows before and after</td></tr></table>"
     got, result = strict_scan(before=identical, after=identical,
-                              callbacks=[UNRELATED, targeting("broker-dist-stalker", "data")])
+                              callbacks=[UNRELATED, targeting("broker-dist-stalker")])
     assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
     assert result.status == nsc.HITS
 
 
-DIST = "broker-dist-stalker"
-
-
 @pytest.mark.parametrize("output, outputs", [
-    (UNSET, {"id": DIST, "property": "children"}),                                  # single object
-    (UNSET, [{"id": "x", "property": "children"}, {"id": DIST, "property": "data"}]),
-    (UNSET, [[{"id": DIST, "property": "data"}], [{"id": "x", "property": "y"}]]),    # nested lists
-    (UNSET, {"group": [{"id": "x", "property": "y"}, {"inner": {"id": DIST, "property": "data"}}]}),
-    (f"{DIST}.children", UNSET),                                                     # single-output string
-    (f"..x.children...{DIST}.data..", UNSET),                                        # multi-output string
-    (f"..x.children...{DIST}.data..", [{"id": "x", "property": "children"}]),       # either declaration
+    (LIVE_OUTPUT, LIVE_OUTPUTS),                                                     # the live request
+    (UNSET, [{"id": DIST, "property": "children"}]),                                # `outputs` alone suffices
+    ("x.children", [{"id": "x", "property": "children"}, {"id": DIST, "property": "children"}]),
 ])
-def test_output_declared_in_any_dash_payload_shape_is_accepted(output, outputs):
+def test_structured_outputs_with_the_exact_side_children_pair_are_accepted(output, outputs):
     got, result = strict_scan(callbacks=[FakeDashResponse(output=output, outputs=outputs)])
     assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (output, outputs)
     assert result.status == nsc.HITS
 
 
 @pytest.mark.parametrize("output, outputs", [
-    (UNSET, UNSET),                                                                  # no output declared
+    # A. the side id is declared, but not as the exact {id, property: children} pair
+    (f"{DIST}.data", [{"id": DIST, "property": "data"}]),                            # wrong property
+    (LIVE_OUTPUT, [{"id": AKUM, "property": "children"}, {"id": DIST, "property": "data"}]),
+    (UNSET, [{"id": DIST, "property": "children.props"}]),
+    (UNSET, [{"id": DIST}]),                                                         # no property
+    (UNSET, [{"id": DIST, "property": "children", "extra": 1}]),                     # not the exact pair
+    (LIVE_OUTPUT, UNSET),                                                            # string only: not the proof
+    (f"{DIST}.children", {"id": DIST, "property": "children"}),                      # object, not a list
+    (UNSET, [[{"id": DIST, "property": "children"}]]),                               # nested list
+    (UNSET, {"group": [{"id": DIST, "property": "children"}]}),
+    # the side id is not declared at all
+    (UNSET, UNSET),
     (None, None),
     ("", []),
-    (123, {"property": "children"}),                                                # no id anywhere
-    (DIST, UNSET),                                                                   # id without a property
+    (123, {"property": "children"}),
+    (DIST, UNSET),
     (f"{DIST}-summary.children", [{"id": f"{DIST}-summary", "property": "children"}]),  # prefix, not the id
-    (f"x-{DIST}.children", UNSET),                                                   # suffix, not the id
-    (UNSET, [{"id": {"type": DIST, "index": 0}, "property": "data"}]),               # pattern id: unproven
+    (f"x-{DIST}.children", [{"id": f"x-{DIST}", "property": "children"}]),             # suffix, not the id
+    (UNSET, [{"id": {"type": DIST, "index": 0}, "property": "children"}]),           # pattern id
     (UNSET, [{"id": "x", "property": DIST}]),                                        # named only as a value
     ("x.children", [{"id": "x", "property": "children", "note": DIST}]),
 ])
@@ -995,11 +1034,158 @@ def test_each_side_accepts_only_its_own_table_callback():
         assert sorted(got) == ["AAAA", "BBBB", "CCCC"], side
 
 
+# ── response side: the matched callback must prove it supplied the side table
+BAD_RESPONSE = "submit-button.n_clicks Dash callback response"
+
+# The live response text, verbatim in shape (Label + DataTable per side).
+LIVE_RESPONSE_TEXT = json.dumps({"multi": True, "response": {
+    "broker-akum-stalker": {"children": [
+        {"props": {"children": "Top Akumulasi"}, "type": "Label", "namespace": "dash_html_components"},
+        {"props": {"id": "stalker-akum-table", "columns": [{"name": "Symbol", "id": "symbol"}],
+                   "data": [{"symbol": "ZZZZ", "netval": "7,000"}]},
+         "type": "DataTable", "namespace": "dash_table"}]},
+    "broker-dist-stalker": {"children": [
+        {"props": {"children": "Top Distribusi"}, "type": "Label", "namespace": "dash_html_components"},
+        {"props": {"id": "stalker-dist-table", "columns": [{"name": "Symbol", "id": "symbol"}],
+                   "data": [{"symbol": "AAAA", "netval": "-5,000"}]},
+         "type": "DataTable", "namespace": "dash_table"}]}}})
+
+
+def response_scan(body, side="dist", before=None, after="fresh"):
+    """get_netflow(strict=True) for `side`, the live request answered by `body`:
+    its rows, or the RuntimeError it raised."""
+    page = FakeStalkerPage(SELL_ROWS, before=before, after=after, callbacks=[FakeDashResponse(body=body)])
+    try:
+        return ns.get_netflow(page, ["XL"], "Today", side=side, strict=True)
+    except RuntimeError as e:
+        return e
+
+
+def assert_response_rejected(body, reason, side="dist"):
+    got = response_scan(body, side)
+    assert isinstance(got, RuntimeError), (body, got)
+    assert f"{BAD_RESPONSE} {reason}" in str(got), str(got)
+    if side == "dist":
+        result = ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, callbacks=[FakeDashResponse(body=body)]))
+        assert result.status == nsc.SOURCE_UNAVAILABLE and result.hits == []
+        assert reason in result.detail and "AAAA" not in stalker_text(result)
+
+
+@pytest.mark.parametrize("side", ["dist", "akum"])                     # F, G
+def test_exact_live_response_shape_is_accepted_for_each_side(side):
+    for body in (LIVE_RESPONSE_TEXT, live_body()):
+        got = response_scan(body, side)
+        assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (side, got)   # rows still come from the DOM
+    got = response_scan(live_body(**{side: live_side(side, data=())}), side)
+    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]                      # an empty data list is a list
+
+
+def test_identical_table_and_data_across_runs_are_accepted():         # H
+    identical = "<table><tr><td>the same rows on both runs</td></tr></table>"
+    runs = [response_scan(LIVE_RESPONSE_TEXT, before=identical, after=identical) for _ in range(2)]
+    assert runs[0] == runs[1] and sorted(runs[0]) == ["AAAA", "BBBB", "CCCC"]
+
+
+@pytest.mark.parametrize("side, other", [("dist", "akum"), ("akum", "dist")])   # B
+def test_response_that_updates_only_the_other_side_is_rejected(side, other):
+    component = ns.SIDE_CONTAINER[side].lstrip("#")
+    assert_response_rejected(live_body(**{side: DROP}), f"does not update {component}", side)
+    # the other side's table, moved under this side's key, is still not this side's table
+    assert_response_rejected(live_body(**{side: live_side(other)}),
+                             f"{component}.children has no stalker-{side}-table DataTable", side)
+
+
+@pytest.mark.parametrize("update, reason", [                             # C
+    ({}, f"does not update {DIST}.children"),
+    ({"data": [{"symbol": "AAAA"}]}, f"does not update {DIST}.children"),
+    (None, f"does not update {DIST}"),
+    ("children", f"does not update {DIST}"),
+    ([live_side("dist")], f"does not update {DIST}"),
+    ({"children": None}, f"{DIST}.children is not a list"),
+    ({"children": dash_table("stalker-dist-table", [])}, f"{DIST}.children is not a list"),
+    ({"children": "stalker-dist-table"}, f"{DIST}.children is not a list"),
+])
+def test_response_with_the_side_but_no_children_list_is_rejected(update, reason):
+    assert_response_rejected(live_body(dist=update), reason)
+
+
+NO_DIST_TABLE = f"{DIST}.children has no stalker-dist-table DataTable"
+
+
+@pytest.mark.parametrize("children, reason", [                           # D
+    ([], NO_DIST_TABLE),
+    ([dash_label("dist stalker")], NO_DIST_TABLE),
+    ([dash_label("x"), dash_table("stalker-akum-table", [])], NO_DIST_TABLE),     # wrong side's id
+    ([dash_label("x"), dash_table("stalker-dist-table-2", [])], NO_DIST_TABLE),   # not the exact id
+    ([dash_label("x"), dash_table(None, [])], NO_DIST_TABLE),
+    ([dash_label("x"), dash_table("stalker-dist-table", [], type_="Div",
+                                  namespace="dash_html_components")], NO_DIST_TABLE),  # not a DataTable
+    ([dash_label("x"), dash_table("stalker-dist-table", [], namespace="other_lib")], NO_DIST_TABLE),
+    ([dash_label("x"), {"props": {"children": [dash_table("stalker-dist-table", [])]},
+                        "type": "Div", "namespace": "dash_html_components"}], NO_DIST_TABLE),  # nested
+    ([dash_label("x"), {"type": "DataTable", "namespace": "dash_table", "props": None}], NO_DIST_TABLE),
+    ([dash_label("x"), "stalker-dist-table"], NO_DIST_TABLE),
+    ([dash_table("stalker-dist-table", []), dash_table("stalker-dist-table", [])],
+     f"{DIST}.children has 2 stalker-dist-table DataTable"),                         # ambiguous
+])
+def test_children_without_the_side_datatable_are_rejected(children, reason):
+    assert_response_rejected(live_body(dist={"children": children}), reason)
+
+
+@pytest.mark.parametrize("data", [UNSET, None, {}, {"symbol": "AAAA"}, "[]", 0])   # E
+def test_side_datatable_without_list_data_is_rejected(data):
+    children = [dash_label("dist stalker"), dash_table("stalker-dist-table", data)]
+    assert_response_rejected(live_body(dist={"children": children}),
+                             "stalker-dist-table props.data is not a list")
+
+
+@pytest.mark.parametrize("body, reason", [                               # I
+    ({**live_body(), "multi": False}, 'is not a multi-output response ("multi" is not true)'),
+    ({"response": live_body()["response"]}, 'is not a multi-output response ("multi" is not true)'),
+    ({**live_body(), "multi": "true"}, 'is not a multi-output response ("multi" is not true)'),
+    ({**live_body(), "multi": 1}, 'is not a multi-output response ("multi" is not true)'),
+    ({"multi": True}, 'has no "response" object'),
+    ({"multi": True, "response": None}, 'has no "response" object'),
+    ({"multi": True, "response": [live_side("dist")]}, 'has no "response" object'),
+    ({"multi": True, "response": {}}, f"does not update {DIST}"),
+    ({DIST: live_side("dist")}, 'is not a multi-output response ("multi" is not true)'),   # single-output
+    ([live_body()], "returned no JSON object"),
+    ("null", "returned no JSON object"),
+    ("", "returned no JSON object"),
+    ('{"multi": true, "response": ', "returned no JSON object"),                    # truncated
+    ("<html>login</html>", "returned no JSON object"),
+])
+def test_malformed_or_non_multi_response_is_rejected(body, reason):
+    assert_response_rejected(body, reason)
+
+
+PATCH = {"__dash_patch_update": "__dash_patch_update", "operations": []}
+
+
+@pytest.mark.parametrize("body, reason", [                               # J
+    ({**live_body(), "job": "a1b2"}, "is a background-callback response (job)"),
+    ({**live_body(), "cacheKey": "k"}, "is a background-callback response (cacheKey)"),
+    ({**live_body(), "sideUpdate": {}}, "is a background-callback response (sideUpdate)"),
+    ({"multi": True, "response": {}, "job": "a1b2", "cacheKey": "k", "progress": None},
+     "is a background-callback response (job, cacheKey)"),
+    (live_body(dist={"children": PATCH}), "is a Patch (partial) update"),
+    (live_body(dist={"children": [dash_label("x"), dash_table("stalker-dist-table", [PATCH])]}),
+     "is a Patch (partial) update"),                                                # Patch inside the data
+    (live_body(akum={"children": PATCH}), "is a Patch (partial) update"),           # Patch on either side
+])
+def test_background_or_patch_response_is_rejected(body, reason):
+    assert_response_rejected(body, reason)
+
+
 @pytest.mark.parametrize("before, after, callbacks", [
     (OLD_TABLE, OLD_TABLE, []),                                           # no callback at all
     (None, "fresh", [FakeDashResponse(status=500)]),                      # failed callback
     (None, "fresh", [FakeDashResponse(changed=("broker.value",))]),       # not submit-triggered
     (OLD_TABLE, OLD_TABLE, [UNRELATED]),                                  # not the side table
+    (None, "fresh", [FakeDashResponse(outputs=[{"id": DIST, "property": "data"}])]),  # wrong property
+    (None, "fresh", [FakeDashResponse(body=live_body(dist=DROP))]),       # response: other side only
+    (None, "fresh", [FakeDashResponse(body={**live_body(), "job": "a1b2"})]),         # background
+    (None, "fresh", [FakeDashResponse(body=live_body(dist={"children": PATCH}))]),    # Patch
 ])
 def test_legacy_netflow_is_unchanged_by_the_submit_contract(before, after, callbacks):
     page = FakeStalkerPage(SELL_ROWS, before=before, after=after, callbacks=callbacks)

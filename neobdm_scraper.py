@@ -960,67 +960,54 @@ def parse_stalker_table(page, side="dist"):
     return data
 
 
-# Strict submit contract (Broker Stalker only).
+# Strict submit contract (Broker Stalker only), pinned to the live capture of
+# 2026-09-29. One submit fires exactly one relevant Dash callback:
+#   POST /django_plotly_dash/app/bs_app/_dash-update-component
+#   request  changedPropIds ["submit-button.n_clicks"]
+#            outputs [{"id": "broker-akum-stalker", "property": "children"},
+#                     {"id": "broker-dist-stalker", "property": "children"}]
+#   response HTTP 200 {"multi": true, "response": {
+#              "broker-akum-stalker": {"children": [<Label>, <DataTable stalker-akum-table>]},
+#              "broker-dist-stalker": {"children": [<Label>, <DataTable stalker-dist-table>]}}}
+# with no job / cacheKey / sideUpdate (background callback) and no Patch.
 #
-# What it proves: the server acknowledged and completed the Dash callback that
-# the #submit-button click triggered AND that declares the `side` table's
-# component as an output. The page's cells carry data-dash-column (a Dash
-# DataTable), and Dash sends every server callback as a POST to its standard
-# `_dash-update-component` endpoint with a JSON body naming the property that
-# fired it (changedPropIds) and the outputs it updates (output / outputs). So,
-# with a response waiter armed BEFORE the click, the scan accepts only a
+# With a response waiter armed BEFORE the click, the scan accepts only a
 # response that is
 #   POST, URL containing "_dash-update-component",
 #   request body valid JSON with "submit-button.n_clicks" in changedPropIds,
-#   request body whose declared output(s) name the side component
-#     (SIDE_CONTAINER without the "#": broker-dist-stalker / broker-akum-stalker),
-#   HTTP 200 with a JSON object body (204 = Dash PreventUpdate = nothing updated),
-# and fails closed if none arrives within STALKER_CALLBACK_TIMEOUT_MS. A
-# submit-triggered callback for another component is ignored: it says nothing
-# about this table. No app path is assumed; this page's callback URL and output
-# ids have never been captured, so if the live callback writes to a different
-# component id than the container, the scan fails closed (SOURCE_UNAVAILABLE).
+#   request body whose structured `outputs` list holds exactly
+#     {"id": <SIDE_CONTAINER without "#">, "property": "children"}
+#     (the "output" string is not consulted: `outputs` is the proof),
+# and fails closed if none arrives within STALKER_CALLBACK_TIMEOUT_MS; a
+# submit-triggered callback for another component or property is ignored. The
+# matched response must then prove it supplied the side table (see
+# _check_side_response): HTTP 200 (204 = Dash PreventUpdate = nothing updated),
+# the live multi-output body, and the side's children list holding the side's
+# DataTable with a list `data`. Its contents are not compared with anything: an
+# unchanged result is a valid result.
 #
-# After that callback, the side table only has to be present and settled across
-# polls; its HTML may be byte-identical to the pre-submit table (an unchanged
-# result is a valid result), and DOM changes before the callback never count.
+# After that, the side table only has to be present and settled across DOM
+# polls, which only guards against reading it mid-render (rows are still
+# parsed from the DOM); DOM changes before the callback never count.
 DASH_CALLBACK_ENDPOINT = "_dash-update-component"
 SUBMIT_TRIGGER = "submit-button.n_clicks"
+SIDE_TABLE_ID = {"akum": "stalker-akum-table", "dist": "stalker-dist-table"}
+DASH_BACKGROUND_KEYS = ("job", "cacheKey", "sideUpdate")
+DASH_PATCH_MARKER = "__dash_patch_update"
 STALKER_CALLBACK_TIMEOUT_MS = 20000
 STALKER_SETTLE_TIMEOUT_MS = 15000
 STALKER_SETTLE_POLL_MS = 500
 
 
-def _dash_output_ids(value):
-    """Every string component id a Dash callback payload's output/outputs value
-    declares, whatever its shape: an "id.prop" or "..id.prop...id.prop.." string,
-    {"id": ..., "property": ...} objects, or lists / nested objects of those.
-    Pattern-matching (dict) ids and anything unrecognised declare nothing."""
-    if isinstance(value, str):
-        return {part.rsplit(".", 1)[0] for part in value.strip(".").split("...") if "." in part}
-    ids = set()
-    if isinstance(value, dict):
-        if isinstance(value.get("id"), str):
-            ids.add(value["id"])
-        for v in value.values():
-            if isinstance(v, (dict, list)):
-                ids |= _dash_output_ids(v)
-    elif isinstance(value, list):
-        for v in value:
-            ids |= _dash_output_ids(v)
-    return ids
-
-
-def _callback_targets(payload, component_id):
-    """Does this Dash callback payload declare `component_id` as an output?"""
-    return component_id in (_dash_output_ids(payload.get("output"))
-                            | _dash_output_ids(payload.get("outputs")))
+def _side_output(side):
+    """The structured output the live submit callback declares for `side`."""
+    return {"id": SIDE_CONTAINER[side].lstrip("#"), "property": "children"}
 
 
 def _submit_callback_for(side):
-    """Predicate: is a response the submit-triggered Dash callback that outputs to
-    the `side` table's component? Never raises."""
-    component_id = SIDE_CONTAINER[side].lstrip("#")
+    """Predicate: is a response the submit-triggered Dash callback whose
+    structured outputs include the `side` container's children? Never raises."""
+    expected = _side_output(side)
 
     def is_it(response):
         import json as _json
@@ -1031,18 +1018,63 @@ def _submit_callback_for(side):
             payload = _json.loads(request.post_data or "")
             if not isinstance(payload, dict):
                 return False
-            changed = payload.get("changedPropIds")
+            changed, outputs = payload.get("changedPropIds"), payload.get("outputs")
             return (isinstance(changed, list) and SUBMIT_TRIGGER in changed
-                    and _callback_targets(payload, component_id))
+                    and isinstance(outputs, list) and expected in outputs)
         except Exception:
             return False
     return is_it
 
 
+def _has_patch_marker(value):
+    if isinstance(value, dict):
+        return DASH_PATCH_MARKER in value or any(_has_patch_marker(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_patch_marker(v) for v in value)
+    return value == DASH_PATCH_MARKER
+
+
+def _check_side_response(body, side):
+    """Raise ValueError unless `body` (the submit callback's parsed JSON) is the
+    live multi-output response that supplies the `side` table: a plain (not
+    background, not Patch) update of the side container's children, a list
+    holding exactly one DataTable with the side's table id and a list `data`."""
+    if not isinstance(body, dict):
+        raise ValueError("returned no JSON object")
+    background = [k for k in DASH_BACKGROUND_KEYS if k in body]
+    if background:
+        raise ValueError(f"is a background-callback response ({', '.join(background)})")
+    if _has_patch_marker(body):
+        raise ValueError("is a Patch (partial) update")
+    if body.get("multi") is not True:
+        raise ValueError('is not a multi-output response ("multi" is not true)')
+    response = body.get("response")
+    if not isinstance(response, dict):
+        raise ValueError('has no "response" object')
+    component = SIDE_CONTAINER[side].lstrip("#")
+    update = response.get(component)
+    if not isinstance(update, dict):
+        raise ValueError(f"does not update {component}")
+    if "children" not in update:
+        raise ValueError(f"does not update {component}.children")
+    children = update["children"]
+    if not isinstance(children, list):
+        raise ValueError(f"{component}.children is not a list")
+    table_id = SIDE_TABLE_ID[side]
+    tables = [c for c in children
+              if isinstance(c, dict) and c.get("namespace") == "dash_table"
+              and c.get("type") == "DataTable" and isinstance(c.get("props"), dict)
+              and c["props"].get("id") == table_id]
+    if len(tables) != 1:
+        raise ValueError(f"{component}.children has {len(tables) or 'no'} {table_id} DataTable")
+    if not isinstance(tables[0]["props"].get("data"), list):
+        raise ValueError(f"{table_id} props.data is not a list")
+
+
 def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
     """Click #submit-button with a response waiter already armed, and require the
-    submit-triggered Dash callback that targets the `side` table to complete
-    successfully. Raises otherwise."""
+    submit-triggered Dash callback that outputs the `side` container's children
+    to complete successfully and supply the side table. Raises otherwise."""
     component_id = SIDE_CONTAINER[side].lstrip("#")
     try:
         with page.expect_response(_submit_callback_for(side), timeout=timeout_ms) as info:
@@ -1059,8 +1091,10 @@ def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT
                            f"{timeout_ms // 1000}s of submit: {_safe_error(e)}") from e
     if response.status != 200:
         raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
-    if not isinstance(_api_json(response), dict):
-        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback returned no JSON object")
+    try:
+        _check_side_response(_api_json(response), side)
+    except ValueError as e:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
     return response
 
 
@@ -1089,10 +1123,10 @@ def get_netflow(page, codes, duration="Today", side="dist", strict=False):
     switch or submit click is logged and ignored, a fixed 4s wait follows the
     submit, and a failed table parse returns {}. strict=True (Broker Stalker)
     raises on each of those instead, and replaces the fixed wait with the
-    submit contract above (a confirmed submit-button Dash callback that outputs
-    to the `side` table, then a settled table), so neither a technical failure
-    nor a submit the server never answered for this table can be read as this
-    query's result."""
+    submit contract above (a confirmed submit-button Dash callback whose
+    response supplies the `side` table, then a settled table), so neither a
+    technical failure nor a submit the server never answered for this table can
+    be read as this query's result."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
