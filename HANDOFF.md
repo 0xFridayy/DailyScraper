@@ -1160,6 +1160,10 @@ mengosongkan tabel kalau sumbernya kebetulan kosong. `price_history` dan
 dari API, bukan tanggal scrape — justru itu sebabnya ketidaksepakatan kedua
 jalur terdeteksi keras.
 
+> **Koreksi (2026-09-30, Lampiran R):** untuk `broker_flow` itu hanya benar bagi
+> baris backfill (≤ 2026-07-04, `bval` NULL). Baris live (≥ 2026-07-05, `bval`
+> terisi) berkunci **tanggal scrape MYT**, dan dulu tanpa pagar jendela.
+
 Sesudahnya: `🟢 signal integrity OK — offset=1d n=113 agree=100%`, exit 0.
 
 ### 2. Pagar dipasang
@@ -1188,3 +1192,67 @@ data sebenarnya** alih-alih menyimpulkannya dari tanggal scrape. Kolom
 `last_date` yang disediakan untuk itu NULL di semua baris. Pagar di atas
 mencegah penulisan yang salah, tapi tidak membuat run di luar jendela jadi
 berguna untuk panel — itu butuh tanggal data yang otoritatif.
+
+## Lampiran R — capture `broker_flow` live: tabel lengkap, sesi terbukti, tulis semua-atau-tidak-sama-sekali (2026-09-30)
+
+### Masalah (audit baca-saja, `neobdm.db` per 2026-09-29)
+
+- Jalur lama (`get_netflow(strict=False)`) membaca tabel DOM yang dirender:
+  `page_size=15`, padahal `props.data` callback berisi ratusan baris (probe live
+  XL/AK/IF: 181–612 baris per sisi, diurutkan menurut netval). Ticker di luar
+  15 teratas hilang diam-diam; tidak ada catatan bahwa scan terpotong.
+- Sel kosong/`-`/`N/A` lewat `parse_num` → 0.0; gagal klik durasi/submit
+  diabaikan dan tabelnya tetap dibaca.
+- Tanpa pagar jendela: run sore/malam Juli (07-06/07/09/10/13) menyimpan sesi
+  hari itu sendiri, bukan sesi sebelumnya; sesi 07-08 tak pernah tertangkap.
+- Rerun di tanggal yang sama hanya `INSERT OR REPLACE`: 2026-08-12 = 212 baris
+  sesi 08-12 + 90 baris sisa sesi 08-11; 2026-08-27 = 158 + 121 baris sisa.
+- Hanya 60 dari 86 tanggal live yang snapshot-nya berbeda (salinan akhir
+  pekan/libur/basi).
+
+### Kontrak baru (`method = dash_callback_v1`)
+
+`read_broker_flow_code` = satu muat halaman + **satu** submit per kode (callback
+menjawab akum DAN dist). Diterima hanya bila:
+
+- request membuktikan dirinya: `inputs` `duration-picker.value == "Today"` dan
+  `foreign-only-checkbox.value == []`, `state` `broker.value == [kode]`,
+  `changedPropIds` memuat `submit-button.n_clicks`, `outputs` memuat kedua
+  kontainer `.children`;
+- respons lolos validasi Broker Stalker (PR #71) untuk kedua sisi — setiap baris,
+  bukan hanya ticker yang dilacak;
+- Label dbc tiap sisi persis `Stalking Net Buy|Sell from D Mon YYYY to D Mon
+  YYYY`, from == to, tanggal akum == dist → `session_date` (bukti sesi dari
+  sumber; jam mesin tidak dipakai);
+- tidak ada ticker berulang dalam satu sisi dan tidak ada ticker di kedua sisi
+  (tidak di-dedupe).
+
+Angka dikonversi ketat: 0 eksplisit dari sumber = nol teramati (dibulatkan
+sumber); sel hilang/tidak valid = scan GAGAL, tidak pernah 0.0.
+
+### Persistensi
+
+Semua kode ditangkap dulu, baru diputuskan. `broker_flow` untuk `scrape_date`
+diganti HANYA jika semua `BROKER_FLOW_CODES` OK, semua melaporkan
+`session_date` yang sama, dan `session_date < scrape_date` (MYT, awal capture).
+Salinan akhir pekan/libur tetap diizinkan (Minggu membawa sesi Jumat). Bila
+lolos: satu transaksi menghapus baris live tanggal itu (`bval IS NOT NULL`;
+baris backfill dipertahankan) lalu memasukkan snapshot baru. Bila tidak:
+`broker_flow` **tidak disentuh sama sekali**.
+
+Provenance per kode per run di tabel baru `broker_flow_scan` (status OK /
+SOURCE_FAILURE, `snapshot` PERSISTED / REJECTED / SUPERSEDED, `session_date`,
+jumlah baris, alasan di `detail`). Tidak ada model yang membacanya.
+
+### Yang TIDAK dikerjakan di sini (tindak lanjut)
+
+- `broker_flow.date` live **tetap** berkunci tanggal scrape (= sesi selesai
+  terakhir sebelum tanggal itu), berbeda dengan backfill yang berkunci tanggal
+  sesi. Re-key / migrasi ke `session_date` belum dilakukan; pembaca yang
+  menggabungkan `broker_flow.date` langsung dengan `price_history.date` masih
+  melihat dua rezim.
+- Baris live sebelum PR ini tetap apa adanya: sampel 15 teratas, bisa campuran
+  dua sesi (08-12, 08-27), bisa sesi hari yang sama (Juli). Belum diperbaiki.
+- Missingness di level konsumen belum diperbaiki: `horizon_scan` (`fillna(0)`),
+  `ml_v2_experiment_1` (`reindex(...).fillna(0.0)`) dan agregasi `groupby().sum()`
+  masih memperlakukan broker/tanggal yang absen sebagai nol.

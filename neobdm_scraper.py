@@ -264,9 +264,9 @@ STOCK_OWNER = {
 # actual watchlist.
 TRACKED_TICKERS = sorted(set(STOCK_OWNER.keys()))
 
-# Broker codes to persist per-ticker flow for. Each code costs 2 get_netflow
-# calls (akum side + dist side), each a full page reload (~10-15s) — this
-# list size drives the nightly job's runtime. Trim it if the GH Actions
+# Broker codes to persist per-ticker flow for. Each code costs one page load
+# and one submit (read_broker_flow_code: one callback answers both sides) —
+# this list size drives the nightly job's runtime. Trim it if the GH Actions
 # timeout gets tight.
 BROKER_FLOW_CODES = sorted(set(
     RETAIL_BROKERS + STALKER_RETAIL + list(SMART_MONEY) +
@@ -917,8 +917,8 @@ def set_broker_codes(page, codes):
 
 
 def set_duration(page, label="Today", strict=False):
-    """strict=False (broker_flow) logs a failed click and carries on, as it always
-    has. strict=True raises: the table would then show whatever duration the page
+    """strict=False (legacy get_netflow) logs a failed click and carries on, as it
+    always has. strict=True raises: the table would then show whatever duration the page
     defaulted to, which the caller must not report as `label`."""
     try:
         page.locator(f"#duration-picker label:has-text('{label}')").first.click(timeout=5000)
@@ -1181,7 +1181,8 @@ def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT
 def get_netflow(page, codes, duration="Today", side="dist", strict=False):
     """symbol -> row of the broker_stalker `side` table for `codes` over `duration`.
 
-    strict=False is the broker_flow path and is unchanged: a failed duration
+    strict=False is the legacy DOM path and is unchanged (broker_flow no longer
+    uses it: see read_broker_flow_code): a failed duration
     switch or submit click is logged and ignored, a fixed 4s wait follows the
     submit, the rows are parsed from the DOM table, and a failed parse returns
     {}. strict=True (Broker Stalker) raises on a failed duration switch or
@@ -1421,65 +1422,321 @@ def scrape_broker_stalker(page):
 # here. Feature computation (broker_concentration, retail_presence_pct, etc.)
 # happens downstream once there's enough history to build/validate them.
 
+BROKER_FLOW_DDL = """
+    CREATE TABLE IF NOT EXISTS broker_flow (
+        date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        broker_code TEXT NOT NULL,
+        bval REAL,
+        sval REAL,
+        netval REAL,
+        bavg REAL,
+        savg REAL,
+        PRIMARY KEY (date, ticker, broker_code)
+    )
+"""
+
+# Provenance of every broker_flow capture, one row per code per run (additive;
+# no model reads it). status is the code's own scan (OK / SOURCE_FAILURE, the
+# reason in detail); snapshot is what the RUN did to broker_flow for scrape_date:
+# PERSISTED (its rows are the live snapshot), REJECTED (broker_flow untouched,
+# the run's reason in detail), SUPERSEDED (a later run replaced the snapshot).
+# run_started_utc is in the key so a rejected rerun never overwrites the record
+# of the snapshot that is still in broker_flow.
+BROKER_FLOW_SCAN_DDL = """
+    CREATE TABLE IF NOT EXISTS broker_flow_scan (
+        scrape_date TEXT NOT NULL,
+        broker_code TEXT NOT NULL,
+        run_started_utc TEXT NOT NULL,
+        status TEXT NOT NULL,
+        snapshot TEXT NOT NULL,
+        session_date TEXT,
+        akum_rows_returned INTEGER,
+        dist_rows_returned INTEGER,
+        tracked_rows INTEGER,
+        method TEXT NOT NULL,
+        started_utc TEXT,
+        completed_utc TEXT,
+        detail TEXT,
+        PRIMARY KEY (scrape_date, broker_code, run_started_utc)
+    )
+"""
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS broker_flow (
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            broker_code TEXT NOT NULL,
-            bval REAL,
-            sval REAL,
-            netval REAL,
-            bavg REAL,
-            savg REAL,
-            PRIMARY KEY (date, ticker, broker_code)
-        )
-    """)
+    conn.execute(BROKER_FLOW_DDL)
+    conn.execute(BROKER_FLOW_SCAN_DDL)
     conn.commit()
     return conn
 
 
-def scrape_broker_flow_for_db(page, tickers):
-    """For each code in BROKER_FLOW_CODES, pull today's net flow on both sides
-    (akum=net-buy, dist=net-sell) across all symbols, keeping only rows for
-    `tickers`. Reuses the already-authenticated `page` — no separate login."""
-    tickers = set(tickers)
-    rows = []
-    for code in BROKER_FLOW_CODES:
-        for side in ("akum", "dist"):
+# broker_flow capture contract (dash_callback_v1), pinned to the live probe of
+# 2026-09-30 (XL, AK, IF). One submit answers BOTH sides: the matched callback's
+# request carries inputs duration-picker.value "Today" and
+# foreign-only-checkbox.value [] and state broker.value [code], and its response
+# is the Broker Stalker multi-output body (see _side_response_data) whose side
+# children are a dbc Label and the side DataTable. props.data holds the whole
+# table (hundreds of rows) although the DOM renders page_size=15 of them, so the
+# DOM is never read. Each Label names the session the table covers:
+#   "Stalking Net Buy from 29 Sep 2026 to 29 Sep 2026"   (akum)
+#   "Stalking Net Sell from 29 Sep 2026 to 29 Sep 2026"  (dist)
+# That is the only source-side proof of the session, so the clock is not used.
+BROKER_FLOW_METHOD = "dash_callback_v1"
+BROKER_FLOW_DURATION = "Today"
+FLOW_OK, FLOW_SOURCE_FAILURE = "OK", "SOURCE_FAILURE"
+SNAPSHOT_PERSISTED, SNAPSHOT_REJECTED, SNAPSHOT_SUPERSEDED = "PERSISTED", "REJECTED", "SUPERSEDED"
+FLOW_LABEL_NAMESPACE = "dash_bootstrap_components"
+FLOW_LABEL_SIDE = {"akum": "Buy", "dist": "Sell"}
+FLOW_LABEL_RE = re.compile(
+    r"Stalking Net (\w+) from (\d{1,2}) ([A-Z][a-z]{2}) (\d{4}) to (\d{1,2}) ([A-Z][a-z]{2}) (\d{4})")
+# English abbreviations, independent of the process locale.
+FLOW_LABEL_MONTHS = {m: i for i, m in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+_ABSENT = object()
+
+
+def _broker_flow_callback(response):
+    """Waiter predicate: the submit-triggered Dash callback whose structured
+    outputs include BOTH side containers' children. Never raises."""
+    return _submit_callback_for("akum")(response) and _submit_callback_for("dist")(response)
+
+
+def _dash_values(items, section):
+    """{(id, property): value} of a Dash request's `inputs` or `state` list.
+    Raises ValueError on a malformed list or a repeated id.property."""
+    if not isinstance(items, list):
+        raise ValueError(f"request {section} is not a list")
+    values = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or "property" not in item:
+            raise ValueError(f"request {section} holds a malformed entry")
+        key = (item["id"], item["property"])
+        if key in values:
+            raise ValueError(f"request {section} repeats {key[0]}.{key[1]}")
+        values[key] = item.get("value", _ABSENT)
+    return values
+
+
+def _broker_flow_request_proof(payload, code):
+    """Raise ValueError unless the matched request (parsed JSON) proves it is the
+    submit for exactly `code`, Today, foreign-only unchecked, answering both
+    sides. The UI clicks succeeding is not proof."""
+    if not isinstance(payload, dict):
+        raise ValueError("request body is not a JSON object")
+    changed, outputs = payload.get("changedPropIds"), payload.get("outputs")
+    if not isinstance(changed, list) or SUBMIT_TRIGGER not in changed:
+        raise ValueError(f"request changedPropIds lacks {SUBMIT_TRIGGER}")
+    for side in ("akum", "dist"):
+        if not isinstance(outputs, list) or _side_output(side) not in outputs:
+            raise ValueError(f"request outputs lack {_side_output(side)['id']}.children")
+    inputs, state = _dash_values(payload.get("inputs"), "inputs"), _dash_values(payload.get("state"), "state")
+    for values, section, component, want in ((inputs, "inputs", "duration-picker", BROKER_FLOW_DURATION),
+                                             (inputs, "inputs", "foreign-only-checkbox", []),
+                                             (state, "state", "broker", [code])):
+        got = values.get((component, "value"), _ABSENT)
+        if got is _ABSENT:
+            raise ValueError(f"request {section} lacks {component}.value")
+        if type(got) is not type(want) or got != want:
+            raise ValueError(f"request {section} {component}.value is not {want!r}")
+
+
+def _label_day(day, month, year):
+    if month not in FLOW_LABEL_MONTHS:
+        raise ValueError(f"month {month!r} is not an English month abbreviation")
+    try:
+        return datetime(int(year), FLOW_LABEL_MONTHS[month], int(day)).date()
+    except ValueError:
+        raise ValueError(f"{day} {month} {year} is not a date") from None
+
+
+def _flow_label_session(text, side):
+    """The one session date a `side` Label covers. Raises ValueError unless it is
+    exactly "Stalking Net Buy|Sell from D Mon YYYY to D Mon YYYY" with the side's
+    word and from == to."""
+    match = FLOW_LABEL_RE.fullmatch(text) if isinstance(text, str) else None
+    if match is None:
+        raise ValueError(f"{side} Label is not 'Stalking Net {FLOW_LABEL_SIDE[side]} from D Mon YYYY "
+                         f"to D Mon YYYY'")
+    word, *parts = match.groups()
+    if word != FLOW_LABEL_SIDE[side]:
+        raise ValueError(f"{side} Label says Net {word}, not Net {FLOW_LABEL_SIDE[side]}")
+    start, end = _label_day(*parts[:3]), _label_day(*parts[3:])
+    if start != end:
+        raise ValueError(f"{side} Label spans {start} to {end}, not one session")
+    return start
+
+
+def _side_session_date(body, side):
+    """The session date of `side` in a response body _side_response_data has
+    already accepted: its container's children hold exactly one dbc Label."""
+    component = SIDE_CONTAINER[side].lstrip("#")
+    labels = [c for c in body["response"][component]["children"]
+              if isinstance(c, dict) and c.get("namespace") == FLOW_LABEL_NAMESPACE
+              and c.get("type") == "Label"]
+    if len(labels) != 1:
+        raise ValueError(f"{component}.children has {len(labels) or 'no'} Label")
+    return _flow_label_session((labels[0].get("props") or {}).get("children"), side)
+
+
+def read_broker_flow_code(page, code, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
+    """One broker_flow scan: one page load and ONE submit for `code`, Today.
+    Returns {"session_date": date, "akum": rows, "dist": rows}, rows being every
+    row of each side's props.data in parse_stalker_table's shape (validated by
+    _stalker_rows_from_response). Raises RuntimeError unless the matched callback
+    proves its request (_broker_flow_request_proof), supplies both side tables,
+    both Labels name the same single session, no ticker repeats within a side
+    and no ticker is in both sides (never deduped: a net flow has one sign)."""
+    import json as _json
+    page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(5000)
+    set_broker_codes(page, [code])
+    set_duration(page, BROKER_FLOW_DURATION, strict=True)
+    try:
+        with page.expect_response(_broker_flow_callback, timeout=timeout_ms) as info:
             try:
-                flow = get_netflow(page, [code], "Today", side=side)
+                page.click("#submit-button", timeout=5000)
             except Exception as e:
-                log.error(f"broker_flow scan failed for {code}/{side}: {e}")
-                continue
-            for symbol, r in flow.items():
-                if symbol not in tickers:
-                    continue
-                rows.append({
-                    "ticker": symbol,
-                    "broker_code": code,
-                    "bval": parse_num(r.get("bval")),
-                    "sval": parse_num(r.get("sval")),
-                    "netval": parse_num(r.get("netval")),
-                    "bavg": parse_num(r.get("bavg")),
-                    "savg": parse_num(r.get("savg")),
-                })
-    return rows
+                raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
+        response = info.value
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"no {SUBMIT_TRIGGER} Dash callback for both sides within "
+                           f"{timeout_ms // 1000}s of submit: {_safe_error(e)}") from e
+    if response.status != 200:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
+    try:
+        try:
+            payload = _json.loads(response.request.post_data or "")
+        except ValueError:
+            raise ValueError("request body is not JSON") from None
+        _broker_flow_request_proof(payload, code)
+        body = _api_json(response)
+        sides = {side: _stalker_rows_from_response(_side_response_data(body, side), side)
+                 for side in ("akum", "dist")}
+        sessions = {side: _side_session_date(body, side) for side in sides}
+        if sessions["akum"] != sessions["dist"]:
+            raise ValueError(f"akum Label session {sessions['akum']} != dist Label session {sessions['dist']}")
+        for side, rows in sides.items():
+            if len({r["symbol"] for r in rows}) != len(rows):
+                raise ValueError(f"{side} table repeats a ticker")
+        both = {r["symbol"] for r in sides["akum"]} & {r["symbol"] for r in sides["dist"]}
+        if both:
+            raise ValueError(f"{len(both)} ticker(s) are in both the akum and the dist table")
+    except ValueError as e:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
+    return {"session_date": sessions["akum"], "akum": sides["akum"], "dist": sides["dist"]}
 
 
-def save_broker_flow(conn, date_str, rows):
+def _flow_number(text):
+    """A validated response cell (_stalker_cell's text) as a float. Raises
+    ValueError; never parse_num, which reads a missing or malformed cell as 0.0.
+    An explicit source 0 stays an observed (source-rounded) 0.0."""
+    import math
+    if not isinstance(text, str):
+        raise ValueError(f"{text!r} is not number text")
+    number = float(text.replace(",", "").replace("(", "-").replace(")", ""))
+    if not math.isfinite(number):
+        raise ValueError(f"{text!r} is not a finite number")
+    return number
+
+
+def capture_broker_flow(page, tickers, codes=None):
+    """Read every broker code (read_broker_flow_code) and touch no table. Returns
+    {"scrape_started_at", "scrape_date", "scans", "rows", "reason"}: one scan
+    record per code, the `tickers` rows of every code that succeeded, and why the
+    snapshot may NOT be persisted (None when it may). scrape_date is the MYT date
+    the capture started, the live broker_flow.date convention."""
+    codes = list(BROKER_FLOW_CODES if codes is None else codes)
+    tickers = set(tickers)
+    started = datetime.now(pytz.timezone(TIMEZONE))
+    scans, rows = [], []
+    for code in codes:
+        scan = {"broker_code": code, "status": FLOW_SOURCE_FAILURE, "session_date": None,
+                "akum_rows_returned": None, "dist_rows_returned": None, "tracked_rows": None,
+                "started_utc": nsc.utc_now(), "completed_utc": None, "detail": ""}
+        try:
+            got = read_broker_flow_code(page, code)
+            code_rows = [{"ticker": r["symbol"], "broker_code": code,
+                          **{f: _flow_number(r[f]) for f in STALKER_ROW_FIELDS[1:]}}
+                         for side in ("akum", "dist") for r in got[side] if r["symbol"] in tickers]
+        except Exception as e:
+            scan["detail"] = _safe_error(e, 300)
+            log.error(f"broker_flow scan failed for {code}: {scan['detail']}")
+        else:
+            scan.update(status=FLOW_OK, session_date=got["session_date"].isoformat(),
+                        akum_rows_returned=len(got["akum"]), dist_rows_returned=len(got["dist"]),
+                        tracked_rows=len(code_rows))
+            rows.extend(code_rows)
+        scan["completed_utc"] = nsc.utc_now()
+        scans.append(scan)
+    return {"scrape_started_at": started, "scrape_date": started.date().isoformat(), "scans": scans,
+            "rows": rows, "reason": _snapshot_rejection(scans, started.date().isoformat(), codes)}
+
+
+def _snapshot_rejection(scans, scrape_date, codes):
+    """Why a capture's rows may not replace broker_flow for scrape_date, or None.
+    All codes must have succeeded, on one source session, strictly before
+    scrape_date (a same-day session would break the live "previous session"
+    date convention; weekend/holiday copies of the last session are allowed)."""
+    if not codes:
+        return "no broker codes configured"
+    failed = [s["broker_code"] for s in scans if s["status"] != FLOW_OK]
+    if failed:
+        return f"{len(failed)}/{len(scans)} code(s) failed: {', '.join(failed)}"
+    sessions = sorted({s["session_date"] for s in scans})
+    if len(sessions) != 1:
+        return f"codes report different source sessions: {', '.join(sessions)}"
+    if sessions[0] >= scrape_date:
+        return f"source session {sessions[0]} is not before scrape date {scrape_date}"
+    return None
+
+
+def _record_flow_scans(conn, capture, snapshot, reason=None):
+    run = capture["scrape_started_at"].astimezone(pytz.utc).isoformat()
     conn.executemany(
-        """INSERT OR REPLACE INTO broker_flow
-           (date, ticker, broker_code, bval, sval, netval, bavg, savg)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        [
-            (date_str, r["ticker"], r["broker_code"], r["bval"], r["sval"],
-             r["netval"], r["bavg"], r["savg"])
-            for r in rows
-        ],
-    )
+        "INSERT OR REPLACE INTO broker_flow_scan (scrape_date, broker_code, run_started_utc, status, "
+        "snapshot, session_date, akum_rows_returned, dist_rows_returned, tracked_rows, method, "
+        "started_utc, completed_utc, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(capture["scrape_date"], s["broker_code"], run, s["status"], snapshot, s["session_date"],
+          s["akum_rows_returned"], s["dist_rows_returned"], s["tracked_rows"], BROKER_FLOW_METHOD,
+          s["started_utc"], s["completed_utc"],
+          f"snapshot rejected: {reason}" if reason and s["status"] == FLOW_OK else s["detail"])
+         for s in capture["scans"]])
+
+
+def persist_broker_flow_capture(conn, capture):
+    """All or nothing. If the capture is eligible (reason None), ONE transaction
+    deletes scrape_date's live rows (bval IS NOT NULL; backfill rows carry NULL
+    bval and are kept), inserts the new snapshot and records the scans as
+    PERSISTED (earlier PERSISTED runs of the date become SUPERSEDED). Otherwise,
+    or if that transaction fails, broker_flow is not touched and the scans are
+    recorded, on their own, as REJECTED with the reason. Returns True iff the
+    snapshot was persisted."""
+    conn.execute(BROKER_FLOW_DDL)
+    conn.execute(BROKER_FLOW_SCAN_DDL)
     conn.commit()
+    date, reason = capture["scrape_date"], capture["reason"]
+    if reason is None:
+        try:
+            with conn:
+                conn.execute("DELETE FROM broker_flow WHERE date = ? AND bval IS NOT NULL", (date,))
+                conn.executemany(
+                    "INSERT INTO broker_flow (date, ticker, broker_code, bval, sval, netval, bavg, savg) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(date, r["ticker"], r["broker_code"], r["bval"], r["sval"], r["netval"],
+                      r["bavg"], r["savg"]) for r in capture["rows"]])
+                conn.execute("UPDATE broker_flow_scan SET snapshot = ? WHERE scrape_date = ? AND snapshot = ?",
+                             (SNAPSHOT_SUPERSEDED, date, SNAPSHOT_PERSISTED))
+                _record_flow_scans(conn, capture, SNAPSHOT_PERSISTED)
+            return True
+        except Exception as e:
+            reason = f"broker_flow write failed: {_safe_error(e)}"
+    log.error(f"broker_flow NOT written for {date}: {reason}. Existing rows are unchanged.")
+    with conn:
+        _record_flow_scans(conn, capture, SNAPSHOT_REJECTED, reason)
+    return False
 
 
 def log_backfill_progress(conn, tickers, target_days=BACKFILL_TARGET_DAYS):
@@ -1586,12 +1843,16 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
 
 
 def save_daily_broker_flow(page):
-    date_str = datetime.now(pytz.timezone(TIMEZONE)).strftime("%Y-%m-%d")
+    """Capture every code first (capture_broker_flow), then replace scrape_date's
+    live broker_flow snapshot only if the whole capture is eligible
+    (persist_broker_flow_capture); a partial or unproven capture writes nothing
+    to broker_flow, only its broker_flow_scan provenance."""
+    capture = capture_broker_flow(page, TRACKED_TICKERS)
     conn = init_db()
     try:
-        rows = scrape_broker_flow_for_db(page, TRACKED_TICKERS)
-        save_broker_flow(conn, date_str, rows)
-        log.info(f"broker_flow: saved {len(rows)} rows for {date_str}")
+        if persist_broker_flow_capture(conn, capture):
+            log.info(f"broker_flow: replaced the live snapshot for {capture['scrape_date']} with "
+                     f"{len(capture['rows'])} rows (source session {capture['scans'][0]['session_date']})")
         return log_backfill_progress(conn, TRACKED_TICKERS)
     finally:
         conn.close()
