@@ -658,7 +658,33 @@ def dash_table(table_id, data=UNSET, type_="DataTable", namespace="dash_table"):
     return {"props": props, "type": type_, "namespace": namespace}
 
 
-def live_side(side, data=({"symbol": "AAAA", "netval": "-5,000"},)):
+def stalker_row(symbol, netval, savg="100"):
+    """A row as parse_stalker_table reads it from the DOM (the live DOM shows the
+    plain ticker and the cells' float text, e.g. "-5000" or "-1234.5")."""
+    return {"symbol": symbol, "netval": netval, "bval": "1", "sval": "2", "bavg": "3", "savg": savg}
+
+
+SELL_ROWS = [stalker_row("AAAA", "-5000"), stalker_row("BBBB", "-3000"), stalker_row("CCCC", "1000")]
+# strict=False (broker_flow) reads DOM text through parse_num, which also takes comma-grouped
+# numbers; its tests keep that text so the legacy parse stays covered.
+LEGACY_DOM_ROWS = [stalker_row("AAAA", "-5,000"), stalker_row("BBBB", "-3,000"), stalker_row("CCCC", "1,000")]
+LIVE_ROUTE = "/some_route/"          # any route: only the label and last segment are the contract
+
+
+def live_entry(row, route=LIVE_ROUTE):
+    """The live props.data entry a DOM `row` is rendered from: the symbol as a
+    Markdown link [TICKER](/route/TICKER), every other cell a JSON float."""
+    return {"symbol": f"[{row['symbol']}]({route}{row['symbol']})",
+            **{f: float(row[f].replace(",", "")) for f in ("netval", "bval", "sval", "bavg", "savg")}}
+
+
+def live_entries(rows):
+    return [live_entry(r) for r in rows]
+
+
+def live_side(side, data=None):
+    """One side's live update; its DataTable data defaults to SELL_ROWS' live entries."""
+    data = live_entries(SELL_ROWS) if data is None else data
     return {"children": [dash_label(f"{side} stalker"), dash_table(f"stalker-{side}-table", list(data))]}
 
 
@@ -705,16 +731,24 @@ class FakeStalkerPage:
     """Just enough of the broker_stalker page for get_netflow. `fail` names the
     one step that raises: "duration", "submit" or "parse".
 
-    The side container's HTML is `before` (None = no container) until the
-    submit click; `lag` polls later it becomes `after` (default: a fresh table
-    for `rows`). The click emits `callbacks` (default: one successful submit
-    callback), which only a response waiter armed before the click can see."""
-    def __init__(self, rows=(), fail=None, before=None, after="fresh", lag=1, callbacks=None):
+    `rows` are the rows the DOM table shows. The side container's HTML is
+    `before` (None = no container) until the submit click; `lag` polls later it
+    becomes `after` (default: a fresh table for `rows`). The click emits
+    `callbacks` (default: one live submit callback whose DataTable data is the
+    props.data entries `response_rows`, by default `rows` in the live shape),
+    which only a response waiter armed before the click can see. `dom_reads`
+    counts reads of the DOM table."""
+    def __init__(self, rows=(), fail=None, before=None, after="fresh", lag=1, callbacks=None,
+                 response_rows=UNSET):
         self.rows, self.fail = list(rows), fail
+        self.dom_reads = 0
         self.before = before
         self.after = f"<table><tr><td>{len(self.rows)} fresh rows</td></tr></table>" if after == "fresh" else after
         self.lag = lag
-        self.callbacks = [SUBMIT_OK] if callbacks is None else list(callbacks)
+        data = live_entries(self.rows) if response_rows is UNSET else list(response_rows)
+        self.callbacks = ([FakeDashResponse(body=live_body(akum=live_side("akum", data),
+                                                          dist=live_side("dist", data)))]
+                          if callbacks is None else list(callbacks))
         self.keyboard = self
         self.gotos, self.waits = [], []
         self.fingerprints = 0
@@ -786,18 +820,13 @@ class FakeStalkerPage:
         return Loc()
 
     def wait_for_selector(self, sel, timeout=None):
+        self.dom_reads += 1
         if self.fail == "parse":
             raise TimeoutError(f"page.wait_for_selector: Timeout 15000ms waiting for {sel}")
 
     def query_selector_all(self, sel):
+        self.dom_reads += 1
         return [FakeTr(r) for r in self.rows]
-
-
-def stalker_row(symbol, netval, savg="100"):
-    return {"symbol": symbol, "netval": netval, "bval": "1", "sval": "2", "bavg": "3", "savg": savg}
-
-
-SELL_ROWS = [stalker_row("AAAA", "-5,000"), stalker_row("BBBB", "-3,000"), stalker_row("CCCC", "1,000")]
 
 
 def stalker_text(result):
@@ -805,8 +834,7 @@ def stalker_text(result):
 
 
 @pytest.mark.parametrize("fail, stage", [("duration", "duration 'Today' switch failed"),
-                                         ("submit", "submit failed"),
-                                         ("parse", "dist table parse failed")])
+                                         ("submit", "submit failed")])
 def test_broker_stalker_strict_scan_failures_are_source_unavailable(fail, stage):
     got = ns.scrape_broker_stalker(FakeStalkerPage(SELL_ROWS, fail=fail))
     assert isinstance(got, nsc.SignalResult)
@@ -828,7 +856,7 @@ def test_broker_stalker_other_scan_failure_is_source_unavailable():
     assert got.status == nsc.SOURCE_UNAVAILABLE and "ERR_CONNECTION_RESET" in got.detail
 
 
-@pytest.mark.parametrize("rows, detail", [([stalker_row("CCCC", "1,000"), stalker_row("DDDD", "0")],
+@pytest.mark.parametrize("rows, detail", [([stalker_row("CCCC", "1000"), stalker_row("DDDD", "0")],
                                            "2 row(s) parsed, none with a negative netval"),
                                           ([], "dist table parsed with no rows")])
 def test_broker_stalker_parsed_but_no_negative_rows_is_empty_unverified(rows, detail):
@@ -847,7 +875,7 @@ def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
         return [{"code": "AK", "cum": 12345.0, "avg": 1500.0}] if symbol == "AAAA" else []
     monkeypatch.setattr(ns, "get_inventory_bagholders", holders)
     monkeypatch.setattr(ns, "_bagholder_captures", lambda: None)
-    rows = SELL_ROWS + [stalker_row("EEEE", "-1,000", savg="90")]
+    rows = SELL_ROWS + [stalker_row("EEEE", "-1000", savg="90")]
     got = ns.scrape_broker_stalker(FakeStalkerPage(rows))
     assert got.status == nsc.HITS
     assert [(r["symbol"], r["holders_failed"]) for r in got] == [
@@ -855,11 +883,11 @@ def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
     assert ns._broker_stalker_lines(got) == [
         "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
         "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
-        "1. AAAA | retail jual -5,000  savg: 100",
+        "1. AAAA | retail jual -5000  savg: 100",
         "   🎒 Bag holder: AK 12k lot @1500",
-        "2. BBBB | retail jual -3,000  savg: 100",
+        "2. BBBB | retail jual -3000  savg: 100",
         "   🎒 Bag holder: ⚠️ gagal ambil",
-        "3. EEEE | retail jual -1,000  savg: 90",
+        "3. EEEE | retail jual -1000  savg: 90",
         "   🎒 Bag holder: tidak ada akumulator",
     ]
     # the HITS rendering is the one the plain row list always had
@@ -924,22 +952,248 @@ def test_callback_not_proven_submit_triggered_is_ignored_and_the_scan_fails(call
     assert result.status == nsc.SOURCE_UNAVAILABLE
 
 
-def test_submit_callback_among_others_is_found_and_the_table_waited_for():
+def test_submit_callback_among_others_is_found():
     others = [FakeDashResponse(changed=("broker.value",)), SUBMIT_OK]
     for before, lag in ((None, 1), (None, 6), (OLD_TABLE, 6)):
         got, result = strict_scan(before=before, lag=lag, callbacks=others)
         assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (before, lag)
         assert result.status == nsc.HITS
-    page = FakeStalkerPage([stalker_row("CCCC", "1,000")], lag=4)
+    page = FakeStalkerPage([stalker_row("CCCC", "1000")], lag=4)
     assert ns.scrape_broker_stalker(page).status == nsc.EMPTY_UNVERIFIED
     assert page.expect_calls == 1
 
 
-@pytest.mark.parametrize("after", [None, "<div>Loading...</div>"])
-def test_confirmed_callback_but_the_table_never_settles_is_unavailable(after):
-    got, result = strict_scan(before=None, after=after)
-    assert isinstance(got, RuntimeError) and "dist table not present and settled within 15s" in str(got)
-    assert result.status == nsc.SOURCE_UNAVAILABLE
+# ── strict rows are the validated response's rows, never the DOM's
+STALE_DOM_ROWS = [stalker_row("OLDA", "-9000"), stalker_row("OLDB", "-8000")]
+NEW_ROWS = [stalker_row("NEWA", "-4000", savg="55.5"), stalker_row("NEWB", "2000")]
+
+
+def stale_dom_page(response_rows, **kw):
+    """A page whose DOM table shows STALE_DOM_ROWS, present and byte-stable before
+    and after the submit, forever; the validated response's props.data is `response_rows`."""
+    return FakeStalkerPage(STALE_DOM_ROWS, before=OLD_TABLE, after=OLD_TABLE,
+                           response_rows=response_rows, **kw)
+
+
+def by_symbol(rows):
+    return {r["symbol"]: r for r in rows}
+
+
+def test_strict_rows_are_the_response_rows_while_the_dom_stays_stale():          # ROWS-A
+    page = stale_dom_page(live_entries(NEW_ROWS))
+    assert ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True) == by_symbol(NEW_ROWS)
+    assert page.dom_reads == 0 and page.fingerprints == 0                  # the DOM is never read
+    unreadable = stale_dom_page(live_entries(NEW_ROWS), fail="parse")                    # nor needed
+    assert ns.get_netflow(unreadable, ["XL"], "Today", side="dist", strict=True) == by_symbol(NEW_ROWS)
+    result = ns.scrape_broker_stalker(stale_dom_page(live_entries(NEW_ROWS)))
+    assert result.status == nsc.HITS and [r["symbol"] for r in result] == ["NEWA"]
+    text = stalker_text(result)
+    assert "NEWA | retail jual -4000  savg: 55.5" in text and "OLD" not in text
+
+
+def test_empty_response_data_never_lets_stale_dom_rows_through():                # ROWS-B
+    page = stale_dom_page([])
+    assert ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True) == {}
+    assert page.dom_reads == 0
+    for rows, detail in (([], "dist table parsed with no rows"),
+                         ([stalker_row("NEWB", "2000")], "1 row(s) parsed, none with a negative netval")):
+        result = ns.scrape_broker_stalker(stale_dom_page(live_entries(rows)))
+        assert result.status == nsc.EMPTY_UNVERIFIED and result.hits == [] and result.detail == detail
+        assert "OLD" not in stalker_text(result)
+
+
+def test_response_rows_identical_to_the_dom_are_accepted():                      # ROWS-C
+    runs = [ns.get_netflow(FakeStalkerPage(SELL_ROWS, before=OLD_TABLE, after=OLD_TABLE),
+                           ["XL"], "Today", side="dist", strict=True) for _ in range(2)]
+    assert runs[0] == runs[1] == by_symbol(SELL_ROWS)
+
+
+def test_numeric_response_cells_become_the_dom_text_contract():
+    entry = {"symbol": "[AAAA](/some_route/AAAA)", "netval": -5000, "bval": 1.5, "sval": 2.0, "bavg": "(3)", "savg": " 1,234.5 "}
+    got = ns.get_netflow(stale_dom_page([entry]), ["XL"], "Today", side="dist", strict=True)
+    assert got == {"AAAA": {"symbol": "AAAA", "netval": "-5000", "bval": "1.5", "sval": "2",
+                            "bavg": "(3)", "savg": "1,234.5"}}
+    assert [ns.parse_num(got["AAAA"][f]) for f in ns.STALKER_ROW_FIELDS[1:]] == [-5000, 1.5, 2, -3, 1234.5]
+
+
+GOOD_ROW = live_entry(stalker_row("AAAA", "-5000"))
+NOT_A_LINK = "is not a Markdown link [TICKER](/path/TICKER)"
+
+
+@pytest.mark.parametrize("entry, reason", [                                      # ROWS-D
+    ("AAAA", "row 0 is not an object"),
+    (None, "row 0 is not an object"),
+    (["AAAA", "-5,000"], "row 0 is not an object"),
+    ({}, "row 0 lacks symbol, netval, bval, sval, bavg, savg"),
+    ({"symbol": "AAAA", "netval": "-5,000"}, "row 0 lacks bval, sval, bavg, savg"),
+    ({k: v for k, v in GOOD_ROW.items() if k != "savg"}, "row 0 lacks savg"),
+    ({**GOOD_ROW, "symbol": ""}, f"row 0 symbol: '' {NOT_A_LINK}"),
+    ({**GOOD_ROW, "symbol": "   "}, f"row 0 symbol: '   ' {NOT_A_LINK}"),
+    ({**GOOD_ROW, "symbol": None}, f"row 0 symbol: None {NOT_A_LINK}"),
+    ({**GOOD_ROW, "symbol": 123}, f"row 0 symbol: 123 {NOT_A_LINK}"),
+    ({**GOOD_ROW, "symbol": "ZZZZ"}, f"row 0 symbol: 'ZZZZ' {NOT_A_LINK}"),            # a plain ticker
+    ({**GOOD_ROW, "netval": None}, "row 0 netval: None is not a number"),
+    ({**GOOD_ROW, "netval": ""}, "row 0 netval: '' is not a number"),
+    ({**GOOD_ROW, "netval": "-"}, "row 0 netval: '-' is not a number"),
+    ({**GOOD_ROW, "netval": "N/A"}, "row 0 netval: 'N/A' is not a number"),
+    ({**GOOD_ROW, "savg": "12abc"}, "row 0 savg: '12abc' is not a number"),
+    ({**GOOD_ROW, "netval": True}, "row 0 netval: True is not a number"),
+    ({**GOOD_ROW, "bval": [1]}, "row 0 bval: [1] is not a number"),
+    ({**GOOD_ROW, "bavg": {"v": 1}}, "row 0 bavg: {'v': 1} is not a number"),
+    ({**GOOD_ROW, "netval": "nan"}, "row 0 netval: 'nan' is not a finite number"),
+    ({**GOOD_ROW, "sval": float("inf")}, "row 0 sval: inf is not a finite number"),
+])
+def test_malformed_response_row_fails_closed(entry, reason):
+    for rows, where in (([entry], reason), ([GOOD_ROW, entry], reason.replace("row 0", "row 1"))):
+        page = stale_dom_page(rows)
+        with pytest.raises(RuntimeError) as e:
+            ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
+        assert f"{BAD_RESPONSE} stalker-dist-table {where}" in str(e.value)
+        assert page.dom_reads == 0
+        result = ns.scrape_broker_stalker(stale_dom_page(rows))
+        assert result.status == nsc.SOURCE_UNAVAILABLE and result.hits == []
+        assert "OLD" not in stalker_text(result) and "retail jual" not in stalker_text(result)
+
+
+def test_legacy_netflow_reads_the_dom_even_when_a_response_carries_other_rows():  # ROWS-E
+    page = FakeStalkerPage(STALE_DOM_ROWS, response_rows=live_entries(NEW_ROWS))
+    assert ns.get_netflow(page, ["XL"], "Today", side="dist") == by_symbol(STALE_DOM_ROWS)
+    assert page.expect_calls == 0 and page.dom_reads == 2 and page.waits[page.submitted_at:] == [4000]
+
+
+# ── strict symbol contract: the live Markdown link [TICKER](/route/TICKER) ──
+@pytest.mark.parametrize("cell, ticker", [
+    ("[BBCA](/some_route/BBCA)", "BBCA"),                     # SYM-A. the live shape
+    ("[BBCA](/other_route/BBCA)", "BBCA"),                    # any route: not the contract
+    ("[BBCA](/BBCA)", "BBCA"),
+    ("[BBCA](/a/b/c/BBCA)", "BBCA"),
+    ("[BBCA](/some_route/BBCA/)", "BBCA"),                    # final NON-EMPTY segment
+    ("[BBCA](/some_route/BBCA?tab=flow)", "BBCA"),            # query ignored
+    ("[BBCA](/some_route/BBCA#top)", "BBCA"),                 # fragment ignored
+    ("[BBCA](/some_route/BBCA?next=/x/ZZZZ#/y/QQQQ)", "BBCA"),
+    ("[AB](/some_route/AB)", "AB"),                           # no fixed length
+    ("[ABCDEFGH](/some_route/ABCDEFGH)", "ABCDEFGH"),
+    ("[AB1C](/some_route/AB1C)", "AB1C"),                     # SYM-B. digits
+    ("[1234](/some_route/1234)", "1234"),
+    ("[BBCA-R](/some_route/BBCA-R)", "BBCA-R"),               # SYM-C. suffixes
+    ("[ABCD-W](/some_route/ABCD-W)", "ABCD-W"),
+    ("[AB1C-W2-R](/some_route/AB1C-W2-R)", "AB1C-W2-R"),
+])
+def test_live_markdown_symbol_becomes_the_canonical_ticker(cell, ticker):
+    assert ns._stalker_symbol(cell) == ticker
+
+
+MISMATCH = "does not end in its label"
+NOT_RELATIVE = "is not a site-relative /path"
+NOT_TICKER = "is not a ticker"
+
+
+@pytest.mark.parametrize("cell, reason", [
+    # SYM-D. label and path disagree
+    ("[BBCA](/some_route/BBRI)", MISMATCH),
+    ("[BBCA](/some_route/BBCA-R)", MISMATCH),
+    ("[BBCA-R](/some_route/BBCA)", MISMATCH),
+    ("[BBCA](/some_route/bbca)", MISMATCH),
+    ("[BBCA](/some_route/XBBCA)", MISMATCH),
+    ("[BBCA](/some_route/BBCA/extra)", MISMATCH),
+    ("[BBCA](/BBCA/some_route)", MISMATCH),
+    ("[BBCA](/some_route/BB%43A)", MISMATCH),                 # no decoding
+    ("[BBCA](/some_route/)", MISMATCH),
+    ("[BBCA](/)", MISMATCH),
+    ("[BBCA](/?q=/x/BBCA)", MISMATCH),                        # the label only in the query
+    ("[BBCA](/some_route/#/BBCA)", MISMATCH),                 # ... or the fragment
+    # SYM-E. malformed Markdown / not a link at all
+    ("BBCA", NOT_A_LINK),
+    ("", NOT_A_LINK),
+    ("[BBCA]", NOT_A_LINK),
+    ("[BBCA](/some_route/BBCA", NOT_A_LINK),
+    ("BBCA](/some_route/BBCA)", NOT_A_LINK),
+    ("[BBCA] (/some_route/BBCA)", NOT_A_LINK),
+    ("[BBCA][/some_route/BBCA]", NOT_A_LINK),
+    ("[[BBCA]](/some_route/BBCA)", NOT_A_LINK),
+    ("[BBCA](/some_route/BBCA) ", NOT_A_LINK),
+    (" [BBCA](/some_route/BBCA)", NOT_A_LINK),
+    ("[BBCA](/some_route/BBCA)\n", NOT_A_LINK),
+    ("x[BBCA](/some_route/BBCA)", NOT_A_LINK),
+    ("[BBCA](/some_route/BBCA)[BBRI](/some_route/BBRI)", NOT_A_LINK),
+    ("[BBCA]( /some_route/BBCA)", NOT_A_LINK),
+    ('[BBCA](/some_route/BBCA "title")', NOT_A_LINK),
+    ("[BBCA](/some_route/(BBCA))", NOT_A_LINK),
+    ("<a href='/some_route/BBCA'>BBCA</a>", NOT_A_LINK),
+    ("[BBCA](/some_route\x01/BBCA)", NOT_A_LINK),           # ASCII control characters
+    ("[BBCA](/x\x1b[31m/BBCA)", NOT_A_LINK),
+    ("[BBCA](/x\x7f/BBCA)", NOT_A_LINK),
+    ("[BBCA](/x\x00y/BBCA)", NOT_A_LINK),
+    (None, NOT_A_LINK),
+    (123, NOT_A_LINK),
+    (["[BBCA](/some_route/BBCA)"], NOT_A_LINK),
+    # SYM-F. absolute / external / scheme URLs
+    ("[BBCA](https://example.com/some_route/BBCA)", NOT_RELATIVE),
+    ("[BBCA](http://example.com/BBCA)", NOT_RELATIVE),
+    ("[BBCA](//example.com/BBCA)", NOT_RELATIVE),             # protocol-relative
+    ("[BBCA](/\\example.com/BBCA)", NOT_RELATIVE),            # browsers read /\ as //
+    ("[BBCA](\\\\example.com\\BBCA)", NOT_RELATIVE),
+    ("[BBCA](javascript:void/BBCA)", NOT_RELATIVE),
+    ("[BBCA](javascript:alert(1))", NOT_A_LINK),
+    ("[BBCA](data:text/html,/BBCA)", NOT_RELATIVE),
+    ("[BBCA](mailto:x/BBCA)", NOT_RELATIVE),
+    ("[BBCA](some_route/BBCA)", NOT_RELATIVE),                # relative, not site-relative
+    ("[BBCA](BBCA)", NOT_RELATIVE),
+    ("[BBCA]()", NOT_RELATIVE),
+    # SYM-G. not a plausible ticker token
+    ("[](/some_route/)", NOT_TICKER),
+    ("[bbca](/some_route/bbca)", NOT_TICKER),
+    ("[Bbca](/some_route/Bbca)", NOT_TICKER),
+    ("[BBCA-r](/some_route/BBCA-r)", NOT_TICKER),
+    ("[BBCA-](/some_route/BBCA-)", NOT_TICKER),
+    ("[-BBCA](/some_route/-BBCA)", NOT_TICKER),
+    ("[BBCA--R](/some_route/BBCA--R)", NOT_TICKER),
+    ("[BB CA](/some_route/BBCA)", NOT_TICKER),
+    ("[BB.CA](/some_route/BB.CA)", NOT_TICKER),
+    ("[BBCA.JK](/some_route/BBCA.JK)", NOT_TICKER),
+    ("[BBCA_R](/some_route/BBCA_R)", NOT_TICKER),
+    ("[BBÇA](/some_route/BBÇA)", NOT_TICKER),                 # non-ASCII uppercase
+    ("[ＢＢＣＡ](/some_route/ＢＢＣＡ)", NOT_TICKER),            # full-width
+    ("[BBCA​](/some_route/BBCA​)", NOT_TICKER),     # zero-width space
+    ("[AB１](/some_route/AB１)", NOT_TICKER),         # full-width digit
+    ("[AB١](/some_route/AB١)", NOT_TICKER),         # Arabic-Indic digit
+    ("[BBCA-２](/some_route/BBCA-２)", NOT_TICKER),
+    ("[\\BBCA](/some_route/\\BBCA)", NOT_TICKER),
+])
+def test_anything_but_the_live_symbol_link_fails_closed(cell, reason):
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        ns._stalker_symbol(cell)
+    # ... and through the strict scan it is SOURCE_UNAVAILABLE, never a row
+    entry = {**live_entry(stalker_row("AAAA", "-5000")), "symbol": cell}
+    page = stale_dom_page([entry])
+    with pytest.raises(RuntimeError, match=re.escape(f"{BAD_RESPONSE} stalker-dist-table row 0 symbol: ")):
+        ns.get_netflow(page, ["XL"], "Today", side="dist", strict=True)
+    assert page.dom_reads == 0
+    assert ns.scrape_broker_stalker(stale_dom_page([entry])).status == nsc.SOURCE_UNAVAILABLE
+
+
+def test_a_raw_markdown_link_never_escapes_as_a_symbol():                        # SYM-H
+    routes = ("/some_route/", "/a/b/", "/")
+    entries = [live_entry(stalker_row(t, n), route=r) for t, n, r in
+               zip(("AAAA", "BB1C", "CCCC-R"), ("-5000", "-3000.5", "1000"), routes)]
+    got = ns.get_netflow(stale_dom_page(entries), ["XL"], "Today", side="dist", strict=True)
+    assert sorted(got) == ["AAAA", "BB1C", "CCCC-R"]
+    for key, row in got.items():
+        assert key == row["symbol"]
+        assert not any(mark in row["symbol"] for mark in ("[", "]", "(", ")", "](", "/"))
+    result = ns.scrape_broker_stalker(stale_dom_page(entries))
+    assert result.status == nsc.HITS and [r["symbol"] for r in result] == ["AAAA", "BB1C"]
+    text = stalker_text(result)
+    assert "](" not in text and "some_route" not in text
+    assert "1. AAAA | retail jual -5000" in text and "2. BB1C | retail jual -3000.5" in text
+
+
+def test_legacy_netflow_keeps_the_dom_symbol_text():                             # SYM-I
+    page = FakeStalkerPage(LEGACY_DOM_ROWS)            # the response carries Markdown links
+    assert "](" in json.dumps(page.callbacks[0]._body)
+    got = ns.get_netflow(page, ["XL"], "Today", side="dist")
+    assert got == by_symbol(LEGACY_DOM_ROWS) and page.expect_calls == 0
+    assert page.dom_reads == 2 and page.waits[page.submitted_at:] == [4000]
 
 
 def targeting(component, prop="children"):
@@ -1042,13 +1296,23 @@ LIVE_RESPONSE_TEXT = json.dumps({"multi": True, "response": {
     "broker-akum-stalker": {"children": [
         {"props": {"children": "Top Akumulasi"}, "type": "Label", "namespace": "dash_html_components"},
         {"props": {"id": "stalker-akum-table", "columns": [{"name": "Symbol", "id": "symbol"}],
-                   "data": [{"symbol": "ZZZZ", "netval": "7,000"}]},
+                   "data": [{"symbol": "[ZZZZ](/some_route/ZZZZ)", "netval": 7000.0, "bval": 9000.0,
+                             "sval": 2000.0, "bavg": 150.25, "savg": 148.0}]},
          "type": "DataTable", "namespace": "dash_table"}]},
     "broker-dist-stalker": {"children": [
         {"props": {"children": "Top Distribusi"}, "type": "Label", "namespace": "dash_html_components"},
         {"props": {"id": "stalker-dist-table", "columns": [{"name": "Symbol", "id": "symbol"}],
-                   "data": [{"symbol": "AAAA", "netval": "-5,000"}]},
+                   "data": [{"symbol": "[AAAA](/some_route/AAAA)", "netval": -5000.0, "bval": 1000.0,
+                             "sval": 6000.0, "bavg": 99.0, "savg": 101.75}]},
          "type": "DataTable", "namespace": "dash_table"}]}}})
+
+
+# ... and the parse_stalker_table rows it stands for: plain tickers, float text.
+LIVE_RESPONSE_ROWS = {
+    "akum": {"ZZZZ": {"symbol": "ZZZZ", "netval": "7000", "bval": "9000", "sval": "2000",
+                      "bavg": "150.25", "savg": "148"}},
+    "dist": {"AAAA": {"symbol": "AAAA", "netval": "-5000", "bval": "1000", "sval": "6000",
+                      "bavg": "99", "savg": "101.75"}}}
 
 
 def response_scan(body, side="dist", before=None, after="fresh"):
@@ -1073,17 +1337,15 @@ def assert_response_rejected(body, reason, side="dist"):
 
 @pytest.mark.parametrize("side", ["dist", "akum"])                     # F, G
 def test_exact_live_response_shape_is_accepted_for_each_side(side):
-    for body in (LIVE_RESPONSE_TEXT, live_body()):
-        got = response_scan(body, side)
-        assert sorted(got) == ["AAAA", "BBBB", "CCCC"], (side, got)   # rows still come from the DOM
-    got = response_scan(live_body(**{side: live_side(side, data=())}), side)
-    assert sorted(got) == ["AAAA", "BBBB", "CCCC"]                      # an empty data list is a list
+    assert response_scan(LIVE_RESPONSE_TEXT, side) == LIVE_RESPONSE_ROWS[side]           # the response rows
+    assert response_scan(live_body(), side) == by_symbol(SELL_ROWS)
+    assert response_scan(live_body(**{side: live_side(side, data=())}), side) == {}   # an empty list is a list
 
 
 def test_identical_table_and_data_across_runs_are_accepted():         # H
     identical = "<table><tr><td>the same rows on both runs</td></tr></table>"
     runs = [response_scan(LIVE_RESPONSE_TEXT, before=identical, after=identical) for _ in range(2)]
-    assert runs[0] == runs[1] and sorted(runs[0]) == ["AAAA", "BBBB", "CCCC"]
+    assert runs[0] == runs[1] and sorted(runs[0]) == ["AAAA"]
 
 
 @pytest.mark.parametrize("side, other", [("dist", "akum"), ("akum", "dist")])   # B
@@ -1188,7 +1450,7 @@ def test_background_or_patch_response_is_rejected(body, reason):
     (None, "fresh", [FakeDashResponse(body=live_body(dist={"children": PATCH}))]),    # Patch
 ])
 def test_legacy_netflow_is_unchanged_by_the_submit_contract(before, after, callbacks):
-    page = FakeStalkerPage(SELL_ROWS, before=before, after=after, callbacks=callbacks)
+    page = FakeStalkerPage(LEGACY_DOM_ROWS, before=before, after=after, callbacks=callbacks)
     got = ns.get_netflow(page, ["XL"], "Today", side="dist")
     assert sorted(got) == ["AAAA", "BBBB", "CCCC"]          # no callback/settle check, as before
     assert page.expect_calls == 0 and page.fingerprints == 0
@@ -1197,16 +1459,16 @@ def test_legacy_netflow_is_unchanged_by_the_submit_contract(before, after, callb
 
 @pytest.mark.parametrize("fail", ["duration", "submit"])
 def test_legacy_netflow_still_swallows_duration_and_submit_failures(fail):
-    got = ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist")
+    got = ns.get_netflow(FakeStalkerPage(LEGACY_DOM_ROWS, fail=fail), ["XL"], "Today", side="dist")
     assert sorted(got) == ["AAAA", "BBBB", "CCCC"]
 
 
 def test_legacy_netflow_still_turns_a_parse_failure_into_an_empty_table():
-    assert ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail="parse"), ["XL"], "Today", side="dist") == {}
-    assert ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail="parse"), ["XL"], strict=False) == {}
+    assert ns.get_netflow(FakeStalkerPage(LEGACY_DOM_ROWS, fail="parse"), ["XL"], "Today", side="dist") == {}
+    assert ns.get_netflow(FakeStalkerPage(LEGACY_DOM_ROWS, fail="parse"), ["XL"], strict=False) == {}
 
 
-@pytest.mark.parametrize("fail", ["duration", "submit", "parse"])
+@pytest.mark.parametrize("fail", ["duration", "submit"])
 def test_strict_netflow_raises_on_every_scan_failure(fail):
     with pytest.raises(RuntimeError):
         ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist", strict=True)
@@ -1215,10 +1477,10 @@ def test_strict_netflow_raises_on_every_scan_failure(fail):
 def test_broker_flow_path_keeps_its_non_strict_behaviour(monkeypatch):
     monkeypatch.setattr(ns, "BROKER_FLOW_CODES", ["XL"])
     for fail in ("duration", "submit"):
-        rows = ns.scrape_broker_flow_for_db(FakeStalkerPage(SELL_ROWS, fail=fail), ["AAAA", "CCCC"])
+        rows = ns.scrape_broker_flow_for_db(FakeStalkerPage(LEGACY_DOM_ROWS, fail=fail), ["AAAA", "CCCC"])
         assert sorted((r["ticker"], r["netval"]) for r in rows) == [
             ("AAAA", -5000.0), ("AAAA", -5000.0), ("CCCC", 1000.0), ("CCCC", 1000.0)]
-    assert ns.scrape_broker_flow_for_db(FakeStalkerPage(SELL_ROWS, fail="parse"), ["AAAA"]) == []
+    assert ns.scrape_broker_flow_for_db(FakeStalkerPage(LEGACY_DOM_ROWS, fail="parse"), ["AAAA"]) == []
 
 
 def test_record_konglo_signals_keeps_the_broker_stalker_status_and_reason():

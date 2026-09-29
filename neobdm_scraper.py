@@ -981,22 +981,24 @@ def parse_stalker_table(page, side="dist"):
 # and fails closed if none arrives within STALKER_CALLBACK_TIMEOUT_MS; a
 # submit-triggered callback for another component or property is ignored. The
 # matched response must then prove it supplied the side table (see
-# _check_side_response): HTTP 200 (204 = Dash PreventUpdate = nothing updated),
+# _side_response_data): HTTP 200 (204 = Dash PreventUpdate = nothing updated),
 # the live multi-output body, and the side's children list holding the side's
 # DataTable with a list `data`. Its contents are not compared with anything: an
 # unchanged result is a valid result.
 #
-# After that, the side table only has to be present and settled across DOM
-# polls, which only guards against reading it mid-render (rows are still
-# parsed from the DOM); DOM changes before the callback never count.
+# That `data` IS the strict result: each entry becomes the row dict
+# parse_stalker_table returns (see _stalker_rows_from_response), and every entry
+# must carry a Markdown ticker link as its symbol (reduced to the plain ticker
+# the DOM shows) and a numeric value for every column, or the scan fails
+# closed. The DOM table is never read on the strict path: a stable old table
+# does not prove the validated response was rendered.
 DASH_CALLBACK_ENDPOINT = "_dash-update-component"
 SUBMIT_TRIGGER = "submit-button.n_clicks"
 SIDE_TABLE_ID = {"akum": "stalker-akum-table", "dist": "stalker-dist-table"}
 DASH_BACKGROUND_KEYS = ("job", "cacheKey", "sideUpdate")
 DASH_PATCH_MARKER = "__dash_patch_update"
+STALKER_ROW_FIELDS = ("symbol", "netval", "bval", "sval", "bavg", "savg")
 STALKER_CALLBACK_TIMEOUT_MS = 20000
-STALKER_SETTLE_TIMEOUT_MS = 15000
-STALKER_SETTLE_POLL_MS = 500
 
 
 def _side_output(side):
@@ -1034,11 +1036,12 @@ def _has_patch_marker(value):
     return value == DASH_PATCH_MARKER
 
 
-def _check_side_response(body, side):
-    """Raise ValueError unless `body` (the submit callback's parsed JSON) is the
-    live multi-output response that supplies the `side` table: a plain (not
-    background, not Patch) update of the side container's children, a list
-    holding exactly one DataTable with the side's table id and a list `data`."""
+def _side_response_data(body, side):
+    """The `side` DataTable's props.data from `body` (the submit callback's parsed
+    JSON). Raises ValueError unless `body` is the live multi-output response that
+    supplies the `side` table: a plain (not background, not Patch) update of the
+    side container's children, a list holding exactly one DataTable with the
+    side's table id and a list `data`."""
     if not isinstance(body, dict):
         raise ValueError("returned no JSON object")
     background = [k for k in DASH_BACKGROUND_KEYS if k in body]
@@ -1067,14 +1070,91 @@ def _check_side_response(body, side):
               and c["props"].get("id") == table_id]
     if len(tables) != 1:
         raise ValueError(f"{component}.children has {len(tables) or 'no'} {table_id} DataTable")
-    if not isinstance(tables[0]["props"].get("data"), list):
+    data = tables[0]["props"].get("data")
+    if not isinstance(data, list):
         raise ValueError(f"{table_id} props.data is not a list")
+    return data
+
+
+def _stalker_cell(value):
+    """A response cell as the text parse_stalker_table would read from the DOM.
+    Raises ValueError for anything that is not a finite number: parse_num reads
+    None, "", "-" or "N/A" as 0, which would invent a value."""
+    import math
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{value!r} is not a number")
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text.replace(",", "").replace("(", "-").replace(")", ""))
+        except ValueError:
+            raise ValueError(f"{value!r} is not a number") from None
+    else:
+        number = float(value)
+        text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{value!r} is not a finite number")
+    return text
+
+
+# The symbol column is presentation="markdown": each live cell is a link
+# [TICKER](/<route>/TICKER) that the DOM renders as the plain TICKER. The route
+# is not part of the contract; the label and the path's last segment are.
+STALKER_SYMBOL_LINK_RE = re.compile(r"\[([^\[\]]*)\]\(([^()\s\x00-\x1f\x7f]*)\)")
+STALKER_TICKER_RE = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)*")
+
+
+def _stalker_symbol(value):
+    """The canonical ticker of a response `symbol` cell: LABEL of exactly
+    [LABEL](PATH), where LABEL is an uppercase ticker token and PATH is a
+    site-relative /path (query and fragment ignored) whose last non-empty
+    segment is LABEL. Raises ValueError otherwise; the raw link is never a ticker."""
+    match = STALKER_SYMBOL_LINK_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"{value!r} is not a Markdown link [TICKER](/path/TICKER)")
+    label, path = match.groups()
+    if not STALKER_TICKER_RE.fullmatch(label):
+        raise ValueError(f"link label {label!r} is not a ticker")
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        raise ValueError(f"link target {path!r} is not a site-relative /path")
+    segments = [s for s in re.split(r"[?#]", path)[0].split("/") if s]
+    if not segments or segments[-1] != label:
+        raise ValueError(f"link target {path!r} does not end in its label {label!r}")
+    return label
+
+
+def _stalker_rows_from_response(data, side):
+    """The validated response's `side` DataTable data as parse_stalker_table rows
+    ({symbol, netval, bval, sval, bavg, savg}, all text). Every entry must be an
+    object whose symbol is the live Markdown ticker link (see _stalker_symbol)
+    and whose other columns are numbers; otherwise ValueError, never a guessed
+    zero, blank or raw link."""
+    table_id = SIDE_TABLE_ID[side]
+    rows = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{table_id} row {i} is not an object")
+        missing = [f for f in STALKER_ROW_FIELDS if f not in entry]
+        if missing:
+            raise ValueError(f"{table_id} row {i} lacks {', '.join(missing)}")
+        try:
+            row = {"symbol": _stalker_symbol(entry["symbol"])}
+        except ValueError as e:
+            raise ValueError(f"{table_id} row {i} symbol: {e}") from None
+        for field in STALKER_ROW_FIELDS[1:]:
+            try:
+                row[field] = _stalker_cell(entry[field])
+            except ValueError as e:
+                raise ValueError(f"{table_id} row {i} {field}: {e}") from None
+        rows.append(row)
+    return rows
 
 
 def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
-    """Click #submit-button with a response waiter already armed, and require the
+    """Click #submit-button with a response waiter already armed, require the
     submit-triggered Dash callback that outputs the `side` container's children
-    to complete successfully and supply the side table. Raises otherwise."""
+    to complete successfully and supply the side table, and return that table's
+    rows (parse_stalker_table's row shape). Raises otherwise."""
     component_id = SIDE_CONTAINER[side].lstrip("#")
     try:
         with page.expect_response(_submit_callback_for(side), timeout=timeout_ms) as info:
@@ -1092,28 +1172,10 @@ def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT
     if response.status != 200:
         raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
     try:
-        _check_side_response(_api_json(response), side)
+        data = _side_response_data(_api_json(response), side)
+        return _stalker_rows_from_response(data, side)
     except ValueError as e:
         raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
-    return response
-
-
-def _wait_for_stalker_table_settled(page, side, timeout_ms=STALKER_SETTLE_TIMEOUT_MS,
-                                    poll_ms=STALKER_SETTLE_POLL_MS):
-    """After a confirmed submit callback: return once the `side` container holds a
-    table whose HTML is the same on two consecutive polls. This is not a freshness
-    proof (the callback is); it only avoids reading a table mid-render."""
-    last, waited = None, 0
-    while waited < timeout_ms:
-        page.wait_for_timeout(poll_ms)
-        waited += poll_ms
-        el = page.query_selector(SIDE_CONTAINER[side])
-        now = None if el is None else el.inner_html()
-        if now is not None and "<table" in now.lower() and now == last:
-            return
-        last = now
-    raise RuntimeError(f"{side} table not present and settled within {timeout_ms // 1000}s "
-                       f"of the submit callback")
 
 
 def get_netflow(page, codes, duration="Today", side="dist", strict=False):
@@ -1121,32 +1183,30 @@ def get_netflow(page, codes, duration="Today", side="dist", strict=False):
 
     strict=False is the broker_flow path and is unchanged: a failed duration
     switch or submit click is logged and ignored, a fixed 4s wait follows the
-    submit, and a failed table parse returns {}. strict=True (Broker Stalker)
-    raises on each of those instead, and replaces the fixed wait with the
-    submit contract above (a confirmed submit-button Dash callback whose
-    response supplies the `side` table, then a settled table), so neither a
-    technical failure nor a submit the server never answered for this table can
-    be read as this query's result."""
+    submit, the rows are parsed from the DOM table, and a failed parse returns
+    {}. strict=True (Broker Stalker) raises on a failed duration switch or
+    submit instead, and takes its rows from the submit contract above (the
+    validated submit-button Dash callback response for the `side` table), never
+    from the DOM, so neither a technical failure, a submit the server never
+    answered for this table, nor a stale rendered table can be read as this
+    query's result."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
     set_duration(page, duration, strict=strict)
     if strict:
-        _submit_and_confirm_callback(page, side)
-        _wait_for_stalker_table_settled(page, side)
+        rows = _submit_and_confirm_callback(page, side)
     else:
         try:
             page.click("#submit-button", timeout=5000)
         except Exception as e:
             log.warning(f"Could not click #submit-button: {e}")
         page.wait_for_timeout(4000)
-    try:
-        rows = parse_stalker_table(page, side)
-    except Exception as e:
-        log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
-        if strict:
-            raise RuntimeError(f"{side} table parse failed: {_safe_error(e)}") from e
-        rows = []
+        try:
+            rows = parse_stalker_table(page, side)
+        except Exception as e:
+            log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
+            rows = []
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
 
@@ -1296,11 +1356,11 @@ def scrape_broker_stalker(page):
     (highest cumulative net inventory) from the inventory chart, as a SignalResult.
 
     The scan uses get_netflow's strict path, so the status is:
-      SOURCE_UNAVAILABLE  the duration switch, submit, table parse or any other
-                          part of the scan failed
-      EMPTY_UNVERIFIED    the table parsed but held no negative-netval row. Never
-                          NO_HITS: this DOM table cannot prove a genuine zero-sell
-                          session strongly enough
+      SOURCE_UNAVAILABLE  the duration switch, submit, callback response or row
+                          validation, or any other part of the scan failed
+      EMPTY_UNVERIFIED    the validated response held no negative-netval row.
+                          Never NO_HITS: this table cannot prove a genuine
+                          zero-sell session strongly enough
       HITS                one or more retail net-sell rows"""
     def result(status, hits=(), detail=""):
         return nsc.SignalResult(BROKER_STALKER_SOURCE, status, list(hits), detail)
@@ -1614,7 +1674,7 @@ def _broker_stalker_lines(data):
         lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a zero-sell day.")
         return lines
     if not data:
-        # EMPTY_UNVERIFIED, or a bare empty list: the DOM table cannot prove a
+        # EMPTY_UNVERIFIED, or a bare empty list: the stalker table cannot prove a
         # genuine zero-sell session, so nothing here may claim one.
         detail = getattr(data, "detail", "") or "no qualifying rows"
         lines.append(f"⚠️ Empty — unverified: {detail}. Cannot be told apart from a "
