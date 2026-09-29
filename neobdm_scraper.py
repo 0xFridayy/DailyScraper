@@ -19,7 +19,7 @@ import pytz
 
 # Pure, playwright-free helpers parked in price_audit so CI can test them.
 from price_audit import (bagholders_from_payloads, inventory_date_blocks,
-                         date_offset_holds)
+                         date_offset_holds, IDX_OPEN_HOUR_LOCAL)
 import inventory_capture as ic
 import neobdm_source_contract as nsc
 
@@ -916,11 +916,16 @@ def set_broker_codes(page, codes):
         add_broker_chip(page, code)
 
 
-def set_duration(page, label="Today"):
+def set_duration(page, label="Today", strict=False):
+    """strict=False (broker_flow) logs a failed click and carries on, as it always
+    has. strict=True raises: the table would then show whatever duration the page
+    defaulted to, which the caller must not report as `label`."""
     try:
         page.locator(f"#duration-picker label:has-text('{label}')").first.click(timeout=5000)
     except Exception as e:
         log.warning(f"Could not click duration '{label}': {e}")
+        if strict:
+            raise RuntimeError(f"duration '{label}' switch failed: {_safe_error(e)}") from e
 
 
 # The broker_stalker page splits results into two tables:
@@ -955,21 +960,253 @@ def parse_stalker_table(page, side="dist"):
     return data
 
 
-def get_netflow(page, codes, duration="Today", side="dist"):
+# Strict submit contract (Broker Stalker only), pinned to the live capture of
+# 2026-09-29. One submit fires exactly one relevant Dash callback:
+#   POST /django_plotly_dash/app/bs_app/_dash-update-component
+#   request  changedPropIds ["submit-button.n_clicks"]
+#            outputs [{"id": "broker-akum-stalker", "property": "children"},
+#                     {"id": "broker-dist-stalker", "property": "children"}]
+#   response HTTP 200 {"multi": true, "response": {
+#              "broker-akum-stalker": {"children": [<Label>, <DataTable stalker-akum-table>]},
+#              "broker-dist-stalker": {"children": [<Label>, <DataTable stalker-dist-table>]}}}
+# with no job / cacheKey / sideUpdate (background callback) and no Patch.
+#
+# With a response waiter armed BEFORE the click, the scan accepts only a
+# response that is
+#   POST, URL containing "_dash-update-component",
+#   request body valid JSON with "submit-button.n_clicks" in changedPropIds,
+#   request body whose structured `outputs` list holds exactly
+#     {"id": <SIDE_CONTAINER without "#">, "property": "children"}
+#     (the "output" string is not consulted: `outputs` is the proof),
+# and fails closed if none arrives within STALKER_CALLBACK_TIMEOUT_MS; a
+# submit-triggered callback for another component or property is ignored. The
+# matched response must then prove it supplied the side table (see
+# _side_response_data): HTTP 200 (204 = Dash PreventUpdate = nothing updated),
+# the live multi-output body, and the side's children list holding the side's
+# DataTable with a list `data`. Its contents are not compared with anything: an
+# unchanged result is a valid result.
+#
+# That `data` IS the strict result: each entry becomes the row dict
+# parse_stalker_table returns (see _stalker_rows_from_response), and every entry
+# must carry a Markdown ticker link as its symbol (reduced to the plain ticker
+# the DOM shows) and a numeric value for every column, or the scan fails
+# closed. The DOM table is never read on the strict path: a stable old table
+# does not prove the validated response was rendered.
+DASH_CALLBACK_ENDPOINT = "_dash-update-component"
+SUBMIT_TRIGGER = "submit-button.n_clicks"
+SIDE_TABLE_ID = {"akum": "stalker-akum-table", "dist": "stalker-dist-table"}
+DASH_BACKGROUND_KEYS = ("job", "cacheKey", "sideUpdate")
+DASH_PATCH_MARKER = "__dash_patch_update"
+STALKER_ROW_FIELDS = ("symbol", "netval", "bval", "sval", "bavg", "savg")
+STALKER_CALLBACK_TIMEOUT_MS = 20000
+
+
+def _side_output(side):
+    """The structured output the live submit callback declares for `side`."""
+    return {"id": SIDE_CONTAINER[side].lstrip("#"), "property": "children"}
+
+
+def _submit_callback_for(side):
+    """Predicate: is a response the submit-triggered Dash callback whose
+    structured outputs include the `side` container's children? Never raises."""
+    expected = _side_output(side)
+
+    def is_it(response):
+        import json as _json
+        try:
+            request = response.request
+            if request.method != "POST" or DASH_CALLBACK_ENDPOINT not in response.url:
+                return False
+            payload = _json.loads(request.post_data or "")
+            if not isinstance(payload, dict):
+                return False
+            changed, outputs = payload.get("changedPropIds"), payload.get("outputs")
+            return (isinstance(changed, list) and SUBMIT_TRIGGER in changed
+                    and isinstance(outputs, list) and expected in outputs)
+        except Exception:
+            return False
+    return is_it
+
+
+def _has_patch_marker(value):
+    if isinstance(value, dict):
+        return DASH_PATCH_MARKER in value or any(_has_patch_marker(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_patch_marker(v) for v in value)
+    return value == DASH_PATCH_MARKER
+
+
+def _side_response_data(body, side):
+    """The `side` DataTable's props.data from `body` (the submit callback's parsed
+    JSON). Raises ValueError unless `body` is the live multi-output response that
+    supplies the `side` table: a plain (not background, not Patch) update of the
+    side container's children, a list holding exactly one DataTable with the
+    side's table id and a list `data`."""
+    if not isinstance(body, dict):
+        raise ValueError("returned no JSON object")
+    background = [k for k in DASH_BACKGROUND_KEYS if k in body]
+    if background:
+        raise ValueError(f"is a background-callback response ({', '.join(background)})")
+    if _has_patch_marker(body):
+        raise ValueError("is a Patch (partial) update")
+    if body.get("multi") is not True:
+        raise ValueError('is not a multi-output response ("multi" is not true)')
+    response = body.get("response")
+    if not isinstance(response, dict):
+        raise ValueError('has no "response" object')
+    component = SIDE_CONTAINER[side].lstrip("#")
+    update = response.get(component)
+    if not isinstance(update, dict):
+        raise ValueError(f"does not update {component}")
+    if "children" not in update:
+        raise ValueError(f"does not update {component}.children")
+    children = update["children"]
+    if not isinstance(children, list):
+        raise ValueError(f"{component}.children is not a list")
+    table_id = SIDE_TABLE_ID[side]
+    tables = [c for c in children
+              if isinstance(c, dict) and c.get("namespace") == "dash_table"
+              and c.get("type") == "DataTable" and isinstance(c.get("props"), dict)
+              and c["props"].get("id") == table_id]
+    if len(tables) != 1:
+        raise ValueError(f"{component}.children has {len(tables) or 'no'} {table_id} DataTable")
+    data = tables[0]["props"].get("data")
+    if not isinstance(data, list):
+        raise ValueError(f"{table_id} props.data is not a list")
+    return data
+
+
+def _stalker_cell(value):
+    """A response cell as the text parse_stalker_table would read from the DOM.
+    Raises ValueError for anything that is not a finite number: parse_num reads
+    None, "", "-" or "N/A" as 0, which would invent a value."""
+    import math
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{value!r} is not a number")
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text.replace(",", "").replace("(", "-").replace(")", ""))
+        except ValueError:
+            raise ValueError(f"{value!r} is not a number") from None
+    else:
+        number = float(value)
+        text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{value!r} is not a finite number")
+    return text
+
+
+# The symbol column is presentation="markdown": each live cell is a link
+# [TICKER](/<route>/TICKER) that the DOM renders as the plain TICKER. The route
+# is not part of the contract; the label and the path's last segment are.
+STALKER_SYMBOL_LINK_RE = re.compile(r"\[([^\[\]]*)\]\(([^()\s\x00-\x1f\x7f]*)\)")
+STALKER_TICKER_RE = re.compile(r"[A-Z0-9]+(?:-[A-Z0-9]+)*")
+
+
+def _stalker_symbol(value):
+    """The canonical ticker of a response `symbol` cell: LABEL of exactly
+    [LABEL](PATH), where LABEL is an uppercase ticker token and PATH is a
+    site-relative /path (query and fragment ignored) whose last non-empty
+    segment is LABEL. Raises ValueError otherwise; the raw link is never a ticker."""
+    match = STALKER_SYMBOL_LINK_RE.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"{value!r} is not a Markdown link [TICKER](/path/TICKER)")
+    label, path = match.groups()
+    if not STALKER_TICKER_RE.fullmatch(label):
+        raise ValueError(f"link label {label!r} is not a ticker")
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        raise ValueError(f"link target {path!r} is not a site-relative /path")
+    segments = [s for s in re.split(r"[?#]", path)[0].split("/") if s]
+    if not segments or segments[-1] != label:
+        raise ValueError(f"link target {path!r} does not end in its label {label!r}")
+    return label
+
+
+def _stalker_rows_from_response(data, side):
+    """The validated response's `side` DataTable data as parse_stalker_table rows
+    ({symbol, netval, bval, sval, bavg, savg}, all text). Every entry must be an
+    object whose symbol is the live Markdown ticker link (see _stalker_symbol)
+    and whose other columns are numbers; otherwise ValueError, never a guessed
+    zero, blank or raw link."""
+    table_id = SIDE_TABLE_ID[side]
+    rows = []
+    for i, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{table_id} row {i} is not an object")
+        missing = [f for f in STALKER_ROW_FIELDS if f not in entry]
+        if missing:
+            raise ValueError(f"{table_id} row {i} lacks {', '.join(missing)}")
+        try:
+            row = {"symbol": _stalker_symbol(entry["symbol"])}
+        except ValueError as e:
+            raise ValueError(f"{table_id} row {i} symbol: {e}") from None
+        for field in STALKER_ROW_FIELDS[1:]:
+            try:
+                row[field] = _stalker_cell(entry[field])
+            except ValueError as e:
+                raise ValueError(f"{table_id} row {i} {field}: {e}") from None
+        rows.append(row)
+    return rows
+
+
+def _submit_and_confirm_callback(page, side, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
+    """Click #submit-button with a response waiter already armed, require the
+    submit-triggered Dash callback that outputs the `side` container's children
+    to complete successfully and supply the side table, and return that table's
+    rows (parse_stalker_table's row shape). Raises otherwise."""
+    component_id = SIDE_CONTAINER[side].lstrip("#")
+    try:
+        with page.expect_response(_submit_callback_for(side), timeout=timeout_ms) as info:
+            try:
+                page.click("#submit-button", timeout=5000)
+            except Exception as e:
+                log.warning(f"Could not click #submit-button: {e}")
+                raise RuntimeError(f"submit failed: {_safe_error(e)}") from e
+        response = info.value
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"no {SUBMIT_TRIGGER} Dash callback for {component_id} within "
+                           f"{timeout_ms // 1000}s of submit: {_safe_error(e)}") from e
+    if response.status != 200:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback failed: HTTP {response.status}")
+    try:
+        data = _side_response_data(_api_json(response), side)
+        return _stalker_rows_from_response(data, side)
+    except ValueError as e:
+        raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
+
+
+def get_netflow(page, codes, duration="Today", side="dist", strict=False):
+    """symbol -> row of the broker_stalker `side` table for `codes` over `duration`.
+
+    strict=False is the broker_flow path and is unchanged: a failed duration
+    switch or submit click is logged and ignored, a fixed 4s wait follows the
+    submit, the rows are parsed from the DOM table, and a failed parse returns
+    {}. strict=True (Broker Stalker) raises on a failed duration switch or
+    submit instead, and takes its rows from the submit contract above (the
+    validated submit-button Dash callback response for the `side` table), never
+    from the DOM, so neither a technical failure, a submit the server never
+    answered for this table, nor a stale rendered table can be read as this
+    query's result."""
     page.goto(NEOBDM_BROKER_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(5000)
     set_broker_codes(page, codes)
-    set_duration(page, duration)
-    try:
-        page.click("#submit-button", timeout=5000)
-    except Exception as e:
-        log.warning(f"Could not click #submit-button: {e}")
-    page.wait_for_timeout(4000)
-    try:
-        rows = parse_stalker_table(page, side)
-    except Exception as e:
-        log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
-        rows = []
+    set_duration(page, duration, strict=strict)
+    if strict:
+        rows = _submit_and_confirm_callback(page, side)
+    else:
+        try:
+            page.click("#submit-button", timeout=5000)
+        except Exception as e:
+            log.warning(f"Could not click #submit-button: {e}")
+        page.wait_for_timeout(4000)
+        try:
+            rows = parse_stalker_table(page, side)
+        except Exception as e:
+            log.error(f"Broker stalker {side} table parse failed for {codes}: {e}")
+            rows = []
     return {r["symbol"]: r for r in rows if r.get("symbol")}
 
 
@@ -1111,22 +1348,39 @@ def _fmt_lot(v):
     return f"{v:.0f} lot"
 
 
+BROKER_STALKER_SOURCE = "broker_stalker"
+
+
 def scrape_broker_stalker(page):
     """Retail (XL+XC) top net-sell tickers, then the top-2 'bag holders' of each
-    (highest cumulative net inventory) from the inventory chart."""
+    (highest cumulative net inventory) from the inventory chart, as a SignalResult.
+
+    The scan uses get_netflow's strict path, so the status is:
+      SOURCE_UNAVAILABLE  the duration switch, submit, callback response or row
+                          validation, or any other part of the scan failed
+      EMPTY_UNVERIFIED    the validated response held no negative-netval row.
+                          Never NO_HITS: this table cannot prove a genuine
+                          zero-sell session strongly enough
+      HITS                one or more retail net-sell rows"""
+    def result(status, hits=(), detail=""):
+        return nsc.SignalResult(BROKER_STALKER_SOURCE, status, list(hits), detail)
+
     # 1) retail net SELL (XL+XC, Foreign Only unchecked) -> top tickers
     log.info(f"Retail net sell scan ({'+'.join(STALKER_RETAIL)})...")
     try:
-        retail_sell = get_netflow(page, STALKER_RETAIL, "Today", side="dist")
+        retail_sell = get_netflow(page, STALKER_RETAIL, "Today", side="dist", strict=True)
     except Exception as e:
-        log.error(f"Retail net sell scan failed: {e}")
-        return []
+        err = _safe_error(e)
+        log.error(f"Retail net sell scan failed: {err}")
+        return result(nsc.SOURCE_UNAVAILABLE, detail=f"retail net sell scan failed: {err}")
 
     top = sorted(retail_sell.values(), key=lambda r: parse_num(r.get("netval", "")))
     top = [r for r in top if parse_num(r.get("netval", "")) < 0][:STALKER_TOP_N]
     log.info(f"Top retail net sell: {[(r['symbol'], r['netval']) for r in top]}")
     if not top:
-        return []
+        return result(nsc.EMPTY_UNVERIFIED, detail=(
+            f"{len(retail_sell)} row(s) parsed, none with a negative netval" if retail_sell
+            else "dist table parsed with no rows"))
 
     # 2) per ticker -> top bag holders from the inventory JSON API.
     # Prime the inventory path ONCE so its session cookies are set; the GETs below
@@ -1159,7 +1413,7 @@ def scrape_broker_stalker(page):
             "holders": holders,
             "holders_failed": failed,
         })
-    return results
+    return result(nsc.HITS, results)
 
 
 # ── 3b. PERSISTENCE (SQLite) ───────────────────
@@ -1285,7 +1539,10 @@ def record_konglo_signals(conn, date_str, ms_data, dash_data, bs_data):
     statuses += [rows if isinstance(rows, nsc.SignalResult)
                  else nsc.signal_status_from_rows(f"dashboard_{label}", rows)
                  for label, _emoji, rows in dash_data]
-    statuses.append(nsc.signal_status_from_rows("broker_stalker", list(bs_data)))
+    # Broker Stalker's own result carries SOURCE_UNAVAILABLE vs EMPTY_UNVERIFIED and
+    # the reason; recomputing it from its (empty) rows would erase both.
+    statuses.append(bs_data if isinstance(bs_data, nsc.SignalResult)
+                    else nsc.signal_status_from_rows(BROKER_STALKER_SOURCE, list(bs_data)))
     nsc.record_signal_source_status(conn, date_str, statuses)
 
     for r in ms_data:
@@ -1358,9 +1615,11 @@ def format_market_summary_message(data):
     return "\n".join(_market_summary_lines(data))
 
 
-def _market_summary_lines(data):
+def _market_summary_lines(data, in_window=True):
+    """Off-window (in_window=False) the session is unverified, so no "(Daily)" or
+    "today" claim is made about it."""
     lines = [
-        "📊 Top 2 Akum Bandar (Daily)",
+        "📊 Top 2 Akum Bandar (Daily)" if in_window else "📊 Top 2 Akum Bandar",
         "Universe: likuid, non-gorengan | Filter: unusual=v | Rank: dn-0 > dn-3",
     ]
     if isinstance(data, nsc.SignalResult):
@@ -1373,8 +1632,14 @@ def _market_summary_lines(data):
             lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a "
                          f"zero-candidate day.")
             return lines
+        if data.status == nsc.EMPTY_UNVERIFIED:
+            lines.append(f"⚠️ Empty — unverified: {data.detail or 'no rows returned'}. The source "
+                         f"cannot tell no candidates from a failed capture, so this is not "
+                         f"proven to be a zero-candidate day.")
+            return lines
         if data.status == nsc.NO_HITS:
-            lines.append("No unusual-volume candidates today (source healthy).")
+            lines.append("No unusual-volume candidates today (source healthy)." if in_window
+                         else "No unusual-volume candidates in this capture (source healthy).")
             return lines
         data = data.hits
     if not data:
@@ -1390,7 +1655,8 @@ def _market_summary_lines(data):
         flag = " ⚠️" if row.get("_caution") else ""
         lines.append(f"{i}. {symbol}{flag} | {details}")
         if row.get("_caution"):
-            lines.append(f"   ⚠️ caution: dn-0 < {MARKET_DN0_MIN}, akumulasi lemah hari ini")
+            lines.append(f"   ⚠️ caution: dn-0 < {MARKET_DN0_MIN}, akumulasi lemah"
+                         + (" hari ini" if in_window else ""))
     return lines
 
 
@@ -1403,8 +1669,16 @@ def _broker_stalker_lines(data):
         "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
         "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
     ]
+    status = getattr(data, "status", None)
+    if status == nsc.SOURCE_UNAVAILABLE:
+        lines.append(f"⚠️ Source unavailable: {data.detail}. This is not a zero-sell day.")
+        return lines
     if not data:
-        lines.append("Tidak ada retail net sell hari ini.")
+        # EMPTY_UNVERIFIED, or a bare empty list: the stalker table cannot prove a
+        # genuine zero-sell session, so nothing here may claim one.
+        detail = getattr(data, "detail", "") or "no qualifying rows"
+        lines.append(f"⚠️ Empty — unverified: {detail}. Cannot be told apart from a "
+                     f"failed scan; not a confirmed zero-sell day.")
         return lines
     for i, row in enumerate(data, 1):
         holders = row.get("holders", [])
@@ -1416,32 +1690,75 @@ def _broker_stalker_lines(data):
     return lines
 
 
-def _dashboard_lines(data):
-    lines = ["📋 Dashboard Top Akum (EOD) — ticker (%M)"]
+def _dashboard_cell(rows):
+    if rows:
+        return " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
+    status, detail = getattr(rows, "status", None), getattr(rows, "detail", "")
+    if status == nsc.SOURCE_UNAVAILABLE:
+        return f"⚠️ unavailable: {detail}" if detail else "⚠️ unavailable"
+    if status == nsc.RETIRED_SOURCE:
+        return "⛔ source retired"
+    if status == nsc.NO_HITS:
+        return "no hits (source healthy)"
+    # EMPTY_UNVERIFIED, or a bare empty list: never a bare "-", which reads as a
+    # confirmed empty list.
+    return f"⚠️ empty — unverified: {detail}" if detail else "⚠️ empty — unverified"
+
+
+def _dashboard_lines(data, in_window=True):
+    lines = ["📋 Dashboard Top Akum (EOD) — ticker (%M)" if in_window
+             else "📋 Dashboard Top Akum — ticker (%M)"]
     if not data:
         lines.append("No dashboard data.")
         return lines
     for label, emoji, rows in data:
-        if rows:
-            tickers = " ".join(f"{r.get('tick')}({r.get('tx','')})" for r in rows)
-        elif getattr(rows, "status", None) == nsc.SOURCE_UNAVAILABLE:
-            tickers = "⚠️ unavailable"
-        else:
-            tickers = "-"
-        lines.append(f"{emoji} {label}: {tickers}")
+        lines.append(f"{emoji} {label}: {_dashboard_cell(rows)}")
     return lines
 
 
-def format_combined_message(ms_data, dash_data, bs_data):
-    """All sections in ONE Telegram message with a single timestamp."""
-    lines = [
-        "📈 NeoBDM Daily Signal",
-        f"🕗 {now_str()}",
-        "═════════════════════",
-    ]
-    lines += _market_summary_lines(ms_data)
+def report_is_pre_open(scrape_started_at, report_sources_completed_at):
+    """May the report claim the pre-open basis (the latest completed session)?
+    Only if every source it shows was read inside the safe morning window: the
+    scrape started AND the last report source finished before IDX open, on the
+    same day. A run that starts at 09:59 and finishes at 10:01 may have read
+    live-session data, so it is unverified."""
+    return (date_offset_holds(scrape_started_at)
+            and date_offset_holds(report_sources_completed_at)
+            and scrape_started_at.date() == report_sources_completed_at.date())
+
+
+def _scrape_span(started, completed):
+    if started.date() == completed.date():
+        return f"{started:%d %b %Y, %I:%M %p} – {completed:%I:%M %p} MYT"
+    return f"{started:%d %b %Y, %I:%M %p} – {completed:%d %b %Y, %I:%M %p} MYT"
+
+
+def _basis_lines(scrape_started_at, report_sources_completed_at):
+    """Header lines stating when the report's sources were read and what session
+    they describe. No trading date is named: nothing NeoBDM returns here says
+    which session it served, and the previous weekday can be a holiday."""
+    lines = [f"🕗 Scraped {_scrape_span(scrape_started_at, report_sources_completed_at)}"]
+    if report_is_pre_open(scrape_started_at, report_sources_completed_at):
+        lines.append("📅 Basis: latest completed session served by NeoBDM (pre-open capture)")
+    else:
+        lines.append(f"⚠️ Scrape ran (at least partly) after the safe morning window, after "
+                     f"IDX open ({IDX_OPEN_HOUR_LOCAL:02d}:00 MYT): session UNVERIFIED — may be "
+                     f"intraday or today's close; not a closing-session report.")
+    return lines
+
+
+def format_combined_message(ms_data, dash_data, bs_data, scrape_started_at,
+                            report_sources_completed_at):
+    """All sections in ONE Telegram message, headed by when the report's sources
+    were read and the session basis that timing supports. Unless the whole read
+    was pre-open, nothing in the message claims a Daily/EOD/current session."""
+    pre_open = report_is_pre_open(scrape_started_at, report_sources_completed_at)
+    lines = ["📈 NeoBDM Daily Signal" if pre_open else "📈 NeoBDM Signal — Session Unverified"]
+    lines += _basis_lines(scrape_started_at, report_sources_completed_at)
+    lines.append("═════════════════════")
+    lines += _market_summary_lines(ms_data, pre_open)
     lines.append("─────────────────────")
-    lines += _dashboard_lines(dash_data)
+    lines += _dashboard_lines(dash_data, pre_open)
     lines.append("─────────────────────")
     lines += _broker_stalker_lines(bs_data)
     lines.append("═════════════════════")
@@ -1469,6 +1786,12 @@ def send_telegram(message):
 
 def run_all_jobs():
     log.info("=== Daily job starting ===")
+    # The report's basis is when its sources were read, not when it is sent: from
+    # before scraping starts until the last report source (Broker Stalker) is
+    # done. broker_flow persistence runs later and feeds no report section, so
+    # it cannot move the basis. report_is_pre_open() applies the same pre-open
+    # rule _offset_safe uses for persistence, to BOTH ends.
+    scrape_started_at = datetime.now(pytz.timezone(TIMEZONE))
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, slow_mo=300)
@@ -1488,6 +1811,7 @@ def run_all_jobs():
             ms_data = scrape_market_summary(page, capture)
             dash_data = scrape_dashboard_presets(page, capture.get("rows"), capture.get("capture_id"))
             bs_data = scrape_broker_stalker(page)
+            report_sources_completed_at = datetime.now(pytz.timezone(TIMEZONE))
 
             backfill_progress = None
             try:
@@ -1508,7 +1832,8 @@ def run_all_jobs():
 
             browser.close()
 
-        message = format_combined_message(ms_data, dash_data, bs_data)
+        message = format_combined_message(ms_data, dash_data, bs_data,
+                                          scrape_started_at, report_sources_completed_at)
         if backfill_progress:
             message = f"{message}\n\n{backfill_progress}"
         send_telegram(message)

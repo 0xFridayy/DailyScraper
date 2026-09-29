@@ -1004,14 +1004,14 @@ def test_broker_stalker_shares_one_manifest_and_reports_as_before():
         script[t] = [ok(json.loads(r.text())["data"], t) for r in script[t]]
     rows = {"AAAA": "-5.0", "BBBB": "-3.0", "CCCC": "-1.0", "DDDD": "2.0"}
     saved = ns.get_netflow
-    ns.get_netflow = lambda page, codes, duration="Today", side="dist": {
+    ns.get_netflow = lambda page, codes, duration="Today", side="dist", strict=False: {
         t: {"symbol": t, "netval": v, "savg": "100"} for t, v in rows.items()}
     try:
         with tempfile.TemporaryDirectory() as tmp, no_cache_root(tmp):
             request = FakeRequest(tmp, script)
             page = SimpleNamespace(context=SimpleNamespace(request=request),
                                    goto=lambda *a, **k: None, wait_for_timeout=lambda ms: None)
-            results = ns.scrape_broker_stalker(page)
+            results = ns.scrape_broker_stalker(page).hits
             caps = ic.read_captures(only_manifest(tmp))          # exactly one run file
     finally:
         ns.get_netflow = saved

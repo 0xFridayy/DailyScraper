@@ -1082,12 +1082,29 @@ def telegram_sender_from_env():
 
 # ── Morning run ────────────────────────────────────────────────────────────
 
+def record_stale_warning(run_utc, text, sent_utc, picks_db=PICKS_DB):
+    """Record a stale warning that was delivered outside run_morning (morning.py's
+    retry after "stale_send_failed"), exactly as run_morning records one: kind
+    "stale", key = the MYT date of the run (`run_utc`, the instant run_morning
+    was given), sent at `sent_utc`. INSERT OR IGNORE, so it is idempotent."""
+    day = run_utc.astimezone(MYT).date().isoformat()
+    conn = sqlite3.connect(picks_db)
+    try:
+        ensure_schema(conn)
+        record_sent(conn, "stale", day, text, sent_utc)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 follows_json=FOLLOWS_JSON, preview=False):
     """Build and send the morning message. Returns (status, text).
 
     Sends nothing on weekends, and at most one message per trading session
     (so the morning after a holiday, which has no new data, stays quiet).
+    With no fresh data it sends a stale warning instead: "stale" once that is
+    delivered, "stale_send_failed" (nothing recorded) when the send fails.
     preview=True ignores those checks and writes/sends nothing.
     """
     local = now_utc.astimezone(MYT)
@@ -1118,9 +1135,12 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
                 return "stale_already_warned", None
             text = ("⚠️ No fresh NeoBDM data this morning (the scrape ran late or "
                     "failed), so no new picks today.")
-            if send(text):
-                record_sent(conn, "stale", today.isoformat(), text, now_utc)
-                conn.commit()
+            if not send(text):
+                # Not recorded, and not "stale": the caller must know the
+                # warning never went out (it retries this text, never raw data).
+                return "stale_send_failed", text
+            record_sent(conn, "stale", today.isoformat(), text, now_utc)
+            conn.commit()
             return "stale", text
         if not snaps:
             return "no_data", None
