@@ -108,17 +108,31 @@ def score(panel_path=PANEL, top_n=TOP_N, min_turn=MIN_TURN, horizon=HORIZON):
 
 
 def write(as_of, top, picks_db=PICKS_DB, valid_days=VALID_DAYS):
+    """Replace the as_of list with top, all or nothing.
+
+    One as_of is one computation, so a rerun for the same session replaces
+    its list rather than merging into it. INSERT OR REPLACE alone kept every
+    name the rerun no longer flagged, and daily_picks.arb_veto() went on
+    vetoing it until valid_until: 2026-09-23 carries BTEK and BAJA from the
+    Rp0.5bn run the Rp2bn rerun replaced. The delete and the inserts share one
+    transaction, so a rerun that fails part way leaves the previous list
+    whole. Other as_of lists are never touched.
+    """
+    day = as_of.date().isoformat()
     valid_until = (as_of + timedelta(days=valid_days)).date().isoformat()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn = sqlite3.connect(picks_db)
     try:
-        conn.execute(SCHEMA)
-        conn.executemany(
-            "INSERT OR REPLACE INTO arb_veto "
-            "(as_of, ticker, p, rank, valid_until, recorded_utc) VALUES (?,?,?,?,?,?)",
-            [(as_of.date().isoformat(), r.ticker, float(r.p), int(r.rank),
-              valid_until, now) for r in top.itertuples()])
-        conn.commit()
+        with conn:
+            conn.execute(SCHEMA)
+            conn.execute("DELETE FROM arb_veto WHERE as_of = ?", (day,))
+            # Plain INSERT: with the old rows gone, a key clash can only be a
+            # ticker listed twice, which must fail rather than collapse.
+            conn.executemany(
+                "INSERT INTO arb_veto "
+                "(as_of, ticker, p, rank, valid_until, recorded_utc) VALUES (?,?,?,?,?,?)",
+                [(day, r.ticker, float(r.p), int(r.rank), valid_until, now)
+                 for r in top.itertuples()])
     finally:
         conn.close()
     return valid_until
