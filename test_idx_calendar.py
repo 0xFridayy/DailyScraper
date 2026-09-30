@@ -45,6 +45,8 @@ def test_sources_name_the_verified_announcements():
     s26, s27 = cal.SOURCES[2026], cal.SOURCES[2027]
     assert (s26["idx"]["announcement"], s26["idx"]["date"]) == ("Peng-00171/BEI.POP/09-2025", "2025-09-23")
     assert (s26["ksei"]["announcement"], s26["ksei"]["date"]) == ("PENG-0002/DIR/KSEI/0126", "2026-01-08")
+    assert s26["ksei"]["title"] and s26["ksei"]["url"].startswith("https://web.ksei.co.id/files/")
+    assert [h["announcement"] for h in s26["ksei_history"]] == ["PENG-0005/DIR/KSEI/1025"]
     assert (s27["idx"]["announcement"], s27["idx"]["date"]) == ("Peng-00169/BEI.POP/09-2026", "2026-09-16")
     assert (s27["ksei"]["announcement"], s27["ksei"]["date"]) == ("PENG-0004/DIR/KSEI/0926", "2026-09-24")
     assert all(s["verified_at"] == cal.VERIFIED_AT == "2026-09-30" for s in cal.SOURCES.values())

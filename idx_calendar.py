@@ -91,9 +91,13 @@ SOURCES = {
                 "title": "Kalender Libur Bursa Tahun 2026",
                 "url": "https://www.idx.co.id/StaticData/NewsAndAnnouncement/ANNOUNCEMENTSTOCK/Exchange/"
                        "Peng-00171%20Libur%20Bursa%202026-No.%20Peng-00171BEI.POP09-2025.pdf"},
+        # The adjustment (penyesuaian) of PENG-0005/DIR/KSEI/1025 that KSEI's
+        # "Jadwal Operasional dan Libur" page links for 2026. Same 22 closures;
+        # only clause 2 changed (service hours now per KSEI-8073/DIR/1225).
         "ksei": {"announcement": "PENG-0002/DIR/KSEI/0126", "date": "2026-01-08",
-                 "title": None,   # adjustment of PENG-0005/DIR/KSEI/1025; follows the IDX announcement above
-                 "url": None},
+                 "title": "Penyesuaian Pengumuman Hari Libur dan Cuti Bersama PT KSEI Tahun 2026",
+                 "url": "https://web.ksei.co.id/files/1767843003_Penyesuaian_Pengumuman_Hari_Libur_dan_"
+                        "Cuti_Bersama_PT_KSEI_Ta....pdf"},
         "ksei_history": [
             {"announcement": "PENG-0005/DIR/KSEI/1025", "date": "2025-10-01",
              "title": "Pengumuman Hari Libur dan Cuti Bersama PT KSEI Tahun 2026",
