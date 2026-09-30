@@ -162,6 +162,7 @@ def snapshot_of(db, pq, name="synthetic"):
     con = bfr.connect_readonly(db)
     rows, digest = bfr.broker_flow_fingerprint(con)
     groups = bfr._groups(con)
+    scan_rows, scan_digest = bfr._scan_fingerprint(bfr._scan_rows(con))
     con.close()
     by_regime = {}
     for _, is_bf, n in groups:
@@ -171,6 +172,7 @@ def snapshot_of(db, pq, name="synthetic"):
     return {"name": name, "source_commit": "0" * 40,
             "broker_flow": {"rows": rows, "records": len(groups), "ordered_sha256": digest,
                             "by_regime": by_regime},
+            "broker_flow_scan": {"rows": scan_rows, "ordered_sha256": scan_digest},
             "broker_daily_sha256": bfr.file_sha256(pq)}
 
 
@@ -452,6 +454,7 @@ def test_committed_manifest_holds_the_audited_classification():
         (snap["name"], snap["source_commit"])
     assert bf["ordered_sha256"] == snap["broker_flow"]["ordered_sha256"]
     assert bf["by_regime"] == snap["broker_flow"]["by_regime"]
+    assert m["input"]["broker_flow_scan"] == snap["broker_flow_scan"]
     assert m["input"]["content_match_evidence"]["sha256"] == snap["broker_daily_sha256"]
     assert (bf["rows"], bf["dates"]) == (AUDIT["rows"], AUDIT["dates"])
     for regime in (bfr.BACKFILL, bfr.LIVE):
@@ -615,7 +618,12 @@ def test_synthetic_snapshot_contract_passes_exactly_and_fails_on_drift(fixture, 
             (FUTURE_ROW, "records"),
             ("DELETE FROM broker_flow WHERE date = '2026-07-02'", "records"),
             ("UPDATE broker_flow SET netval = 0.25 WHERE date = '2026-07-03' "
-             "AND ticker = 'AAAA' AND broker_code = 'AK'", "ordered sha256")]):
+             "AND ticker = 'AAAA' AND broker_code = 'AK'", "ordered sha256"),
+            ("UPDATE broker_flow_scan SET session_date = '2026-09-28' "
+             "WHERE scrape_date = '2026-09-30' AND snapshot = 'PERSISTED'",
+             "broker_flow_scan ordered sha256"),
+            ("DELETE FROM broker_flow_scan WHERE snapshot = 'REJECTED'",
+             "broker_flow_scan rows")]):
         other = edited_copy(db, tmp_path / f"drift{i}.db", edit)
         with pytest.raises(bfr.SnapshotMismatch, match=reason):
             bfr.build_manifest(other, pq, snapshot=contract)
@@ -641,6 +649,132 @@ def test_new_snapshot_mode_is_explicit_and_cannot_target_the_committed_manifest(
                      "--out", str(out)]) == 0
     written = json.loads(out.read_text(encoding="ascii"))
     assert written["input"]["snapshot"] is None and written["records"]
+
+
+# broker_flow_scan is a classification input (SCAN_VERIFIED and its canonical
+# session), so the audited snapshot pins it as well. Each edit below leaves
+# broker_flow byte-identical.
+
+SCAN_COLS = ("scrape_date, broker_code, run_started_utc, status, snapshot, session_date, "
+             "akum_rows_returned, dist_rows_returned, tracked_rows, method, started_utc, "
+             "completed_utc, detail")
+SCAN_0930 = "scrape_date = '2026-09-30' AND snapshot = 'PERSISTED'"
+SCAN_EDITS = {
+    "session_date": f"UPDATE broker_flow_scan SET session_date = '2026-09-28' WHERE {SCAN_0930}",
+    "snapshot": f"UPDATE broker_flow_scan SET snapshot = 'SUPERSEDED' "
+                f"WHERE {SCAN_0930} AND broker_code = 'AI'",
+    "status": f"UPDATE broker_flow_scan SET status = 'SOURCE_FAILURE' "
+              f"WHERE {SCAN_0930} AND broker_code = 'AI'",
+    "tracked_rows": f"UPDATE broker_flow_scan SET tracked_rows = tracked_rows + 1 "
+                    f"WHERE {SCAN_0930} AND broker_code = 'AI'",
+    "extra_row": f"INSERT INTO broker_flow_scan ({SCAN_COLS}) VALUES ('2026-09-29', 'AI', "
+                 "'2026-09-29T01:00:00+00:00', 'SOURCE_FAILURE', 'REJECTED', NULL, NULL, NULL, "
+                 "NULL, 'dash_callback_v1', NULL, NULL, 'http 500')",
+}
+
+
+def flow_fp(db):
+    con = bfr.connect_readonly(db)
+    try:
+        return bfr.broker_flow_fingerprint(con)
+    finally:
+        con.close()
+
+
+def scan_fp(db):
+    con = bfr.connect_readonly(db)
+    try:
+        return bfr._scan_fingerprint(bfr._scan_rows(con))
+    finally:
+        con.close()
+
+
+def optional_real_parquet():
+    """The recorded parquet when supplied, else None; an explicitly supplied
+    wrong one still fails."""
+    verdict, value = parquet_choice(os.environ.get("BROKER_DAILY_PARQUET"),
+                                    os.path.join(HERE, "broker_daily.parquet"),
+                                    bfr.AUDITED_SNAPSHOT["broker_daily_sha256"])
+    if verdict == "fail":
+        pytest.fail(value)
+    return value if verdict == "use" else None
+
+
+def sandbox_committed(tmp_path, monkeypatch):
+    """Point the CLI's default target at a copy so nothing here can touch the
+    real committed manifest."""
+    home = tmp_path / "repo"
+    (home / "evidence").mkdir(parents=True)
+    target = home / bfr.MANIFEST_PATH
+    target.write_text("audited", encoding="ascii")
+    monkeypatch.setattr(bfr, "HERE", str(home))
+    return target
+
+
+def test_exact_baseline_scan_is_the_pinned_scan(baseline_db):
+    want = bfr.AUDITED_SNAPSHOT["broker_flow_scan"]
+    assert scan_fp(baseline_db) == (want["rows"], want["ordered_sha256"]) == (
+        29, "ff59ea3a7bcb8014aca70a3d077da68d55ea98fd709720d6897cb47c51f104d7")
+    pq = optional_real_parquet()
+    if pq is None:
+        # the only objection to the exact baseline is the missing parquet
+        with pytest.raises(bfr.SnapshotMismatch) as e:
+            bfr.build_manifest(baseline_db, None, snapshot=bfr.AUDITED_SNAPSHOT)
+        assert "broker_flow_scan" not in str(e.value) and "not supplied" in str(e.value)
+    else:
+        m = bfr.build_manifest(baseline_db, pq, snapshot=bfr.AUDITED_SNAPSHOT)
+        assert m["input"]["broker_flow_scan"] == want
+
+
+@pytest.mark.parametrize("edit, reasons", [
+    ("session_date", ["broker_flow_scan ordered sha256"]),
+    ("snapshot", ["broker_flow_scan ordered sha256"]),
+    ("status", ["broker_flow_scan ordered sha256"]),
+    ("tracked_rows", ["broker_flow_scan ordered sha256"]),
+    ("extra_row", ["broker_flow_scan rows 30 != 29", "broker_flow_scan ordered sha256"]),
+])
+def test_audited_build_refuses_a_changed_scan_even_with_identical_broker_flow(
+        baseline_db, tmp_path, monkeypatch, edit, reasons):
+    db = edited_copy(baseline_db, tmp_path / "scan.db", SCAN_EDITS[edit])
+    assert flow_fp(db) == flow_fp(baseline_db)
+    assert scan_fp(db) != scan_fp(baseline_db)
+    pq = optional_real_parquet()
+    # SnapshotMismatch, not ProvenanceContradiction: refused before classifying
+    with pytest.raises(bfr.SnapshotMismatch) as e:
+        bfr.build_manifest(db, pq, snapshot=bfr.AUDITED_SNAPSHOT)
+    msg = str(e.value)
+    for reason in reasons:
+        assert reason in msg, (reason, msg)
+    assert "broker_flow rows" not in msg and "records" not in msg and "by_regime" not in msg
+    if pq is not None:
+        assert "parquet" not in msg
+    target = sandbox_committed(tmp_path, monkeypatch)
+    real_before = sha(COMMITTED) if os.path.exists(COMMITTED) else None
+    args = ["build", "--db", db] + (["--broker-daily", pq] if pq else [])
+    assert bfr.main(args) == 2
+    assert target.read_text(encoding="ascii") == "audited"
+    assert sorted(os.listdir(target.parent)) == [target.name]
+    if real_before is not None:
+        assert sha(COMMITTED) == real_before
+
+
+def test_new_snapshot_mode_can_describe_a_different_scan_without_touching_the_audit(
+        baseline_db, tmp_path, monkeypatch):
+    db = edited_copy(baseline_db, tmp_path / "scan.db", SCAN_EDITS["session_date"])
+    target = sandbox_committed(tmp_path, monkeypatch)
+    real_before = sha(COMMITTED) if os.path.exists(COMMITTED) else None
+    out = tmp_path / "other" / "scan_snapshot.json"
+    assert bfr.main(["build", "--new-snapshot", "--db", db, "--out", str(out)]) == 0
+    m = json.loads(out.read_text(encoding="ascii"))
+    r = by_key(m)[("2026-09-30", bfr.LIVE)]
+    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-28")
+    assert m["input"]["snapshot"] is None
+    assert m["input"]["broker_flow_scan"] != bfr.AUDITED_SNAPSHOT["broker_flow_scan"]
+    assert m["input"]["broker_flow"]["ordered_sha256"] == \
+        bfr.AUDITED_SNAPSHOT["broker_flow"]["ordered_sha256"]
+    assert target.read_text(encoding="ascii") == "audited"
+    if real_before is not None:
+        assert sha(COMMITTED) == real_before
 
 
 def test_explicitly_supplied_wrong_parquet_fails_but_a_missing_one_skips(tmp_path):

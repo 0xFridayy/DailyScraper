@@ -132,6 +132,12 @@ AUDITED_SNAPSHOT = {
         "by_regime": {"BACKFILL": {"dates": 218, "rows": 212_839},
                       "LIVE": {"dates": 87, "rows": 19_654}},
     },
+    # SCAN_VERIFIED and its canonical session come from these rows, so they
+    # are pinned too (_scan_fingerprint: every row, NULL columns omitted).
+    "broker_flow_scan": {
+        "rows": 29,
+        "ordered_sha256": "ff59ea3a7bcb8014aca70a3d077da68d55ea98fd709720d6897cb47c51f104d7",
+    },
     "broker_daily_sha256": "c8d1948f00d99ba96fe17376292f32a9cda2be36e2eb5ce303e680427f05cc32",
 }
 
@@ -375,8 +381,11 @@ def _groups(con):
         "ORDER BY date, bval IS NULL").fetchall()
 
 
-def check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_commit):
-    """Every difference from the snapshot contract, as one SnapshotMismatch."""
+def check_snapshot(snapshot, total, flow_sha, groups, scan_fp, broker_daily_path,
+                   source_commit):
+    """Every difference from the snapshot contract, as one SnapshotMismatch.
+    scan_fp: (rows, sha256) of broker_flow_scan by _scan_fingerprint, the
+    same value the manifest records as input.broker_flow_scan."""
     want = snapshot["broker_flow"]
     got_regime = {}
     for _, is_bf, n in groups:
@@ -392,6 +401,12 @@ def check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_
         diffs.append(f"by_regime {got_regime} != {want['by_regime']}")
     if flow_sha != want["ordered_sha256"]:
         diffs.append(f"ordered sha256 {flow_sha} != {want['ordered_sha256']}")
+    want_scan = snapshot["broker_flow_scan"]
+    if scan_fp[0] != want_scan["rows"]:
+        diffs.append(f"broker_flow_scan rows {scan_fp[0]} != {want_scan['rows']}")
+    if scan_fp[1] != want_scan["ordered_sha256"]:
+        diffs.append(f"broker_flow_scan ordered sha256 {scan_fp[1]} != "
+                     f"{want_scan['ordered_sha256']}")
     if source_commit is not None and source_commit != snapshot["source_commit"]:
         diffs.append(f"source_commit {source_commit} != {snapshot['source_commit']}")
     if not (broker_daily_path and os.path.isfile(broker_daily_path)):
@@ -405,10 +420,12 @@ def check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_
 def _build(con, broker_daily_path, source_commit, snapshot):
     total, flow_sha = broker_flow_fingerprint(con)
     groups = _groups(con)
-    if snapshot is not None:
-        check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_commit)
-        source_commit = snapshot["source_commit"]
     scan = _scan_rows(con)
+    scan_fp = _scan_fingerprint(scan)
+    if snapshot is not None:
+        check_snapshot(snapshot, total, flow_sha, groups, scan_fp, broker_daily_path,
+                       source_commit)
+        source_commit = snapshot["source_commit"]
     live_dates = [d for d, is_bf, _ in groups if not is_bf]
     live = {d: _live_rows(con, d) for d in live_dates}
 
@@ -504,7 +521,7 @@ def _build(con, broker_daily_path, source_commit, snapshot):
                             "order": "date, ticker, broker_code",
                             "dates": len({d for d, _, _ in groups}),
                             "by_regime": _regime_counts(records)},
-            "broker_flow_scan": dict(zip(("rows", "ordered_sha256"), _scan_fingerprint(scan))),
+            "broker_flow_scan": dict(zip(("rows", "ordered_sha256"), scan_fp)),
             "content_match_evidence": evidence,
             "idx_calendar_version": idx_calendar.CALENDAR_VERSION,
         },

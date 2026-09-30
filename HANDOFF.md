@@ -1392,9 +1392,11 @@ lampau tidak boleh berubah.
 
 **Manifest yang di-commit = satu snapshot teraudit** (`AUDITED_SNAPSHOT`,
 `audited-2026-09-30`, master 1aeca53): 232.493 baris, 305 record, BACKFILL
-212.839/218, LIVE 19.654/87, hash urut `9c433af0…d353`, parquet `c8d1948f…`.
+212.839/218, LIVE 19.654/87, hash urut `9c433af0…d353`, `broker_flow_scan` 29
+baris / `ff59ea3a…04d7` (sumber SCAN_VERIFIED), parquet `c8d1948f…`.
 `build` default memeriksa semua fakta itu **sebelum** mengklasifikasi; kalau ada
-yang beda (tanggal baru, grup hilang/berubah, parquet lain/tidak ada) → ditolak,
+yang beda (tanggal baru, grup hilang/berubah, baris scan berubah/bertambah
+walau `broker_flow` identik, parquet lain/tidak ada) → ditolak,
 exit 2, tidak ada yang ditulis. DB kerja berubah tiap malam, jadi rebuild
 dilakukan dari `neobdm.db` di commit 1aeca53 (identik byte):
 
