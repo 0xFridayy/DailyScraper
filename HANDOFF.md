@@ -1388,11 +1388,25 @@ sesi kanonis harus dedupe. Sesi 07-08 tidak pernah tertangkap.
 **Memakai:** `py -3 broker_flow_regime.py verify` membandingkan manifest dengan
 DB (`rows_sha256` per record). Nilai backfill disembuhkan tiap malam oleh
 top-up, jadi di backfill hanya jumlah baris yang dikunci; baris live tanggal
-lampau tidak boleh berubah. Membuat ulang (identik byte bila DB dan parquet
-sama):
+lampau tidak boleh berubah.
 
-    py -3 broker_flow_regime.py build --db neobdm.db \
-        --broker-daily <path>/broker_daily.parquet --source-commit <sha>
+**Manifest yang di-commit = satu snapshot teraudit** (`AUDITED_SNAPSHOT`,
+`audited-2026-09-30`, master 1aeca53): 232.493 baris, 305 record, BACKFILL
+212.839/218, LIVE 19.654/87, hash urut `9c433af0…d353`, parquet `c8d1948f…`.
+`build` default memeriksa semua fakta itu **sebelum** mengklasifikasi; kalau ada
+yang beda (tanggal baru, grup hilang/berubah, parquet lain/tidak ada) → ditolak,
+exit 2, tidak ada yang ditulis. DB kerja berubah tiap malam, jadi rebuild
+dilakukan dari `neobdm.db` di commit 1aeca53 (identik byte):
+
+    git show 1aeca53:neobdm.db > <tmp>/neobdm.db
+    py -3 broker_flow_regime.py build --db <tmp>/neobdm.db \
+        --broker-daily <path>/broker_daily.parquet
+
+Snapshot baru harus disengaja: `build --new-snapshot --out <file lain>`; path
+manifest teraudit ditolak. Tanggal MIXED juga dikunci ke `rows_sha256` baris
+rerun-nya: bila baris 08-12/08-27 berubah, build menolak alih-alih tetap
+menyebutnya MIXED.
 
 Tes: `test_broker_flow_regime.py` (pytest; set `BROKER_DAILY_PARQUET` untuk
-tes reproduksi byte-identik). Belum masuk daftar CI `check_ml_health`.
+tes reproduksi byte-identik — parquet yang disebut eksplisit tapi hash-nya
+salah membuat tes GAGAL, bukan skip). Belum masuk daftar CI `check_ml_health`.

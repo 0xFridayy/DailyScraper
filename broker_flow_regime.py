@@ -30,9 +30,16 @@ says the evidence was unavailable. It never falls back to the calendar rule.
 Each record carries rows_sha256 of the exact rows it classified, so a committed
 manifest can be checked against the database without the parquet (verify).
 
+The committed manifest is ONE snapshot: AUDITED_SNAPSHOT (2026-09-30, master
+1aeca53). The default build checks that the database and the parquet are
+exactly that snapshot before classifying anything, and writes nothing if they
+are not. A later database is a new snapshot and needs --new-snapshot with a
+different --out; it can never replace the audited manifest.
+
 Usage:
-  py -3 broker_flow_regime.py build  --db neobdm.db --broker-daily PATH \
-        --out evidence/broker_flow_date_evidence.json [--source-commit SHA]
+  py -3 broker_flow_regime.py build  --db neobdm.db --broker-daily PATH
+  py -3 broker_flow_regime.py build  --new-snapshot --db DB --broker-daily PATH \
+        --out OTHER.json
   py -3 broker_flow_regime.py verify --db neobdm.db \
         --manifest evidence/broker_flow_date_evidence.json
 """
@@ -49,6 +56,7 @@ from pathlib import Path
 
 import idx_calendar
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA = "broker_flow_date_evidence_v1"
 GENERATOR_VERSION = 1
 MANIFEST_PATH = os.path.join("evidence", "broker_flow_date_evidence.json")
@@ -84,6 +92,9 @@ TOP_CANDIDATES = 3
 # neobdm.db. INSERT OR REPLACE kept every row the rerun did not return, so the
 # `identical` rows are either untouched first-write rows or rewritten with the
 # same values; nothing tells which. Recomputed by rerun_diff() in the tests.
+# rerun.rows_sha256 pins the rows the rerun left (== _group_hash of the rerun
+# blob): a date whose current rows differ is NOT the audited mixture and the
+# build refuses it instead of calling it MIXED.
 AUDITED_MIXED = {
     "2026-08-12": {
         "first_write": {"commit": "6793d52abe39c0888c32726b59f0952e957d4cb6",
@@ -91,7 +102,8 @@ AUDITED_MIXED = {
                         "live_rows": 212},
         "rerun": {"commit": "f441ec1146c0c93dcfd1e11cc14d5fb3ca475b9c",
                   "neobdm_db_blob": "c0000cc0d4e39d564c4f5136bf593e23cc46742b",
-                  "live_rows": 322},
+                  "live_rows": 322,
+                  "rows_sha256": "3d9482f2e2f928a01a2d054655ba3dce5041c916a518724ee1f684a25b72f1e6"},
         "rerun_diff": {"identical": 110, "changed": 102, "new": 110, "removed": 0},
     },
     "2026-08-27": {
@@ -100,9 +112,27 @@ AUDITED_MIXED = {
                         "live_rows": 198},
         "rerun": {"commit": "da4d96bf7b8d4f56a66a67f2cd7fa28d554b0462",
                   "neobdm_db_blob": "356c126d8b380e9d248e677226e6dcdb5b80f4e5",
-                  "live_rows": 279},
+                  "live_rows": 279,
+                  "rows_sha256": "9e05d901556a262e1a90a2a3285f835835d1c10c420b6f4c9c548875d71a3b5a"},
         "rerun_diff": {"identical": 92, "changed": 106, "new": 81, "removed": 0},
     },
+}
+
+# The committed manifest is the 2026-09-30 audited snapshot and nothing else.
+# The default build checks every fact here BEFORE classifying or writing
+# anything; a later database or a different parquet raises SnapshotMismatch.
+# A new snapshot is a deliberate `build --new-snapshot --out OTHER_PATH`.
+AUDITED_SNAPSHOT = {
+    "name": "audited-2026-09-30",
+    "source_commit": "1aeca5313819e4843ce5cab210d0030dd8f58a78",
+    "broker_flow": {
+        "rows": 232_493,
+        "records": 305,
+        "ordered_sha256": "9c433af09daa3ed6780f90583cfa5e268d33265f4b8ddde6678777389b46d353",
+        "by_regime": {"BACKFILL": {"dates": 218, "rows": 212_839},
+                      "LIVE": {"dates": 87, "rows": 19_654}},
+    },
+    "broker_daily_sha256": "c8d1948f00d99ba96fe17376292f32a9cda2be36e2eb5ce303e680427f05cc32",
 }
 
 BACKFILL_EVIDENCE_REF = ("backfill_inventory.insert_inventory: broker_flow.date = "
@@ -114,6 +144,10 @@ COLUMNS = ("date", "ticker", "broker_code", "bval", "sval", "netval", "bavg", "s
 
 class ProvenanceContradiction(ValueError):
     """broker_flow and its own provenance disagree; nothing is classified."""
+
+
+class SnapshotMismatch(ValueError):
+    """The inputs are not the audited snapshot the build was asked for."""
 
 
 def regime_of(bval):
@@ -322,20 +356,58 @@ def _live_rows(con, d):
         "WHERE date = ? AND bval IS NOT NULL", (d,))}
 
 
-def build_manifest(db_path, broker_daily_path=None, source_commit=None):
-    """Classify every (broker_flow.date, regime). Opens db_path read-only."""
+def build_manifest(db_path, broker_daily_path=None, source_commit=None, snapshot=None):
+    """Classify every (broker_flow.date, regime). Opens db_path read-only.
+
+    snapshot: a contract like AUDITED_SNAPSHOT. When given, the database and
+    the parquet must be exactly that snapshot's, checked before anything is
+    classified; otherwise SnapshotMismatch. None = a generic, unpinned build."""
     con = connect_readonly(db_path)
     try:
-        return _build(con, broker_daily_path, source_commit)
+        return _build(con, broker_daily_path, source_commit, snapshot)
     finally:
         con.close()
 
 
-def _build(con, broker_daily_path, source_commit):
-    total, flow_sha = broker_flow_fingerprint(con)
-    groups = con.execute(
+def _groups(con):
+    return con.execute(
         "SELECT date, bval IS NULL, COUNT(*) FROM broker_flow GROUP BY date, bval IS NULL "
         "ORDER BY date, bval IS NULL").fetchall()
+
+
+def check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_commit):
+    """Every difference from the snapshot contract, as one SnapshotMismatch."""
+    want = snapshot["broker_flow"]
+    got_regime = {}
+    for _, is_bf, n in groups:
+        c = got_regime.setdefault(BACKFILL if is_bf else LIVE, {"dates": 0, "rows": 0})
+        c["dates"] += 1
+        c["rows"] += n
+    diffs = []
+    if total != want["rows"]:
+        diffs.append(f"broker_flow rows {total} != {want['rows']}")
+    if len(groups) != want["records"]:
+        diffs.append(f"(date, regime) records {len(groups)} != {want['records']}")
+    if got_regime != want["by_regime"]:
+        diffs.append(f"by_regime {got_regime} != {want['by_regime']}")
+    if flow_sha != want["ordered_sha256"]:
+        diffs.append(f"ordered sha256 {flow_sha} != {want['ordered_sha256']}")
+    if source_commit is not None and source_commit != snapshot["source_commit"]:
+        diffs.append(f"source_commit {source_commit} != {snapshot['source_commit']}")
+    if not (broker_daily_path and os.path.isfile(broker_daily_path)):
+        diffs.append("broker_daily.parquet not supplied; the audited snapshot requires it")
+    elif file_sha256(broker_daily_path) != snapshot["broker_daily_sha256"]:
+        diffs.append(f"broker_daily.parquet sha256 != {snapshot['broker_daily_sha256']}")
+    if diffs:
+        raise SnapshotMismatch(f"not the {snapshot['name']} snapshot: " + "; ".join(diffs))
+
+
+def _build(con, broker_daily_path, source_commit, snapshot):
+    total, flow_sha = broker_flow_fingerprint(con)
+    groups = _groups(con)
+    if snapshot is not None:
+        check_snapshot(snapshot, total, flow_sha, groups, broker_daily_path, source_commit)
+        source_commit = snapshot["source_commit"]
     scan = _scan_rows(con)
     live_dates = [d for d, is_bf, _ in groups if not is_bf]
     live = {d: _live_rows(con, d) for d in live_dates}
@@ -377,6 +449,10 @@ def _build(con, broker_daily_path, source_commit):
             if sc is not None:
                 raise ProvenanceContradiction(f"{d}: quarantined MIXED date has a PERSISTED scan")
             mx = AUDITED_MIXED[d]
+            if (n, rows_sha) != (mx["rerun"]["live_rows"], mx["rerun"]["rows_sha256"]):
+                raise ProvenanceContradiction(
+                    f"{d}: live rows ({n}, {rows_sha[:12]}) are not the audited rerun state "
+                    f"({mx['rerun']['live_rows']}, {mx['rerun']['rows_sha256'][:12]})")
             rec.update(date_class=MIXED, capture_class=DOM_TOP15, evidence_kind="git_rerun_diff",
                        evidence_ref=f"neobdm.db@{mx['first_write']['commit'][:7]} -> "
                                     f"neobdm.db@{mx['rerun']['commit'][:7]}",
@@ -422,6 +498,7 @@ def _build(con, broker_daily_path, source_commit):
         "principle": ("broker_flow.date is untouched historical/acquisition evidence; "
                       "canonical_session_date is metadata only and is NULL unless PROVEN"),
         "input": {
+            "snapshot": snapshot["name"] if snapshot else None,
             "source_commit": source_commit,
             "broker_flow": {"rows": total, "ordered_sha256": flow_sha,
                             "order": "date, ticker, broker_code",
@@ -541,25 +618,55 @@ def rerun_diff(db_before, db_after, d):
             "removed": sum(1 for k in a if k not in b)}
 
 
+def _same_path(a, b):
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def write_manifest(manifest, out):
+    """Write via a temp file + os.replace, so a failed write never leaves a
+    half-written manifest in place."""
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w", encoding="ascii", newline="\n") as f:
+        f.write(dumps(manifest))
+    os.replace(tmp, out)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    b = sub.add_parser("build")
+    b = sub.add_parser("build", help=f"default: rebuild the {AUDITED_SNAPSHOT['name']} "
+                                     "manifest; fails unless the inputs are exactly that snapshot")
     b.add_argument("--db", default="neobdm.db")
     b.add_argument("--broker-daily", default=None)
     b.add_argument("--source-commit", default=None)
-    b.add_argument("--out", default=MANIFEST_PATH)
+    b.add_argument("--out", default=None, help=f"default {MANIFEST_PATH}")
+    b.add_argument("--new-snapshot", action="store_true",
+                   help="unpinned build of whatever the inputs are; needs --out, "
+                        "and never the committed audited manifest")
     v = sub.add_parser("verify")
     v.add_argument("--db", default="neobdm.db")
     v.add_argument("--manifest", default=MANIFEST_PATH)
     args = ap.parse_args(argv)
 
     if args.cmd == "build":
-        m = build_manifest(args.db, args.broker_daily, args.source_commit)
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="ascii", newline="\n") as f:
-            f.write(dumps(m))
-        print(json.dumps({"out": args.out, "input": m["input"]["broker_flow"],
+        committed = os.path.join(HERE, MANIFEST_PATH)
+        if args.new_snapshot:
+            if not args.out or _same_path(args.out, committed):
+                ap.error("--new-snapshot needs an explicit --out other than the committed "
+                         f"{AUDITED_SNAPSHOT['name']} manifest ({MANIFEST_PATH})")
+            snapshot = None
+        else:
+            snapshot = AUDITED_SNAPSHOT
+        out = args.out or committed
+        try:
+            m = build_manifest(args.db, args.broker_daily, args.source_commit, snapshot)
+        except (SnapshotMismatch, ProvenanceContradiction) as e:
+            print(f"REFUSED, nothing written: {e}", file=sys.stderr)
+            return 2
+        write_manifest(m, out)
+        print(json.dumps({"out": out, "snapshot": m["input"]["snapshot"],
+                          "input": m["input"]["broker_flow"],
                           "content_match_evidence": m["input"]["content_match_evidence"]["status"],
                           "summary": m["summary"]["by_date_class"],
                           "unresolved": m["summary"]["unresolved"]}, indent=1))

@@ -33,6 +33,7 @@
    "upstream": "build_inventory_db.py <- inventory_raw/*.json.gz (/api/inventory, source-dated)"
   },
   "idx_calendar_version": "idx-2026-2027.v1",
+  "snapshot": "audited-2026-09-30",
   "source_commit": "1aeca5313819e4843ce5cab210d0030dd8f58a78"
  },
  "principle": "broker_flow.date is untouched historical/acquisition evidence; canonical_session_date is metadata only and is NULL unless PROVEN",
@@ -5985,7 +5986,8 @@
     "rerun": {
      "commit": "f441ec1146c0c93dcfd1e11cc14d5fb3ca475b9c",
      "live_rows": 322,
-     "neobdm_db_blob": "c0000cc0d4e39d564c4f5136bf593e23cc46742b"
+     "neobdm_db_blob": "c0000cc0d4e39d564c4f5136bf593e23cc46742b",
+     "rows_sha256": "3d9482f2e2f928a01a2d054655ba3dce5041c916a518724ee1f684a25b72f1e6"
     },
     "rerun_diff": {
      "changed": 102,
@@ -6830,7 +6832,8 @@
     "rerun": {
      "commit": "da4d96bf7b8d4f56a66a67f2cd7fa28d554b0462",
      "live_rows": 279,
-     "neobdm_db_blob": "356c126d8b380e9d248e677226e6dcdb5b80f4e5"
+     "neobdm_db_blob": "356c126d8b380e9d248e677226e6dcdb5b80f4e5",
+     "rows_sha256": "9e05d901556a262e1a90a2a3285f835835d1c10c420b6f4c9c548875d71a3b5a"
     },
     "rerun_diff": {
      "changed": 106,

@@ -4,8 +4,13 @@ Synthetic fixtures pin the classification rules. The real neobdm.db and the
 committed manifest are checked when present; the gitignored
 broker_daily.parquet is used only when BROKER_DAILY_PARQUET (or a local
 broker_daily.parquet) supplies it, and its hash must equal the one the
-committed manifest recorded."""
+committed manifest recorded: an explicitly supplied wrong file FAILS.
 
+The audited-snapshot baseline database is neobdm.db at
+AUDITED_SNAPSHOT["source_commit"], read from git history, so the snapshot
+tests do not depend on the nightly-changing working copy."""
+
+import copy
 import hashlib
 import json
 import os
@@ -126,9 +131,60 @@ def make_parquet(tmp_path):
     return str(path)
 
 
+def group_state(db, d, regime=bfr.LIVE):
+    con = bfr.connect_readonly(db)
+    try:
+        return bfr._group_hash(con, d, regime)
+    finally:
+        con.close()
+
+
 @pytest.fixture
-def fixture(tmp_path):
-    return make_fixture(tmp_path), make_parquet(tmp_path)
+def pin(monkeypatch):
+    """Point the audited 2026-08-12 rerun pin at a synthetic fixture's rows;
+    the real pin describes the real rows, which no fixture reproduces."""
+    def _pin(db):
+        n, h = group_state(db, "2026-08-12")
+        ev = copy.deepcopy(bfr.AUDITED_MIXED)
+        ev["2026-08-12"]["rerun"].update(live_rows=n, rows_sha256=h)
+        monkeypatch.setattr(bfr, "AUDITED_MIXED", ev)
+        return db
+    return _pin
+
+
+@pytest.fixture
+def fixture(tmp_path, pin):
+    return pin(make_fixture(tmp_path)), make_parquet(tmp_path)
+
+
+def snapshot_of(db, pq, name="synthetic"):
+    """A snapshot contract describing exactly this fixture."""
+    con = bfr.connect_readonly(db)
+    rows, digest = bfr.broker_flow_fingerprint(con)
+    groups = bfr._groups(con)
+    con.close()
+    by_regime = {}
+    for _, is_bf, n in groups:
+        c = by_regime.setdefault(bfr.BACKFILL if is_bf else bfr.LIVE, {"dates": 0, "rows": 0})
+        c["dates"] += 1
+        c["rows"] += n
+    return {"name": name, "source_commit": "0" * 40,
+            "broker_flow": {"rows": rows, "records": len(groups), "ordered_sha256": digest,
+                            "by_regime": by_regime},
+            "broker_daily_sha256": bfr.file_sha256(pq)}
+
+
+def edited_copy(src, dst, *sql):
+    shutil.copy(src, dst)
+    con = sqlite3.connect(dst)
+    for s in sql:
+        con.execute(s)
+    con.commit()
+    con.close()
+    return str(dst)
+
+
+FUTURE_ROW = "INSERT INTO broker_flow VALUES ('2026-10-01','AAAA','AK',1.0,1.0,0.0,1.0,1.0)"
 
 
 def by_key(m):
@@ -175,8 +231,8 @@ def test_scan_verified_takes_the_session_from_broker_flow_scan(fixture):
     assert r["evidence_hash"].startswith("sha256:")
 
 
-def test_scan_that_disagrees_with_the_rows_raises_instead_of_classifying(tmp_path):
-    db = make_fixture(tmp_path, scan_tracked=(3, 3))
+def test_scan_that_disagrees_with_the_rows_raises_instead_of_classifying(tmp_path, pin):
+    db = pin(make_fixture(tmp_path, scan_tracked=(3, 3)))
     with pytest.raises(bfr.ProvenanceContradiction, match="tracked 6 rows"):
         bfr.build_manifest(db, None)
 
@@ -320,8 +376,8 @@ def test_verify_reports_drift_per_record(fixture, tmp_path):
         "content_changed": [("2026-07-06", bfr.LIVE)]}
 
 
-def test_a_scan_table_is_optional(tmp_path):
-    db = make_fixture(tmp_path, with_scan=False)
+def test_a_scan_table_is_optional(tmp_path, pin):
+    db = pin(make_fixture(tmp_path, with_scan=False))
     r = by_key(bfr.build_manifest(db, None))[("2026-09-30", bfr.LIVE)]
     assert r["date_class"] == bfr.INFERRED_ONLY and r["canonical_session_date"] is None
 
@@ -343,18 +399,60 @@ def real_db():
     return REAL_DB
 
 
+def parquet_choice(explicit, local, expected_sha):
+    """("use", path) | ("skip", why) | ("fail", why). An explicitly supplied
+    parquet that is missing or not the recorded file is an error, never a skip;
+    only the implicit local fallback may be skipped."""
+    if explicit:
+        if not os.path.isfile(explicit):
+            return "fail", f"BROKER_DAILY_PARQUET={explicit} does not exist"
+        if bfr.file_sha256(explicit) != expected_sha:
+            return "fail", f"BROKER_DAILY_PARQUET={explicit} is not sha256 {expected_sha}"
+        return "use", explicit
+    if not os.path.isfile(local):
+        return "skip", "broker_daily.parquet not supplied (set BROKER_DAILY_PARQUET)"
+    if bfr.file_sha256(local) != expected_sha:
+        return "skip", "local broker_daily.parquet is not the file the manifest recorded"
+    return "use", local
+
+
 def real_parquet(manifest):
-    path = os.environ.get("BROKER_DAILY_PARQUET") or os.path.join(HERE, "broker_daily.parquet")
-    if not os.path.isfile(path):
-        pytest.skip("broker_daily.parquet not supplied (set BROKER_DAILY_PARQUET)")
-    if bfr.file_sha256(path) != manifest["input"]["content_match_evidence"]["sha256"]:
-        pytest.skip("supplied broker_daily.parquet is not the file the manifest recorded")
-    return path
+    verdict, value = parquet_choice(os.environ.get("BROKER_DAILY_PARQUET"),
+                                    os.path.join(HERE, "broker_daily.parquet"),
+                                    manifest["input"]["content_match_evidence"]["sha256"])
+    if verdict == "fail":
+        pytest.fail(value)
+    if verdict == "skip":
+        pytest.skip(value)
+    return value
+
+
+@pytest.fixture(scope="session")
+def baseline_db(tmp_path_factory):
+    """neobdm.db exactly as the audited snapshot saw it, from git history."""
+    commit = bfr.AUDITED_SNAPSHOT["source_commit"]
+    blob = git("rev-parse", f"{commit}:neobdm.db").stdout.decode().strip()
+    if len(blob) != 40:
+        pytest.skip(f"git history for {commit[:7]}:neobdm.db is not available")
+    path = tmp_path_factory.mktemp("baseline") / "neobdm.db"
+    with open(path, "wb") as f:
+        assert subprocess.run(["git", "cat-file", "blob", blob], cwd=HERE, stdout=f).returncode == 0
+    con = bfr.connect_readonly(path)
+    assert bfr.broker_flow_fingerprint(con)[1] == \
+        bfr.AUDITED_SNAPSHOT["broker_flow"]["ordered_sha256"]
+    con.close()
+    return str(path)
 
 
 def test_committed_manifest_holds_the_audited_classification():
     m = committed()
     bf = m["input"]["broker_flow"]
+    snap = bfr.AUDITED_SNAPSHOT
+    assert (m["input"]["snapshot"], m["input"]["source_commit"]) == \
+        (snap["name"], snap["source_commit"])
+    assert bf["ordered_sha256"] == snap["broker_flow"]["ordered_sha256"]
+    assert bf["by_regime"] == snap["broker_flow"]["by_regime"]
+    assert m["input"]["content_match_evidence"]["sha256"] == snap["broker_daily_sha256"]
     assert (bf["rows"], bf["dates"]) == (AUDIT["rows"], AUDIT["dates"])
     for regime in (bfr.BACKFILL, bfr.LIVE):
         assert bf["by_regime"][regime] == AUDIT[regime]
@@ -437,19 +535,151 @@ def test_real_db_build_fails_closed_without_the_parquet_and_never_mutates():
         assert fresh["summary"]["unresolved"]["rows"] == 7_256 + 11_433
 
 
-def test_supplied_parquet_reproduces_the_committed_manifest():
-    m, db = committed(), real_db()
+def test_exact_audited_baseline_reproduces_the_committed_manifest_byte_for_byte(baseline_db,
+                                                                                tmp_path):
+    m = committed()
     pq = real_parquet(m)
-    fresh = bfr.build_manifest(db, pq, m["input"]["source_commit"])
-    if fresh["input"]["broker_flow"]["ordered_sha256"] == m["input"]["broker_flow"]["ordered_sha256"]:
-        with open(COMMITTED, encoding="ascii") as f:
-            assert bfr.dumps(fresh) == f.read()
+    with open(COMMITTED, encoding="ascii") as f:
+        text = f.read()
+    fresh = bfr.build_manifest(baseline_db, pq, snapshot=bfr.AUDITED_SNAPSHOT)
+    assert bfr.dumps(fresh) == text
+    out = tmp_path / "out.json"
+    assert bfr.main(["build", "--db", baseline_db, "--broker-daily", pq, "--out", str(out)]) == 0
+    assert out.read_text(encoding="ascii") == text
+
+
+def test_audited_snapshot_refuses_the_baseline_without_its_parquet(baseline_db, tmp_path):
+    with pytest.raises(bfr.SnapshotMismatch, match="not supplied"):
+        bfr.build_manifest(baseline_db, None, snapshot=bfr.AUDITED_SNAPSHOT)
+    wrong = make_parquet(tmp_path)
+    with pytest.raises(bfr.SnapshotMismatch, match="broker_daily.parquet sha256"):
+        bfr.build_manifest(baseline_db, wrong, snapshot=bfr.AUDITED_SNAPSHOT)
+    with pytest.raises(bfr.SnapshotMismatch, match="source_commit"):
+        bfr.build_manifest(baseline_db, None, "f" * 40, snapshot=bfr.AUDITED_SNAPSHOT)
+
+
+@pytest.mark.parametrize("edit, reasons", [
+    (FUTURE_ROW, ["broker_flow rows 232494 != 232493", "records 306 != 305",
+                  "'LIVE': {'dates': 88, 'rows': 19655}", "ordered sha256"]),
+    ("DELETE FROM broker_flow WHERE date = '2025-08-04'",
+     ["records 304 != 305", "'BACKFILL': {'dates': 217", "ordered sha256"]),
+    ("DELETE FROM broker_flow WHERE date = '2026-09-30'",
+     ["broker_flow rows 231528 != 232493", "records 304 != 305",
+      "'LIVE': {'dates': 86, 'rows': 18689}"]),
+    ("UPDATE broker_flow SET netval = netval + 1e-9 WHERE rowid = (SELECT MIN(rowid) "
+     "FROM broker_flow WHERE date = '2026-07-06')", ["ordered sha256"]),
+])
+def test_audited_snapshot_build_fails_on_any_departure_from_the_baseline(
+        baseline_db, tmp_path, edit, reasons):
+    db = edited_copy(baseline_db, tmp_path / "later.db", edit)
+    with pytest.raises(bfr.SnapshotMismatch) as e:
+        bfr.build_manifest(db, None, snapshot=bfr.AUDITED_SNAPSHOT)
+    for reason in reasons:
+        assert reason in str(e.value), (reason, str(e.value))
+    # the generic engine still classifies it, as an explicit new snapshot
+    if edit != FUTURE_ROW:
         return
-    old, new = by_key(m), by_key(fresh)
-    for key, r in old.items():
-        if r["regime"] == bfr.LIVE and new.get(key, {}).get("rows_sha256") == r["rows_sha256"]:
-            for field in ("date_class", "canonical_session_date", "content_match", "evidence_hash"):
-                assert new[key][field] == r[field], (key, field)
+    m = bfr.build_manifest(db, None)
+    assert m["input"]["snapshot"] is None
+    assert by_key(m)[("2026-10-01", bfr.LIVE)]["date_class"] == bfr.INFERRED_ONLY
+
+
+def test_refused_audited_build_writes_nothing(baseline_db, tmp_path, monkeypatch):
+    """Default CLI target is the committed manifest; point HERE at a copy so a
+    broken guard could only damage the copy, then prove it is untouched."""
+    home = tmp_path / "repo"
+    (home / "evidence").mkdir(parents=True)
+    target = home / bfr.MANIFEST_PATH
+    shutil.copy(COMMITTED if os.path.exists(COMMITTED) else __file__, target)
+    before = sha(target)
+    monkeypatch.setattr(bfr, "HERE", str(home))
+    db = edited_copy(baseline_db, tmp_path / "later.db", FUTURE_ROW)
+    pq = make_parquet(tmp_path)
+    assert bfr.main(["build", "--db", db, "--broker-daily", pq]) == 2
+    assert sha(target) == before
+    other = tmp_path / "elsewhere.json"
+    other.write_text("keep", encoding="ascii")
+    assert bfr.main(["build", "--db", db, "--broker-daily", pq, "--out", str(other)]) == 2
+    assert other.read_text(encoding="ascii") == "keep"
+    assert sorted(os.listdir(home / "evidence")) == [os.path.basename(bfr.MANIFEST_PATH)]
+    assert not os.path.exists(str(other) + ".tmp")
+
+
+def test_synthetic_snapshot_contract_passes_exactly_and_fails_on_drift(fixture, tmp_path):
+    db, pq = fixture
+    contract = snapshot_of(db, pq)
+    pinned = bfr.build_manifest(db, pq, snapshot=contract)
+    assert pinned["input"]["snapshot"] == "synthetic"
+    assert bfr.dumps(pinned) == bfr.dumps(bfr.build_manifest(db, pq, snapshot=contract))
+    for i, (edit, reason) in enumerate([
+            (FUTURE_ROW, "records"),
+            ("DELETE FROM broker_flow WHERE date = '2026-07-02'", "records"),
+            ("UPDATE broker_flow SET netval = 0.25 WHERE date = '2026-07-03' "
+             "AND ticker = 'AAAA' AND broker_code = 'AK'", "ordered sha256")]):
+        other = edited_copy(db, tmp_path / f"drift{i}.db", edit)
+        with pytest.raises(bfr.SnapshotMismatch, match=reason):
+            bfr.build_manifest(other, pq, snapshot=contract)
+
+
+def test_new_snapshot_mode_is_explicit_and_cannot_target_the_committed_manifest(
+        fixture, tmp_path, monkeypatch):
+    db, pq = fixture
+    # sandbox the committed path so a broken guard can only hit a copy
+    home = tmp_path / "repo"
+    (home / "evidence").mkdir(parents=True)
+    committed_path = str(home / bfr.MANIFEST_PATH)
+    with open(committed_path, "w", encoding="ascii") as f:
+        f.write("audited")
+    monkeypatch.setattr(bfr, "HERE", str(home))
+    for extra in ([], ["--out", committed_path],
+                  ["--out", str(home / "evidence" / ".." / bfr.MANIFEST_PATH)]):
+        with pytest.raises(SystemExit):
+            bfr.main(["build", "--new-snapshot", "--db", db, "--broker-daily", pq, *extra])
+    assert open(committed_path, encoding="ascii").read() == "audited"
+    out = tmp_path / "new" / "snapshot.json"
+    assert bfr.main(["build", "--new-snapshot", "--db", db, "--broker-daily", pq,
+                     "--out", str(out)]) == 0
+    written = json.loads(out.read_text(encoding="ascii"))
+    assert written["input"]["snapshot"] is None and written["records"]
+
+
+def test_explicitly_supplied_wrong_parquet_fails_but_a_missing_one_skips(tmp_path):
+    good = tmp_path / "good.parquet"
+    good.write_bytes(b"right bytes")
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"wrong bytes")
+    want = bfr.file_sha256(good)
+    absent = str(tmp_path / "absent.parquet")
+    assert parquet_choice(str(good), absent, want) == ("use", str(good))
+    assert parquet_choice(str(bad), absent, want)[0] == "fail"
+    assert parquet_choice(absent, absent, want)[0] == "fail"
+    assert parquet_choice(None, absent, want)[0] == "skip"
+    assert parquet_choice("", str(bad), want)[0] == "skip"
+    assert parquet_choice(None, str(good), want) == ("use", str(good))
+
+
+def test_audited_mixed_date_with_other_rows_is_refused_not_called_mixed(fixture, tmp_path,
+                                                                        monkeypatch):
+    db, pq = fixture
+    changed = edited_copy(db, tmp_path / "cleaned.db",
+                          "DELETE FROM broker_flow WHERE date = '2026-08-12' AND broker_code = 'ZP'")
+    with pytest.raises(bfr.ProvenanceContradiction, match="not the audited rerun state"):
+        bfr.build_manifest(changed, pq)
+    revalued = edited_copy(db, tmp_path / "revalued.db",
+                           "UPDATE broker_flow SET bval = bval + 0.1 WHERE date = '2026-08-12' "
+                           "AND ticker = 'AAAA' AND broker_code = 'AK'")
+    with pytest.raises(bfr.ProvenanceContradiction, match="not the audited rerun state"):
+        bfr.build_manifest(revalued, pq)
+    # the real pin does not describe synthetic rows either
+    monkeypatch.undo()
+    with pytest.raises(bfr.ProvenanceContradiction, match="2026-08-12"):
+        bfr.build_manifest(db, pq)
+
+
+def test_real_mixed_dates_still_hold_the_pinned_rerun_rows():
+    db = real_db()
+    for d, ev in bfr.AUDITED_MIXED.items():
+        assert group_state(db, d) == (ev["rerun"]["live_rows"], ev["rerun"]["rows_sha256"]), d
 
 
 def git(*args, **kw):
@@ -472,6 +702,7 @@ def test_mixed_quarantine_is_rederived_from_git_history(d, tmp_path):
     assert diff["before_rows"] == ev["first_write"]["live_rows"]
     assert diff["after_rows"] == ev["rerun"]["live_rows"]
     assert {k: diff[k] for k in ("identical", "changed", "new", "removed")} == ev["rerun_diff"]
-    # the rerun rows are what the current database still holds for that date
-    assert by_key(committed())[(d, bfr.LIVE)]["rows_sha256"] == \
-        bfr._group_hash(bfr.connect_readonly(paths[1]), d, bfr.LIVE)[1]
+    # the pin is exactly the rows the rerun commit left, and the manifest holds them
+    rerun_state = group_state(paths[1], d)
+    assert rerun_state == (ev["rerun"]["live_rows"], ev["rerun"]["rows_sha256"])
+    assert by_key(committed())[(d, bfr.LIVE)]["rows_sha256"] == rerun_state[1]
