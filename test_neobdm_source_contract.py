@@ -1474,13 +1474,585 @@ def test_strict_netflow_raises_on_every_scan_failure(fail):
         ns.get_netflow(FakeStalkerPage(SELL_ROWS, fail=fail), ["XL"], "Today", side="dist", strict=True)
 
 
-def test_broker_flow_path_keeps_its_non_strict_behaviour(monkeypatch):
-    monkeypatch.setattr(ns, "BROKER_FLOW_CODES", ["XL"])
-    for fail in ("duration", "submit"):
-        rows = ns.scrape_broker_flow_for_db(FakeStalkerPage(LEGACY_DOM_ROWS, fail=fail), ["AAAA", "CCCC"])
-        assert sorted((r["ticker"], r["netval"]) for r in rows) == [
-            ("AAAA", -5000.0), ("AAAA", -5000.0), ("CCCC", 1000.0), ("CCCC", 1000.0)]
-    assert ns.scrape_broker_flow_for_db(FakeStalkerPage(LEGACY_DOM_ROWS, fail="parse"), ["AAAA"]) == []
+# ── broker_flow capture (dash_callback_v1) ─────
+# The live contract of 2026-09-30: one submit answers both sides; the request
+# carries duration/foreign-only in inputs and the broker list in state; each side
+# is a dbc Label naming the session plus the whole DataTable in props.data.
+FLOW_SESSION = "29 Sep 2026"
+FLOW_TRACKED = {"TRKA", "TRKB", "TRKC"}
+FLOW_FIELDS = ("netval", "bval", "sval", "bavg", "savg")
+
+
+def flow_label(side, day=FLOW_SESSION, text=None, namespace="dash_bootstrap_components"):
+    word = {"akum": "Buy", "dist": "Sell"}[side]
+    text = f"Stalking Net {word} from {day} to {day}" if text is None else text
+    return {"props": {"children": text}, "type": "Label", "namespace": namespace}
+
+
+def flow_entry(symbol, **cells):
+    """A live props.data entry: Markdown ticker link, JSON float cells."""
+    return {"symbol": f"[{symbol}]({LIVE_ROUTE}{symbol})",
+            **{"netval": 1.5, "bval": 2.0, "sval": 0.5, "bavg": 100.0, "savg": 99.0, **cells}}
+
+
+def filler(prefix, n):
+    return [flow_entry(f"{prefix}{i:03d}") for i in range(n)]
+
+
+def flow_body(akum=None, dist=None, akum_label=UNSET, dist_label=UNSET, day=FLOW_SESSION):
+    akum = filler("A", 3) + [flow_entry("TRKA")] if akum is None else akum
+    dist = filler("D", 3) + [flow_entry("TRKB", netval=-1.5)] if dist is None else dist
+    labels = {"akum": flow_label("akum", day) if akum_label is UNSET else akum_label,
+              "dist": flow_label("dist", day) if dist_label is UNSET else dist_label}
+    return {"multi": True, "response": {
+        component: {"children": [c for c in (labels[side], dash_table(f"stalker-{side}-table", data))
+                                 if c is not None]}
+        for component, side, data in ((AKUM, "akum", akum), (DIST, "dist", dist))}}
+
+
+def flow_request(code, duration="Today", foreign=(), broker=UNSET, outputs=LIVE_OUTPUTS,
+                 changed=("submit-button.n_clicks",), drop=()):
+    inputs = [{"id": "submit-button", "property": "n_clicks", "value": 1},
+              {"id": "duration-picker", "property": "value", "value": duration},
+              {"id": "foreign-only-checkbox", "property": "value", "value": list(foreign)}]
+    state = [{"id": "broker", "property": "value", "value": [code] if broker is UNSET else broker}]
+    return json.dumps({"output": LIVE_OUTPUT, "outputs": list(outputs), "changedPropIds": list(changed),
+                       "inputs": [i for i in inputs if i["id"] not in drop],
+                       "state": [s for s in state if s["id"] not in drop]})
+
+
+def flow_response(code, body=None, **request):
+    return FakeDashResponse(post_data=flow_request(code, **request), body=flow_body() if body is None else body)
+
+
+class PickerLocator:
+    """A locator on a FlowPage's broker picker: menu options, the focused option,
+    the chips, or the clear zone (present while there are chips)."""
+    def __init__(self, page, sel):
+        self.page, self.sel = page, sel
+
+    first = property(lambda self: self)
+
+    def all_inner_texts(self):
+        rendered, focused = self.page.menu()
+        return list({ns.FLOW_PICKER_OPTION: rendered, ns.FLOW_PICKER_FOCUSED: focused,
+                     ns.FLOW_PICKER_CHIP: self.page.shown_chips()}[self.sel])
+
+    def count(self):
+        return 1 if self.page.shown_chips() else 0
+
+    def click(self, timeout=None):
+        self.page.chips, self.page.late = [], None
+
+
+class FlowPage(FakeStalkerPage):
+    """The broker_stalker page for read_broker_flow_code.
+
+    The broker picker is the DOM a user sees. After the n-th type() of a page
+    load, menu(code, n, ms) gives (rendered option texts, focused option texts)
+    `ms` of page waits later (default: just the typed code, focused). Enter adds
+    the focused option to the chips; late(code, n, ms) may then replace them `ms`
+    after that Enter (the server's debounced broker.value write), and
+    on_duration(chips) when the duration is clicked. The submit emits
+    `responses[typed code]` (a FakeDashResponse, or None for no callback).
+    `rows` is only the stalker table DOM, which the broker_flow path never reads."""
+    def __init__(self, responses, rows=LEGACY_DOM_ROWS, fail=None, menu=None, late=None, on_duration=None):
+        super().__init__(rows, fail=fail, callbacks=[])
+        self.responses, self.code, self.submits = responses, None, 0
+        self.menu_script, self.late_script, self.on_duration = menu, late, on_duration
+        self.typed, self.enters = [], []          # every type(); (n, rendered, focused) at each Enter
+        self._fresh()
+
+    def _fresh(self):
+        self.chips, self.n, self.typed_at, self.open, self.late = [], 0, None, False, None
+
+    def menu(self):
+        if not self.open:
+            return [], []
+        if self.menu_script:
+            return self.menu_script(self.code, self.n, sum(self.waits[self.typed_at:]))
+        return [self.code], [self.code]
+
+    def shown_chips(self):
+        if self.late is not None and self.late_script:
+            n, mark = self.late
+            chips = self.late_script(self.code, n, sum(self.waits[mark:]))
+            if chips is not None:
+                self.chips, self.late = list(chips), None
+        return list(self.chips)
+
+    def goto(self, url, **kw):
+        super().goto(url, **kw)
+        self._fresh()
+
+    def type(self, text):
+        self.typed.append(text)
+        self.code, self.n, self.typed_at, self.open = text, self.n + 1, len(self.waits), True
+
+    def press(self, key):
+        if key == "Enter" and self.open:
+            rendered, focused = self.menu()
+            self.enters.append((self.n, rendered, focused))
+            self.chips = self.shown_chips() + focused[:1]
+            self.open, self.late = False, (self.n, len(self.waits))
+        elif key == "Escape":
+            self.open = False
+
+    def locator(self, sel):
+        if sel in (ns.FLOW_PICKER_OPTION, ns.FLOW_PICKER_FOCUSED, ns.FLOW_PICKER_CHIP,
+                   "#broker .Select-clear-zone"):
+            return PickerLocator(self, sel)
+        loc = super().locator(sel)
+        if "duration-picker" in sel and self.on_duration:
+            page, click = self, loc.click
+
+            def clicked(timeout=None):
+                click(timeout)
+                page.chips = list(page.on_duration(page.shown_chips()))
+            loc.click = clicked
+        return loc
+
+    def click(self, sel, timeout=None):
+        if sel == "#submit-button" and self.fail != "submit":
+            self.submits += 1
+            response = self.responses.get(self.code)
+            self.callbacks = [] if response is None else [response]
+        super().click(sel, timeout)
+
+
+def flow_clock(monkeypatch, *when):
+    import datetime as dt
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return myt(*when)
+    monkeypatch.setattr(ns, "datetime", Clock)
+
+
+def capture(monkeypatch, responses, codes=("XL",), when=(2026, 9, 30, 7, 5), page=None):
+    flow_clock(monkeypatch, *when)
+    page = FlowPage(responses) if page is None else page
+    return ns.capture_broker_flow(page, FLOW_TRACKED, codes=list(codes)), page
+
+
+def flow_db(live=(), backfill=()):
+    """In-memory db with broker_flow rows: live (date, ticker, code, netval) get
+    full columns, backfill ones only netval (bval NULL), as the two writers do."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(ns.BROKER_FLOW_DDL)
+    conn.executemany("INSERT INTO broker_flow VALUES (?,?,?,?,?,?,?,?)",
+                     [(d, t, c, 1.0, 1.0, n, 1.0, 1.0) for d, t, c, n in live] +
+                     [(d, t, c, None, None, n, None, None) for d, t, c, n in backfill])
+    conn.commit()
+    return conn
+
+
+def flow_rows(conn):
+    return sorted(conn.execute("SELECT * FROM broker_flow"), key=lambda r: tuple(str(x) for x in r))
+
+
+def scans(conn):
+    return {(r[0], r[1]): r[2:] for r in conn.execute(
+        "SELECT broker_code, run_started_utc, status, snapshot, session_date, akum_rows_returned, "
+        "dist_rows_returned, tracked_rows, method, detail FROM broker_flow_scan")}
+
+
+def test_broker_flow_captures_tracked_rows_beyond_the_rendered_page(monkeypatch):
+    akum = filler("A", 20) + [flow_entry("TRKA", netval=0.25)]        # row 21: never on DOM page 1
+    got, page = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=akum))})
+    assert got["reason"] is None and page.dom_reads == 0
+    assert {(r["ticker"], r["netval"]) for r in got["rows"]} == {("TRKA", 0.25), ("TRKB", -1.5)}
+    assert got["scans"][0]["akum_rows_returned"] == 21 and got["scans"][0]["tracked_rows"] == 2
+
+
+def test_broker_flow_uses_one_submit_per_code_for_both_sides(monkeypatch):
+    codes = ("XL", "AK", "IF")
+    got, page = capture(monkeypatch, {c: flow_response(c) for c in codes}, codes=codes)
+    assert page.submits == 3 and page.expect_calls == 3 and page.dom_reads == 0
+    assert sorted((r["broker_code"], r["ticker"]) for r in got["rows"]) == [
+        (c, t) for c in sorted(codes) for t in ("TRKA", "TRKB")]
+
+
+@pytest.mark.parametrize("request_kw", [
+    {"broker": ["AK"]},                                   # another broker
+    {"broker": ["XL", "AK"]},                             # more than one broker
+    {"broker": "XL"},                                     # not the live list form
+    {"broker": []},                                       # no broker
+    {"duration": "1 Week"},                               # wrong duration
+    {"foreign": ["foreign"]},                             # foreign-only checked
+    {"drop": ("duration-picker",)},                       # missing input
+    {"drop": ("foreign-only-checkbox",)},
+    {"drop": ("broker",)},                                # missing state
+    {"outputs": [{"id": AKUM, "property": "children"}]},  # only one side
+    {"outputs": [{"id": AKUM, "property": "children"}, {"id": DIST, "property": "data"}]},
+    {"changed": ("broker.value",)},                       # not the submit
+])
+def test_broker_flow_rejects_a_callback_that_does_not_prove_its_request(request_kw):
+    page = FlowPage({"XL": flow_response("XL", **request_kw)})
+    with pytest.raises(RuntimeError):
+        ns.read_broker_flow_code(page, "XL", timeout_ms=10)
+
+
+def test_broker_flow_request_proof_rejects_malformed_request_lists():
+    good = json.loads(flow_request("XL"))
+    ns._broker_flow_request_proof(good, "XL")
+    for bad in ({**good, "state": {"broker": ["XL"]}}, {**good, "inputs": None},
+                {**good, "state": good["state"] * 2}, {**good, "inputs": good["inputs"] + ["x"]},
+                {**good, "state": [{"id": "broker", "property": "value"}]}, []):
+        with pytest.raises(ValueError):
+            ns._broker_flow_request_proof(bad, "XL")
+
+
+@pytest.mark.parametrize("side, text, day", [
+    ("akum", "Stalking Net Buy from 29 Sep 2026 to 29 Sep 2026", (2026, 9, 29)),
+    ("dist", "Stalking Net Sell from 29 Sep 2026 to 29 Sep 2026", (2026, 9, 29)),
+    ("akum", "Stalking Net Buy from 2 Jan 2027 to 2 Jan 2027", (2027, 1, 2)),
+])
+def test_flow_label_accepts_the_live_shapes(side, text, day):
+    import datetime as dt
+    assert ns._flow_label_session(text, side) == dt.date(*day)
+
+
+@pytest.mark.parametrize("side, text", [
+    ("akum", "Stalking Net Sell from 29 Sep 2026 to 29 Sep 2026"),    # wrong side word
+    ("dist", "Stalking Net Buy from 29 Sep 2026 to 29 Sep 2026"),
+    ("akum", "Stalking Net Buy from 26 Sep 2026 to 29 Sep 2026"),     # from != to
+    ("akum", "Stalking Net Buy from 31 Feb 2026 to 31 Feb 2026"),     # not a date
+    ("akum", "Stalking Net Buy from 29 Agu 2026 to 29 Agu 2026"),     # not an English month
+    ("akum", "Stalking Net Buy from 29 sep 2026 to 29 sep 2026"),
+    ("akum", "Stalking Net Buy from 2026-09-29 to 2026-09-29"),
+    ("akum", "Stalking Net Buy 29 Sep 2026"),
+    ("akum", " Stalking Net Buy from 29 Sep 2026 to 29 Sep 2026"),
+    ("akum", ""), ("akum", None), ("akum", ["Stalking Net Buy from 29 Sep 2026 to 29 Sep 2026"]),
+])
+def test_flow_label_rejects_everything_else(side, text):
+    with pytest.raises(ValueError):
+        ns._flow_label_session(text, side)
+
+
+@pytest.mark.parametrize("body", [
+    flow_body(dist_label=flow_label("dist", "28 Sep 2026")),                   # akum date != dist date
+    flow_body(akum_label=None),                                                # no Label
+    flow_body(akum_label=flow_label("akum", namespace="dash_html_components")),  # not the dbc Label
+    flow_body(dist_label=flow_label("dist", text="Stalking Net Sell today")),  # malformed
+])
+def test_broker_flow_code_fails_without_one_session_date_for_both_sides(body):
+    with pytest.raises(RuntimeError):
+        ns.read_broker_flow_code(FlowPage({"XL": flow_response("XL", body)}), "XL", timeout_ms=10)
+
+
+def test_broker_flow_code_fails_on_a_label_pair_that_repeats():
+    body = flow_body()
+    body["response"][AKUM]["children"].insert(0, flow_label("akum"))
+    with pytest.raises(RuntimeError, match="2 Label"):
+        ns.read_broker_flow_code(FlowPage({"XL": flow_response("XL", body)}), "XL", timeout_ms=10)
+
+
+def test_broker_flow_code_returns_the_label_session():
+    import datetime as dt
+    got = ns.read_broker_flow_code(FlowPage({"XL": flow_response("XL")}), "XL", timeout_ms=10)
+    assert got["session_date"] == dt.date(2026, 9, 29) and len(got["akum"]) == len(got["dist"]) == 4
+
+
+@pytest.mark.parametrize("fail", ["duration", "submit"])
+def test_broker_flow_code_fails_when_the_ui_step_fails(fail):
+    with pytest.raises(RuntimeError):
+        ns.read_broker_flow_code(FlowPage({"XL": flow_response("XL")}, fail=fail), "XL", timeout_ms=10)
+
+
+def test_broker_flow_code_fails_on_a_failed_callback():
+    for response in (None, FakeDashResponse(status=500, post_data=flow_request("XL"), body=flow_body()),
+                     FakeDashResponse(post_data=flow_request("XL"), body={**flow_body(), "job": "a1"})):
+        with pytest.raises(RuntimeError):
+            ns.read_broker_flow_code(FlowPage({"XL": response}), "XL", timeout_ms=10)
+
+
+def run_sessions(monkeypatch, sessions, when):
+    responses = {c: flow_response(c, flow_body(day=d)) for c, d in sessions.items()}
+    got, _ = capture(monkeypatch, responses, codes=tuple(sessions), when=when)
+    conn = flow_db(live=[(got["scrape_date"], "OLD1", "XL", 9.0)])
+    return got, ns.persist_broker_flow_capture(conn, got), flow_rows(conn)
+
+
+def test_broker_flow_persists_when_every_code_serves_the_same_prior_session(monkeypatch):
+    got, persisted, rows = run_sessions(monkeypatch, {"XL": FLOW_SESSION, "AK": FLOW_SESSION}, (2026, 9, 30, 7, 5))
+    assert got["reason"] is None and persisted
+    assert {(r[0], r[1], r[2]) for r in rows} == {("2026-09-30", t, c) for c in ("XL", "AK") for t in ("TRKA", "TRKB")}
+
+
+def test_broker_flow_allows_a_weekend_copy_of_the_last_session(monkeypatch):
+    got, persisted, _ = run_sessions(monkeypatch, {"XL": "25 Sep 2026"}, (2026, 9, 27, 7, 5))   # Sun <- Fri
+    assert got["scrape_date"] == "2026-09-27" and persisted
+
+
+@pytest.mark.parametrize("sessions, when, reason", [
+    ({"XL": FLOW_SESSION, "AK": "28 Sep 2026"}, (2026, 9, 30, 7, 5), "different source sessions"),
+    ({"XL": "30 Sep 2026", "AK": "30 Sep 2026"}, (2026, 9, 30, 18, 0), "is not before scrape date"),
+    ({"XL": "1 Oct 2026"}, (2026, 9, 30, 7, 5), "is not before scrape date"),
+])
+def test_broker_flow_writes_nothing_without_one_prior_session(monkeypatch, sessions, when, reason):
+    got, persisted, rows = run_sessions(monkeypatch, sessions, when)
+    assert reason in got["reason"] and not persisted
+    assert rows == [(got["scrape_date"], "OLD1", "XL", 1.0, 1.0, 9.0, 1.0, 1.0)]
+
+
+BAD_CELLS = [None, "", "   ", "-", "N/A", "abc", "1.2.3", float("nan"), float("inf"), float("-inf"), True, [1]]
+
+
+@pytest.mark.parametrize("field", FLOW_FIELDS)
+@pytest.mark.parametrize("bad", BAD_CELLS, ids=repr)
+@pytest.mark.parametrize("ticker", ["TRKA", "A001"])                   # tracked or not: the whole table
+def test_broker_flow_never_turns_a_missing_or_invalid_cell_into_zero(monkeypatch, field, bad, ticker):
+    akum = [flow_entry("A001"), flow_entry("TRKA")]
+    akum[1 if ticker == "TRKA" else 0][field] = bad
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=akum))})
+    assert got["rows"] == [] and got["scans"][0]["status"] == ns.FLOW_SOURCE_FAILURE
+    assert f"row {0 if ticker == 'A001' else 1} {field}" in got["scans"][0]["detail"]
+    assert got["reason"] and "1/1 code(s) failed: XL" in got["reason"]
+
+
+@pytest.mark.parametrize("field", FLOW_FIELDS)
+def test_broker_flow_fails_a_row_missing_a_column(monkeypatch, field):
+    entry = flow_entry("TRKA")
+    del entry[field]
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=[entry]))})
+    assert got["rows"] == [] and f"lacks {field}" in got["scans"][0]["detail"]
+
+
+@pytest.mark.parametrize("field", FLOW_FIELDS)
+@pytest.mark.parametrize("zero", [0.0, 0, "0", "0.0"])
+def test_broker_flow_keeps_an_explicit_source_zero(monkeypatch, field, zero):
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=[flow_entry("TRKA", **{field: zero})]))})
+    row = next(r for r in got["rows"] if r["ticker"] == "TRKA")
+    assert got["reason"] is None and row[field] == 0.0 and isinstance(row[field], float)
+
+
+@pytest.mark.parametrize("field", FLOW_FIELDS)
+@pytest.mark.parametrize("text, value", [("1,234.5", 1234.5), ("(1,234.5)", -1234.5), ("-12,000", -12000.0)])
+def test_broker_flow_reads_comma_grouped_cells_in_every_column(monkeypatch, field, text, value):
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=[flow_entry("TRKA", **{field: text})]))})
+    row = next(r for r in got["rows"] if r["ticker"] == "TRKA")
+    assert row[field] == value
+    assert all(row[f] == flow_entry("TRKA")[f] for f in FLOW_FIELDS if f != field)
+
+
+@pytest.mark.parametrize("akum, dist", [
+    ([flow_entry("TRKA")], [flow_entry("TRKA", netval=-1.0)]),     # tracked, differing
+    ([flow_entry("A001")], [flow_entry("A001")]),                   # untracked, identical
+    ([flow_entry("A001", netval=0.0)], [flow_entry("A001", netval=0.0)]),
+])
+def test_broker_flow_fails_a_code_whose_sides_share_a_ticker(monkeypatch, akum, dist):
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=akum, dist=dist))})
+    assert got["rows"] == [] and "in both the akum and the dist table" in got["scans"][0]["detail"]
+
+
+def test_broker_flow_fails_a_side_that_repeats_a_ticker(monkeypatch):
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL", flow_body(akum=[flow_entry("A001")] * 2))})
+    assert got["rows"] == [] and "akum table repeats a ticker" in got["scans"][0]["detail"]
+
+
+def test_one_failed_code_leaves_broker_flow_untouched(monkeypatch):
+    codes = ("XL", "AK", "IF")
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL"), "AK": flow_response("AK")}, codes=codes)
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0), ("2026-09-29", "TRKA", "XL", 3.0)],
+                   backfill=[("2026-07-01", "TRKA", "XL", 4.0)])
+    before = flow_rows(conn)
+    assert not ns.persist_broker_flow_capture(conn, got)
+    assert flow_rows(conn) == before
+    status = {code: v for (code, _run), v in scans(conn).items()}
+    assert status["IF"][:2] == (ns.FLOW_SOURCE_FAILURE, ns.SNAPSHOT_REJECTED) and "no submit-button" in status["IF"][-1]
+    for code in ("XL", "AK"):
+        assert status[code][:3] == (ns.FLOW_OK, ns.SNAPSHOT_REJECTED, "2026-09-29")
+        assert status[code][-1] == "snapshot rejected: 1/3 code(s) failed: IF"
+
+
+def test_successful_rerun_replaces_the_date_snapshot_completely(monkeypatch):
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0), ("2026-09-30", "TRKA", "XL", 9.0),
+                         ("2026-09-29", "OLD1", "XL", 7.0)],
+                   backfill=[("2026-09-30", "TRKC", "AK", 5.0), ("2026-07-01", "TRKA", "XL", 4.0)])
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL")})
+    assert ns.persist_broker_flow_capture(conn, got)
+    assert flow_rows(conn) == sorted([
+        ("2026-07-01", "TRKA", "XL", None, None, 4.0, None, None),     # backfill kept
+        ("2026-09-29", "OLD1", "XL", 1.0, 1.0, 7.0, 1.0, 1.0),         # other date kept
+        ("2026-09-30", "TRKA", "XL", 2.0, 0.5, 1.5, 100.0, 99.0),      # new snapshot only
+        ("2026-09-30", "TRKB", "XL", 2.0, 0.5, -1.5, 100.0, 99.0),
+        ("2026-09-30", "TRKC", "AK", None, None, 5.0, None, None),     # backfill-shaped row kept
+    ], key=lambda r: tuple(str(x) for x in r))
+
+
+def test_a_failed_snapshot_write_rolls_back_and_is_recorded(monkeypatch):
+    # A backfill row on the same key makes the INSERT fail after the DELETE ran.
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0)], backfill=[("2026-09-30", "TRKA", "XL", 5.0)])
+    before = flow_rows(conn)
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL")})
+    assert not ns.persist_broker_flow_capture(conn, got)
+    assert flow_rows(conn) == before
+    (status,) = scans(conn).values()
+    assert status[:2] == (ns.FLOW_OK, ns.SNAPSHOT_REJECTED) and "broker_flow write failed" in status[-1]
+
+
+def test_scan_status_records_provenance_and_keeps_the_persisted_run(monkeypatch):
+    conn = flow_db()
+    first, _ = capture(monkeypatch, {"XL": flow_response("XL")}, when=(2026, 9, 30, 7, 5))
+    assert ns.persist_broker_flow_capture(conn, first)
+    ((key, row),) = scans(conn).items()
+    assert key == ("XL", "2026-09-29T23:05:00+00:00")
+    assert row == (ns.FLOW_OK, ns.SNAPSHOT_PERSISTED, "2026-09-29", 4, 4, 2, "dash_callback_v1", "")
+
+    failed, _ = capture(monkeypatch, {}, when=(2026, 9, 30, 8, 0))              # rerun: no callback
+    assert not ns.persist_broker_flow_capture(conn, failed)
+    got = scans(conn)
+    assert got[key][1] == ns.SNAPSHOT_PERSISTED                                  # still the live snapshot
+    assert got[("XL", "2026-09-30T00:00:00+00:00")][:2] == (ns.FLOW_SOURCE_FAILURE, ns.SNAPSHOT_REJECTED)
+
+    again, _ = capture(monkeypatch, {"XL": flow_response("XL")}, when=(2026, 9, 30, 9, 0))
+    assert ns.persist_broker_flow_capture(conn, again)
+    snapshots = {k[1]: v[1] for k, v in scans(conn).items()}
+    assert snapshots == {"2026-09-29T23:05:00+00:00": ns.SNAPSHOT_SUPERSEDED,
+                         "2026-09-30T00:00:00+00:00": ns.SNAPSHOT_REJECTED,
+                         "2026-09-30T01:00:00+00:00": ns.SNAPSHOT_PERSISTED}
+
+
+def test_save_daily_broker_flow_persists_one_complete_snapshot(monkeypatch, tmpdir_path):
+    monkeypatch.setattr(ns, "DB_PATH", os.path.join(tmpdir_path, "neobdm.db"))
+    monkeypatch.setattr(ns, "BROKER_FLOW_CAPTURE_CODES", ["XL", "AK"])
+    monkeypatch.setattr(ns, "TRACKED_TICKERS", sorted(FLOW_TRACKED))
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    page = FlowPage({"XL": flow_response("XL"), "AK": flow_response("AK")})
+    summary = ns.save_daily_broker_flow(page)
+    conn = sqlite3.connect(ns.DB_PATH)
+    assert {r[:3] for r in flow_rows(conn)} == {("2026-09-30", t, c) for c in ("XL", "AK") for t in ("TRKA", "TRKB")}
+    assert {v[1] for v in scans(conn).values()} == {ns.SNAPSHOT_PERSISTED}
+    conn.close()
+    assert "Backfill" in summary and page.dom_reads == 0 and page.submits == 2
+
+
+def test_save_daily_broker_flow_writes_nothing_on_a_partial_capture(monkeypatch, tmpdir_path):
+    monkeypatch.setattr(ns, "DB_PATH", os.path.join(tmpdir_path, "neobdm.db"))
+    monkeypatch.setattr(ns, "BROKER_FLOW_CAPTURE_CODES", ["XL", "AK"])
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    ns.save_daily_broker_flow(FlowPage({"XL": flow_response("XL")}))
+    conn = sqlite3.connect(ns.DB_PATH)
+    assert flow_rows(conn) == [] and {v[1] for v in scans(conn).values()} == {ns.SNAPSHOT_REJECTED}
+    conn.close()
+
+
+# ── verified broker selection + the live capture universe ──
+# Live 2026-09-30: typing fires broker.search_value callbacks and ~1.1s later a
+# debounce callback may write broker.value itself, so a blind Enter can race it.
+HTML_500 = "<html><head><title>500 Internal Server Error</title></head><body></body></html>"
+
+
+def test_live_capture_universe_excludes_only_cs():
+    assert set(ns.BROKER_FLOW_LIVE_UNAVAILABLE) == {"CS"} and "HTTP 500" in ns.BROKER_FLOW_LIVE_UNAVAILABLE["CS"]
+    assert "CS" in ns.BROKER_FLOW_CODES and "CS" in ns.BANDAR_GROUPS["Sinarmas"]     # still a known code
+    assert "CS" not in ns.BROKER_FLOW_CAPTURE_CODES
+    assert set(ns.BROKER_FLOW_CAPTURE_CODES) == set(ns.BROKER_FLOW_CODES) - {"CS"}      # nothing else dropped
+    assert ns.BROKER_FLOW_CAPTURE_CODES == sorted(ns.BROKER_FLOW_CAPTURE_CODES)
+    assert (len(ns.BROKER_FLOW_CODES), len(ns.BROKER_FLOW_CAPTURE_CODES)) == (30, 29)
+
+
+@pytest.mark.parametrize("first", [
+    (["AK", "BK", "KI", "KK"], ["AK"]),     # filter not applied yet: several options, another one focused
+    (["KI", "KIX"], ["KI"]),               # the code is focused but not the only option
+    (["KI"], []),                          # the only option, not focused
+    ([], []),                              # nothing rendered
+])
+def test_flow_selection_presses_enter_only_on_one_exact_focused_option(monkeypatch, first):
+    page = FlowPage({"KI": flow_response("KI")}, menu=lambda code, n, ms: first if n == 1 else ([code], [code]))
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(2, ["KI"], ["KI"])]                  # never on attempt 1's menu
+    assert page.typed == ["KI", "KI"] and page.submits == 1
+    assert got["reason"] is None and got["scans"][0]["status"] == ns.FLOW_OK
+
+
+def test_flow_selection_waits_for_the_filter_instead_of_a_fixed_delay(monkeypatch):
+    # The old helper pressed Enter 800ms after typing; here the menu settles only at 1200ms.
+    page = FlowPage({"KI": flow_response("KI")},
+                    menu=lambda code, n, ms: (["AK", "BK", "KI"], ["AK"]) if ms < 1200 else ([code], [code]))
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.typed == ["KI"]
+    assert got["reason"] is None
+
+
+@pytest.mark.parametrize("wrong", [[], ["KI", "AD"], ["AK"], ["KI", "KI"]])
+def test_flow_selection_retries_once_when_the_settled_chips_are_wrong(monkeypatch, wrong):
+    # The debounced server write lands 1100ms after Enter: only a check after it sees it.
+    page = FlowPage({"KI": flow_response("KI")}, late=lambda code, n, ms: wrong if n == 1 and ms >= 1100 else None)
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert [n for n, _r, _f in page.enters] == [1, 2] and page.submits == 1
+    assert got["reason"] is None and got["scans"][0]["status"] == ns.FLOW_OK
+
+
+@pytest.mark.parametrize("script", [
+    {"menu": lambda code, n, ms: (["AK", "KI"], ["AK"]) if code == "KI" else ([code], [code])},
+    {"late": lambda code, n, ms: ["KI", "AD"] if code == "KI" and ms >= 1100 else None},
+])
+def test_flow_selection_gives_up_after_two_attempts_and_the_snapshot_is_rejected(monkeypatch, script):
+    page = FlowPage({"XL": flow_response("XL"), "KI": flow_response("KI")}, **script)
+    got, _ = capture(monkeypatch, None, codes=("XL", "KI"), page=page)
+    assert page.typed.count("KI") == 2 and page.submits == 1                  # XL only: KI never submitted
+    status = {s["broker_code"]: s for s in got["scans"]}
+    assert status["XL"]["status"] == ns.FLOW_OK and status["KI"]["status"] == ns.FLOW_SOURCE_FAILURE
+    assert "broker picker never selected exactly ['KI']" in status["KI"]["detail"]
+    assert got["reason"] == "1/2 code(s) failed: KI"
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0)])
+    before = flow_rows(conn)
+    assert not ns.persist_broker_flow_capture(conn, got) and flow_rows(conn) == before
+
+
+@pytest.mark.parametrize("change", [lambda chips: chips + ["AD"], lambda chips: [], lambda chips: ["AK"]])
+def test_flow_scan_fails_closed_when_the_chips_change_before_submit(monkeypatch, change):
+    page = FlowPage({"KI": flow_response("KI")}, on_duration=change)
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.submits == 0 and page.expect_calls == 0
+    assert "broker picker changed before submit" in got["scans"][0]["detail"] and got["rows"] == []
+
+
+def test_flow_request_stays_the_final_authority_over_the_picker(monkeypatch):
+    page = FlowPage({"KI": flow_response("KI", broker=["AK"])})
+    got, _ = capture(monkeypatch, None, codes=("KI",), page=page)
+    assert page.enters == [(1, ["KI"], ["KI"])] and page.submits == 1       # the picker proved KI...
+    assert "request state broker.value is not ['KI']" in got["scans"][0]["detail"]   # ...the request did not
+    assert got["rows"] == [] and got["reason"] == "1/1 code(s) failed: KI"
+
+
+def test_flow_request_proof_is_checked_before_the_http_status():
+    wrong = FakeDashResponse(status=500, post_data=flow_request("KI", broker=["AK"]), body=HTML_500)
+    with pytest.raises(RuntimeError) as err:
+        ns.read_broker_flow_code(FlowPage({"KI": wrong}), "KI", timeout_ms=10)
+    assert "request state broker.value is not ['KI']" in str(err.value)
+    assert "its HTTP 500 response was not used" in str(err.value) and "failed: HTTP" not in str(err.value)
+    exact = FakeDashResponse(status=500, post_data=flow_request("CS"), body=HTML_500)
+    with pytest.raises(RuntimeError, match=r"failed: HTTP 500 for the exact \['CS'\] request"):
+        ns.read_broker_flow_code(FlowPage({"CS": exact}), "CS", timeout_ms=10)
+
+
+def test_default_capture_requests_the_active_codes_only_and_never_invents_cs(monkeypatch):
+    active = ns.BROKER_FLOW_CAPTURE_CODES
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    page = FlowPage({c: flow_response(c) for c in active + ["CS"]})      # CS would answer if asked
+    got = ns.capture_broker_flow(page, FLOW_TRACKED)
+    assert page.typed == active and "CS" not in page.typed               # every active code once, CS never
+    assert [s["broker_code"] for s in got["scans"]] == active and got["reason"] is None
+    assert not [r for r in got["rows"] if r["broker_code"] == "CS"]
+    conn = flow_db()
+    assert ns.persist_broker_flow_capture(conn, got)
+    assert conn.execute("SELECT COUNT(*) FROM broker_flow WHERE broker_code = 'CS'").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM broker_flow_scan WHERE broker_code = 'CS'").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(DISTINCT broker_code) FROM broker_flow").fetchone() == (len(active),)
+
+
+def test_one_failing_active_code_rejects_the_whole_default_snapshot(monkeypatch):
+    active = ns.BROKER_FLOW_CAPTURE_CODES
+    flow_clock(monkeypatch, 2026, 9, 30, 7, 5)
+    got = ns.capture_broker_flow(FlowPage({c: flow_response(c) for c in active[:-1]}), FLOW_TRACKED)
+    assert got["reason"] == f"1/{len(active)} code(s) failed: {active[-1]}"
+    conn = flow_db(live=[("2026-09-30", "OLD1", "XL", 9.0)])
+    before = flow_rows(conn)
+    assert not ns.persist_broker_flow_capture(conn, got) and flow_rows(conn) == before
 
 
 def test_record_konglo_signals_keeps_the_broker_stalker_status_and_reason():
