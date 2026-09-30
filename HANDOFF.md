@@ -1330,3 +1330,69 @@ PERSISTED maupun REJECTED.
 sudah terbit, tambahkan/ubah tahun itu di `idx_calendar.py` beserta sumbernya
 dan naikkan `CALENDAR_VERSION`. Tanpa itu, capture mulai 2028-01-02 ditolak
 ("cannot establish the latest IDX session").
+
+## Lampiran S — manifest bukti tanggal `broker_flow` historis (2026-09-30)
+
+Hanya bukti, bukan migrasi. `broker_flow` **tidak diubah**: tidak ada baris
+yang di-re-key, di-update, atau dihapus, dan 2026-08-12 / 2026-08-27 tidak
+dibersihkan. `broker_flow.date` tetap bukti akuisisi historis apa adanya.
+Interpretasi sesi kanonis hanya **metadata** di
+`evidence/broker_flow_date_evidence.json`, dibuat oleh `broker_flow_regime.py`
+(baca `neobdm.db` dengan `mode=ro&immutable=1`, tanpa jaringan, tanpa jam
+dinding). Belum ada tabel/DB sidecar kanonis, dan belum ada pembaca yang
+dimigrasikan.
+
+Baris live historis **tidak punya satu konvensi tanggal**: sebagian memuat sesi
+sebelumnya, lima tanggal Juli (07-06/07/09/10/13) memuat sesi hari itu sendiri,
+dua tanggal memuat campuran dua sesi. Karena itu setiap `(date, regime)`
+(regime: `bval IS NULL` = BACKFILL, selain itu LIVE) diklasifikasi dari bukti:
+
+| date_class | level | canonical_session_date | bukti | tanggal | baris |
+|---|---|---|---|---|---|
+| SOURCE_DATED_BACKFILL | PROVEN | = `broker_flow.date` | jalur `backfill_inventory.insert_inventory` (`data.date` API) | 218 | 212.839 |
+| SCAN_VERIFIED | PROVEN | `broker_flow_scan.session_date` | run PERSISTED `dash_callback_v1` | 1 (09-30 → 09-29) | 965 |
+| CONTENT_MATCHED | PROVEN | satu-satunya sesi yang cocok | `broker_daily.parquet` | 49 | 11.433 |
+| INFERRED_ONLY | INFERRED | **NULL** | aturan kalender saja | 35 | 6.655 |
+| MIXED | AMBIGUOUS | **NULL** | diff git rerun | 2 (08-12, 08-27) | 601 |
+
+`capture_class` terpisah: FULL_CALLBACK (PR #72), DOM_TOP15 (tabel 15 baris
+lama), SELECTOR_UNION_BACKFILL (TOP_5_NB/NS).
+
+**CONTENT_MATCHED** = tepat satu sesi di `broker_daily.parquet` dalam jendela
+14 hari yang cocok di **setiap** baris (bval dan sval, selisih ≤ 0,05 miliar
+setelah /1e9; baris tanpa pasangan di parquet tidak pernah dihitung cocok).
+Hasil: 49/49 tanggal cocok penuh, korelasi ≥ 0,999995, runner-up ≤ 0,9004, dan
+sesi runner-up cocok di ≤ 3,7% baris. Parquet itu gitignored, jadi bukti yang
+dibawa manifest: SHA-256 file (`c8d1948f…05cc32`, 5.609.444 baris,
+2025-08-22..2026-08-21), statistik per tanggal, dan `rows_sha256` baris yang
+diklasifikasi. **Gagal tertutup:** tanpa parquet (atau hash berbeda) tidak ada
+tanggal yang menjadi CONTENT_MATCHED; tanggal itu tetap INFERRED_ONLY.
+
+**Inferred ≠ verified.** `inferred_session_date` = `idx_calendar.latest_idx_session_before`
+(asumsi scrape sebelum pasar buka) dan tidak pernah menjadi kanonis. Pada 5
+tanggal Juli di atas, inferensi ini terbukti **salah**
+(`summary.live_inference_disagrees_with_proof`). 35 tanggal INFERRED_ONLY
+(08-25..09-29 minus 08-27) berada di luar cakupan parquet.
+
+**MIXED dikarantina.** Bukti dari riwayat git `neobdm.db` (blob tercatat di
+`AUDITED_MIXED`, diturunkan ulang oleh tes): 08-12 = tulis pertama 212 baris
+(6793d52) lalu rerun (f441ec1): 110 identik, 102 berubah, 110 baru. 08-27 = 198
+baris (8b454b0) lalu rerun (da4d96b): 92 identik, 106 berubah, 81 baru. Baris
+"identik" bisa sisa tulis pertama atau ditulis ulang dengan nilai sama; tidak
+bisa dibedakan. Kanonis dan inferensi keduanya NULL.
+
+Salinan akhir pekan/libur: satu sesi bisa dipegang beberapa tanggal
+(`summary.live_sessions_held_by_several_dates`); konsumen yang nanti memakai
+sesi kanonis harus dedupe. Sesi 07-08 tidak pernah tertangkap.
+
+**Memakai:** `py -3 broker_flow_regime.py verify` membandingkan manifest dengan
+DB (`rows_sha256` per record). Nilai backfill disembuhkan tiap malam oleh
+top-up, jadi di backfill hanya jumlah baris yang dikunci; baris live tanggal
+lampau tidak boleh berubah. Membuat ulang (identik byte bila DB dan parquet
+sama):
+
+    py -3 broker_flow_regime.py build --db neobdm.db \
+        --broker-daily <path>/broker_daily.parquet --source-commit <sha>
+
+Tes: `test_broker_flow_regime.py` (pytest; set `BROKER_DAILY_PARQUET` untuk
+tes reproduksi byte-identik). Belum masuk daftar CI `check_ml_health`.

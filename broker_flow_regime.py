@@ -1,0 +1,576 @@
+"""Read-only evidence manifest for the historical broker_flow table.
+
+broker_flow.date is NOT one convention (HANDOFF Appendix R, Appendix S):
+
+  BACKFILL  bval IS NULL      date = the /api/inventory session date
+                              (backfill_inventory.insert_inventory stores
+                              data.date as-is, days <= BACKFILL_END only)
+  LIVE      bval IS NOT NULL  date = MYT scrape date. Before PR #72 there was
+                              no window gate, so a row can hold the previous
+                              session, the same day's session, or a mixture.
+
+This module never changes a row. It reads neobdm.db immutable/read-only and
+writes one JSON document that says, for every (broker_flow.date, regime),
+what session that date is PROVEN to hold, and on what evidence:
+
+  date_class              evidence level  canonical_session_date
+  SCAN_VERIFIED           PROVEN          broker_flow_scan.session_date
+  SOURCE_DATED_BACKFILL   PROVEN          broker_flow.date
+  CONTENT_MATCHED         PROVEN          the one session in broker_daily.parquet
+                                          every row agrees with
+  INFERRED_ONLY           INFERRED        NULL (inferred_session_date is a guess)
+  MIXED                   AMBIGUOUS       NULL (rows from two sessions)
+
+capture_class: FULL_CALLBACK (PR #72 dash_callback_v1), DOM_TOP15 (the legacy
+rendered 15-row table), SELECTOR_UNION_BACKFILL (TOP_5_NB/NS selector union).
+
+CONTENT_MATCHED needs broker_daily.parquet, which is gitignored. Without it
+the generator FAILS CLOSED: those dates become INFERRED_ONLY and the manifest
+says the evidence was unavailable. It never falls back to the calendar rule.
+Each record carries rows_sha256 of the exact rows it classified, so a committed
+manifest can be checked against the database without the parquet (verify).
+
+Usage:
+  py -3 broker_flow_regime.py build  --db neobdm.db --broker-daily PATH \
+        --out evidence/broker_flow_date_evidence.json [--source-commit SHA]
+  py -3 broker_flow_regime.py verify --db neobdm.db \
+        --manifest evidence/broker_flow_date_evidence.json
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import sqlite3
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+import idx_calendar
+
+SCHEMA = "broker_flow_date_evidence_v1"
+GENERATOR_VERSION = 1
+MANIFEST_PATH = os.path.join("evidence", "broker_flow_date_evidence.json")
+
+BACKFILL, LIVE = "BACKFILL", "LIVE"
+
+SCAN_VERIFIED = "SCAN_VERIFIED"
+SOURCE_DATED_BACKFILL = "SOURCE_DATED_BACKFILL"
+CONTENT_MATCHED = "CONTENT_MATCHED"
+INFERRED_ONLY = "INFERRED_ONLY"
+MIXED = "MIXED"
+DATE_CLASSES = (SCAN_VERIFIED, SOURCE_DATED_BACKFILL, CONTENT_MATCHED, INFERRED_ONLY, MIXED)
+EVIDENCE_LEVEL = {SCAN_VERIFIED: "PROVEN", SOURCE_DATED_BACKFILL: "PROVEN",
+                  CONTENT_MATCHED: "PROVEN", INFERRED_ONLY: "INFERRED", MIXED: "AMBIGUOUS"}
+
+FULL_CALLBACK = "FULL_CALLBACK"
+DOM_TOP15 = "DOM_TOP15"
+SELECTOR_UNION_BACKFILL = "SELECTOR_UNION_BACKFILL"
+CAPTURE_CLASSES = (FULL_CALLBACK, DOM_TOP15, SELECTOR_UNION_BACKFILL)
+
+# Content match: live bval/sval are billions of Rupiah rounded to 0.1, the
+# parquet holds full Rupiah. A row agrees with a session when both sides are
+# within half a display unit. A date is CONTENT_MATCHED only when EXACTLY ONE
+# candidate session agrees on EVERY row (a row with no parquet counterpart
+# never agrees: absent is not zero).
+RP_PER_UNIT = 1e9
+TOLERANCE = 0.05 + 1e-6
+CANDIDATE_WINDOW_DAYS = 14
+TOP_CANDIDATES = 3
+
+# Quarantined by the date-regime audit (2026-09-30). Proof is in committed git
+# history: the first write and the same-date rerun are both commits of
+# neobdm.db. INSERT OR REPLACE kept every row the rerun did not return, so the
+# `identical` rows are either untouched first-write rows or rewritten with the
+# same values; nothing tells which. Recomputed by rerun_diff() in the tests.
+AUDITED_MIXED = {
+    "2026-08-12": {
+        "first_write": {"commit": "6793d52abe39c0888c32726b59f0952e957d4cb6",
+                        "neobdm_db_blob": "e362f31e0d2e85ebc8801a4f5d852fa863aa68a4",
+                        "live_rows": 212},
+        "rerun": {"commit": "f441ec1146c0c93dcfd1e11cc14d5fb3ca475b9c",
+                  "neobdm_db_blob": "c0000cc0d4e39d564c4f5136bf593e23cc46742b",
+                  "live_rows": 322},
+        "rerun_diff": {"identical": 110, "changed": 102, "new": 110, "removed": 0},
+    },
+    "2026-08-27": {
+        "first_write": {"commit": "8b454b0297994209c0e190b400ed3932afcbad15",
+                        "neobdm_db_blob": "8da082a0bc238d2b382f03f343f939bd08a994c8",
+                        "live_rows": 198},
+        "rerun": {"commit": "da4d96bf7b8d4f56a66a67f2cd7fa28d554b0462",
+                  "neobdm_db_blob": "356c126d8b380e9d248e677226e6dcdb5b80f4e5",
+                  "live_rows": 279},
+        "rerun_diff": {"identical": 92, "changed": 106, "new": 81, "removed": 0},
+    },
+}
+
+BACKFILL_EVIDENCE_REF = ("backfill_inventory.insert_inventory: broker_flow.date = "
+                         "/api/inventory data.date, days <= BACKFILL_END (2026-07-04), "
+                         "brokers=TOP_5_NB_LOT_C20+TOP_5_NS_LOT_C20")
+
+COLUMNS = ("date", "ticker", "broker_code", "bval", "sval", "netval", "bavg", "savg")
+
+
+class ProvenanceContradiction(ValueError):
+    """broker_flow and its own provenance disagree; nothing is classified."""
+
+
+def regime_of(bval):
+    """bval is NULL only on backfill rows; the live path always writes it."""
+    return BACKFILL if bval is None else LIVE
+
+
+# --------------------------------------------------------------------------
+# Read-only access and hashing
+# --------------------------------------------------------------------------
+
+def connect_readonly(db_path):
+    """immutable=1 takes no locks and never writes a journal or WAL."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _row_line(row):
+    return json.dumps(list(row), separators=(",", ":"), ensure_ascii=True) + "\n"
+
+
+def _sha256_rows(rows):
+    h = hashlib.sha256()
+    n = 0
+    for row in rows:
+        h.update(_row_line(row).encode("ascii"))
+        n += 1
+    return n, h.hexdigest()
+
+
+def broker_flow_fingerprint(con):
+    """(row count, sha256 over every row ordered by the primary key)."""
+    return _sha256_rows(con.execute(
+        f"SELECT {', '.join(COLUMNS)} FROM broker_flow ORDER BY date, ticker, broker_code"))
+
+
+def _group_hash(con, d, regime):
+    null = "IS NULL" if regime == BACKFILL else "IS NOT NULL"
+    return _sha256_rows(con.execute(
+        f"SELECT {', '.join(COLUMNS)} FROM broker_flow WHERE date = ? AND bval {null} "
+        "ORDER BY ticker, broker_code", (d,)))
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _table_exists(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                       (name,)).fetchone() is not None
+
+
+# --------------------------------------------------------------------------
+# Evidence readers
+# --------------------------------------------------------------------------
+
+def _scan_rows(con):
+    if not _table_exists(con, "broker_flow_scan"):
+        return []
+    cols = [r[1] for r in con.execute("PRAGMA table_info(broker_flow_scan)")]
+    return [dict(zip(cols, r)) for r in con.execute(
+        "SELECT * FROM broker_flow_scan ORDER BY scrape_date, run_started_utc, broker_code")]
+
+
+def _scan_fingerprint(scan):
+    # NULL columns are left out so a later nullable ALTER (PR #73 added two)
+    # does not change the hash of rows written before it.
+    return _sha256_rows([sorted((k, v) for k, v in r.items() if v is not None) for r in scan])
+
+
+def scan_evidence(scan, d, live_rows):
+    """The PERSISTED run for scrape_date d, or None. Any disagreement between
+    that run and the live rows it claims to have written raises."""
+    persisted = [r for r in scan if r["scrape_date"] == d and r["snapshot"] == "PERSISTED"]
+    if not persisted:
+        return None
+    runs = sorted({r["run_started_utc"] for r in persisted})
+    sessions = sorted({r["session_date"] for r in persisted})
+    tracked = sum(r["tracked_rows"] or 0 for r in persisted)
+    bad = [r["broker_code"] for r in persisted
+           if r["status"] != "OK" or r["method"] != "dash_callback_v1"]
+    if len(runs) != 1 or len(sessions) != 1 or sessions[0] is None or bad:
+        raise ProvenanceContradiction(
+            f"{d}: PERSISTED scan rows disagree (runs={runs}, sessions={sessions}, not-ok={bad})")
+    if tracked != live_rows:
+        raise ProvenanceContradiction(
+            f"{d}: PERSISTED scan tracked {tracked} rows but broker_flow holds {live_rows} live rows")
+    return {"run_started_utc": runs[0], "session_date": sessions[0],
+            "codes": len(persisted), "tracked_rows": tracked,
+            "expected_session_date": sorted({r.get("expected_session_date") for r in persisted},
+                                            key=str),
+            "calendar_version": sorted({r.get("calendar_version") for r in persisted}, key=str),
+            "sha256": _scan_fingerprint(persisted)[1]}
+
+
+def load_broker_daily(path, live, window_days=CANDIDATE_WINDOW_DAYS):
+    """{session: {(ticker, broker): (bval, sval)}} limited to what the live
+    dates can need, plus file metadata. live: {date: {(ticker, broker): ...}}.
+    pyarrow is imported only here."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    dates = sorted(live)
+    tickers = sorted({t for rows in live.values() for t, _ in rows})
+    brokers = sorted({b for rows in live.values() for _, b in rows})
+    pf = pq.ParquetFile(path)
+    meta = {"name": os.path.basename(path), "sha256": file_sha256(path),
+            "bytes": os.path.getsize(path), "num_rows": pf.metadata.num_rows}
+    by_session = {}
+    if dates:
+        lo = (date.fromisoformat(dates[0]) - timedelta(days=window_days)).isoformat()
+        t = pq.read_table(path, columns=["date", "ticker", "broker", "bval", "sval"],
+                          filters=[("date", ">=", lo), ("date", "<=", dates[-1])])
+        t = t.filter(pc.and_(pc.is_in(t["ticker"], value_set=_pa_strings(tickers)),
+                             pc.is_in(t["broker"], value_set=_pa_strings(brokers))))
+        for s, tk, br, bv, sv in zip(*(t[c].to_pylist()
+                                       for c in ("date", "ticker", "broker", "bval", "sval"))):
+            by_session.setdefault(s, {})[(tk, br)] = (bv, sv)
+    date_col = pq.read_table(path, columns=["date"])["date"]
+    meta["date_min"] = pc.min(date_col).as_py()
+    meta["date_max"] = pc.max(date_col).as_py()
+    return by_session, meta
+
+
+def _pa_strings(values):
+    import pyarrow as pa
+    return pa.array(values, type=pa.string())
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = math.fsum(xs) / n, math.fsum(ys) / n
+    sxy = math.fsum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = math.fsum((x - mx) ** 2 for x in xs)
+    syy = math.fsum((y - my) ** 2 for y in ys)
+    if sxx == 0 or syy == 0:
+        return None
+    return round(sxy / math.sqrt(sxx * syy), 6)
+
+
+def _agrees(live_v, src_v):
+    return all(abs(a - b / RP_PER_UNIT) <= TOLERANCE for a, b in zip(live_v, src_v))
+
+
+def content_match(d, rows, by_session, window_days=CANDIDATE_WINDOW_DAYS):
+    """Compare one live date's rows with every parquet session in
+    [d - window_days, d]. rows: {(ticker, broker): (bval, sval)}."""
+    lo = (date.fromisoformat(d) - timedelta(days=window_days)).isoformat()
+    cands = []
+    agree_sets = {}
+    for s in sorted(x for x in by_session if lo <= x <= d):
+        src = by_session[s]
+        joined = [k for k in rows if k in src]
+        agree = frozenset(k for k in joined if _agrees(rows[k], src[k]))
+        xs = [v for k in joined for v in rows[k]]
+        ys = [v / RP_PER_UNIT for k in joined for v in src[k]]
+        agree_sets[s] = agree
+        cands.append({"session": s, "joined_rows": len(joined),
+                      "agreeing_rows": len(agree), "correlation": _pearson(xs, ys)})
+    by_corr = sorted((c for c in cands if c["correlation"] is not None),
+                     key=lambda c: (-c["correlation"], c["session"]))
+    by_agree = sorted(cands, key=lambda c: (-c["agreeing_rows"],
+                                            -(c["correlation"] or -2.0), c["session"]))
+    full = [c["session"] for c in cands if c["agreeing_rows"] == len(rows) > 0]
+    out = {
+        "row_count": len(rows),
+        "candidates_considered": len(cands),
+        "window": [lo, d],
+        "full_agreement_sessions": full,
+        "matched_session": full[0] if len(full) == 1 else None,
+        "correlation": by_corr[0]["correlation"] if by_corr else None,
+        "best_correlation_session": by_corr[0]["session"] if by_corr else None,
+        "runner_up_session": by_corr[1]["session"] if len(by_corr) > 1 else None,
+        "runner_up_correlation": by_corr[1]["correlation"] if len(by_corr) > 1 else None,
+        "top_candidates": by_agree[:TOP_CANDIDATES],
+    }
+    if out["matched_session"] is None and len(by_agree) >= 2:
+        a, b = by_agree[0]["session"], by_agree[1]["session"]
+        sa, sb = agree_sets[a], agree_sets[b]
+        out["agreement_partition"] = {
+            "sessions": [a, b], "only_first": len(sa - sb), "only_second": len(sb - sa),
+            "both": len(sa & sb), "neither": len(set(rows) - sa - sb)}
+    return out
+
+
+# --------------------------------------------------------------------------
+# Manifest
+# --------------------------------------------------------------------------
+
+def _inferred_session(d):
+    try:
+        return idx_calendar.latest_idx_session_before(date.fromisoformat(d)).isoformat()
+    except idx_calendar.IdxCalendarUnavailable:
+        return None
+
+
+def _live_rows(con, d):
+    return {(t, b): (bv, sv) for t, b, bv, sv in con.execute(
+        "SELECT ticker, broker_code, bval, sval FROM broker_flow "
+        "WHERE date = ? AND bval IS NOT NULL", (d,))}
+
+
+def build_manifest(db_path, broker_daily_path=None, source_commit=None):
+    """Classify every (broker_flow.date, regime). Opens db_path read-only."""
+    con = connect_readonly(db_path)
+    try:
+        return _build(con, broker_daily_path, source_commit)
+    finally:
+        con.close()
+
+
+def _build(con, broker_daily_path, source_commit):
+    total, flow_sha = broker_flow_fingerprint(con)
+    groups = con.execute(
+        "SELECT date, bval IS NULL, COUNT(*) FROM broker_flow GROUP BY date, bval IS NULL "
+        "ORDER BY date, bval IS NULL").fetchall()
+    scan = _scan_rows(con)
+    live_dates = [d for d, is_bf, _ in groups if not is_bf]
+    live = {d: _live_rows(con, d) for d in live_dates}
+
+    if broker_daily_path and os.path.isfile(broker_daily_path):
+        by_session, pq_meta = load_broker_daily(broker_daily_path, live)
+        evidence = dict(pq_meta, status="AVAILABLE",
+                        upstream="build_inventory_db.py <- inventory_raw/*.json.gz "
+                                 "(/api/inventory, source-dated)")
+    else:
+        by_session = None
+        evidence = {"status": "UNAVAILABLE", "name": "broker_daily.parquet", "sha256": None,
+                    "reason": ("no --broker-daily path given" if not broker_daily_path else
+                               f"{os.path.basename(broker_daily_path)} not found"),
+                    "effect": "no date can be CONTENT_MATCHED; those dates stay INFERRED_ONLY"}
+
+    records = []
+    for d, is_bf, n in groups:
+        regime = BACKFILL if is_bf else LIVE
+        n_hashed, rows_sha = _group_hash(con, d, regime)
+        assert n_hashed == n
+        rec = {"broker_flow_date": d, "regime": regime, "row_count": n, "rows_sha256": rows_sha,
+               "canonical_session_date": None, "inferred_session_date": None,
+               "inferred_matches_canonical": None, "content_match": None,
+               "capture_commit": None, "notes": []}
+        if regime == BACKFILL:
+            rec.update(date_class=SOURCE_DATED_BACKFILL, capture_class=SELECTOR_UNION_BACKFILL,
+                       canonical_session_date=d, evidence_kind="generation_path",
+                       evidence_ref=BACKFILL_EVIDENCE_REF, evidence_hash=None)
+            records.append(_finish(rec))
+            continue
+
+        rec["inferred_session_date"] = _inferred_session(d)
+        cm = content_match(d, live[d], by_session) if by_session is not None else None
+        rec["content_match"] = cm
+        sc = scan_evidence(scan, d, n)
+
+        if d in AUDITED_MIXED:
+            if sc is not None:
+                raise ProvenanceContradiction(f"{d}: quarantined MIXED date has a PERSISTED scan")
+            mx = AUDITED_MIXED[d]
+            rec.update(date_class=MIXED, capture_class=DOM_TOP15, evidence_kind="git_rerun_diff",
+                       evidence_ref=f"neobdm.db@{mx['first_write']['commit'][:7]} -> "
+                                    f"neobdm.db@{mx['rerun']['commit'][:7]}",
+                       evidence_hash="git-blob:" + mx["rerun"]["neobdm_db_blob"],
+                       capture_commit=mx["rerun"]["commit"], git_rerun=mx,
+                       inferred_session_date=None)
+            rec["notes"].append("same-date rerun kept rows it did not return (INSERT OR REPLACE); "
+                                "rows from two sessions, no canonical session")
+        elif sc is not None:
+            rec.update(date_class=SCAN_VERIFIED, capture_class=FULL_CALLBACK,
+                       canonical_session_date=sc["session_date"], evidence_kind="broker_flow_scan",
+                       evidence_ref=f"broker_flow_scan scrape_date={d} "
+                                    f"run_started_utc={sc['run_started_utc']} snapshot=PERSISTED",
+                       evidence_hash="sha256:" + sc["sha256"], scan=sc)
+        elif cm is not None and cm["matched_session"] is not None:
+            rec.update(date_class=CONTENT_MATCHED, capture_class=DOM_TOP15,
+                       canonical_session_date=cm["matched_session"],
+                       evidence_kind="content_match", evidence_ref="broker_daily.parquet",
+                       evidence_hash="sha256:" + evidence["sha256"])
+        else:
+            rec.update(date_class=INFERRED_ONLY, capture_class=DOM_TOP15,
+                       evidence_kind="idx_calendar_inference",
+                       evidence_ref=f"idx_calendar.latest_idx_session_before "
+                                    f"({idx_calendar.CALENDAR_VERSION})",
+                       evidence_hash=None)
+            rec["notes"].append("inferred_session_date assumes a pre-open scrape; NOT verified")
+            if cm is None:
+                rec["notes"].append("content-match evidence unavailable")
+            elif len(cm["full_agreement_sessions"]) > 1:
+                rec["notes"].append("several sessions agree on every row; ambiguous")
+            elif (evidence.get("date_max") and rec["inferred_session_date"]
+                  and rec["inferred_session_date"] > evidence["date_max"]):
+                rec["notes"].append("inferred session is after the content-match evidence "
+                                    f"coverage ({evidence['date_max']})")
+            else:
+                rec["notes"].append("no candidate session agrees on every row")
+        records.append(_finish(rec))
+
+    return {
+        "schema": SCHEMA,
+        "generator": "broker_flow_regime.py",
+        "generator_version": GENERATOR_VERSION,
+        "principle": ("broker_flow.date is untouched historical/acquisition evidence; "
+                      "canonical_session_date is metadata only and is NULL unless PROVEN"),
+        "input": {
+            "source_commit": source_commit,
+            "broker_flow": {"rows": total, "ordered_sha256": flow_sha,
+                            "order": "date, ticker, broker_code",
+                            "dates": len({d for d, _, _ in groups}),
+                            "by_regime": _regime_counts(records)},
+            "broker_flow_scan": dict(zip(("rows", "ordered_sha256"), _scan_fingerprint(scan))),
+            "content_match_evidence": evidence,
+            "idx_calendar_version": idx_calendar.CALENDAR_VERSION,
+        },
+        "rules": {
+            "regime": "BACKFILL if bval IS NULL else LIVE",
+            "order": ["BACKFILL -> SOURCE_DATED_BACKFILL", "LIVE in AUDITED_MIXED -> MIXED",
+                      "LIVE with PERSISTED dash_callback_v1 scan -> SCAN_VERIFIED",
+                      "LIVE with exactly one fully agreeing session -> CONTENT_MATCHED",
+                      "otherwise -> INFERRED_ONLY"],
+            "content_match": {"unit_rp": RP_PER_UNIT, "tolerance": TOLERANCE,
+                              "candidate_window_days": CANDIDATE_WINDOW_DAYS,
+                              "requires": "every live row has a parquet counterpart within "
+                                          "tolerance on bval AND sval, for exactly one session"},
+            "evidence_level": EVIDENCE_LEVEL,
+        },
+        "summary": _summary(records),
+        "records": records,
+    }
+
+
+def _finish(rec):
+    rec["evidence_level"] = EVIDENCE_LEVEL[rec["date_class"]]
+    if rec["canonical_session_date"] and rec["inferred_session_date"]:
+        rec["inferred_matches_canonical"] = rec["canonical_session_date"] == rec["inferred_session_date"]
+    if rec["date_class"] in (INFERRED_ONLY, MIXED):
+        assert rec["canonical_session_date"] is None
+    return rec
+
+
+def _regime_counts(records):
+    out = {}
+    for r in records:
+        c = out.setdefault(r["regime"], {"dates": 0, "rows": 0})
+        c["dates"] += 1
+        c["rows"] += r["row_count"]
+    return out
+
+
+def _summary(records):
+    by_class = {c: {"dates": 0, "rows": 0} for c in DATE_CLASSES}
+    by_capture = {c: {"dates": 0, "rows": 0} for c in CAPTURE_CLASSES}
+    copies = {}
+    for r in records:
+        for bucket, key in ((by_class, r["date_class"]), (by_capture, r["capture_class"])):
+            bucket[key]["dates"] += 1
+            bucket[key]["rows"] += r["row_count"]
+        if r["regime"] == LIVE and r["canonical_session_date"]:
+            copies.setdefault(r["canonical_session_date"], []).append(r["broker_flow_date"])
+    return {
+        "records": len(records),
+        "by_date_class": by_class,
+        "by_capture_class": by_capture,
+        "unresolved": {"dates": by_class[INFERRED_ONLY]["dates"] + by_class[MIXED]["dates"],
+                       "rows": by_class[INFERRED_ONLY]["rows"] + by_class[MIXED]["rows"]},
+        "live_sessions_held_by_several_dates": {s: ds for s, ds in sorted(copies.items())
+                                                if len(ds) > 1},
+        "live_inference_disagrees_with_proof": sorted(
+            r["broker_flow_date"] for r in records if r["inferred_matches_canonical"] is False),
+    }
+
+
+def dumps(manifest):
+    return json.dumps(manifest, indent=1, sort_keys=True, ensure_ascii=True) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Verification of a committed manifest against a database
+# --------------------------------------------------------------------------
+
+def verify_manifest(manifest, db_path):
+    """Compare each record with the rows it was computed over. Returns
+    {"missing": [...], "gone": [...], "count_changed": [...], "content_changed": [...]}
+    keyed by (date, regime). Read-only."""
+    con = connect_readonly(db_path)
+    try:
+        groups = {(d, BACKFILL if is_bf else LIVE): n for d, is_bf, n in con.execute(
+            "SELECT date, bval IS NULL, COUNT(*) FROM broker_flow GROUP BY date, bval IS NULL")}
+        out = {"missing": [], "gone": [], "count_changed": [], "content_changed": []}
+        seen = set()
+        for r in manifest["records"]:
+            key = (r["broker_flow_date"], r["regime"])
+            seen.add(key)
+            if key not in groups:
+                out["gone"].append(key)
+            elif groups[key] != r["row_count"]:
+                out["count_changed"].append(key)
+            elif _group_hash(con, *key)[1] != r["rows_sha256"]:
+                out["content_changed"].append(key)
+        out["missing"] = sorted(set(groups) - seen)
+        return out
+    finally:
+        con.close()
+
+
+def rerun_diff(db_before, db_after, d):
+    """Live rows for date d in two versions of neobdm.db: how the second write
+    relates to the first. Used to re-derive AUDITED_MIXED from git blobs."""
+    def rows(path):
+        con = connect_readonly(path)
+        try:
+            return {(t, b): v for t, b, *v in con.execute(
+                "SELECT ticker, broker_code, bval, sval, netval, bavg, savg FROM broker_flow "
+                "WHERE date = ? AND bval IS NOT NULL", (d,))}
+        finally:
+            con.close()
+    a, b = rows(db_before), rows(db_after)
+    return {"before_rows": len(a), "after_rows": len(b),
+            "identical": sum(1 for k in b if k in a and a[k] == b[k]),
+            "changed": sum(1 for k in b if k in a and a[k] != b[k]),
+            "new": sum(1 for k in b if k not in a),
+            "removed": sum(1 for k in a if k not in b)}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build")
+    b.add_argument("--db", default="neobdm.db")
+    b.add_argument("--broker-daily", default=None)
+    b.add_argument("--source-commit", default=None)
+    b.add_argument("--out", default=MANIFEST_PATH)
+    v = sub.add_parser("verify")
+    v.add_argument("--db", default="neobdm.db")
+    v.add_argument("--manifest", default=MANIFEST_PATH)
+    args = ap.parse_args(argv)
+
+    if args.cmd == "build":
+        m = build_manifest(args.db, args.broker_daily, args.source_commit)
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="ascii", newline="\n") as f:
+            f.write(dumps(m))
+        print(json.dumps({"out": args.out, "input": m["input"]["broker_flow"],
+                          "content_match_evidence": m["input"]["content_match_evidence"]["status"],
+                          "summary": m["summary"]["by_date_class"],
+                          "unresolved": m["summary"]["unresolved"]}, indent=1))
+        return 0
+    with open(args.manifest, encoding="ascii") as f:
+        m = json.load(f)
+    res = verify_manifest(m, args.db)
+    print(json.dumps(res, indent=1))
+    live_changed = [k for k in res["content_changed"] if k[1] == LIVE]
+    return 1 if (res["gone"] or res["count_changed"] or live_changed) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
