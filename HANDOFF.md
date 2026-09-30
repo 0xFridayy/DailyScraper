@@ -1234,7 +1234,9 @@ sumber); sel hilang/tidak valid = scan GAGAL, tidak pernah 0.0.
 
 Semua kode ditangkap dulu, baru diputuskan. `broker_flow` untuk `scrape_date`
 diganti HANYA jika semua `BROKER_FLOW_CODES` OK, semua melaporkan
-`session_date` yang sama, dan `session_date < scrape_date` (MYT, awal capture).
+`session_date` yang sama, dan `session_date < scrape_date` (MYT, awal capture);
+syarat terakhir ini sudah diperketat menjadi `session_date` == sesi IDX
+terakhir sebelum `scrape_date` (lihat "Sesi sumber yang diharapkan" di bawah).
 Salinan akhir pekan/libur tetap diizinkan (Minggu membawa sesi Jumat). Bila
 lolos: satu transaksi menghapus baris live tanggal itu (`bval IS NOT NULL`;
 baris backfill dipertahankan) lalu memasukkan snapshot baru. Bila tidak:
@@ -1294,3 +1296,37 @@ baru dan perubahan kode eksplisit.
 - Missingness di level konsumen belum diperbaiki: `horizon_scan` (`fillna(0)`),
   `ml_v2_experiment_1` (`reindex(...).fillna(0.0)`) dan agregasi `groupby().sum()`
   masih memperlakukan broker/tanggal yang absen sebagai nol.
+
+### Sesi sumber yang diharapkan: kalender IDX resmi (2026-09-30)
+
+`session_date < scrape_date` saja membiarkan sumber basi lolos (scrape Rabu,
+sumber Senin, padahal Selasa sesi). Sekarang:
+
+    expected_source_session(scrape_date) = latest_idx_session_before(scrape_date)
+
+yaitu sesi IDX resmi terakhir **sebelum** tanggal scrape MYT, tidak bergantung
+jam capture. Konvensi `broker_flow.date = scrape_date` tidak berubah, dan sesi
+hari yang sama tetap ditolak walau capture setelah penutupan.
+
+`idx_calendar.py` (murni, tanpa dependensi) memuat libur bursa hari kerja 2026
+dan 2027 persis seperti diumumkan, dengan sumber per tahun di `SOURCES`:
+2026 = BEI Peng-00171/BEI.POP/09-2025 (23-09-2025), KSEI PENG-0002/DIR/KSEI/0126
+(08-01-2026; sebelumnya PENG-0005/DIR/KSEI/1025); 2027 = BEI
+Peng-00169/BEI.POP/09-2026 (16-09-2026), KSEI PENG-0004/DIR/KSEI/0926
+(24-09-2026). Cakupan `COVERED_FROM` 2026-01-01 s.d. `COVERED_THROUGH`
+2027-12-31, versi `CALENDAR_VERSION = idx-2026-2027.v1`. `price_history` hanya
+cek konsistensi sekunder (test), bukan otoritas.
+
+Snapshot ditolak (broker_flow tidak disentuh) bila: kalender tidak bisa
+menetapkan sesi (tanggal di luar cakupan, lookback > 14 hari, atau lookup
+error apa pun); sesi sumber lebih lama dari yang diharapkan (basi); sesi sumber
+lebih baru (hari yang sama/masa depan, atau bukan sesi IDX menurut kalender).
+Tidak ada fallback ke "hari kerja sebelumnya", `price_history`, atau aturan
+lama. `broker_flow_scan` mendapat kolom nullable `expected_session_date` dan
+`calendar_version` (migrasi ALTER otomatis; baris lama NULL), diisi untuk run
+PERSISTED maupun REJECTED.
+
+**Perawatan:** saat BEI mengumumkan kalender tahun berikut atau mengubah yang
+sudah terbit, tambahkan/ubah tahun itu di `idx_calendar.py` beserta sumbernya
+dan naikkan `CALENDAR_VERSION`. Tanpa itu, capture mulai 2028-01-02 ditolak
+("cannot establish the latest IDX session").

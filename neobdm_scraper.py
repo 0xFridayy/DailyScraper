@@ -20,6 +20,7 @@ import pytz
 # Pure, playwright-free helpers parked in price_audit so CI can test them.
 from price_audit import (bagholders_from_payloads, inventory_date_blocks,
                          date_offset_holds, IDX_OPEN_HOUR_LOCAL)
+import idx_calendar
 import inventory_capture as ic
 import neobdm_source_contract as nsc
 
@@ -1455,7 +1456,10 @@ BROKER_FLOW_DDL = """
 # PERSISTED (its rows are the live snapshot), REJECTED (broker_flow untouched,
 # the run's reason in detail), SUPERSEDED (a later run replaced the snapshot).
 # run_started_utc is in the key so a rejected rerun never overwrites the record
-# of the snapshot that is still in broker_flow.
+# of the snapshot that is still in broker_flow. expected_session_date is the IDX
+# session the run had to hold (idx_calendar.latest_idx_session_before, NULL when
+# the calendar could not establish it) and calendar_version the calendar asked;
+# both are NULL on rows recorded before they existed.
 BROKER_FLOW_SCAN_DDL = """
     CREATE TABLE IF NOT EXISTS broker_flow_scan (
         scrape_date TEXT NOT NULL,
@@ -1471,16 +1475,29 @@ BROKER_FLOW_SCAN_DDL = """
         started_utc TEXT,
         completed_utc TEXT,
         detail TEXT,
+        expected_session_date TEXT,
+        calendar_version TEXT,
         PRIMARY KEY (scrape_date, broker_code, run_started_utc)
     )
 """
+BROKER_FLOW_SCAN_ADDED_COLUMNS = ("expected_session_date", "calendar_version")
+
+
+def _ensure_broker_flow_tables(conn):
+    """Create broker_flow and broker_flow_scan, and add the scan columns a table
+    created before them lacks (nullable: existing rows keep NULL)."""
+    conn.execute(BROKER_FLOW_DDL)
+    conn.execute(BROKER_FLOW_SCAN_DDL)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(broker_flow_scan)")}
+    for column in BROKER_FLOW_SCAN_ADDED_COLUMNS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE broker_flow_scan ADD COLUMN {column} TEXT")
+    conn.commit()
 
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(BROKER_FLOW_DDL)
-    conn.execute(BROKER_FLOW_SCAN_DDL)
-    conn.commit()
+    _ensure_broker_flow_tables(conn)
     return conn
 
 
@@ -1733,15 +1750,19 @@ def _flow_number(text):
 
 def capture_broker_flow(page, tickers, codes=None):
     """Read every broker code (read_broker_flow_code) and touch no table. Returns
-    {"scrape_started_at", "scrape_date", "scans", "rows", "reason"}: one scan
-    record per code, the `tickers` rows of every code that succeeded, and why the
-    snapshot may NOT be persisted (None when it may). scrape_date is the MYT date
-    the capture started, the live broker_flow.date convention. `codes` defaults to
-    BROKER_FLOW_CAPTURE_CODES: an excluded code (BROKER_FLOW_LIVE_UNAVAILABLE) is
-    neither requested nor recorded, and it gets no rows at all, never zeros."""
+    {"scrape_started_at", "scrape_date", "expected_session_date",
+    "calendar_version", "scans", "rows", "reason"}: one scan record per code, the
+    `tickers` rows of every code that succeeded, and why the snapshot may NOT be
+    persisted (None when it may). scrape_date is the MYT date the capture
+    started, the live broker_flow.date convention; expected_session_date is the
+    IDX session such a capture must hold (None if the calendar cannot establish
+    it). `codes` defaults to BROKER_FLOW_CAPTURE_CODES: an excluded code
+    (BROKER_FLOW_LIVE_UNAVAILABLE) is neither requested nor recorded, and it gets
+    no rows at all, never zeros."""
     codes = list(BROKER_FLOW_CAPTURE_CODES if codes is None else codes)
     tickers = set(tickers)
     started = datetime.now(pytz.timezone(TIMEZONE))
+    expected, calendar_problem = expected_source_session(started.date())
     scans, rows = [], []
     for code in codes:
         scan = {"broker_code": code, "status": FLOW_SOURCE_FAILURE, "session_date": None,
@@ -1762,15 +1783,32 @@ def capture_broker_flow(page, tickers, codes=None):
             rows.extend(code_rows)
         scan["completed_utc"] = nsc.utc_now()
         scans.append(scan)
-    return {"scrape_started_at": started, "scrape_date": started.date().isoformat(), "scans": scans,
-            "rows": rows, "reason": _snapshot_rejection(scans, started.date().isoformat(), codes)}
+    scrape_date = started.date().isoformat()
+    return {"scrape_started_at": started, "scrape_date": scrape_date,
+            "expected_session_date": expected.isoformat() if expected else None,
+            "calendar_version": idx_calendar.CALENDAR_VERSION, "scans": scans, "rows": rows,
+            "reason": _snapshot_rejection(scans, scrape_date, codes, expected, calendar_problem)}
 
 
-def _snapshot_rejection(scans, scrape_date, codes):
+def expected_source_session(scrape_date):
+    """(session, None) with the IDX session a capture dated `scrape_date` must
+    hold, idx_calendar.latest_idx_session_before: the latest official session
+    STRICTLY before it, whatever the clock time of the capture. (None, why) if
+    the calendar cannot establish it, for any reason: the caller then rejects."""
+    try:
+        return idx_calendar.latest_idx_session_before(scrape_date), None
+    except Exception as e:
+        return None, _safe_error(e, 300)
+
+
+def _snapshot_rejection(scans, scrape_date, codes, expected, calendar_problem):
     """Why a capture's rows may not replace broker_flow for scrape_date, or None.
-    All codes must have succeeded, on one source session, strictly before
-    scrape_date (a same-day session would break the live "previous session"
-    date convention; weekend/holiday copies of the last session are allowed)."""
+    All codes must have succeeded, on one source session, and that session must
+    be exactly `expected`, the latest IDX session strictly before scrape_date
+    (expected_source_session). An earlier session is stale; a later one is
+    same-day (breaking the live "previous session" date convention even after
+    the close) or not an IDX session per the calendar. Weekend/holiday copies of
+    the last session are allowed. Without an expected session nothing is."""
     if not codes:
         return "no broker codes configured"
     failed = [s["broker_code"] for s in scans if s["status"] != FLOW_OK]
@@ -1779,8 +1817,18 @@ def _snapshot_rejection(scans, scrape_date, codes):
     sessions = sorted({s["session_date"] for s in scans})
     if len(sessions) != 1:
         return f"codes report different source sessions: {', '.join(sessions)}"
-    if sessions[0] >= scrape_date:
-        return f"source session {sessions[0]} is not before scrape date {scrape_date}"
+    session = sessions[0]
+    if expected is None:
+        return f"cannot establish the latest IDX session before scrape date {scrape_date}: {calendar_problem}"
+    want, version = expected.isoformat(), idx_calendar.CALENDAR_VERSION
+    if session >= scrape_date:
+        return f"source session {session} is not before scrape date {scrape_date}"
+    if session < want:
+        return (f"source session {session} is stale: the latest IDX session before scrape date "
+                f"{scrape_date} is {want} ({version})")
+    if session > want:
+        return (f"source session {session} is not an IDX session per {version} "
+                f"(latest before scrape date {scrape_date} is {want})")
     return None
 
 
@@ -1789,11 +1837,13 @@ def _record_flow_scans(conn, capture, snapshot, reason=None):
     conn.executemany(
         "INSERT OR REPLACE INTO broker_flow_scan (scrape_date, broker_code, run_started_utc, status, "
         "snapshot, session_date, akum_rows_returned, dist_rows_returned, tracked_rows, method, "
-        "started_utc, completed_utc, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "started_utc, completed_utc, detail, expected_session_date, calendar_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [(capture["scrape_date"], s["broker_code"], run, s["status"], snapshot, s["session_date"],
           s["akum_rows_returned"], s["dist_rows_returned"], s["tracked_rows"], BROKER_FLOW_METHOD,
           s["started_utc"], s["completed_utc"],
-          f"snapshot rejected: {reason}" if reason and s["status"] == FLOW_OK else s["detail"])
+          f"snapshot rejected: {reason}" if reason and s["status"] == FLOW_OK else s["detail"],
+          capture["expected_session_date"], capture["calendar_version"])
          for s in capture["scans"]])
 
 
@@ -1805,9 +1855,7 @@ def persist_broker_flow_capture(conn, capture):
     or if that transaction fails, broker_flow is not touched and the scans are
     recorded, on their own, as REJECTED with the reason. Returns True iff the
     snapshot was persisted."""
-    conn.execute(BROKER_FLOW_DDL)
-    conn.execute(BROKER_FLOW_SCAN_DDL)
-    conn.commit()
+    _ensure_broker_flow_tables(conn)
     date, reason = capture["scrape_date"], capture["reason"]
     if reason is None:
         try:

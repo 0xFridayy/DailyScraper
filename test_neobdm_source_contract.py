@@ -1797,6 +1797,139 @@ def test_broker_flow_writes_nothing_without_one_prior_session(monkeypatch, sessi
     assert rows == [(got["scrape_date"], "OLD1", "XL", 1.0, 1.0, 9.0, 1.0, 1.0)]
 
 
+# ── expected source session: exactly the latest IDX session before scrape_date ──
+@pytest.mark.parametrize("label, when, expected", [
+    ("29 Sep 2026", (2026, 9, 30, 7, 5), "2026-09-29"),     # normal next-day capture (Wed <- Tue)
+    ("29 Sep 2026", (2026, 9, 30, 18, 0), "2026-09-29"),    # clock time plays no part
+    ("25 Sep 2026", (2026, 9, 28, 7, 5), "2026-09-25"),     # Monday <- Friday
+    ("25 Sep 2026", (2026, 9, 26, 7, 5), "2026-09-25"),     # Saturday copy of Friday
+    ("14 Aug 2026", (2026, 8, 18, 7, 5), "2026-08-14"),     # previous weekday 08-17 is a holiday
+    ("14 Aug 2026", (2026, 8, 17, 7, 5), "2026-08-14"),     # run on the holiday itself
+    ("17 Mar 2026", (2026, 3, 25, 7, 5), "2026-03-17"),     # Nyepi + Lebaran closure 03-18..03-24
+    ("30 Dec 2026", (2027, 1, 4, 7, 5), "2026-12-30"),      # 12-31 Libur Bursa, 01-01 closed, weekend
+])
+def test_broker_flow_persists_exactly_the_expected_source_session(monkeypatch, label, when, expected):
+    got, persisted, rows = run_sessions(monkeypatch, {"XL": label, "AK": label}, when)
+    assert got["reason"] is None and persisted
+    assert got["expected_session_date"] == expected == got["scans"][0]["session_date"]
+    assert {r[0] for r in rows} == {got["scrape_date"]} and ("OLD1", "XL") not in {r[1:3] for r in rows}
+
+
+@pytest.mark.parametrize("label, when, reason", [
+    ("28 Sep 2026", (2026, 9, 30, 7, 5),      # stale by one session
+     "source session 2026-09-28 is stale: the latest IDX session before scrape date 2026-09-30 is 2026-09-29"),
+    ("24 Sep 2026", (2026, 9, 30, 7, 5), "source session 2026-09-24 is stale"),     # by several
+    ("24 Sep 2026", (2026, 9, 28, 7, 5), "the latest IDX session before scrape date 2026-09-28 is 2026-09-25"),
+    ("16 Mar 2026", (2026, 3, 25, 7, 5), "source session 2026-03-16 is stale"),     # across the closure
+    ("17 Aug 2026", (2026, 8, 18, 7, 5),      # a holiday: what a previous-weekday rule would expect
+     "source session 2026-08-17 is not an IDX session per idx-2026-2027.v1 "
+     "(latest before scrape date 2026-08-18 is 2026-08-14)"),
+    ("27 Sep 2026", (2026, 9, 28, 7, 5), "source session 2026-09-27 is not an IDX session"),   # a Sunday
+    ("30 Sep 2026", (2026, 9, 30, 18, 0), "source session 2026-09-30 is not before scrape date 2026-09-30"),
+    ("26 Mar 2026", (2026, 3, 25, 7, 5), "source session 2026-03-26 is not before scrape date 2026-03-25"),
+])
+def test_broker_flow_rejects_a_session_other_than_the_expected_one(monkeypatch, label, when, reason):
+    got, persisted, rows = run_sessions(monkeypatch, {"XL": label, "AK": label}, when)
+    assert reason in got["reason"]
+    assert not persisted and rows == [(got["scrape_date"], "OLD1", "XL", 1.0, 1.0, 9.0, 1.0, 1.0)]
+
+
+@pytest.mark.parametrize("label, when, missing", [
+    ("31 Dec 2027", (2028, 1, 4, 7, 5), "2028-01-03"),      # after COVERED_THROUGH
+    ("31 Dec 2025", (2026, 1, 2, 7, 5), "2025-12-31"),      # the walk leaves COVERED_FROM
+])
+def test_broker_flow_fails_closed_when_the_calendar_cannot_establish_the_session(monkeypatch, label, when, missing):
+    got, persisted, rows = run_sessions(monkeypatch, {"XL": label}, when)
+    assert got["reason"] == (f"cannot establish the latest IDX session before scrape date {got['scrape_date']}: "
+                             f"IdxCalendarUnavailable: {missing} is outside IDX calendar idx-2026-2027.v1 "
+                             f"(2026-01-01 to 2027-12-31)")
+    assert got["expected_session_date"] is None and not persisted
+    assert rows == [(got["scrape_date"], "OLD1", "XL", 1.0, 1.0, 9.0, 1.0, 1.0)]
+
+
+def test_broker_flow_fails_closed_when_the_calendar_lookup_raises(monkeypatch):
+    def broken(scrape_date):
+        raise RuntimeError("calendar exploded")
+    monkeypatch.setattr(ns.idx_calendar, "latest_idx_session_before", broken)
+    got, persisted, rows = run_sessions(monkeypatch, {"XL": FLOW_SESSION}, (2026, 9, 30, 7, 5))
+    assert got["reason"] == ("cannot establish the latest IDX session before scrape date 2026-09-30: "
+                             "RuntimeError: calendar exploded")
+    assert not persisted and rows == [("2026-09-30", "OLD1", "XL", 1.0, 1.0, 9.0, 1.0, 1.0)]
+
+
+def test_a_failed_code_is_still_the_reason_before_the_calendar(monkeypatch):
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL")}, codes=("XL", "AK"), when=(2028, 1, 4, 7, 5))
+    assert got["reason"] == "1/2 code(s) failed: AK" and got["expected_session_date"] is None
+
+
+def scan_provenance(conn):
+    return {r[0]: r[1:] for r in conn.execute(
+        "SELECT broker_code, snapshot, session_date, expected_session_date, calendar_version, detail "
+        "FROM broker_flow_scan")}
+
+
+@pytest.mark.parametrize("label, when, snapshot, expected, detail", [
+    ("29 Sep 2026", (2026, 9, 30, 7, 5), ns.SNAPSHOT_PERSISTED, "2026-09-29", ""),
+    ("28 Sep 2026", (2026, 9, 30, 7, 5), ns.SNAPSHOT_REJECTED, "2026-09-29", "snapshot rejected: source session "
+     "2026-09-28 is stale: the latest IDX session before scrape date 2026-09-30 is 2026-09-29 (idx-2026-2027.v1)"),
+    ("31 Dec 2027", (2028, 1, 4, 7, 5), ns.SNAPSHOT_REJECTED, None, "snapshot rejected: cannot establish"),
+])
+def test_scan_provenance_records_the_expected_session_and_calendar(monkeypatch, label, when, snapshot, expected,
+                                                                     detail):
+    got, _ = capture(monkeypatch, {c: flow_response(c, flow_body(day=label)) for c in ("XL", "AK")},
+                     codes=("XL", "AK"), when=when)
+    conn = flow_db()
+    ns.persist_broker_flow_capture(conn, got)
+    rows = scan_provenance(conn)
+    assert set(rows) == {"XL", "AK"}
+    for row in rows.values():
+        assert row[:4] == (snapshot, ns._label_day(*label.split()).isoformat(), expected, "idx-2026-2027.v1")
+        assert row[4].startswith(detail)
+
+
+# broker_flow_scan exactly as PR #72 created it, before the provenance columns.
+OLD_FLOW_SCAN_DDL = """
+    CREATE TABLE broker_flow_scan (
+        scrape_date TEXT NOT NULL, broker_code TEXT NOT NULL, run_started_utc TEXT NOT NULL,
+        status TEXT NOT NULL, snapshot TEXT NOT NULL, session_date TEXT, akum_rows_returned INTEGER,
+        dist_rows_returned INTEGER, tracked_rows INTEGER, method TEXT NOT NULL, started_utc TEXT,
+        completed_utc TEXT, detail TEXT,
+        PRIMARY KEY (scrape_date, broker_code, run_started_utc))
+"""
+OLD_SCAN_ROW = ("2026-09-30", "XL", "2026-09-29T23:04:00+00:00", "OK", "PERSISTED", "2026-09-29",
+                4, 4, 2, "dash_callback_v1", None, None, "")
+
+
+def old_scan_table(conn):
+    conn.execute(OLD_FLOW_SCAN_DDL)
+    conn.execute("INSERT INTO broker_flow_scan VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", OLD_SCAN_ROW)
+    conn.commit()
+
+
+def test_an_old_broker_flow_scan_table_gains_the_provenance_columns(monkeypatch):
+    conn = flow_db()
+    old_scan_table(conn)
+    got, _ = capture(monkeypatch, {"XL": flow_response("XL")}, when=(2026, 9, 30, 8, 0))
+    assert ns.persist_broker_flow_capture(conn, got)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(broker_flow_scan)")]
+    assert columns[-2:] == ["expected_session_date", "calendar_version"]
+    rows = conn.execute("SELECT run_started_utc, snapshot, expected_session_date, calendar_version "
+                        "FROM broker_flow_scan ORDER BY run_started_utc").fetchall()
+    assert rows == [("2026-09-29T23:04:00+00:00", ns.SNAPSHOT_SUPERSEDED, None, None),     # old row: NULL
+                    ("2026-09-30T00:00:00+00:00", ns.SNAPSHOT_PERSISTED, "2026-09-29", "idx-2026-2027.v1")]
+
+
+def test_init_db_migrates_an_old_scan_table_once_and_keeps_its_rows(monkeypatch, tmpdir_path):
+    monkeypatch.setattr(ns, "DB_PATH", os.path.join(tmpdir_path, "neobdm.db"))
+    conn = sqlite3.connect(ns.DB_PATH)
+    old_scan_table(conn)
+    conn.close()
+    for _ in range(2):                                                    # idempotent
+        conn = ns.init_db()
+        assert conn.execute("SELECT * FROM broker_flow_scan").fetchall() == [OLD_SCAN_ROW + (None, None)]
+        conn.close()
+
+
 BAD_CELLS = [None, "", "   ", "-", "N/A", "abc", "1.2.3", float("nan"), float("inf"), float("-inf"), True, [1]]
 
 
