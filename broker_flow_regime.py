@@ -51,6 +51,7 @@ import math
 import os
 import sqlite3
 import sys
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -139,7 +140,15 @@ AUDITED_SNAPSHOT = {
         "ordered_sha256": "ff59ea3a7bcb8014aca70a3d077da68d55ea98fd709720d6897cb47c51f104d7",
     },
     "broker_daily_sha256": "c8d1948f00d99ba96fe17376292f32a9cda2be36e2eb5ce303e680427f05cc32",
+    # inferred_session_date and SCAN_VERIFIED validation both use the calendar
+    "idx_calendar_version": "idx-2026-2027.v1",
 }
+
+# PERSISTED scan runs written before PR #73 added expected_session_date and
+# calendar_version. Their NULL metadata is accepted for exactly these runs;
+# any other run with NULL metadata is contradictory (every PR #73 write fills
+# both). Never inferred from NULLs or timestamps.
+AUDITED_LEGACY_SCAN_RUNS = frozenset({("2026-09-30", "2026-09-30T01:52:17.810039+00:00")})
 
 BACKFILL_EVIDENCE_REF = ("backfill_inventory.insert_inventory: broker_flow.date = "
                          "/api/inventory data.date, days <= BACKFILL_END (2026-07-04), "
@@ -228,28 +237,91 @@ def _scan_fingerprint(scan):
     return _sha256_rows([sorted((k, v) for k, v in r.items() if v is not None) for r in scan])
 
 
-def scan_evidence(scan, d, live_rows):
-    """The PERSISTED run for scrape_date d, or None. Any disagreement between
-    that run and the live rows it claims to have written raises."""
+def scan_evidence(scan, d, live_by_broker):
+    """The PERSISTED run for scrape_date d, or None. live_by_broker:
+    {broker_code: live broker_flow rows on d}.
+
+    SCAN_VERIFIED needs provenance that proves itself; anything contradictory
+    raises ProvenanceContradiction (never a silent downgrade):
+      - one run, each broker_code once, every row status OK / dash_callback_v1;
+      - one non-NULL session_date, equal to the latest IDX session strictly
+        before d under the runtime calendar (so never same-day, future,
+        non-session or stale; an unanswerable calendar fails too);
+      - PR #73 metadata: every row has the same non-NULL expected_session_date,
+        equal to session_date, and the same non-NULL calendar_version. All-NULL
+        metadata only for a run in AUDITED_LEGACY_SCAN_RUNS.
+        The recorded calendar_version is NOT required to equal the runtime one:
+        the runtime calendar re-derives the session and must agree with the
+        recorded expected_session_date, which is the substantive check. A
+        version-label match would add nothing and would make every run recorded
+        before a calendar bump (needed for 2028) unusable.
+      - tracked_rows non-NULL and equal, per broker, to the live rows of that
+        broker on d, and no live broker outside the run."""
     persisted = [r for r in scan if r["scrape_date"] == d and r["snapshot"] == "PERSISTED"]
     if not persisted:
         return None
-    runs = sorted({r["run_started_utc"] for r in persisted})
-    sessions = sorted({r["session_date"] for r in persisted})
-    tracked = sum(r["tracked_rows"] or 0 for r in persisted)
-    bad = [r["broker_code"] for r in persisted
-           if r["status"] != "OK" or r["method"] != "dash_callback_v1"]
-    if len(runs) != 1 or len(sessions) != 1 or sessions[0] is None or bad:
-        raise ProvenanceContradiction(
-            f"{d}: PERSISTED scan rows disagree (runs={runs}, sessions={sessions}, not-ok={bad})")
-    if tracked != live_rows:
-        raise ProvenanceContradiction(
-            f"{d}: PERSISTED scan tracked {tracked} rows but broker_flow holds {live_rows} live rows")
-    return {"run_started_utc": runs[0], "session_date": sessions[0],
-            "codes": len(persisted), "tracked_rows": tracked,
-            "expected_session_date": sorted({r.get("expected_session_date") for r in persisted},
-                                            key=str),
-            "calendar_version": sorted({r.get("calendar_version") for r in persisted}, key=str),
+
+    def contradiction(why):
+        return ProvenanceContradiction(f"{d}: PERSISTED scan {why}")
+
+    runs = sorted({r["run_started_utc"] for r in persisted}, key=str)
+    if len(runs) != 1:
+        raise contradiction(f"has {len(runs)} runs: {runs}")
+    run = runs[0]
+    counts = Counter(r["broker_code"] for r in persisted)
+    dupes = sorted(c for c, k in counts.items() if k > 1)
+    if dupes:
+        raise contradiction(f"repeats broker codes {dupes}")
+    bad = sorted(r["broker_code"] for r in persisted
+                 if r["status"] != "OK" or r["method"] != "dash_callback_v1")
+    if bad:
+        raise contradiction(f"has rows that are not OK dash_callback_v1: {bad}")
+
+    sessions = sorted({r["session_date"] for r in persisted}, key=str)
+    if len(sessions) != 1 or sessions[0] is None:
+        raise contradiction(f"does not name one source session: {sessions}")
+    session = sessions[0]
+    version = idx_calendar.CALENDAR_VERSION
+    try:
+        want = idx_calendar.latest_idx_session_before(date.fromisoformat(d)).isoformat()
+    except Exception as e:     # uncovered date, lookback exhausted, bad date: unprovable
+        raise contradiction(f"session {session} cannot be checked against {version}: {e}")
+    if session != want:
+        raise contradiction(f"source session {session} is not {want}, the latest IDX session "
+                            f"before {d} per {version}")
+
+    expected = {r.get("expected_session_date") for r in persisted}
+    versions = {r.get("calendar_version") for r in persisted}
+    if expected == {None} and versions == {None}:
+        if (d, run) not in AUDITED_LEGACY_SCAN_RUNS:
+            raise contradiction(f"run {run} has no expected_session_date/calendar_version and "
+                                "is not an audited pre-PR #73 run")
+    elif None in expected or None in versions:
+        raise contradiction("has expected_session_date/calendar_version on some rows only")
+    elif len(expected) != 1 or len(versions) != 1:
+        raise contradiction(f"rows disagree: expected_session_date {sorted(expected)}, "
+                            f"calendar_version {sorted(versions)}")
+    elif expected != {session}:
+        raise contradiction(f"expected_session_date {sorted(expected)[0]} != "
+                            f"source session {session}")
+
+    missing = sorted(r["broker_code"] for r in persisted if r["tracked_rows"] is None)
+    if missing:
+        raise contradiction(f"has NULL tracked_rows for {missing}")
+    tracked = {r["broker_code"]: r["tracked_rows"] for r in persisted}
+    total, live_rows = sum(tracked.values()), sum(live_by_broker.values())
+    if total != live_rows:
+        raise contradiction(f"tracked {total} rows but broker_flow holds {live_rows} live rows")
+    wrong = sorted(f"{c}:{n}!={live_by_broker.get(c, 0)}" for c, n in tracked.items()
+                   if n != live_by_broker.get(c, 0))
+    unscanned = sorted(set(live_by_broker) - set(tracked))
+    if wrong or unscanned:
+        raise contradiction(f"does not match live rows per broker: tracked!=live {wrong}, "
+                            f"live brokers outside the run {unscanned}")
+    return {"run_started_utc": run, "session_date": session,
+            "codes": len(persisted), "tracked_rows": total,
+            "expected_session_date": sorted(expected, key=str),
+            "calendar_version": sorted(versions, key=str),
             "sha256": _scan_fingerprint(persisted)[1]}
 
 
@@ -407,6 +479,9 @@ def check_snapshot(snapshot, total, flow_sha, groups, scan_fp, broker_daily_path
     if scan_fp[1] != want_scan["ordered_sha256"]:
         diffs.append(f"broker_flow_scan ordered sha256 {scan_fp[1]} != "
                      f"{want_scan['ordered_sha256']}")
+    if idx_calendar.CALENDAR_VERSION != snapshot["idx_calendar_version"]:
+        diffs.append(f"runtime idx_calendar {idx_calendar.CALENDAR_VERSION} != "
+                     f"{snapshot['idx_calendar_version']}")
     if source_commit is not None and source_commit != snapshot["source_commit"]:
         diffs.append(f"source_commit {source_commit} != {snapshot['source_commit']}")
     if not (broker_daily_path and os.path.isfile(broker_daily_path)):
@@ -460,7 +535,7 @@ def _build(con, broker_daily_path, source_commit, snapshot):
         rec["inferred_session_date"] = _inferred_session(d)
         cm = content_match(d, live[d], by_session) if by_session is not None else None
         rec["content_match"] = cm
-        sc = scan_evidence(scan, d, n)
+        sc = scan_evidence(scan, d, Counter(b for _, b in live[d]))
 
         if d in AUDITED_MIXED:
             if sc is not None:

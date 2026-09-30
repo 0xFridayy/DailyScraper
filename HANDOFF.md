@@ -1393,10 +1393,11 @@ lampau tidak boleh berubah.
 **Manifest yang di-commit = satu snapshot teraudit** (`AUDITED_SNAPSHOT`,
 `audited-2026-09-30`, master 1aeca53): 232.493 baris, 305 record, BACKFILL
 212.839/218, LIVE 19.654/87, hash urut `9c433af0…d353`, `broker_flow_scan` 29
-baris / `ff59ea3a…04d7` (sumber SCAN_VERIFIED), parquet `c8d1948f…`.
+baris / `ff59ea3a…04d7` (sumber SCAN_VERIFIED), parquet `c8d1948f…`, kalender
+runtime `idx-2026-2027.v1`.
 `build` default memeriksa semua fakta itu **sebelum** mengklasifikasi; kalau ada
 yang beda (tanggal baru, grup hilang/berubah, baris scan berubah/bertambah
-walau `broker_flow` identik, parquet lain/tidak ada) → ditolak,
+walau `broker_flow` identik, parquet lain/tidak ada, versi kalender lain) → ditolak,
 exit 2, tidak ada yang ditulis. DB kerja berubah tiap malam, jadi rebuild
 dilakukan dari `neobdm.db` di commit 1aeca53 (identik byte):
 
@@ -1408,6 +1409,27 @@ Snapshot baru harus disengaja: `build --new-snapshot --out <file lain>`; path
 manifest teraudit ditolak. Tanggal MIXED juga dikunci ke `rows_sha256` baris
 rerun-nya: bila baris 08-12/08-27 berubah, build menolak alih-alih tetap
 menyebutnya MIXED.
+
+**SCAN_VERIFIED harus membuktikan dirinya** (berlaku juga untuk
+`--new-snapshot`). Untuk run PERSISTED satu `scrape_date`: satu
+`run_started_utc`; tiap `broker_code` sekali; semua baris OK /
+`dash_callback_v1`; satu `session_date` non-NULL yang **sama dengan**
+`idx_calendar.latest_idx_session_before(scrape_date)` (jadi sesi hari yang
+sama, masa depan, bukan-sesi, atau basi ditolak; kalender yang tidak bisa
+menjawab juga ditolak). Metadata PR #73: setiap baris punya satu
+`expected_session_date` non-NULL yang sama dengan `session_date`, dan satu
+`calendar_version` non-NULL. Metadata NULL hanya diterima untuk run di
+`AUDITED_LEGACY_SCAN_RUNS` (hanya run 09-30 pra-PR #73, `…01:52:17.810039`).
+`calendar_version` yang tercatat tidak harus sama dengan versi runtime:
+kalender runtime menurunkan ulang sesinya dan harus cocok dengan
+`expected_session_date`, dan itulah cek yang substantif. Menuntut label versi
+sama justru membuat semua run lama tak terpakai setelah kalender dinaikkan
+(wajib sebelum 2028). `tracked_rows` non-NULL dan **per broker** sama dengan
+jumlah baris live broker itu pada tanggal tersebut, dan tidak ada broker live di
+luar run. Tidak ada angka 29 yang dikunci di aturan umum (konfigurasi capture
+bisa berubah); snapshot teraudit sudah mengunci 29 barisnya lewat hash scan.
+Pelanggaran apa pun → `ProvenanceContradiction`, build ditolak (exit 2), tidak
+pernah diturunkan diam-diam ke INFERRED_ONLY.
 
 Tes: `test_broker_flow_regime.py` (pytest; set `BROKER_DAILY_PARQUET` untuk
 tes reproduksi byte-identik — parquet yang disebut eksplisit tapi hash-nya

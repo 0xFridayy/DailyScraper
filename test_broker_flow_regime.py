@@ -17,6 +17,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+from datetime import date
 
 import pytest
 
@@ -96,21 +97,26 @@ def make_fixture(tmp_path, scan_tracked=None, with_scan=True):
             snapshot TEXT NOT NULL, session_date TEXT, akum_rows_returned INTEGER,
             dist_rows_returned INTEGER, tracked_rows INTEGER, method TEXT NOT NULL,
             started_utc TEXT, completed_utc TEXT, detail TEXT,
+            expected_session_date TEXT, calendar_version TEXT,
             PRIMARY KEY (scrape_date, broker_code, run_started_utc))""")
         tracked = scan_tracked or (3, 2)
         run = "2026-09-30T01:52:17+00:00"
-        con.executemany("INSERT INTO broker_flow_scan VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+        cal = "idx-2026-2027.v1"
+        con.executemany("INSERT INTO broker_flow_scan VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
             ("2026-09-30", "AK", run, "OK", "PERSISTED", "2026-09-29", 10, 10, tracked[0],
-             "dash_callback_v1", run, run, ""),
+             "dash_callback_v1", run, run, "", "2026-09-29", cal),
             ("2026-09-30", "ZP", run, "OK", "PERSISTED", "2026-09-29", 10, 10, tracked[1],
-             "dash_callback_v1", run, run, ""),
+             "dash_callback_v1", run, run, "", "2026-09-29", cal),
             ("2026-09-29", "AK", "2026-09-29T01:00:00+00:00", "SOURCE_FAILURE", "REJECTED",
-             None, None, None, None, "dash_callback_v1", None, None, "http 500"),
+             None, None, None, None, "dash_callback_v1", None, None, "http 500",
+             "2026-09-28", cal),
             # an earlier run for the same scrape_date that was not persisted
             ("2026-09-30", "AK", "2026-09-30T00:10:00+00:00", "SOURCE_FAILURE", "REJECTED",
-             None, None, None, None, "dash_callback_v1", None, None, "http 500"),
+             None, None, None, None, "dash_callback_v1", None, None, "http 500",
+             "2026-09-29", cal),
             ("2026-09-30", "ZP", "2026-09-30T00:10:00+00:00", "OK", "REJECTED",
-             "2026-09-28", 10, 10, 4, "dash_callback_v1", None, None, "stale session"),
+             "2026-09-28", 10, 10, 4, "dash_callback_v1", None, None, "stale session",
+             "2026-09-29", cal),
         ])
     con.commit()
     con.close()
@@ -173,7 +179,8 @@ def snapshot_of(db, pq, name="synthetic"):
             "broker_flow": {"rows": rows, "records": len(groups), "ordered_sha256": digest,
                             "by_regime": by_regime},
             "broker_flow_scan": {"rows": scan_rows, "ordered_sha256": scan_digest},
-            "broker_daily_sha256": bfr.file_sha256(pq)}
+            "broker_daily_sha256": bfr.file_sha256(pq),
+            "idx_calendar_version": bfr.idx_calendar.CALENDAR_VERSION}
 
 
 def edited_copy(src, dst, *sql):
@@ -456,6 +463,7 @@ def test_committed_manifest_holds_the_audited_classification():
     assert bf["by_regime"] == snap["broker_flow"]["by_regime"]
     assert m["input"]["broker_flow_scan"] == snap["broker_flow_scan"]
     assert m["input"]["content_match_evidence"]["sha256"] == snap["broker_daily_sha256"]
+    assert m["input"]["idx_calendar_version"] == snap["idx_calendar_version"]
     assert (bf["rows"], bf["dates"]) == (AUDIT["rows"], AUDIT["dates"])
     for regime in (bfr.BACKFILL, bfr.LIVE):
         assert bf["by_regime"][regime] == AUDIT[regime]
@@ -739,6 +747,10 @@ def test_audited_build_refuses_a_changed_scan_even_with_identical_broker_flow(
     assert flow_fp(db) == flow_fp(baseline_db)
     assert scan_fp(db) != scan_fp(baseline_db)
     pq = optional_real_parquet()
+
+    def never(*args, **kwargs):
+        raise AssertionError("scan_evidence ran before the audited snapshot guard")
+    monkeypatch.setattr(bfr, "scan_evidence", never)
     # SnapshotMismatch, not ProvenanceContradiction: refused before classifying
     with pytest.raises(bfr.SnapshotMismatch) as e:
         bfr.build_manifest(db, pq, snapshot=bfr.AUDITED_SNAPSHOT)
@@ -760,18 +772,36 @@ def test_audited_build_refuses_a_changed_scan_even_with_identical_broker_flow(
 
 def test_new_snapshot_mode_can_describe_a_different_scan_without_touching_the_audit(
         baseline_db, tmp_path, monkeypatch):
-    db = edited_copy(baseline_db, tmp_path / "scan.db", SCAN_EDITS["session_date"])
+    """A different but valid scan state (an extra REJECTED run) is described;
+    the audited manifest is not touched."""
+    db = edited_copy(baseline_db, tmp_path / "scan.db", SCAN_EDITS["extra_row"])
     target = sandbox_committed(tmp_path, monkeypatch)
     real_before = sha(COMMITTED) if os.path.exists(COMMITTED) else None
     out = tmp_path / "other" / "scan_snapshot.json"
     assert bfr.main(["build", "--new-snapshot", "--db", db, "--out", str(out)]) == 0
     m = json.loads(out.read_text(encoding="ascii"))
     r = by_key(m)[("2026-09-30", bfr.LIVE)]
-    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-28")
+    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-29")
     assert m["input"]["snapshot"] is None
     assert m["input"]["broker_flow_scan"] != bfr.AUDITED_SNAPSHOT["broker_flow_scan"]
     assert m["input"]["broker_flow"]["ordered_sha256"] == \
         bfr.AUDITED_SNAPSHOT["broker_flow"]["ordered_sha256"]
+    assert target.read_text(encoding="ascii") == "audited"
+    if real_before is not None:
+        assert sha(COMMITTED) == real_before
+
+
+@pytest.mark.parametrize("edit", ["session_date", "tracked_rows"])
+def test_new_snapshot_refuses_the_real_run_with_contradictory_scan_and_writes_nothing(
+        baseline_db, tmp_path, monkeypatch, edit):
+    """The real audited run, with its session moved to a stale 09-28 or one
+    broker's tracked_rows off by one, is contradictory provenance."""
+    db = edited_copy(baseline_db, tmp_path / "scan.db", SCAN_EDITS[edit])
+    target = sandbox_committed(tmp_path, monkeypatch)
+    real_before = sha(COMMITTED) if os.path.exists(COMMITTED) else None
+    out = tmp_path / "other" / "scan_snapshot.json"
+    assert bfr.main(["build", "--new-snapshot", "--db", db, "--out", str(out)]) == 2
+    assert not out.exists() and not os.path.exists(str(out) + ".tmp")
     assert target.read_text(encoding="ascii") == "audited"
     if real_before is not None:
         assert sha(COMMITTED) == real_before
@@ -840,3 +870,250 @@ def test_mixed_quarantine_is_rederived_from_git_history(d, tmp_path):
     rerun_state = group_state(paths[1], d)
     assert rerun_state == (ev["rerun"]["live_rows"], ev["rerun"]["rows_sha256"])
     assert by_key(committed())[(d, bfr.LIVE)]["rows_sha256"] == rerun_state[1]
+
+
+# --------------------------------------------------------------------------
+# SCAN_VERIFIED provenance integrity (generic builds). A contradictory PERSISTED
+# run raises; it is never downgraded. The audited snapshot is hash-pinned and
+# refused before any of this runs (see the scan-mutation tests above).
+# --------------------------------------------------------------------------
+
+CAL = bfr.idx_calendar.CALENDAR_VERSION
+RUN = "2026-09-30T02:00:00+00:00"
+LEGACY_RUN = "2026-09-30T01:52:17.810039+00:00"
+PR73_FIELDS = ("expected_session_date", "calendar_version")
+SCAN_FIELDS = ("scrape_date", "broker_code", "run_started_utc", "status", "snapshot",
+               "session_date", "akum_rows_returned", "dist_rows_returned", "tracked_rows",
+               "method", "started_utc", "completed_utc", "detail") + PR73_FIELDS
+
+
+def scan_row(code, tracked, **over):
+    row = {"scrape_date": "2026-09-30", "broker_code": code, "run_started_utc": RUN,
+           "status": "OK", "snapshot": "PERSISTED", "session_date": "2026-09-29",
+           "akum_rows_returned": 10, "dist_rows_returned": 10, "tracked_rows": tracked,
+           "method": "dash_callback_v1", "started_utc": RUN, "completed_utc": RUN, "detail": "",
+           "expected_session_date": "2026-09-29", "calendar_version": CAL}
+    row.update(over)
+    return row
+
+
+def run_db(tmp_path, scans, live=None, d="2026-09-30", pr73_columns=True, pk=True):
+    """broker_flow with `live` {broker: n rows} on d, and a broker_flow_scan
+    holding `scans`: PR #73 schema, or the pre-PR #73 one without its columns."""
+    live = {"AK": 3, "ZP": 2} if live is None else live
+    fields = SCAN_FIELDS if pr73_columns else SCAN_FIELDS[:-2]
+    db = tmp_path / "run.db"
+    con = sqlite3.connect(db)
+    con.execute("""CREATE TABLE broker_flow (date TEXT NOT NULL, ticker TEXT NOT NULL,
+        broker_code TEXT NOT NULL, bval REAL, sval REAL, netval REAL, bavg REAL, savg REAL,
+        PRIMARY KEY (date, ticker, broker_code))""")
+    con.executemany("INSERT INTO broker_flow VALUES (?,?,?,?,?,?,?,?)",
+                    [(d, f"T{i:03d}", code, 1.0, 0.5, 0.5, 100.0, 100.0)
+                     for code, n in live.items() for i in range(n)])
+    key = ", PRIMARY KEY (scrape_date, broker_code, run_started_utc)" if pk else ""
+    con.execute(f"CREATE TABLE broker_flow_scan ({', '.join(fields)}{key})")
+    for row in scans:
+        assert pr73_columns or all(row[f] is None for f in PR73_FIELDS)
+        con.execute(f"INSERT INTO broker_flow_scan ({', '.join(fields)}) "
+                    f"VALUES ({', '.join('?' * len(fields))})", [row[f] for f in fields])
+    con.commit()
+    con.close()
+    return str(db)
+
+
+def classify(db, d="2026-09-30"):
+    return by_key(bfr.build_manifest(db, None))[(d, bfr.LIVE)]
+
+
+def both(**over):
+    return [scan_row("AK", 3, **over), scan_row("ZP", 2, **over)]
+
+
+def zp_only(**over):
+    return [scan_row("AK", 3), scan_row("ZP", 2, **over)]
+
+
+LEGACY = {"run_started_utc": LEGACY_RUN, "expected_session_date": None, "calendar_version": None}
+
+
+def test_consistent_post_pr73_run_is_scan_verified(tmp_path):
+    assert bfr.idx_calendar.latest_idx_session_before(date(2026, 9, 30)) == date(2026, 9, 29)
+    r = classify(run_db(tmp_path, both()))
+    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-29")
+    assert (r["scan"]["expected_session_date"], r["scan"]["calendar_version"]) == \
+        (["2026-09-29"], [CAL])
+    assert (r["scan"]["codes"], r["scan"]["tracked_rows"]) == (2, 5)
+
+
+@pytest.mark.parametrize("scans, pr73_columns, reason", [
+    # the source session itself is wrong for scrape_date 2026-09-30 (metadata agrees with it,
+    # so only the calendar can catch these)
+    (both(session_date="2026-10-01", expected_session_date="2026-10-01"), True,
+     "source session 2026-10-01 is not 2026-09-29"),                               # future
+    (both(session_date="2026-09-30", expected_session_date="2026-09-30"), True,
+     "source session 2026-09-30 is not 2026-09-29"),                               # same day
+    (both(session_date="2026-09-28", expected_session_date="2026-09-28"), True,
+     "source session 2026-09-28 is not 2026-09-29"),                               # stale
+    (both(session_date="2026-09-27", expected_session_date="2026-09-27"), True,
+     "source session 2026-09-27 is not 2026-09-29"),                               # Sunday
+    (zp_only(session_date="2026-09-28"), True, "does not name one source session"),
+    (both(session_date=None), True, "does not name one source session"),
+    # PR #73 metadata contradicts itself or the session
+    (both(expected_session_date="2026-09-28"), True,
+     "expected_session_date 2026-09-28 != source session 2026-09-29"),
+    (zp_only(expected_session_date="2026-09-28"), True, "rows disagree"),
+    (zp_only(calendar_version="idx-2026-2027.v0"), True, "rows disagree"),
+    (zp_only(expected_session_date=None), True, "on some rows only"),
+    (zp_only(calendar_version=None), True, "on some rows only"),
+    (both(expected_session_date=None, calendar_version=None), True,
+     "is not an audited pre-PR #73 run"),
+    (both(expected_session_date=None, calendar_version=None), False,
+     "is not an audited pre-PR #73 run"),
+    # the legacy exemption covers NULL metadata only, never a wrong session
+    (both(session_date="2026-09-28", **LEGACY), False, "source session 2026-09-28 is not"),
+    # run-level integrity
+    (zp_only(run_started_utc="2026-09-30T03:00:00+00:00"), True, "has 2 runs"),
+    (zp_only(status="SOURCE_FAILURE"), True, "not OK dash_callback_v1: ['ZP']"),
+])
+def test_contradictory_session_provenance_raises_instead_of_scan_verified(
+        tmp_path, scans, pr73_columns, reason):
+    db = run_db(tmp_path, scans, pr73_columns=pr73_columns)
+    with pytest.raises(bfr.ProvenanceContradiction) as e:
+        bfr.build_manifest(db, None)
+    assert reason in str(e.value), str(e.value)
+
+
+@pytest.mark.parametrize("pr73_columns", [False, True])
+def test_the_known_audited_legacy_run_keeps_its_null_metadata(tmp_path, pr73_columns):
+    """Pre-PR #73 table, or the same rows after the nullable ALTER."""
+    r = classify(run_db(tmp_path, both(**LEGACY), pr73_columns=pr73_columns))
+    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-29")
+    assert (r["scan"]["expected_session_date"], r["scan"]["calendar_version"]) == ([None], [None])
+    assert ("2026-09-30", LEGACY_RUN) in bfr.AUDITED_LEGACY_SCAN_RUNS
+
+
+def test_the_legacy_exemption_is_keyed_by_scrape_date_and_run(tmp_path):
+    scans = [dict(r, scrape_date="2026-10-01", session_date="2026-09-30")
+             for r in both(**LEGACY)]
+    db = run_db(tmp_path, scans, d="2026-10-01", pr73_columns=False)
+    with pytest.raises(bfr.ProvenanceContradiction, match="not an audited pre-PR #73 run"):
+        bfr.build_manifest(db, None)
+
+
+def test_the_real_audited_legacy_run_is_still_scan_verified(baseline_db):
+    r = by_key(bfr.build_manifest(baseline_db, None))[("2026-09-30", bfr.LIVE)]
+    assert (r["date_class"], r["capture_class"], r["canonical_session_date"], r["row_count"]) \
+        == (bfr.SCAN_VERIFIED, bfr.FULL_CALLBACK, "2026-09-29", 965)
+    assert (r["scan"]["run_started_utc"], r["scan"]["codes"]) == (LEGACY_RUN, 29)
+
+
+def test_an_unanswerable_calendar_fails_closed(tmp_path, monkeypatch):
+    # 2028 is outside idx-2026-2027.v1
+    scans = [dict(r, scrape_date="2028-01-05", run_started_utc="2028-01-05T02:00:00+00:00",
+                  session_date="2028-01-04", expected_session_date="2028-01-04")
+             for r in both()]
+    db = run_db(tmp_path, scans, d="2028-01-05")
+    with pytest.raises(bfr.ProvenanceContradiction, match="cannot be checked against"):
+        bfr.build_manifest(db, None)
+
+    # any lookup failure, not only IdxCalendarUnavailable, is unprovable
+    def broken(_):
+        raise RuntimeError("calendar lookup failed")
+    monkeypatch.setattr(bfr.idx_calendar, "latest_idx_session_before", broken)
+    with pytest.raises(bfr.ProvenanceContradiction, match="calendar lookup failed"):
+        bfr.scan_evidence(both(), "2026-09-30", {"AK": 3, "ZP": 2})
+    # and a whole build with a broken calendar fails before anything is written
+    other = tmp_path / "covered"
+    other.mkdir()
+    out = tmp_path / "out.json"
+    with pytest.raises(RuntimeError):
+        bfr.main(["build", "--new-snapshot", "--db", run_db(other, both()), "--out", str(out)])
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("scans, live, pk, reason", [
+    # offsetting per-broker errors, same aggregate total (5)
+    ([scan_row("AK", 4), scan_row("ZP", 1)], None, True, "AK:4!=3"),
+    # live rows of a broker the run never scanned
+    ([scan_row("AK", 3), scan_row("ZP", 2)], {"AK": 3, "ZP": 1, "XX": 1}, True,
+     "live brokers outside the run ['XX']"),
+    # a persisted broker renamed to an unrelated code
+    ([scan_row("AK", 3), scan_row("ZZ", 2)], None, True, "ZZ:2!=0"),
+    # NULL tracked_rows (the old `or 0` made this total 3 == 3)
+    ([scan_row("AK", 3), scan_row("ZP", None)], {"AK": 3}, True, "NULL tracked_rows for ['ZP']"),
+    # a broker code twice in one run (possible only without the primary key)
+    ([scan_row("AK", 3), scan_row("AK", 0), scan_row("ZP", 2)], None, False,
+     "repeats broker codes ['AK']"),
+])
+def test_tracked_rows_must_match_live_rows_per_broker(tmp_path, scans, live, pk, reason):
+    db = run_db(tmp_path, scans, live=live, pk=pk)
+    with pytest.raises(bfr.ProvenanceContradiction) as e:
+        bfr.build_manifest(db, None)
+    assert reason in str(e.value), str(e.value)
+
+
+def test_a_broker_with_zero_tracked_rows_and_no_live_rows_is_valid(tmp_path):
+    r = classify(run_db(tmp_path, both() + [scan_row("BB", 0)]))
+    assert r["date_class"] == bfr.SCAN_VERIFIED
+    assert (r["scan"]["codes"], r["scan"]["tracked_rows"]) == (3, 5)
+
+
+def test_rejected_and_superseded_runs_take_no_part_in_reconciliation(tmp_path):
+    old, late = "2026-09-30T00:10:00+00:00", "2026-09-30T05:00:00+00:00"
+    noise = [scan_row("AK", 9, run_started_utc=old, snapshot="SUPERSEDED",
+                      session_date="2026-09-28", expected_session_date="2026-09-28"),
+             scan_row("XX", 4, run_started_utc=old, snapshot="SUPERSEDED"),
+             scan_row("ZP", None, run_started_utc=late, snapshot="REJECTED", status="SOURCE_FAILURE",
+                      session_date=None),
+             scan_row("QQ", 7, run_started_utc=late, snapshot="REJECTED",
+                      expected_session_date=None, calendar_version=None)]
+    r = classify(run_db(tmp_path, both() + noise))
+    assert (r["date_class"], r["canonical_session_date"]) == (bfr.SCAN_VERIFIED, "2026-09-29")
+    assert (r["scan"]["run_started_utc"], r["scan"]["codes"], r["scan"]["tracked_rows"]) == \
+        (RUN, 2, 5)
+
+
+def test_contradictory_new_snapshot_exits_2_and_writes_nothing(tmp_path, monkeypatch):
+    db = run_db(tmp_path, both(session_date="2026-09-28"))        # expected stays 09-29
+    target = sandbox_committed(tmp_path, monkeypatch)
+    out = tmp_path / "other" / "new.json"
+    assert bfr.main(["build", "--new-snapshot", "--db", db, "--out", str(out)]) == 2
+    assert not out.exists() and not os.path.exists(str(out) + ".tmp")
+    assert target.read_text(encoding="ascii") == "audited"
+
+
+# Calendar pin: the audited snapshot is reproducible only with its calendar.
+
+def test_audited_snapshot_refuses_another_runtime_calendar(fixture, monkeypatch):
+    db, pq = fixture
+    contract = snapshot_of(db, pq)
+    bfr.build_manifest(db, pq, snapshot=contract)                # passes as pinned
+    monkeypatch.setattr(bfr.idx_calendar, "CALENDAR_VERSION", "idx-2026-2028.v2")
+    with pytest.raises(bfr.SnapshotMismatch,
+                       match="runtime idx_calendar idx-2026-2028.v2 != idx-2026-2027.v1"):
+        bfr.build_manifest(db, pq, snapshot=contract)
+
+
+def test_the_real_audited_snapshot_refuses_another_runtime_calendar(baseline_db, monkeypatch):
+    monkeypatch.setattr(bfr.idx_calendar, "CALENDAR_VERSION", "idx-2026-2028.v2")
+    with pytest.raises(bfr.SnapshotMismatch) as e:
+        bfr.build_manifest(baseline_db, optional_real_parquet(), snapshot=bfr.AUDITED_SNAPSHOT)
+    assert "runtime idx_calendar idx-2026-2028.v2 != idx-2026-2027.v1" in str(e.value)
+    assert "broker_flow rows" not in str(e.value) and "ordered sha256" not in str(e.value)
+
+
+def test_new_snapshot_uses_the_runtime_calendar_and_accepts_an_older_recorded_one(
+        tmp_path, monkeypatch):
+    """The runtime calendar re-derives the session; a run recorded under an
+    earlier calendar version is valid when that session agrees."""
+    db = run_db(tmp_path, both())                                  # recorded idx-2026-2027.v1
+    monkeypatch.setattr(bfr.idx_calendar, "CALENDAR_VERSION", "idx-2026-2028.v2")
+    target = sandbox_committed(tmp_path, monkeypatch)
+    out = tmp_path / "other" / "new.json"
+    assert bfr.main(["build", "--new-snapshot", "--db", db, "--out", str(out)]) == 0
+    m = json.loads(out.read_text(encoding="ascii"))
+    assert m["input"]["idx_calendar_version"] == "idx-2026-2028.v2"
+    r = by_key(m)[("2026-09-30", bfr.LIVE)]
+    assert (r["date_class"], r["canonical_session_date"], r["scan"]["calendar_version"]) == \
+        (bfr.SCAN_VERIFIED, "2026-09-29", ["idx-2026-2027.v1"])
+    assert target.read_text(encoding="ascii") == "audited"
