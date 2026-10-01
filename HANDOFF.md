@@ -1763,15 +1763,28 @@ Alur (dua langkah, dua lapis terpisah; manifest hasil refresh tidak di-commit):
   Tidak ada baris sintetis, tidak ada penjumlahan salinan (pembaca sudah
   dedupe), tidak ada `fillna(0)`. Hanya baris PROVEN: INFERRED_ONLY/MIXED
   dikecualikan, sesi karantina (07-03) tidak menyumbang apa pun.
-- **Satu snapshot.** `conn` harus membaca file DB yang **byte-identik** dengan
-  yang diverifikasi pembaca kanonis: sha256 file `main` milik `conn` (dari
-  `PRAGMA database_list`) = `canonical.db_sha256`, dicek **setelah** harga
-  dibaca. Harga DB A + broker flow DB B → `BrokerFlowSnapshotMismatch` (juga
-  kalau broker_flow-nya sama tapi harganya beda); salinan byte-identik diterima
-  (identitas isi, bukan path). Koneksi in-memory/temporary, database
-  ter-ATTACH, tabel temp yang membayangi `price_history`/`price_quarantine`, atau
-  transaksi terbuka (tulisan yang belum di-commit terlihat oleh `conn` tapi tidak
-  ada di file) → ditolak. Alasan: netval backfill = lot × close dari `price_history` DB itu.
+- **Satu snapshot, yang benar-benar dibaca `conn`.** `build_panel` membuka
+  **satu transaksi baca** di `conn` (karena itu `conn` tidak boleh sedang dalam
+  transaksi), lalu membandingkan **image SQLite `main` yang terlihat di
+  transaksi itu** (`conn.serialize("main")`, sha256 = `image_sha256`) dengan
+  image yang sama dari file yang diverifikasi pembaca kanonis (dibaca dengan
+  `bfr.connect_readonly`, immutable, dan diikat ke `canonical.db_sha256` lewat
+  sha file sebelum dan sesudah). Serialisasinya identik di kedua sisi.
+  `clean_panel` berjalan di dalam transaksi yang sama (pembaca rollback-journal
+  memegang shared lock, pembaca WAL memegang snapshot-nya), image dicek lagi,
+  lalu hanya transaksi milik `build_panel` yang di-ROLLBACK. Hash path saja tidak
+  cukup dan sudah dibuang: perubahan harga di WAL dengan byte file `main` yang
+  sama, dan koneksi lama yang masih membaca inode lama setelah path diganti
+  atomik dengan byte kanonis, keduanya ditolak (`BrokerFlowSnapshotMismatch`).
+  Harga DB A + broker flow DB B → ditolak (juga kalau broker_flow-nya sama tapi
+  harganya beda); salinan byte-identik di path lain (termasuk salinan WAL dengan
+  WAL kosong) diterima. Koneksi in-memory/temporary, database ter-ATTACH,
+  transaksi terbuka, atau TABLE/VIEW temp yang membayangi `price_history` /
+  `price_quarantine` **tanpa peduli huruf besar-kecil** (`PRICE_HISTORY`,
+  `Price_History`, …; SQLite me-resolve nama case-insensitive) → ditolak. Alasan:
+  netval backfill = lot × close dari `price_history` DB itu. Satu file DB format
+  WAL tidak bisa sekaligus jadi sumber kanonis dan koneksi harga: koneksi harga
+  membuat -wal/-shm di sampingnya dan pembaca menolaknya (sumber tidak diam).
 - **Gagal tertutup.** `ManifestInvalid`, `ManifestMismatch` (termasuk bukti scan
   tidak valid), `SourceStateError` (sumber tidak diam, kunci mentah ganda)
   diteruskan apa adanya; file manifest tidak ada → `FileNotFoundError`. Tidak
@@ -1791,9 +1804,12 @@ Alur (dua langkah, dua lapis terpisah; manifest hasil refresh tidak di-commit):
   perilaku helper lama.
 - **Provenance** (bukan fitur): `panel.attrs["broker_flow"]` = `db_path`,
   `db_sha256`, `manifest_path`, `manifest_sha256`, `manifest_snapshot`,
-  `source_commit`, `audited_manifest`, jumlah sesi/baris, akuntansi, sesi
-  karantina, record yang dikecualikan, dan catatan point-in-time. CLI,
-  `check_ml_health`, dan job summary `run_ml_reports` mencetak hash-nya.
+  `source_commit`, `audited_manifest`, `image_sha256` (image SQLite yang dibaca
+  harga), jumlah sesi/baris, akuntansi, sesi karantina, record yang
+  dikecualikan, dan catatan point-in-time. CLI, `check_ml_health`, dan job
+  summary `run_ml_reports` mencetak hash-nya. Output pendek (`check_ml_health`,
+  pesan Telegram `run_ml_reports`) membawa `PIT_WARNING`: "Broker flow:
+  session-aligned; point-in-time availability not proven."
 - `broker_flow_canonical` di-import **di dalam** `build_panel`, bukan di level
   modul: modul yang hanya memakai helper split/agregat
   (`experiment_1f_gate_b.HELPER_FILES`) tetap punya closure modul lokal yang sama.
@@ -1822,7 +1838,7 @@ backfill tidak membawa waktu capture historis sama sekali. Kontrak
 |---|---|
 | `walk_forward_backtest.py` CLI | `--broker-flow-manifest` wajib, `--db` (default `neobdm.db`), koneksi harga read-only |
 | `strategy_variants.py`, `shap_analysis.py`, `ara_arb_simulation.py`, `regime_gated_momentum.py` | CLI sama (`parse_cli`); `run_ara_arb_check(..., broker_flow_manifest_path=...)`, `load_neobdm(manifest, db)` |
-| `check_ml_health.py` (CI ml-health) | `--broker-flow-manifest PATH`; tanpa itu menjalankan **langkah 1 secara eksplisit** (`broker_flow_manifest_refresh.refresh(neobdm.db, backtest_out/ml_health/broker_flow_manifest.json)`), lalu `build_panel`. Refresh ditolak = problem kesehatan, bukan fallback |
+| `check_ml_health.py` (CI ml-health) | argparse ketat (`--quick`, `--telegram`, `--broker-flow-manifest PATH` atau `=PATH`; opsi tak dikenal/singkatan → exit 2). Manifest yang **diberikan** dipakai apa adanya; hilang/rusak/kosong → problem kesehatan, **tidak pernah** diganti refresh. Hanya bila flag tidak ada: **langkah 1 secara eksplisit** (`broker_flow_manifest_refresh.refresh(neobdm.db, backtest_out/ml_health/broker_flow_manifest.json)`), lalu `build_panel`. Refresh ditolak = problem kesehatan, bukan fallback |
 | `run_ml_reports.py` (ml-daily-report) | sama: `--broker-flow-manifest` atau refresh eksplisit ke `backtest_out/ml_reports/`; hash masuk job summary |
 | `test_pipeline.py` | fixture kontaminasi jadi file DB + manifest dari generator PR #74; dua penjaga baru (manifest wajib, tanpa SQL `broker_flow` di koneksi harga) yang ikut jalan di CI |
 
@@ -1877,6 +1893,11 @@ sha256 isi `0188cf97…8660` (deterministik). Dikunci di
 Tes: `test_walk_forward_canonical.py` (pytest; sintetis = fixture
 `test_broker_flow_canonical.Synth` + tabel harga, dan DB backfill kecil dengan
 manifest dari generator; data nyata = blob git `c2f839ad` + refresh, di-skip
-hanya bila objek git tidak ada, artinya tidak berjalan). Belum masuk daftar CI
-`check_ml_health` (CI tidak memasang pytest); dua penjaga intinya ada di
-`test_pipeline.py`, yang ikut CI.
+hanya bila objek git tidak ada, artinya tidak berjalan). **Jalan di CI**: workflow
+`ml-health.yml` memasang `pytest` dan menjalankan
+`python -m pytest -q -rs test_walk_forward_canonical.py` setelah health check
+(`if: !cancelled()`). Checkout dangkal biasanya tidak punya blob `c2f839ad`,
+jadi tes data nyata di CI bisa ter-skip (terlihat di `-rs`); tes sintetis tetap
+menangkap substitusi `acquisition_date`, penjumlahan salinan, karantina, dan
+bukti yang dikecualikan. `test_pipeline.py` (ikut health check) memeriksa bahwa
+langkah pytest itu masih ada di workflow, plus dua penjaga inti.

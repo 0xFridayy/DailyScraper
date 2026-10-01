@@ -1421,6 +1421,22 @@ def test_build_panel_never_reads_raw_broker_flow():
     print("test_build_panel_never_reads_raw_broker_flow passed")
 
 
+def test_ml_health_workflow_runs_the_canonical_migration_suite():
+    # test_pipeline runs inside ml-health's health check, so dropping the step
+    # that runs test_walk_forward_canonical.py (or pytest itself) fails here.
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf = open(os.path.join(here, ".github", "workflows", "ml-health.yml"), encoding="utf-8").read()
+    runs = re.findall(r"^\s*run:\s*(.+)$", wf, flags=re.M)
+    assert any("pip install" in r and re.search(r"\bpytest\b", r) for r in runs), \
+        "ml-health must install pytest for the canonical migration suite"
+    assert any(re.search(r"\bpytest\b", r) and "test_walk_forward_canonical.py" in r
+               and "pip" not in r for r in runs), \
+        "ml-health must run test_walk_forward_canonical.py"
+    assert any("check_ml_health.py" in r for r in runs)
+    print("test_ml_health_workflow_runs_the_canonical_migration_suite passed")
+
+
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
     # d2->d4's gap_1 is NaN for the same reason its fwd_1 is: d3 is missing,
     # so decision-at-d2 -> (positionally-next-but-calendar-discontiguous) d4
@@ -2841,6 +2857,7 @@ if __name__ == "__main__":
     test_build_panel_cannot_recreate_impossible_target_returns()
     test_build_panel_requires_an_explicit_broker_flow_manifest()
     test_build_panel_never_reads_raw_broker_flow()
+    test_ml_health_workflow_runs_the_canonical_migration_suite()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
     test_hold_days_one_uses_entry_session_high_low_and_close()
     test_tp_and_sl_hit_on_entry_session_are_detected()

@@ -36,7 +36,8 @@ import sqlite3
 import pandas as pd
 import requests
 
-from walk_forward_backtest import build_panel, run_walk_forward, DB_PATH, format_broker_flow_provenance
+from walk_forward_backtest import (build_panel, run_walk_forward, DB_PATH,
+                                   format_broker_flow_provenance, PIT_WARNING)
 from strategy_variants import run_strategy_search
 from ddqn_entry_exit import (
     build_episode_frame, split_search_holdout, fit_normalizer,
@@ -270,6 +271,7 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         f"  holdout {format_trade_stats(ddqn['holdout']['trades'])}\n"
         f"{konglo_section}\n\n"
         f"{bar_line}\n"
+        f"{PIT_WARNING}\n"
         f"Full run in GitHub Actions."
     )
 

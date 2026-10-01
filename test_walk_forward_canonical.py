@@ -5,6 +5,9 @@ build_panel() reads broker flow only through
 broker_flow_canonical.load_canonical_broker_flow() under an explicit manifest,
 keys features by canonical_session_date, and refuses rather than falls back.
 
+Also the orchestrator contract this migration introduced (check_ml_health
+CLI, short point-in-time warnings). Runs in the ml-health workflow.
+
 Synthetic fixtures: the PR #75 fixture (test_broker_flow_canonical.Synth,
 classified by the real PR #74 generator and pinned as the anchor) with price
 tables added to the same file, and small backfill-only databases whose
@@ -14,6 +17,7 @@ broker_flow_manifest_refresh; they skip only when that git object is absent
 (a shallow clone), which means they did not run."""
 
 import ast
+import hashlib
 import json
 import math
 import os
@@ -32,6 +36,7 @@ import pytest
 import broker_flow_canonical as bfc
 import broker_flow_manifest_refresh as bmr
 import broker_flow_regime as bfr
+import check_ml_health as chk
 import walk_forward_backtest as wfb
 from price_audit import clean_panel
 from test_broker_flow_canonical import ABSENT_0706, KEYS, SUBSET_0708, ZERO_KEY, Synth, digest, sha
@@ -382,13 +387,9 @@ def test_unverifiable_price_connections_are_refused(synth, tmp_path):
         conn.execute("ATTACH DATABASE ':memory:' AS other")
         with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="attached"):
             wfb.build_panel(conn, broker_flow_db_path=synth.db, broker_flow_manifest_path=synth.mpath)
-        conn.execute("DETACH DATABASE other")
-        conn.execute("CREATE TEMP TABLE price_history (x)")
-        with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="shadow"):
-            wfb.build_panel(conn, broker_flow_db_path=synth.db, broker_flow_manifest_path=synth.mpath)
     finally:
         conn.close()
-    # uncommitted writes are visible to the connection but not in the hashed file
+    # uncommitted writes are visible to the connection but not in the database image
     conn = sqlite3.connect(synth.db)
     try:
         conn.execute("UPDATE price_history SET close = close * 1.01 WHERE date = '2026-07-06'")
@@ -398,6 +399,205 @@ def test_unverifiable_price_connections_are_refused(synth, tmp_path):
     finally:
         conn.rollback()
         conn.close()
+
+
+@pytest.mark.parametrize("ddl", [
+    "CREATE TEMP TABLE price_history (x)",
+    "CREATE TEMP TABLE PRICE_HISTORY AS SELECT * FROM main.price_history",
+    "CREATE TEMP TABLE Price_History AS SELECT * FROM main.price_history",
+    "CREATE TEMP TABLE PRICE_QUARANTINE (date TEXT, ticker TEXT)",
+    "CREATE TEMP VIEW PRICE_HISTORY AS SELECT * FROM main.price_history",
+    "CREATE TEMP VIEW Price_Quarantine AS SELECT * FROM main.price_quarantine",
+])
+def test_temp_objects_shadowing_the_price_tables_are_refused_in_any_case(synth, ddl):
+    conn = wfb.connect_price_db(synth.db)
+    try:
+        conn.execute(ddl)
+        with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="shadow"):
+            wfb.build_panel(conn, broker_flow_db_path=synth.db, broker_flow_manifest_path=synth.mpath)
+    finally:
+        conn.close()
+
+
+def test_unrelated_temp_objects_are_allowed(synth):
+    conn = wfb.connect_price_db(synth.db)
+    try:
+        conn.execute("CREATE TEMP TABLE scratch_notes (x)")
+        conn.execute("CREATE TEMP VIEW price_history_recent AS SELECT * FROM main.price_history")
+        panel = wfb.build_panel(conn, broker_flow_db_path=synth.db,
+                                broker_flow_manifest_path=synth.mpath)
+    finally:
+        conn.close()
+    pd.testing.assert_frame_equal(panel, panel_of(synth.db, synth.mpath))
+
+
+# --------------------------------------------------------------------------
+# The price connection's actual SQLite snapshot
+# --------------------------------------------------------------------------
+
+def image_sha256(path):
+    con = bfr.connect_readonly(path)
+    try:
+        return hashlib.sha256(con.serialize(name="main")).hexdigest()
+    finally:
+        con.close()
+
+
+def wal_canonical(synth):
+    """synth.db in WAL format with no sidecars left (a clean close checkpoints
+    and removes them); the manifest still describes its unchanged rows. A price
+    connection on this same file would create -wal/-shm beside it, which the
+    canonical reader refuses as non-quiescent, so prices come from a copy."""
+    con = sqlite3.connect(synth.db)
+    assert con.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    con.close()
+    assert not [s for s in ("-wal", "-shm") if os.path.exists(synth.db + s)]
+    bfc.load_canonical_broker_flow(synth.db, synth.mpath)
+    return synth.db
+
+
+def test_the_ordinary_snapshot_passes_and_only_build_panels_transaction_is_ended(synth):
+    conn = wfb.connect_price_db(synth.db)
+    try:
+        panel = wfb.build_panel(conn, broker_flow_db_path=synth.db,
+                                broker_flow_manifest_path=synth.mpath)
+        assert not conn.in_transaction
+        assert conn.execute("SELECT count(*) FROM price_history").fetchone()[0] > 0
+    finally:
+        conn.close()
+    assert len(panel) > 0
+
+
+def test_a_wal_price_change_behind_identical_main_file_bytes_is_refused(synth, tmp_path):
+    baseline = panel_of(synth.db, synth.mpath)
+    canonical = wal_canonical(synth)
+    price = str(tmp_path / "price_wal.db")
+    shutil.copy(canonical, price)
+    # a WAL-mode twin is the same snapshot while its WAL is empty
+    pd.testing.assert_frame_equal(panel_of(price, synth.mpath, broker_db=canonical), baseline)
+    writer = sqlite3.connect(price)
+    try:
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("UPDATE price_history SET close = close * 1.05 WHERE date = '2026-07-06'")
+        writer.commit()
+        assert sha(price) == sha(canonical), "the change lives only in the WAL"
+        conn = wfb.connect_price_db(price)
+        try:
+            seen = conn.execute("SELECT close FROM price_history WHERE date = '2026-07-06' "
+                                "ORDER BY ticker").fetchall()
+            assert seen != image_rows(canonical), "the connection reads the WAL-updated prices"
+            with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="not one database snapshot"):
+                wfb.build_panel(conn, broker_flow_db_path=canonical,
+                                broker_flow_manifest_path=synth.mpath)
+            assert not conn.in_transaction
+        finally:
+            conn.close()
+    finally:
+        writer.close()
+
+
+def image_rows(path):
+    con = bfr.connect_readonly(path)
+    try:
+        return con.execute("SELECT close FROM price_history WHERE date = '2026-07-06' "
+                           "ORDER BY ticker").fetchall()
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="an open file cannot be replaced on Windows")
+def test_a_stale_open_connection_after_path_replacement_is_refused(synth, tmp_path):
+    other = synth.db_copy("other.db", "UPDATE price_history SET close = close * 1.05 "
+                                      "WHERE date = '2026-07-06'")
+    conn = wfb.connect_price_db(other)
+    try:
+        assert conn.execute("SELECT count(*) FROM price_history").fetchone()[0] > 0
+        staged = str(tmp_path / "staged.db")
+        shutil.copy(synth.db, staged)
+        os.replace(staged, other)                      # the pathname now names canonical bytes
+        assert sha(other) == sha(synth.db)
+        assert conn.execute("SELECT close FROM price_history WHERE date = '2026-07-06' "
+                            "ORDER BY ticker").fetchall() != image_rows(other)
+        with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="not one database snapshot"):
+            wfb.build_panel(conn, broker_flow_db_path=other, broker_flow_manifest_path=synth.mpath)
+    finally:
+        conn.close()
+
+
+def test_the_snapshot_cannot_change_under_clean_panel_unnoticed(synth, monkeypatch):
+    real_clean = wfb.clean_panel
+
+    def ends_the_snapshot(conn, *a, **k):
+        conn.execute("ROLLBACK")
+        w = sqlite3.connect(synth.db)
+        w.execute("UPDATE price_history SET close = close * 1.05 WHERE date = '2026-07-06'")
+        w.commit()
+        w.close()
+        return real_clean(conn, *a, **k)
+
+    monkeypatch.setattr(wfb, "clean_panel", ends_the_snapshot)
+    conn = wfb.connect_price_db(synth.db)
+    try:
+        with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="did not hold"):
+            wfb.build_panel(conn, broker_flow_db_path=synth.db, broker_flow_manifest_path=synth.mpath)
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_a_rollback_journal_writer_cannot_commit_during_the_read(synth, monkeypatch):
+    real_clean = wfb.clean_panel
+    blocked = []
+
+    def concurrent_writer(conn, *a, **k):
+        w = sqlite3.connect(synth.db, timeout=0)
+        try:
+            w.execute("UPDATE price_history SET close = close * 1.05 WHERE date = '2026-07-06'")
+            w.commit()
+        except sqlite3.OperationalError as e:
+            blocked.append(str(e))
+            w.rollback()
+        finally:
+            w.close()
+        return real_clean(conn, *a, **k)
+
+    baseline = panel_of(synth.db, synth.mpath)
+    monkeypatch.setattr(wfb, "clean_panel", concurrent_writer)
+    pd.testing.assert_frame_equal(panel_of(synth.db, synth.mpath), baseline)
+    assert blocked and "locked" in blocked[0]
+
+
+def test_a_wal_writer_during_the_read_is_invisible_to_it(synth, tmp_path, monkeypatch):
+    baseline = panel_of(synth.db, synth.mpath)
+    canonical = wal_canonical(synth)
+    price = str(tmp_path / "price_wal.db")
+    shutil.copy(canonical, price)
+    real_clean = wfb.clean_panel
+    writers = []
+
+    def concurrent_commit(conn, *a, **k):
+        w = sqlite3.connect(price)
+        w.execute("PRAGMA wal_autocheckpoint=0")
+        w.execute("UPDATE price_history SET close = close * 1.05 WHERE date = '2026-07-06'")
+        w.commit()
+        writers.append(w)
+        return real_clean(conn, *a, **k)
+
+    monkeypatch.setattr(wfb, "clean_panel", concurrent_commit)
+    conn = wfb.connect_price_db(price)
+    try:
+        panel = wfb.build_panel(conn, broker_flow_db_path=canonical,
+                                broker_flow_manifest_path=synth.mpath)
+        pd.testing.assert_frame_equal(panel, baseline)
+        assert panel.attrs["broker_flow"]["image_sha256"] == image_sha256(canonical)
+        monkeypatch.setattr(wfb, "clean_panel", real_clean)
+        with pytest.raises(wfb.BrokerFlowSnapshotMismatch, match="not one database snapshot"):
+            wfb.build_panel(conn, broker_flow_db_path=canonical,
+                            broker_flow_manifest_path=synth.mpath)   # the next read sees it
+    finally:
+        conn.close()
+        for w in writers:
+            w.close()
 
 
 def test_no_usable_broker_rows_is_refused(tmp_path, synth, monkeypatch):
@@ -477,6 +677,7 @@ def test_provenance_is_exposed_and_is_not_a_feature(synth):
     panel = panel_of(synth.db, synth.mpath)
     prov = panel.attrs["broker_flow"]
     assert prov["db_sha256"] == sha(synth.db)
+    assert prov["image_sha256"] == image_sha256(synth.db)
     assert prov["manifest_sha256"] == digest(synth.manifest)
     assert prov["manifest_path"] == os.path.abspath(synth.mpath)
     assert prov["manifest_snapshot"] == synth.manifest["input"].get("snapshot")
@@ -488,6 +689,7 @@ def test_provenance_is_exposed_and_is_not_a_feature(synth):
     assert set(wfb.FEATURES) <= set(panel.columns)
     text = wfb.format_broker_flow_provenance(prov)
     assert prov["db_sha256"] in text and prov["manifest_sha256"] in text
+    assert prov["image_sha256"] in text
 
 
 def test_clean_price_intersection_is_unchanged(synth):
@@ -589,6 +791,9 @@ def test_real_provenance_pins_the_snapshot(real):
     assert (prov["db_sha256"], prov["manifest_sha256"], prov["manifest_snapshot"],
             prov["source_commit"], prov["audited_manifest"]) == \
         (REAL_DB_SHA256, REAL_MANIFEST_SHA256, bmr.REFRESH_CONTRACT, REAL_COMMIT, False)
+    # Measured, not assumed by build_panel: for this quiescent rollback-journal
+    # file the serialized SQLite main image is byte-for-byte the file.
+    assert prov["image_sha256"] == image_sha256(real["db"]) == REAL_DB_SHA256
     assert prov["accounting"] == {"canonical": 221_399, "duplicate": 3_642, "quarantined": 1_252,
                                   "excluded": 7_256, "raw": 233_549}
     assert (prov["canonical_sessions"], prov["quarantined_sessions"], prov["excluded_records"]) == \
@@ -717,3 +922,144 @@ def test_real_old_vs_new_panel_changes_are_all_explained(real):
     assert {d: reasons(prev) for d, prev in (("2026-07-06", "2026-07-03"),
                                               ("2026-07-09", "2026-07-08"))} == \
         {"2026-07-06": {"quarantine"}, "2026-07-09": {"not covered"}}
+
+
+# --------------------------------------------------------------------------
+# Orchestrators: check_ml_health CLI, short point-in-time warnings
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("argv", [["--broker-flow-manifest", "m.json"], ["--broker-flow-manifest=m.json"]])
+def test_health_cli_takes_the_manifest_in_both_forms(argv):
+    assert chk.parse_args(argv).broker_flow_manifest == "m.json"
+    args = chk.parse_args(argv + ["--quick", "--telegram"])
+    assert (args.quick, args.telegram, args.broker_flow_manifest) == (True, True, "m.json")
+    assert chk.parse_args([]).broker_flow_manifest is None
+
+
+@pytest.mark.parametrize("argv", [["--bogus"], ["--broker", "m.json"], ["--broker-flow-manifest"],
+                                  ["stray"]])
+def test_health_cli_rejects_unknown_or_incomplete_options(argv, capsys):
+    with pytest.raises(SystemExit) as e:
+        chk.parse_args(argv)
+    assert e.value.code == 2
+
+
+@pytest.fixture
+def health(synth, monkeypatch):
+    """check_ml_health with its unrelated checks stubbed and DB_PATH on the
+    synthetic database; refresh_broker_flow_manifest records its calls and
+    stands in for the refresh tool with the fixture's own manifest."""
+    for name in ("check_imports", "check_known_defects", "check_unit_tests", "check_model_runs",
+                 "_load_dotenv"):
+        monkeypatch.setattr(chk, name, lambda *a, **k: None)
+    monkeypatch.setattr(chk, "DB_PATH", synth.db)
+    refreshed = []
+
+    def refresh(problems, stats, out=None):
+        refreshed.append(out)
+        stats["broker_flow_refreshed"] = True
+        return synth.mpath
+    monkeypatch.setattr(chk, "refresh_broker_flow_manifest", refresh)
+    return refreshed
+
+
+@pytest.mark.parametrize("form", ["space", "equals"])
+def test_health_never_refreshes_over_an_explicit_bad_manifest(health, tmp_path, capsys, form):
+    missing = str(tmp_path / "nonexistent.json")
+    argv = ["--quick"] + (["--broker-flow-manifest", missing] if form == "space"
+                          else [f"--broker-flow-manifest={missing}"])
+    with pytest.raises(SystemExit) as e:
+        chk.main(argv)
+    assert e.value.code == 1
+    assert health == [], "an explicit manifest must never be replaced by a refresh"
+    assert "FileNotFoundError" in capsys.readouterr().out
+
+
+def test_health_explicit_empty_manifest_is_not_omitted(health, capsys):
+    with pytest.raises(SystemExit) as e:
+        chk.main(["--quick", "--broker-flow-manifest="])
+    assert e.value.code == 1 and health == []
+    assert "BrokerFlowManifestRequired" in capsys.readouterr().out
+
+
+def test_health_explicit_good_manifest_is_used_as_given(health, synth, capsys):
+    with pytest.raises(SystemExit):
+        chk.main(["--quick", f"--broker-flow-manifest={synth.mpath}"])
+    out = capsys.readouterr().out
+    assert health == [] and f"manifest {digest(synth.manifest)[:12]}" in out
+    assert "refreshed this run" not in out
+
+
+def test_health_omitted_manifest_refreshes_then_consumes(health, synth, capsys):
+    with pytest.raises(SystemExit):
+        chk.main(["--quick"])
+    out = capsys.readouterr().out
+    assert len(health) == 1
+    assert f"manifest {digest(synth.manifest)[:12]}" in out and "refreshed this run" in out
+
+
+def test_health_short_output_carries_the_point_in_time_warning(health, capsys):
+    with pytest.raises(SystemExit):
+        chk.main(["--quick"])
+    out = capsys.readouterr().out
+    assert wfb.PIT_WARNING in out and "point-in-time availability not proven" in out
+    assert "leakage-free" not in out
+    assert wfb.PIT_WARNING not in chk.format_report([], [], {})
+
+
+@pytest.fixture
+def reports(monkeypatch):
+    """run_ml_reports imported fresh: it reads the Telegram secrets at import and
+    imports ddqn_entry_exit (torch), neither needed for formatting."""
+    import importlib
+    import types
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_BOT_TOKEN", "test-placeholder"))
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", "test-placeholder"))
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        stub = types.ModuleType("ddqn_entry_exit")
+        for name in ("build_episode_frame", "split_search_holdout", "fit_normalizer",
+                     "normalize_features", "make_envs", "train_ddqn", "evaluate_policy",
+                     "evaluate_policy_with_trade_log", "FEATURES", "STATE_EXTRA"):
+            setattr(stub, name, None)
+        monkeypatch.setitem(sys.modules, "ddqn_entry_exit", stub)
+    monkeypatch.delitem(sys.modules, "run_ml_reports", raising=False)
+    rmr = importlib.import_module("run_ml_reports")
+    yield rmr
+    sys.modules.pop("run_ml_reports", None)
+
+
+def report_inputs(prov):
+    trades = dict(n_trades=4, mean_ret=0.01, median_ret=0.005, hit_rate=0.5, base_rate=0.45,
+                  hit_edge=0.05, ret_per_risk=0.3)
+    pooled = dict(ic=0.01, daily_ic=0.02, daily_ic_median=0.01, top_hit=0.5, base_rate=0.45,
+                  top_hit_edge=0.05, edge=0.001, n=100, n_trades=4, trade_mean=0.01,
+                  trade_hit=0.5, trade_hit_edge=0.05)
+    variants = pd.DataFrame([dict(label="v", mean_ret=0.01, median_ret=0.0, hit_rate=0.5,
+                                  hit_edge=0.05, ret_per_risk=0.3, n_trades=4)])
+    xgb = dict(n_dates=10, n_tickers=3, date_min="2026-01-01", date_max="2026-01-14",
+               pooled=pooled, recent_trades=[], broker_flow=prov)
+    strat = dict(winner_label="v", search_mean=0.01, holdout_mean=0.0, holdout_n=4,
+                 search_results=variants, holdout_results=variants)
+    ddqn = dict(n_dates=10, n_tickers=3, date_min="2026-01-01", date_max="2026-01-14",
+                search=dict(trades=trades), holdout=dict(trades=trades), recent_holdout_trades=[])
+    konglo = dict(signals=[], resolved=dict(n_trades=0), resolved_by_strategy={})
+    return xgb, strat, ddqn, konglo
+
+
+def test_telegram_report_carries_the_point_in_time_warning(reports, synth):
+    prov = panel_of(synth.db, synth.mpath).attrs["broker_flow"]
+    msg = reports.format_telegram_message(*report_inputs(prov))
+    assert wfb.PIT_WARNING in msg and "leakage-free" not in msg
+
+
+def test_github_summary_keeps_the_full_provenance_warning(reports, synth, tmp_path, monkeypatch):
+    prov = panel_of(synth.db, synth.mpath).attrs["broker_flow"]
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    reports.write_step_summary(*report_inputs(prov))
+    text = summary.read_text(encoding="utf-8")
+    assert prov["db_sha256"] in text and prov["manifest_sha256"] in text
+    assert "Session-aligned, not point-in-time proven." in text

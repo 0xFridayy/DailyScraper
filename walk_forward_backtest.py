@@ -309,6 +309,9 @@ MANIFEST_REQUIRED = (
     "then pass it (--broker-flow-manifest <manifest>). The committed audited manifest "
     "describes only neobdm.db at 1aeca53; there is no raw broker_flow fallback.")
 
+#: The short form of the point-in-time caveat, for one-line outputs.
+PIT_WARNING = "Broker flow: session-aligned; point-in-time availability not proven."
+
 #: The only columns the broker feature helpers read.
 CANONICAL_FRAME_COLUMNS = ["date", "ticker", "broker_code", "netval"]
 
@@ -341,11 +344,14 @@ def canonical_broker_flow_frame(canonical):
     return frame
 
 
-def broker_flow_provenance(canonical):
-    """Which broker-flow snapshot a panel was built from. Not a feature."""
+def broker_flow_provenance(canonical, image_sha256):
+    """Which broker-flow snapshot a panel was built from. Not a feature.
+    db_sha256: the source file the canonical reader verified; image_sha256:
+    the SQLite main image the price connection read (_snapshot_image_sha256)."""
     return {
         "db_path": canonical.db_path,
         "db_sha256": canonical.db_sha256,
+        "image_sha256": image_sha256,
         "manifest_path": canonical.manifest_path,
         "manifest_sha256": canonical.manifest_sha256,
         "manifest_snapshot": canonical.snapshot,
@@ -367,6 +373,7 @@ def format_broker_flow_provenance(prov):
         f"{prov['canonical_sessions']} sessions; quarantined {prov['quarantined_sessions']}; "
         f"{prov['excluded_records']} excluded records",
         f"  db        {prov['db_sha256']}  {prov['db_path']}",
+        f"  image     {prov['image_sha256']}  (SQLite main image the prices were read from)",
         f"  manifest  {prov['manifest_sha256']}  {prov['manifest_path']}",
         f"  snapshot  {prov['manifest_snapshot']}  source_commit {prov['source_commit']}  "
         f"audited {prov['audited_manifest']}",
@@ -384,14 +391,13 @@ def _file_sha256(path):
 
 def _price_db_file(conn):
     """The database file `conn` reads price_history from. Refuses an in-memory
-    or temporary database, attached databases, temp tables that would shadow
-    the price tables, and an open transaction (its uncommitted writes are
-    visible to `conn` but not in the file): the file is what gets compared
-    with the broker flow snapshot, so the prices must come from it and
-    nowhere else."""
+    or temporary database, attached databases, temp tables or views that would
+    shadow the price tables (SQLite resolves names case-insensitively), and an
+    open transaction (build_panel opens the read transaction it validates):
+    the prices must come from the main database image and nowhere else."""
     if conn.in_transaction:
-        raise BrokerFlowSnapshotMismatch("the price connection has an open transaction; its "
-                                         "uncommitted writes are not in the database file")
+        raise BrokerFlowSnapshotMismatch("the price connection has an open transaction; "
+                                         "build_panel() needs to open its own read snapshot")
     dbs = conn.execute("PRAGMA database_list").fetchall()
     main = [path for _, name, path in dbs if name == "main"]
     if not main or not main[0]:
@@ -403,10 +409,42 @@ def _price_db_file(conn):
         raise BrokerFlowSnapshotMismatch(f"the price connection has attached databases {other}; "
                                          "prices must come from the one database file")
     shadowed = [n for (n,) in conn.execute(
-        "SELECT name FROM sqlite_temp_master WHERE name IN ('price_history', 'price_quarantine')")]
+        "SELECT name FROM sqlite_temp_master WHERE type IN ('table', 'view') "
+        "AND lower(name) IN ('price_history', 'price_quarantine')")]
     if shadowed:
         raise BrokerFlowSnapshotMismatch(f"temp objects {shadowed} shadow the price tables")
     return main[0]
+
+
+def _snapshot_image_sha256(conn):
+    """sha256 of the main database image `conn` sees in its current read
+    transaction: sqlite3 serialize() reads every page through this connection's
+    own pager, so WAL frames it sees and the file it actually has open (not
+    whatever the pathname names now) are what gets hashed."""
+    return hashlib.sha256(conn.serialize(name="main")).hexdigest()
+
+
+def _canonical_image_sha256(canonical):
+    """The same image digest for the database the canonical reader verified,
+    read the way the reader reads it (broker_flow_regime.connect_readonly,
+    immutable) and bound to canonical.db_sha256 by the file bytes on both sides
+    of the read. Byte-identical files give identical images whatever their path."""
+    import broker_flow_regime as bfr
+
+    def same_file():
+        if _file_sha256(canonical.db_path) != canonical.db_sha256:
+            raise BrokerFlowSnapshotMismatch(f"{canonical.db_path} changed after the canonical "
+                                             "broker flow was read")
+
+    same_file()
+    con = bfr.connect_readonly(canonical.db_path)
+    try:
+        con.execute("BEGIN")
+        image = _snapshot_image_sha256(con)
+    finally:
+        con.close()
+    same_file()
+    return image
 
 
 def _after_withheld_session(price_sessions, covered_sessions):
@@ -426,11 +464,15 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
     canonical broker flow of broker_flow_db_path under broker_flow_manifest_path.
 
     Both broker-flow arguments are required; there is no default manifest.
-    `conn` must read the same database snapshot: its main database file must
-    be byte-identical (sha256) to the file the canonical reader verified,
-    checked after the prices are read. Raises BrokerFlowInputError subclasses,
-    and lets broker_flow_canonical's ManifestInvalid / ManifestMismatch /
-    SourceStateError through unchanged. Provenance: panel.attrs["broker_flow"]."""
+    `conn` must read the same database snapshot. build_panel opens one read
+    transaction on `conn` (so `conn` must not already be in one), checks that
+    the SQLite main image visible in it is the image of the file the canonical
+    reader verified (_snapshot_image_sha256, identical serialization on both
+    sides), runs clean_panel inside that same transaction, checks the image
+    again, and ends only that transaction. Raises BrokerFlowInputError
+    subclasses, and lets broker_flow_canonical's ManifestInvalid /
+    ManifestMismatch / SourceStateError through unchanged. Provenance:
+    panel.attrs["broker_flow"]."""
     # Imported here, not at module level: callers that only reuse the split and
     # aggregate helpers (experiment_1f_gate_b.HELPER_FILES) keep their
     # repo-local module closure.
@@ -443,14 +485,27 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
                                          "the manifest describes")
     price_db = _price_db_file(conn)
     canonical = bfc.load_canonical_broker_flow(broker_flow_db_path, broker_flow_manifest_path)
+    want = _canonical_image_sha256(canonical)
 
-    px = clean_panel(conn, horizons=(1,), lags=(1, 5), open_anchored=True)
-    price_sha = _file_sha256(price_db)
-    if price_sha != canonical.db_sha256:
-        raise BrokerFlowSnapshotMismatch(
-            f"prices were read from {price_db} (sha256 {price_sha[:12]}), broker flow from "
-            f"{canonical.db_path} (sha256 {canonical.db_sha256[:12]}): not one database "
-            "snapshot. Backfilled netval is lot x close of its own database's prices.")
+    # One read transaction: the image checked is the snapshot clean_panel reads
+    # (a rollback-journal reader holds its shared lock, a WAL reader its
+    # snapshot, until it ends). Only this transaction is ended here.
+    conn.execute("BEGIN")
+    try:
+        image = _snapshot_image_sha256(conn)
+        if image != want:
+            raise BrokerFlowSnapshotMismatch(
+                f"the price connection reads {price_db} as SQLite image {image[:12]}, the "
+                f"canonical broker flow was read from {canonical.db_path} (image {want[:12]}, "
+                f"file sha256 {canonical.db_sha256[:12]}): not one database snapshot. "
+                "Backfilled netval is lot x close of its own database's prices.")
+        px = clean_panel(conn, horizons=(1,), lags=(1, 5), open_anchored=True)
+        if not conn.in_transaction or _snapshot_image_sha256(conn) != image:
+            raise BrokerFlowSnapshotMismatch("the price snapshot did not hold while clean_panel "
+                                             "read it")
+    finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
 
     bf = canonical_broker_flow_frame(canonical)
     if bf.empty:
@@ -477,7 +532,7 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
     withheld = _after_withheld_session(sorted(px["date"].unique()), canonical.sessions)
     panel.loc[panel["date"].isin(withheld), "broker_correlation_1d"] = np.nan
     panel = panel.dropna(subset=["target"]).sort_values("date").reset_index(drop=True)
-    panel.attrs["broker_flow"] = broker_flow_provenance(canonical)
+    panel.attrs["broker_flow"] = broker_flow_provenance(canonical, image)
     return panel
 
 

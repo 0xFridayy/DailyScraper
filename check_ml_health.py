@@ -46,6 +46,7 @@ BROKER_FLOW_MANIFEST_OUT, hashes reported), then build_panel() under it. A
 refused refresh is a health problem, never a reason to read raw broker_flow.
 """
 
+import argparse
 import ast
 import os
 import sqlite3
@@ -436,7 +437,9 @@ def format_report(problems, notes, stats):
     if bits:
         lines.append(" | ".join(bits))
     if "broker_flow" in stats:
+        from walk_forward_backtest import PIT_WARNING
         lines.append(f"broker flow: {stats['broker_flow']}")
+        lines.append(f"⚠️ {PIT_WARNING}")
 
     m = []
     if stats.get("pooled_ic") is not None:
@@ -475,23 +478,29 @@ def send_telegram(message):
     print("sent to Telegram" if r.ok else f"telegram error {r.status_code}: {r.text}")
 
 
-def _flag_value(flag):
-    if flag not in sys.argv:
-        return None
-    i = sys.argv.index(flag)
-    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
-        sys.exit(f"{flag} needs a path")
-    return sys.argv[i + 1]
+def parse_args(argv=None):
+    """Strict: unknown options and abbreviations are errors. An explicit
+    --broker-flow-manifest (either form, even empty) is never treated as
+    omitted; only a missing flag lets check_panel refresh one."""
+    ap = argparse.ArgumentParser(description="Does the ML stack still run, and does it still "
+                                             "produce sane numbers?", allow_abbrev=False)
+    ap.add_argument("--quick", action="store_true", help="skip the model fit")
+    ap.add_argument("--telegram", action="store_true", help="also send the report on problems")
+    ap.add_argument("--broker-flow-manifest", default=None, metavar="PATH",
+                    help="build the panel under this manifest; without it the check refreshes "
+                         "one for neobdm.db first")
+    return ap.parse_args(argv)
 
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
     _load_dotenv()
-    problems, notes, stats = check(quick="--quick" in sys.argv,
-                                   broker_flow_manifest=_flag_value("--broker-flow-manifest"))
+    problems, notes, stats = check(quick=args.quick,
+                                   broker_flow_manifest=args.broker_flow_manifest)
     report = format_report(problems, notes, stats)
     print(report)
     # Quiet when healthy: Telegram only hears about problems.
-    if "--telegram" in sys.argv and problems:
+    if args.telegram and problems:
         send_telegram(report)
     sys.exit(1 if problems else 0)
 
