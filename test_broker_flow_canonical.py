@@ -673,6 +673,29 @@ def test_downgrading_one_side_does_not_clear_an_anchored_quarantine(synth):
     assert sum(v for k, v in cf.accounting.items() if k != "raw") == cf.accounting["raw"]
 
 
+def test_a_topped_up_backfill_side_does_not_clear_an_anchored_quarantine(synth):
+    """The nightly top-up rewrites backfill values, never the session (the date
+    itself) or the capture class: with the 07-03 backfill group off its audited
+    hash and 07-05 downgraded (no parquet), the conflict still stands."""
+    db = synth.db_copy("topped_up.db", "UPDATE broker_flow SET netval = 7.0 WHERE date = "
+                                       "'2026-07-03' AND ticker = 'AAAA' AND broker_code = 'AK'")
+    path = synth.write(bfr.build_manifest(db, None), "topped_up_no_parquet.json")
+    cf = synth.load(path, db=db)
+    q = {x.canonical_session_date: x for x in cf.quarantined}["2026-07-03"]
+    assert [(d, regime) for d, regime, *_ in q.records] == \
+        [("2026-07-03", bfr.BACKFILL), ("2026-07-05", bfr.LIVE)]
+    assert "2026-07-03" not in cf.sessions
+    with pytest.raises(bfc.SessionNotCovered) as error:
+        cf.get("2026-07-03", "AAAA", "AK")
+    assert error.value.status == bfc.QUARANTINED
+    affected = [r for r in synth.inspect(path, db=db)
+                if r.acquisition_date in ("2026-07-03", "2026-07-05")]
+    assert affected and {r.status for r in affected} == {bfc.QUARANTINED}
+    assert {r.date_class for r in affected if r.acquisition_date == "2026-07-05"} == \
+        {bfr.INFERRED_ONLY}
+    assert sum(v for k, v in cf.accounting.items() if k != "raw") == cf.accounting["raw"]
+
+
 def test_a_date_proven_by_a_scan_run_must_be_labelled_scan_verified(synth):
     def downgrade(recs, m):
         r = recs[L30]
