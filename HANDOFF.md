@@ -1491,8 +1491,9 @@ Hanya pembaca. Tidak ada tabel/DB sidecar, migrasi, atau baris yang diubah.
   `rows_sha256` yang membentuk konflik teraudit masih hadir persis. Ini bukan
   promosi bukti: record yang diturunkan tetap membawa kelas bukti manifest baru
   saat inspeksi, tetapi status semua baris grup konflik = QUARANTINED dan tidak
-  ada sisi yang bocor ke view kanonis. Grup yang hash-nya berubah tidak memakai
-  jangkar lama.
+  ada sisi yang bocor ke view kanonis. Grup LIVE yang hash-nya berubah tidak
+  memakai jangkar lama; grup BACKFILL yang di-top-up tetap menjangkar
+  (Lampiran U).
 - **Absen ≠ nol.** Tidak ada baris sintetis, tidak ada `fillna`, NULL tetap
   `None`. `get(sesi, ticker, broker)` → `None` hanya untuk broker yang tidak
   teramati di sesi yang tercakup; sesi tanpa baris trusted →
@@ -1564,7 +1565,7 @@ tiap malam (tanggal LIVE baru, top-up backfill), pembaca **menolak
    bukan menurunkan tanggal itu. Menerima content match baru = keputusan PR
    migrasi.
 
-Proses refresh manifest untuk DB kerja belum ada; itu keputusan PR migrasi.
+Refresh manifest untuk DB kerja: Lampiran U (`broker_flow_manifest_refresh.py`).
 
 **Akar kepercayaan.** Manifest teraudit dikenali dari **isinya**:
 sha256 `bfr.dumps(manifest)` = blob git `146b3efd…8025`, tidak tergantung CRLF
@@ -1607,3 +1608,120 @@ oleh generator PR #74 yang asli. Tes data nyata membaca DB 1aeca53 dari git;
 kalau di-skip (mis. shallow clone), artinya tes itu tidak berjalan. Seperti
 `test_broker_flow_regime.py`, file ini belum masuk daftar CI
 `check_ml_health`.
+
+## Lampiran U — refresh manifest bukti `broker_flow` dari jangkar teraudit (2026-10-01)
+
+Hanya infrastruktur refresh. `neobdm.db`, `evidence/broker_flow_date_evidence.json`,
+baris `broker_flow`, capture, dan konsumen **tidak diubah**; belum ada konsumen
+yang dimigrasikan, belum ada tabel/view/migrasi.
+
+    py -3 broker_flow_manifest_refresh.py --db <salinan beku neobdm.db> \
+        --out <file lain> [--source-commit SHA]
+
+**Jangkar, bukan rantai.** Setiap refresh memercayai manifest teraudit PR #74
+secara langsung, dikenali dari **isinya** (sha256 `bfr.dumps` = `146b3efd…8025`,
+`AUDITED_ANCHOR_SHA256`, wajib sama dengan `bfc.AUDITED_MANIFEST_SHA256`).
+Path, nama file, dan label `input.snapshot` tidak memberi hak apa pun; manifest
+hasil refresh tidak pernah bisa jadi jangkar refresh berikutnya. Jangkar hanya
+dibaca.
+
+| grup `(date, regime)` | hasil refresh |
+|---|---|
+| BACKFILL milik jangkar | SOURCE_DATED_BACKFILL diturunkan ulang PR #74 dari baris **sekarang** (`row_count`, `rows_sha256` baru); bukti jalur generasi sama, field lain wajib sama dengan record jangkar |
+| LIVE milik jangkar | `row_count` + `rows_sha256` wajib **persis** sama, untuk **semua** kelas; kalau tidak → ditolak |
+| ↳ CONTENT_MATCHED, MIXED, INFERRED_ONLY | record jangkar dibawa apa adanya; parquet tidak dibaca |
+| ↳ SCAN_VERIFIED | dibuktikan ulang dengan `bfr.scan_evidence` atas `broker_flow_scan` sekarang; sesi, fingerprint, dan run harus sama dengan jangkar |
+| LIVE baru setelah jangkar (> 2026-09-30) | aturan PR #74 tanpa parquet: SCAN_VERIFIED bila run PERSISTED membuktikannya, selain itu INFERRED_ONLY (kanonis NULL) |
+| lainnya | ditolak: grup jangkar hilang, tanggal BACKFILL baru, grup LIVE baru di dalam cakupan jangkar, tanggal historis yang kini diklasifikasi lain (mis. run scan baru untuk tanggal lama) |
+
+Tidak ada CONTENT_MATCHED baru (itu tugas berikutnya). CONTENT_MATCHED jangkar
+yang berubah/hilang **ditolak**, tidak diturunkan ke INFERRED_ONLY dan tidak
+dicarikan sesi lain. Kontradiksi PR #74 (run scan, state rerun AUDITED_MIXED)
+menolak refresh. Semua pelanggaran dilaporkan sekaligus (`RefreshRefused`).
+
+Kenapa INFERRED_ONLY historis juga dikunci: penulis live hanya menulis tanggal
+scrape hari itu, jadi perubahan baris live tanggal lampau = penulisan ulang bukti
+akuisisi (pola yang dulu menghasilkan MIXED), dan tidak ada alasan terdokumentasi
+untuk mengizinkannya. BACKFILL tidak dikunci karena top-up malam
+(`backfill_inventory.insert_inventory`, INSERT OR REPLACE untuk tanggal
+≤ `BACKFILL_END` di jendela 360 hari) memang menulis ulang nilainya.
+
+**Output.** `--out` wajib. Path manifest teraudit yang di-commit, jangkar yang
+dipakai, DB sumber, dan sidecar SQLite-nya (`-wal`, `-shm`, `-journal`, dari path
+yang diberikan maupun path resolve-nya) ditolak, termasuk aliasnya (path yang
+di-resolve: symlink/junction, huruf besar-kecil, `..`, titik/spasi di akhir yang
+dibuang Win32 walau file belum ada; hard link lewat `samefile`), sebelum build dan
+lagi tepat sebelum `os.replace`. File di path sidecar akan membuat sumber terbaca
+hidup/rusak pada cek identitas berikutnya. Ditulis ke file temp di folder yang
+sama, divalidasi, lalu `os.replace`; gagal di titik mana pun → temp dihapus,
+`--out` lama tidak berubah. Deterministik: DB + jangkar sama → byte sama (tanpa
+jam dinding, tanpa path).
+
+**Validasi diri sebelum terbit.** `bfc.check_manifest` →
+`load_canonical_broker_flow(db, temp)` harus menerima (struktur, grup dan hash
+per grup, bukti scan diulang) → file yang divalidasi pembaca harus **persis**
+manifest yang dibangun (`cf.manifest_sha256` = sha256 `bfr.dumps(manifest)`,
+konvensi hash isi pembaca: format/CRLF boleh beda, isi tidak) → `db_sha256`
+pembaca = sha file yang diklasifikasi → setiap sesi yang dikarantina record
+trusted jangkar (aturan collapse pembaca atas baris sekarang) tetap dikarantina.
+Tepat sebelum `os.replace`, isi file temp dicek sekali lagi terhadap manifest
+yang sama.
+
+**Sumber.** Seperti pembaca: -wal/-shm/-journal, `st_nlink > 1`, format tak
+dikenal → `SourceStateError` sebelum apa pun diklasifikasi; identitas file
+(ukuran, mtime_ns, sha256) sebelum = sesudah baca. `mode=ro&immutable=1`, hanya
+SELECT / PRAGMA table_info.
+
+**Bentuk manifest.** Tetap skema PR #74 (`generator` broker_flow_regime.py v1:
+record dibuat generatornya), jadi pembaca tidak perlu diubah untuk metadata.
+`input.snapshot` = `audited-anchor-refresh-v1`; `input.content_match_evidence` =
+milik jangkar (hanya dirujuk record CONTENT_MATCHED jangkar). Blok top-level
+`refresh`: kontrak, jangkar (sha, label, source_commit, jumlah record, tanggal
+terakhir), `current_db` (sha256, bytes), `inheritance` (BACKFILL diturunkan
+ulang + tanggal yang berubah, LIVE jangkar per kelas, LIVE baru), aturan.
+
+### Satu perubahan di pembaca (PR #75)
+
+Data nyata 2026-10-01 membuktikan celah: top-up mengubah grup BACKFILL 07-03
+(KIOS/ZP netval 1,00436 → 0,0; tetap 1.034 baris), sehingga aturan jangkar PR #75
+("grup yang hash-nya berubah tidak memakai jangkar lama") melepas karantina
+07-03. Manifest `broker_flow_regime.py build --new-snapshot` tanpa parquet atas
+DB 6f21a72 membuat pembaca menyajikan sesi 07-03 dari sisi BACKFILL
+(SELECTOR_UNION_BACKFILL). `_anchored_quarantine_records` sekarang: grup LIVE
+jangkar tetap harus persis; grup SOURCE_DATED_BACKFILL jangkar tetap menjangkar
+selama manifest masih mencatatnya SOURCE_DATED_BACKFILL, dengan record
+**sekarang** (akuntansi baris mengikuti baris sekarang). Top-up mengubah nilai,
+bukan sesi (= tanggalnya) atau capture class, jadi konfliknya dengan capture live
+sesi itu tetap ada. Hanya bisa menambah karantina, tidak pernah mengurangi.
+
+### Snapshot nyata 2026-10-01 (master 6f21a72, blob `neobdm.db` c2f839ad, sha256 `df3d94af…`)
+
+- Tanggal akuisisi maks 2026-10-01; 306 grup / 233.549 baris (jangkar 305 /
+  232.493). Grup baru hanya (2026-10-01, LIVE), 947 baris.
+- `broker_flow_scan` 58 baris (jangkar 29). Run PERSISTED 2026-10-01
+  `01:51:07.838116`: 29 broker, `session_date` = `expected_session_date` =
+  2026-09-30, `idx-2026-2027.v1`, `tracked_rows` per broker = baris live →
+  SCAN_VERIFIED → 2026-09-30.
+- 49/49 CONTENT_MATCHED jangkar tidak berubah. Tidak ada grup LIVE historis yang
+  berubah atau hilang.
+- 173 dari 218 grup BACKFILL berubah (2025-10-06..2026-07-03 = jendela top-up),
+  +109 baris (212.839 → 212.948).
+- Manifest refresh diterima pembaca. View kanonis: **251 sesi** (217 backfill,
+  32 DOM_TOP15, 2 FULL_CALLBACK), **221.399 baris** (211.914 backfill, 7.573
+  CONTENT_MATCHED, 1.912 SCAN_VERIFIED). Akuntansi 221.399 + 3.642 salinan +
+  1.252 karantina + 7.256 dikecualikan = 233.549. Sesi baru: 09-30
+  (FULL_CALLBACK, dari akuisisi 10-01).
+- **07-03 tetap dikarantina** (CAPTURE_CLASSES_DIFFER + VALUES_CONFLICT, 168
+  kunci, 1.252 baris); `get` → `SessionNotCovered` QUARANTINED.
+- Refresh atas DB teraudit 1aeca53 menghasilkan record yang **persis** sama
+  dengan jangkar.
+
+Catatan: `test_broker_flow_regime.py::test_committed_manifest_still_describes_the_real_rows`
+sudah gagal di master sejak top-up 2026-10-01, karena tes itu mengunci jumlah
+baris BACKFILL `neobdm.db` kerja (top-up menambah baris). Bukan dari PR ini;
+refresh ini memperlakukan BACKFILL sebagai turunan.
+
+Tes: `test_broker_flow_manifest_refresh.py` (pytest). Fixture sintetis =
+fixture `test_broker_flow_canonical.py` + top-up + capture 10-01. Tes data nyata
+membaca `neobdm.db` 6f21a72 dan 1aeca53 dari git; kalau di-skip, artinya tidak
+berjalan. Belum masuk daftar CI `check_ml_health`.

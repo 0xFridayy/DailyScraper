@@ -51,10 +51,12 @@ line-ending independent). Every PROVEN claim of any manifest is re-verified:
                          own record (same date, canonical, row_count, rows_sha256)
   MIXED                  exactly the AUDITED_MIXED dates, in both directions
 Downgrades to INFERRED_ONLY are allowed; nothing unverifiable is upgraded.
-An exact audited conflict remains quarantined while all of its raw group keys,
+An audited conflict remains quarantined while all of its raw group keys,
 row counts and row hashes remain present, even if a later manifest downgrades
-one side. The anchor preserves a known conflict; it does not promote the
-downgraded record into the canonical view.
+one side; a SOURCE_DATED_BACKFILL side only has to remain one (the nightly
+top-up rewrites its values, never its session or capture class). The anchor
+preserves a known conflict; it does not promote the downgraded record into the
+canonical view.
 
 TRUST. INFERRED_ONLY (a calendar guess) and MIXED (rows of two sessions) never
 enter the trusted view: normally listed in .excluded and visible in inspection
@@ -556,20 +558,26 @@ def _collapse_records(records, groups):
 
 
 def _anchored_quarantine_records(records, groups):
-    """Audited conflict records whose exact raw groups are still present.
+    """Audited conflict records whose raw groups are still present.
 
     A later manifest may downgrade evidence, but matching acquisition keys,
     row counts, and row hashes still prove that the audited conflict groups
-    themselves have not changed. Only sessions that conflict under those
-    audited records are returned.
+    themselves have not changed. A SOURCE_DATED_BACKFILL group anchors while
+    the manifest still records it as one, with its current record: the nightly
+    top-up rewrites backfill values, but not its session (the date itself) or
+    its capture class, so its conflict with a live capture of that session
+    stands. Only sessions that conflict under those records are returned.
     """
     anchor = _audited_records()
-    unchanged = {
-        key: anchored for key, anchored in anchor.items()
-        if key in records
-        and (records[key]["row_count"], records[key]["rows_sha256"])
-        == (anchored["row_count"], anchored["rows_sha256"])
-    }
+    unchanged = {}
+    for key, anchored in anchor.items():
+        rec = records.get(key)
+        if rec is None:
+            continue
+        if (rec["row_count"], rec["rows_sha256"]) == (anchored["row_count"], anchored["rows_sha256"]):
+            unchanged[key] = anchored
+        elif rec["date_class"] == anchored["date_class"] == bfr.SOURCE_DATED_BACKFILL:
+            unchanged[key] = rec
     _, _, quarantined = _collapse_records(unchanged, groups)
     return {
         q.canonical_session_date: {
