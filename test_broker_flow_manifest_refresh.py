@@ -327,6 +327,182 @@ def test_a_refresh_is_deterministic(rf):
 
 
 # --------------------------------------------------------------------------
+# The published file is the manifest built; SQLite sidecars are never written
+# --------------------------------------------------------------------------
+
+def _downgrade(m, key=L06):
+    """m with one CONTENT_MATCHED record downgraded to INFERRED_ONLY: a valid
+    manifest the reader accepts on its own (downgrades are allowed)."""
+    m = copy.deepcopy(m)
+    by_key(m)[key].update(date_class=bfr.INFERRED_ONLY, evidence_level="INFERRED",
+                          evidence_kind="idx_calendar_inference", canonical_session_date=None,
+                          inferred_matches_canonical=None)
+    m["summary"] = bfr._summary(m["records"])
+    return m
+
+
+def _swap_before_reading(monkeypatch, render):
+    """The temp file is rewritten as render(its manifest) just before the
+    reader reads it."""
+    real = bfc.load_canonical_broker_flow
+
+    def swap_then_read(db, path, **kwargs):
+        with open(path, encoding="ascii") as f:
+            data = render(json.load(f))
+        with open(path, "wb") as f:
+            f.write(data)
+        return real(db, path, **kwargs)
+    monkeypatch.setattr(bfc, "load_canonical_broker_flow", swap_then_read)
+
+
+def _replaces(monkeypatch):
+    calls = []
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+def test_the_validated_file_is_the_manifest_built(rf, monkeypatch):
+    calls = _replaces(monkeypatch)
+    out, m, cf = rf.refresh(rf.current())
+    assert cf.manifest_sha256 == bmr.manifest_sha256(m) == bfc._load_json(out)[1]
+    assert open(out, "rb").read() == bfr.dumps(m).encode("ascii")
+    assert len(calls) == 1
+
+
+def test_a_valid_substitute_for_the_validated_file_is_refused(rf, monkeypatch):
+    db = rf.current()
+    _, m, cf = rf.refresh(db, "intended.json")
+    substitute = _downgrade(m)
+    alone = bfc.load_canonical_broker_flow(db, rf.write(substitute, "substitute.json"))
+    assert (len(_content_matched(m)), len(_content_matched(substitute))) == (7, 6)
+    assert len(alone.rows) < len(cf.rows) and "2026-07-06" not in alone.sessions
+    folder = rf.dir / "published"
+    folder.mkdir()
+    (folder / "refreshed.json").write_bytes(b"previous manifest\n")
+    _swap_before_reading(monkeypatch, lambda got: bfr.dumps(_downgrade(got)).encode("ascii"))
+    calls = _replaces(monkeypatch)
+    with pytest.raises(bmr.RefreshRefused, match="is not the refreshed manifest"):
+        bmr.refresh(db, str(folder / "refreshed.json"))
+    assert (folder / "refreshed.json").read_bytes() == b"previous manifest\n"
+    assert os.listdir(folder) == ["refreshed.json"] and calls == []
+
+
+def test_a_reformatted_file_with_the_same_content_is_the_same_manifest(rf, monkeypatch):
+    """The reader's content hash ignores formatting and line endings; so does
+    the binding."""
+    _swap_before_reading(monkeypatch, lambda got: json.dumps(got, indent=4)
+                         .replace("\n", "\r\n").encode("ascii"))
+    out, m, cf = rf.refresh(rf.current())
+    published = open(out, "rb").read()
+    assert published != bfr.dumps(m).encode("ascii") and b"\r\n" in published
+    assert json.loads(published) == m and cf.manifest_sha256 == bmr.manifest_sha256(m)
+
+
+def test_a_file_changed_after_validation_is_not_published(rf, monkeypatch):
+    real = bmr.self_validate
+
+    def validate_then_swap(manifest, path, context):
+        cf = real(manifest, path, context)
+        with open(path, "wb") as f:
+            f.write(bfr.dumps(_downgrade(manifest)).encode("ascii"))
+        return cf
+    monkeypatch.setattr(bmr, "self_validate", validate_then_swap)
+    calls = _replaces(monkeypatch)
+    out = rf.dir / "out.json"
+    with pytest.raises(bmr.RefreshRefused, match="changed after it was validated"):
+        bmr.refresh(rf.current(), str(out))
+    assert not out.exists() and calls == []
+    assert not [n for n in os.listdir(rf.dir) if n.endswith(".tmp")]
+
+
+@pytest.mark.parametrize("suffix", bfc._SIDECARS)
+def test_a_source_sidecar_is_never_the_output(rf, monkeypatch, suffix):
+    db = rf.current()
+    name = os.path.basename(db) + suffix
+    spellings = [db + suffix, str(rf.dir / "sub" / ".." / name), name]
+    if os.name == "nt":                     # Win32 drops trailing dots and spaces
+        spellings += [(db + suffix).upper(), db + suffix + ".", db + suffix + " "]
+    try:
+        os.symlink(db + suffix, str(rf.dir / "sidecar_link"))
+        spellings.append(str(rf.dir / "sidecar_link"))
+    except (OSError, NotImplementedError):
+        pass                                # unprivileged Windows: no symlinks
+    monkeypatch.chdir(rf.dir)               # `name` is relative to the source's folder
+    for out in spellings:
+        with pytest.raises(bmr.RefreshRefused, match=f"the source database's {suffix} sidecar"):
+            bmr.refresh(db, out)
+    assert not os.path.lexists(db + suffix)
+    assert not [n for n in os.listdir(rf.dir) if n.endswith(".tmp")]
+    rf.refresh(db)                          # the source is still quiescent
+
+
+@pytest.mark.parametrize("suffix", bfc._SIDECARS)
+def test_an_existing_sidecar_and_its_hard_links_are_not_written(rf, monkeypatch, suffix):
+    db = rf.current()
+    with open(db + suffix, "wb") as f:
+        f.write(b"sidecar bytes")
+    outs = [db + suffix]
+    try:
+        os.link(db + suffix, str(rf.dir / "sidecar_alias"))
+        outs.append(str(rf.dir / "sidecar_alias"))
+    except (OSError, NotImplementedError):
+        pass
+    classified = []
+    real = bfr._build
+    monkeypatch.setattr(bfr, "_build", lambda *a: classified.append(a) or real(*a))
+    for out in outs:
+        with pytest.raises(bmr.RefreshRefused, match=f"{suffix} sidecar"):
+            bmr.refresh(db, out)
+    assert open(db + suffix, "rb").read() == b"sidecar bytes" and classified == []
+    assert str(rf.dir / "sidecar_alias") in outs
+
+
+@pytest.mark.parametrize("suffix", bfc._SIDECARS)
+def test_an_output_that_becomes_a_sidecar_alias_during_validation_is_refused(rf, monkeypatch,
+                                                                            suffix):
+    db, out = rf.current(), str(rf.dir / "out.json")
+    real = bmr.self_validate
+
+    def validate_then_link(*args):
+        cf = real(*args)
+        with open(db + suffix, "wb") as f:
+            f.write(b"sidecar bytes")
+        os.link(db + suffix, out)
+        return cf
+    monkeypatch.setattr(bmr, "self_validate", validate_then_link)
+    calls = _replaces(monkeypatch)
+    with pytest.raises(bmr.RefreshRefused, match=f"{suffix} sidecar"):
+        bmr.refresh(db, out)
+    assert open(db + suffix, "rb").read() == open(out, "rb").read() == b"sidecar bytes"
+    assert calls == [] and not [n for n in os.listdir(rf.dir) if n.endswith(".tmp")]
+
+
+@pytest.mark.parametrize("suffix", bfc._SIDECARS)
+def test_unrelated_outputs_beside_the_source_still_publish(rf, suffix):
+    db = rf.current()
+    for out in (db + suffix + ".json", db + "-refresh" + suffix + ".json",
+                str(rf.dir / ("other.db" + suffix))):
+        m, _ = bmr.refresh(db, out)
+        assert open(out, "rb").read() == bfr.dumps(m).encode("ascii")
+    assert not os.path.lexists(db + suffix)
+    rf.refresh(db, "again.json")
+
+
+def test_the_sidecars_of_a_symlinked_source_are_protected(rf):
+    db = rf.current()
+    link = str(rf.dir / "link.db")
+    try:
+        os.symlink(db, link)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"symlinks unavailable: {e}")
+    for suffix in bfc._SIDECARS:
+        for out in (link + suffix, db + suffix):
+            with pytest.raises(bmr.RefreshRefused, match=f"{suffix} sidecar"):
+                bmr.refresh(link, out)
+
+
+# --------------------------------------------------------------------------
 # SOURCE_DATED_BACKFILL: re-derived from the current rows
 # --------------------------------------------------------------------------
 
@@ -991,6 +1167,29 @@ def test_real_reader_behaviour_is_unchanged_by_the_refresh(real):
     inferred = {r["broker_flow_date"] for r in m["records"] if r["date_class"] == bfr.INFERRED_ONLY}
     assert len(inferred) == 35 and not [r for r in cf.rows if inferred & set(r.copy_acquisition_dates)]
     assert not [s for s in cf.sessions if "2026-08-21" < s < "2026-09-29"]
+
+
+def test_real_a_valid_substitute_manifest_is_never_published(real, tmp_path, monkeypatch):
+    """Codex's reproduction: the object holds 49 CONTENT_MATCHED records, the
+    file the reader validates a valid manifest with 48 that the reader accepts
+    on its own (fewer canonical rows). The refresh refuses and publishes
+    nothing."""
+    db, _, m, _, _ = real
+    assert by_key(m)[L06]["date_class"] == bfr.CONTENT_MATCHED
+    substitute = _downgrade(m)
+    path = str(tmp_path / "substitute.json")
+    bfr.write_manifest(substitute, path)
+    alone = bfc.load_canonical_broker_flow(db, path)
+    assert (len(_content_matched(m)), len(_content_matched(substitute))) == (49, 48)
+    assert (len(alone.rows), alone.accounting["excluded"]) == (221_182, 7_473)    # not 221,399
+    assert "2026-07-06" not in alone.sessions
+    _swap_before_reading(monkeypatch, lambda got: bfr.dumps(_downgrade(got)).encode("ascii"))
+    calls = _replaces(monkeypatch)
+    out = tmp_path / "refreshed.json"
+    with pytest.raises(bmr.RefreshRefused, match="is not the refreshed manifest"):
+        bmr.refresh(db, str(out), source_commit=CURRENT_COMMIT)
+    assert not out.exists() and calls == []
+    assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
 
 
 def test_real_refresh_is_deterministic(real, tmp_path):

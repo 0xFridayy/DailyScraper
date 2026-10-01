@@ -42,11 +42,16 @@ date. PR #74 contradictions (scan runs, AUDITED_MIXED state) refuse the refresh.
 
 SELF-VALIDATION. The manifest is written to a temp file beside --out, and
 load_canonical_broker_flow(db, temp) must accept it (structure, the database's
-groups and hashes, scan re-proof) on the same database bytes the refresh
-classified, with every session the anchor quarantines still quarantined. Only
-then os.replace(temp, out). Any failure removes the temp file and leaves an
-existing --out untouched. Output is deterministic for the same database and
-anchor (no wall clock, no paths).
+groups and hashes, scan re-proof) as exactly the manifest built (same content
+hash), on the same database bytes the refresh classified, with every session
+the anchor quarantines still quarantined. Only then, with --out and the temp
+file's content checked again, os.replace(temp, out). Any failure removes the
+temp file and leaves an existing --out untouched. Output is deterministic for
+the same database and anchor (no wall clock, no paths).
+
+OUTPUT. --out is required and is never (an alias of) the committed audited
+manifest, the anchor in use, the source database or its -wal/-shm/-journal
+sidecars.
 
 SOURCE. As broker_flow_canonical: bfr.connect_readonly (mode=ro&immutable=1);
 -wal/-shm/-journal beside the file, a hard-linked file, or a file that changes
@@ -59,6 +64,7 @@ Usage:
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sqlite3
@@ -138,11 +144,18 @@ def load_anchor(path=None):
     return anchor, digest
 
 
+def _spellings(path):
+    """The resolved names a path can reach: symlinks, junctions, case, '..',
+    short names, and (abspath) the trailing dots and spaces Win32 drops, which
+    realpath keeps for a file that does not exist yet."""
+    return {os.path.normcase(os.path.realpath(p)) for p in (path, os.path.abspath(path))}
+
+
 def _same_file(a, b):
-    """a and b name one file: the same resolved path (symlinks, junctions, case,
-    '..', short names) or the same inode (hard links)."""
+    """a and b name one file: a shared resolved spelling or the same inode
+    (hard links)."""
     a, b = os.fspath(a), os.fspath(b)
-    if os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b)):
+    if _spellings(a) & _spellings(b):
         return True
     try:
         return os.path.samefile(a, b)
@@ -152,14 +165,18 @@ def _same_file(a, b):
 
 def check_out_path(out, db_path, anchor_path=None):
     """Refuse a missing --out and any --out that is, or aliases, the committed
-    audited manifest, the anchor in use, or the source database."""
+    audited manifest, the anchor in use, the source database, or one of its
+    SQLite sidecars (a file there makes the source read as live or crashed)."""
     if out is None or not os.fspath(out).strip():
         raise RefreshRefused("an explicit output path is required; the audited manifest is "
                              "never the output")
-    protected = (("the committed audited manifest", COMMITTED_ANCHOR),
+    protected = [("the committed audited manifest", COMMITTED_ANCHOR),
                  ("the audited anchor", bfc.AUDITED_MANIFEST_PATH),
                  ("the audited anchor", anchor_path),
-                 ("the source database", db_path))
+                 ("the source database", db_path)]
+    if db_path is not None:
+        for db in (os.fspath(db_path), os.path.realpath(db_path)):
+            protected += [(f"the source database's {s} sidecar", db + s) for s in bfc._SIDECARS]
     for what, path in protected:
         if path is not None and _same_file(out, path):
             raise RefreshRefused(f"--out {os.fspath(out)} is {what} ({os.fspath(path)}); "
@@ -309,15 +326,34 @@ def anchored_quarantine(anchor, groups):
     return {q.canonical_session_date for q in bfc._collapse_records(trusted, groups)[2]}
 
 
+def manifest_sha256(manifest):
+    """The content hash broker_flow_canonical gives a manifest file:
+    sha256(bfr.dumps(parsed)), independent of formatting and line endings."""
+    return hashlib.sha256(bfr.dumps(manifest).encode("ascii")).hexdigest()
+
+
+def _file_is(manifest_path, manifest):
+    """The file at manifest_path holds exactly this manifest (by content hash)."""
+    try:
+        return bfc._load_json(manifest_path)[1] == manifest_sha256(manifest)
+    except (OSError, bfc.ManifestInvalid):
+        return False
+
+
 def self_validate(manifest, manifest_path, context):
     """The PR #75 reader's view of the database under the manifest file, if the
-    reader accepts it and it is the view the refresh promises; else
-    RefreshRefused (bfc.SourceStateError if the database moved)."""
+    reader accepts it, read it as exactly this manifest, and it is the view the
+    refresh promises; else RefreshRefused (bfc.SourceStateError if the
+    database moved)."""
     try:
         bfc.check_manifest(manifest, audited=False)
         cf = bfc.load_canonical_broker_flow(context["db_path"], manifest_path)
     except (bfc.ManifestInvalid, bfc.ManifestMismatch) as e:
         raise RefreshRefused(f"broker_flow_canonical refuses the refreshed manifest: {e}") from None
+    if cf.manifest_sha256 != manifest_sha256(manifest):
+        raise RefreshRefused(f"{manifest_path} is not the refreshed manifest (content sha256 "
+                             f"{cf.manifest_sha256[:12]} != {manifest_sha256(manifest)[:12]}): "
+                             "the reader validated another artifact")
     if cf.db_sha256 != context["identity"][2]:
         raise bfc.SourceStateError(f"{context['db_path']} changed between the refresh and its "
                                    "validation; nothing written")
@@ -347,6 +383,8 @@ def refresh(db_path, out, anchor_path=None, source_commit=None):
             os.fsync(f.fileno())
         cf = self_validate(manifest, tmp, context)
         check_out_path(out, context["db_path"], anchor_path)
+        if not _file_is(tmp, manifest):
+            raise RefreshRefused(f"{tmp} changed after it was validated; nothing written")
         os.replace(tmp, out)
     except BaseException:
         try:

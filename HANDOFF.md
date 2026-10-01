@@ -1647,18 +1647,25 @@ untuk mengizinkannya. BACKFILL tidak dikunci karena top-up malam
 ≤ `BACKFILL_END` di jendela 360 hari) memang menulis ulang nilainya.
 
 **Output.** `--out` wajib. Path manifest teraudit yang di-commit, jangkar yang
-dipakai, dan DB sumber ditolak, termasuk aliasnya (path yang di-resolve:
-symlink/junction, huruf besar-kecil, `..`, titik di akhir; hard link lewat
-`samefile`), dan dicek lagi tepat sebelum `os.replace`. Ditulis ke file temp di
-folder yang sama, divalidasi, lalu `os.replace`; gagal di titik mana pun → temp
-dihapus, `--out` lama tidak berubah. Deterministik: DB + jangkar sama → byte
-sama (tanpa jam dinding, tanpa path).
+dipakai, DB sumber, dan sidecar SQLite-nya (`-wal`, `-shm`, `-journal`, dari path
+yang diberikan maupun path resolve-nya) ditolak, termasuk aliasnya (path yang
+di-resolve: symlink/junction, huruf besar-kecil, `..`, titik/spasi di akhir yang
+dibuang Win32 walau file belum ada; hard link lewat `samefile`), sebelum build dan
+lagi tepat sebelum `os.replace`. File di path sidecar akan membuat sumber terbaca
+hidup/rusak pada cek identitas berikutnya. Ditulis ke file temp di folder yang
+sama, divalidasi, lalu `os.replace`; gagal di titik mana pun → temp dihapus,
+`--out` lama tidak berubah. Deterministik: DB + jangkar sama → byte sama (tanpa
+jam dinding, tanpa path).
 
 **Validasi diri sebelum terbit.** `bfc.check_manifest` →
 `load_canonical_broker_flow(db, temp)` harus menerima (struktur, grup dan hash
-per grup, bukti scan diulang) → `db_sha256` pembaca = sha file yang
-diklasifikasi → setiap sesi yang dikarantina record trusted jangkar (aturan
-collapse pembaca atas baris sekarang) tetap dikarantina.
+per grup, bukti scan diulang) → file yang divalidasi pembaca harus **persis**
+manifest yang dibangun (`cf.manifest_sha256` = sha256 `bfr.dumps(manifest)`,
+konvensi hash isi pembaca: format/CRLF boleh beda, isi tidak) → `db_sha256`
+pembaca = sha file yang diklasifikasi → setiap sesi yang dikarantina record
+trusted jangkar (aturan collapse pembaca atas baris sekarang) tetap dikarantina.
+Tepat sebelum `os.replace`, isi file temp dicek sekali lagi terhadap manifest
+yang sama.
 
 **Sumber.** Seperti pembaca: -wal/-shm/-journal, `st_nlink > 1`, format tak
 dikenal → `SourceStateError` sebelum apa pun diklasifikasi; identitas file
