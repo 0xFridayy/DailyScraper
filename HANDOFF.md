@@ -1434,3 +1434,160 @@ pernah diturunkan diam-diam ke INFERRED_ONLY.
 Tes: `test_broker_flow_regime.py` (pytest; set `BROKER_DAILY_PARQUET` untuk
 tes reproduksi byte-identik — parquet yang disebut eksplisit tapi hash-nya
 salah membuat tes GAGAL, bukan skip). Belum masuk daftar CI `check_ml_health`.
+
+## Lampiran T — pembaca kanonis `broker_flow` (baca-saja) (2026-10-01)
+
+Tiga lapis, masing-masing dengan satu tugas:
+
+| lapis | apa | siapa |
+|---|---|---|
+| RAW | `broker_flow.date` = kunci akuisisi historis, apa adanya | tabel `broker_flow` |
+| EVIDENCE | sesi mana yang **terbukti** dipegang tiap `(date, regime)` | `evidence/broker_flow_date_evidence.json` (Lampiran S) |
+| CANONICAL READ | baris per sesi pasar, hanya yang PROVEN, tanpa salinan ganda | `broker_flow_canonical.py` |
+
+    load_canonical_broker_flow(db_path, manifest_path, trust="proven")
+    inspect_broker_flow_evidence(db_path, manifest_path)
+
+Hanya pembaca. Tidak ada tabel/DB sidecar, migrasi, atau baris yang diubah.
+**Belum ada konsumen yang dimigrasikan**: `walk_forward_backtest`,
+`horizon_scan`, `ml_v2_experiment_1`, `multiday_features` dll. masih membaca
+`broker_flow.date` langsung (dua rezim tanggal, `fillna(0)`). Itu PR berikutnya.
+
+### Aturan
+
+- **Tanggal mentah dipertahankan.** Tiap baris kanonis membawa
+  `acquisition_date` (= `broker_flow.date` baris yang bertahan) **dan**
+  `canonical_session_date`. Tidak ada kolom bernama `date`: konsumen harus
+  memilih kunci sesi secara eksplisit. Semua tanggal berupa `str` ISO.
+- **Sesi kanonis hanya dari bukti.** Nilainya selalu `canonical_session_date`
+  manifest. Tidak ada aturan kalender dan tidak ada fallback ke tanggal mentah.
+  Kalender IDX hanya dipanggil di dalam `bfr.scan_evidence` (bukti PR #74 yang
+  diulang untuk SCAN_VERIFIED) sebagai **cek**; sesinya tetap label sumber.
+- **Trusted = PROVEN.** SOURCE_DATED_BACKFILL, SCAN_VERIFIED, CONTENT_MATCHED.
+  INFERRED_ONLY (tebakan kalender) dan MIXED (dua sesi) **dikecualikan secara
+  default** (`.excluded`), terlihat di `inspect_broker_flow_evidence` dengan
+  `canonical_session_date` NULL, dan tidak pernah dinaikkan. `trust` hanya
+  menerima `"proven"`. Dua fungsi, bukan satu parameter mode, karena bentuk
+  hasilnya berbeda (kanonis ter-dedupe vs baris mentah beranotasi).
+- **Dedupe per sesi.** Satu sesi bisa dipegang beberapa tanggal akuisisi
+  (salinan akhir pekan/libur). Salinan identik persis di
+  `(bval, sval, netval, bavg, savg)` (NULL ikut dibandingkan) → **satu** baris
+  per `(canonical_session_date, ticker, broker_code)`. Yang bertahan = salinan
+  dengan `acquisition_date` paling awal (unik karena PK
+  `(date, ticker, broker_code)`); `copy_acquisition_dates` mencatat semua
+  tanggal yang memegang salinan itu. Kunci yang hanya ada di sebagian salinan
+  tetap diambil (union). Nilai **tidak pernah dijumlahkan**. Kelas bukti tidak
+  dipakai sebagai ranking (semua PROVEN; tidak ada salinan identik lintas kelas).
+- **Salinan yang konflik gagal tertutup.** Satu kunci yang nilainya berbeda
+  antar-salinan (VALUES_CONFLICT), atau record trusted dengan `capture_class`
+  berbeda di satu sesi walau tanpa kunci bersama (CAPTURE_CLASSES_DIFFER), →
+  **seluruh sesi dikarantina** (`.quarantined`, tanpa baris di view trusted).
+  Bukan per kunci: membuang kunci yang konflik saja menyisakan penampang yang
+  justru kehilangan aliran terbesar yang dilihat kedua capture; memilih satu
+  record = ranking karangan.
+- **Absen ≠ nol.** Tidak ada baris sintetis, tidak ada `fillna`, NULL tetap
+  `None`. `get(sesi, ticker, broker)` → `None` hanya untuk broker yang tidak
+  teramati di sesi yang tercakup; sesi tanpa baris trusted →
+  `SessionNotCovered` (`status` QUARANTINED atau NOT_COVERED). `.sessions` =
+  sesi tercakup → capture_class-nya.
+- **`capture_class` tetap terlihat** di tiap baris. Tidak satu pun merupakan
+  universe broker penuh:
+
+| capture_class | unit cakupan | netval |
+|---|---|---|
+| SELECTOR_UNION_BACKFILL | per ticker: union selector TOP_5_NB/NS | `nlot*100*close/1e9`; bval/sval/bavg/savg NULL; 0 = nlot 0 |
+| DOM_TOP15 | per **broker**: tabel beli/jual 15 baris yang dirender, hanya ticker yang dilacak; satu sisi bisa hilang (08-22) | ≈ `bval − sval` (berbasis nilai) |
+| FULL_CALLBACK | per broker: tabel callback penuh PR #72 | ≈ `bval − sval` |
+
+  Nilai LIVE = miliar Rp dibulatkan 0,1: `0.0` dengan avg > 0 = nilai
+  teramati di bawah 0,05 miliar; sisi dengan nilai 0 **dan** avg 0 = sisi yang
+  tidak tampil di tabel (untuk DOM_TOP15: tidak diketahui, bukan nol teramati).
+  Fitur seperti n_brokers, konsentrasi, dan korelasi berubah struktur di batas
+  07-03/07-06 dan 09-29: stratifikasi per capture_class.
+- **PROVEN untuk BACKFILL = tanggalnya dari sumber, bukan nilainya benar.**
+  Nilai backfill ditulis ulang tiap malam oleh top-up, dan snapshot teraudit
+  sendiri memuat cacat yang diketahui (`ML_V2_EXPERIMENT_1E_KNOWN_LIMITATION_RAJA.md`).
+
+### Data teraudit (manifest committed + `git show 1aeca53:neobdm.db`)
+
+- View trusted: **250 sesi, 220.343 baris**. 217 sesi backfill / 211.805
+  baris, 32 sesi CONTENT_MATCHED / 7.573, 1 SCAN_VERIFIED (09-29) / 965.
+- 10 sesi dipegang lebih dari satu record PROVEN; 3.642 salinan identik
+  digabung. Sembilan di antaranya LIVE saja (07-07, 07-10, 07-13, 07-17,
+  07-24, 07-31, 08-07, 08-14, 08-21): 0 konflik nilai di kunci bersama.
+  08-21: 08-22 hanya 202 dari 211 kunci (tabel sisi AO/PD/RX/SQ tidak ada),
+  08-23 = 08-24; union memulihkan 211 (202 dari 08-22, 9 dari 08-23).
+- **Sesi 07-03 dikarantina.** BACKFILL 07-03 (1.034 baris) dan LIVE 07-05 (218
+  baris, CONTENT_MATCHED) sama-sama PROVEN untuk 07-03, tapi ukurannya berbeda
+  (netval lot × close dengan bval/sval NULL vs netval berbasis nilai): 168
+  kunci bersama semuanya berbeda (rasio backfill/live −42,05 s.d. 126,79, 6
+  berlawanan tanda, hanya 1 sama persis), 866 kunci hanya backfill, 50 hanya
+  live. 1.252 baris mentah ditahan. `summary.live_sessions_held_by_several_dates`
+  PR #74 hanya melihat record LIVE, jadi pasangan lintas rezim ini tidak
+  tercantum di sana.
+- Dikecualikan: 37 record / 7.256 baris (35 INFERRED_ONLY, MIXED 08-12 dan
+  08-27). Sesi 08-12 tetap ada lewat akuisisi 08-13.
+- Akuntansi baris mentah: 220.343 + 3.642 + 1.252 + 7.256 = 232.493.
+- Sesi tanpa baris trusted (celah, bukan nol): 07-03 (karantina), 07-08 (tidak
+  pernah tertangkap), 08-11, dan 08-24..09-28 (hanya INFERRED_ONLY/MIXED).
+  Tanggal-tanggal Juli yang sesinya hari itu sendiri (07-06/07/09/10/13) tetap
+  memegang sesi terbuktinya.
+
+### Kontrak snapshot (penting sebelum migrasi konsumen)
+
+Manifest menggambarkan **satu DB persis**: himpunan `(date, regime)` sama, dan
+`row_count` serta `rows_sha256` sama untuk **setiap** kelompok, termasuk
+BACKFILL. Kalau tidak → `ManifestMismatch` dengan `.diff` (kunci sama dengan
+`bfr.verify_manifest`: missing / gone / count_changed / content_changed). Tidak
+ada toleransi drift: `verify` PR #74 memantau drift, sedangkan pembaca hanya
+menyajikan baris yang benar-benar dihitung bukti. Karena DB kerja berubah
+tiap malam (tanggal LIVE baru, top-up backfill), pembaca **menolak
+`neobdm.db` kerja setelah 1aeca53**. Pasangan yang didukung:
+
+1. `git show 1aeca53:neobdm.db` + manifest committed (teraudit);
+2. salinan beku DB lain + manifest yang dibangun untuk salinan itu:
+   `py -3 broker_flow_regime.py build --new-snapshot --db <salinan>
+   --broker-daily <parquet teraudit> --out <file lain>`. `--broker-daily`
+   harus parquet teraudit (sha256 `c8d1948f…`) atau tidak diberikan sama
+   sekali. Tanpa parquet, semua tanggal DOM_TOP15 turun ke INFERRED_ONLY.
+   Kalau manifest itu memuat record CONTENT_MATCHED yang tidak persis sama
+   dengan record manifest teraudit (mis. parquet baru yang mencocokkan tanggal
+   08-25..09-29), pembaca **menolak seluruh manifest** (`ManifestInvalid`),
+   bukan menurunkan tanggal itu. Menerima content match baru = keputusan PR
+   migrasi.
+
+Proses refresh manifest untuk DB kerja belum ada; itu keputusan PR migrasi.
+
+**Akar kepercayaan.** Manifest teraudit dikenali dari **isinya**:
+sha256 `bfr.dumps(manifest)` = blob git `146b3efd…8025`, tidak tergantung CRLF
+checkout (`AUDITED_MANIFEST_SHA256`). Label `input.snapshot` tidak memberi hak
+apa pun, dan manifest lain yang berlabel `audited-2026-09-30` ditolak. Setiap
+klaim PROVEN di manifest mana pun dicek ulang:
+
+- SOURCE_DATED_BACKFILL secara struktural: regime BACKFILL, kanonis = tanggal
+  ≤ `BACKFILL_END` 2026-07-04, dan `evidence_ref` = jalur generasi;
+- SCAN_VERIFIED dibuktikan ulang dengan `bfr.scan_evidence` atas
+  `broker_flow_scan` dan baris live DB, dan fingerprint run harus sama. Tanggal
+  yang dibuktikan run PERSISTED wajib berlabel SCAN_VERIFIED;
+- CONTENT_MATCHED tidak bisa diulang (parquet gitignored), jadi hanya diterima
+  bila record-nya persis sama dengan manifest teraudit (tanggal, kanonis,
+  `row_count`, `rows_sha256`);
+- MIXED = persis tanggal `AUDITED_MIXED`, dua arah, dengan state rerun yang
+  dikunci.
+
+Turun ke INFERRED_ONLY boleh; menaikkan yang tak bisa dicek tidak pernah.
+
+**Sumber harus diam (quiescent).** Tidak boleh ada -wal/-shm/-journal, format
+header harus dikenal, dan identitas file (ukuran, mtime_ns, sha256) harus sama
+sebelum dan sesudah dibaca (konvensi `targeted_actor_observations`); kalau
+tidak → `SourceStateError`. Koneksi `bfr.connect_readonly`
+(`mode=ro&immutable=1`); setiap statement berupa SELECT atau
+PRAGMA table_info. Hasil membawa `db_path`, `db_sha256`, `manifest_sha256`
+dan `audited`. Konsumen sebaiknya membaca harga dari file DB yang sama, karena
+netval backfill = lot × close dari `price_history` DB itu.
+
+Tes: `test_broker_flow_canonical.py` (pytest). Fixture sintetis diklasifikasi
+oleh generator PR #74 yang asli. Tes data nyata membaca DB 1aeca53 dari git;
+kalau di-skip (mis. shallow clone), artinya tes itu tidak berjalan. Seperti
+`test_broker_flow_regime.py`, file ini belum masuk daftar CI
+`check_ml_health`.
