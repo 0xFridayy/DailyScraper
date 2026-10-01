@@ -40,7 +40,8 @@ import sqlite3
 import numpy as np
 import pandas as pd
 
-from walk_forward_backtest import build_panel, DB_PATH
+from walk_forward_backtest import (build_panel, DB_PATH, connect_price_db,
+                                   format_broker_flow_provenance, parse_cli)
 from strategy_variants import get_walk_forward_predictions, _index_price_history
 from ara_arb_simulation import annotate_limits
 from pattern_backtest import build_regime, DB as TX_DB
@@ -54,9 +55,11 @@ SEARCH_FRAC = 0.70
 MIN_SIGNAL_DAYS_FOR_SELECTION = 20
 
 
-def load_neobdm():
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_panel(conn)
+def load_neobdm(broker_flow_manifest_path, db_path=DB_PATH):
+    conn = connect_price_db(db_path)
+    panel = build_panel(conn, broker_flow_db_path=db_path,
+                        broker_flow_manifest_path=broker_flow_manifest_path)
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
     px = clean_panel(conn, horizons=(1,))
     conn.close()
     return panel, px
@@ -201,8 +204,9 @@ def select_threshold(search_arm, min_signal_days=MIN_SIGNAL_DAYS_FOR_SELECTION):
     return winner, reliable_selection
 
 
-def main():
-    panel, px = load_neobdm()
+def main(argv=None):
+    args = parse_cli(argv, description="Regime-gated momentum on the walk-forward signal.")
+    panel, px = load_neobdm(args.broker_flow_manifest, args.db)
     px = annotate_limits(px)
     px_by_ticker, date_idx_by_ticker = _index_price_history(px)
 

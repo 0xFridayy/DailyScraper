@@ -34,7 +34,16 @@ routed through price_audit.clean_panel().
 Run:  py check_ml_health.py            -> print status
       py check_ml_health.py --telegram -> also send it
       py check_ml_health.py --quick    -> skip the model fit (imports + data only)
+      py check_ml_health.py --broker-flow-manifest PATH
+                                       -> build the panel under that manifest
 Exit code is non-zero when unhealthy.
+
+BROKER FLOW. build_panel() reads broker flow only through broker_flow_canonical
+under an explicit manifest for the exact database (HANDOFF Lampiran V). Without
+--broker-flow-manifest this check runs both layers in order, as separate
+steps: broker_flow_manifest_refresh.refresh() for neobdm.db (written to
+BROKER_FLOW_MANIFEST_OUT, hashes reported), then build_panel() under it. A
+refused refresh is a health problem, never a reason to read raw broker_flow.
 """
 
 import ast
@@ -49,6 +58,8 @@ import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "neobdm.db")
+#: Where the refresh step writes the manifest it builds (gitignored).
+BROKER_FLOW_MANIFEST_OUT = os.path.join(HERE, "backtest_out", "ml_health", "broker_flow_manifest.json")
 
 # Modules that must import and stay importable. ddqn_entry_exit needs torch,
 # which is heavy; it is checked but a missing torch downgrades to a note rather
@@ -201,13 +212,33 @@ def check_unit_tests(problems, stats):
     stats["tests_passed"] = passed
 
 
-def check_panel(problems, notes, stats):
+def refresh_broker_flow_manifest(problems, stats, out=BROKER_FLOW_MANIFEST_OUT):
+    """Step 1 of 2: the evidence manifest for neobdm.db, by the refresh tool
+    (HANDOFF Lampiran U). Returns its path, or None after recording why not."""
+    import broker_flow_manifest_refresh as bfmr
+
+    try:
+        manifest, _ = bfmr.refresh(DB_PATH, out)
+    except Exception as e:
+        problems.append(f"broker_flow manifest refresh refused: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None
+    stats["broker_flow_refreshed"] = True
+    return out
+
+
+def check_panel(problems, notes, stats, broker_flow_manifest=None):
     """Build the real training panel and assert it is usable."""
     from walk_forward_backtest import build_panel, FEATURES
 
+    if broker_flow_manifest is None:
+        broker_flow_manifest = refresh_broker_flow_manifest(problems, stats)
+        if broker_flow_manifest is None:
+            return None
     conn = sqlite3.connect(DB_PATH)
     try:
-        panel = build_panel(conn)
+        panel = build_panel(conn, broker_flow_db_path=DB_PATH,
+                            broker_flow_manifest_path=broker_flow_manifest)
     except Exception as e:
         problems.append(f"build_panel() raised {type(e).__name__}: {e}")
         traceback.print_exc()
@@ -215,6 +246,11 @@ def check_panel(problems, notes, stats):
     finally:
         conn.close()
 
+    bf = panel.attrs["broker_flow"]
+    stats["broker_flow"] = (f"db {bf['db_sha256'][:12]} manifest {bf['manifest_sha256'][:12]} "
+                            f"({bf['manifest_snapshot']}"
+                            f"{', refreshed this run' if stats.get('broker_flow_refreshed') else ''})"
+                            f", quarantined {bf['quarantined_sessions']}")
     stats["panel"] = f"{len(panel)} rows / {panel['date'].nunique()}d / {panel['ticker'].nunique()}t"
     if len(panel) < MIN_PANEL_ROWS:
         problems.append(f"panel collapsed to {len(panel)} rows (expected >{MIN_PANEL_ROWS})")
@@ -373,12 +409,12 @@ def check_known_defects(problems, notes, stats):
 
 # ── reporting ─────────────────────────────────
 
-def check(quick=False):
+def check(quick=False, broker_flow_manifest=None):
     problems, notes, stats = [], [], {}
     check_imports(problems, notes, stats)
     check_known_defects(problems, notes, stats)
     check_unit_tests(problems, stats)
-    panel = check_panel(problems, notes, stats)
+    panel = check_panel(problems, notes, stats, broker_flow_manifest)
     if quick:
         notes.append("--quick: model smoke test skipped")
     else:
@@ -399,6 +435,8 @@ def format_report(problems, notes, stats):
         bits.append(f"panel {stats['panel']}")
     if bits:
         lines.append(" | ".join(bits))
+    if "broker_flow" in stats:
+        lines.append(f"broker flow: {stats['broker_flow']}")
 
     m = []
     if stats.get("pooled_ic") is not None:
@@ -437,9 +475,19 @@ def send_telegram(message):
     print("sent to Telegram" if r.ok else f"telegram error {r.status_code}: {r.text}")
 
 
+def _flag_value(flag):
+    if flag not in sys.argv:
+        return None
+    i = sys.argv.index(flag)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        sys.exit(f"{flag} needs a path")
+    return sys.argv[i + 1]
+
+
 def main():
     _load_dotenv()
-    problems, notes, stats = check(quick="--quick" in sys.argv)
+    problems, notes, stats = check(quick="--quick" in sys.argv,
+                                   broker_flow_manifest=_flag_value("--broker-flow-manifest"))
     report = format_report(problems, notes, stats)
     print(report)
     # Quiet when healthy: Telegram only hears about problems.

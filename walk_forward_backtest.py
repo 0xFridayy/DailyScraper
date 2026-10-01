@@ -15,6 +15,34 @@ the panel mean from +0.32% to +14.38%, so mean-based figures stay meaningless
 until build_panel() sources price_audit.clean_panel() (HANDOFF stage 1).
 ================================================================================
 
+BROKER FLOW INPUT (HANDOFF Lampiran V, 2026-10-01). build_panel() no longer
+reads the broker_flow table. Its broker features come ONLY from
+broker_flow_canonical.load_canonical_broker_flow() under an EXPLICIT evidence
+manifest that describes the exact database being read:
+
+    python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
+    python walk_forward_backtest.py --broker-flow-manifest <manifest>
+
+  - feature date = CanonicalRow.canonical_session_date, never acquisition_date
+    (raw broker_flow.date), never a calendar rule; one row per (session,
+    ticker, broker_code), identical acquisition copies already collapsed by
+    the reader and never summed;
+  - only PROVEN rows: INFERRED_ONLY and MIXED records are excluded, quarantined
+    sessions (2026-07-03) contribute nothing; absence stays absence (no row is
+    synthesized, no fillna(0)), NULL netval stays NaN;
+  - no manifest -> refused; a manifest that does not describe the database,
+    a non-quiescent database, or a price connection that is not the same
+    database snapshot -> refused. There is no raw broker_flow fallback, and
+    this module never generates a manifest (that is a separate layer).
+
+POINT-IN-TIME: NOT PROVEN. canonical_session_date is the market session a
+broker-flow observation BELONGS TO; it is not a known_at timestamp. The
+canonical reader fixes session alignment, trust filtering and deduplication.
+It does NOT prove a row was available at EOD of that session (the backfill
+carries no historical capture time at all, see the caveats below and
+_price_features_and_target). A backtest built here is session-aligned; it is
+not thereby "leakage-free" or a live-tradable EOD(T) feature set.
+
 Roadmap #2 — XGBoost walk-forward backtest.
 
 Data status (2026-07-07): neobdm_scraper.py started writing live broker_flow
@@ -122,8 +150,12 @@ April backfill, now ~218 with the full Aug-2025 backfill):
     reconstructed) NeoBDM history, sustained over 8+ weeks.
 """
 
+import argparse
+import hashlib
 import os
 import sqlite3
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import shap
@@ -192,7 +224,9 @@ def _price_features_and_target(px):
     CAPTURE TIME of those rows relative to EOD(T) is unverified — only the
     ~5% of rows carrying live bval/sval/bavg/savg (starting ~2026-07-05) have
     confirmed same-session provenance. This caveat is independent of, and
-    predates, the target-contract fix below.
+    predates, the target-contract fix below. Reading broker flow through
+    broker_flow_canonical (build_panel) does not lift it: the canonical
+    session says which session a row belongs to, not when it was known.
 
     The TARGET is not what it used to be: it is now open(T+1) -> open(T+2), because a
     decision taken at EOD(T) cannot transact at close(T) — that same close and
@@ -250,13 +284,184 @@ def _price_features_and_target(px):
     return px[["ticker", "date", "momentum_1d", "volume_ratio", "target", "target_cc"]]
 
 
-def build_panel(conn):
+class BrokerFlowInputError(ValueError):
+    """build_panel() cannot stand behind its broker-flow input. Never answered
+    by reading raw broker_flow instead."""
+
+
+class BrokerFlowManifestRequired(BrokerFlowInputError):
+    """No explicit broker-flow evidence manifest was given."""
+
+
+class BrokerFlowSnapshotMismatch(BrokerFlowInputError):
+    """The price connection does not read the database snapshot the canonical
+    broker flow was verified against."""
+
+
+class BrokerFlowUnavailable(BrokerFlowInputError):
+    """No trusted canonical broker-flow row survives to the panel."""
+
+
+MANIFEST_REQUIRED = (
+    "build_panel() reads broker flow only through broker_flow_canonical, under an explicit "
+    "evidence manifest that describes this exact database. Generate one first:\n"
+    "    python broker_flow_manifest_refresh.py --db {db} --out <manifest>\n"
+    "then pass it (--broker-flow-manifest <manifest>). The committed audited manifest "
+    "describes only neobdm.db at 1aeca53; there is no raw broker_flow fallback.")
+
+#: The only columns the broker feature helpers read.
+CANONICAL_FRAME_COLUMNS = ["date", "ticker", "broker_code", "netval"]
+
+
+def canonical_broker_flow_frame(canonical):
+    """The frame _broker_day_aggregates / _broker_correlation_1d read, from a
+    broker_flow_canonical.CanonicalBrokerFlow: one row per CanonicalRow.
+
+      date         <- canonical_session_date (never acquisition_date)
+      ticker, broker_code, netval <- as observed; NULL netval -> NaN
+
+    Nothing else happens here: the reader has already excluded unproven
+    evidence, quarantined conflicting sessions and collapsed identical copies.
+    No row is synthesized for an absent broker and nothing is summed."""
+    import broker_flow_canonical as bfc
+
+    if not isinstance(canonical, bfc.CanonicalBrokerFlow):
+        raise TypeError(f"expected broker_flow_canonical.CanonicalBrokerFlow, got "
+                        f"{type(canonical).__name__}")
+    rows = canonical.rows
+    frame = pd.DataFrame({
+        "date": [r.canonical_session_date for r in rows],
+        "ticker": [r.ticker for r in rows],
+        "broker_code": [r.broker_code for r in rows],
+        "netval": pd.Series([r.netval for r in rows], dtype="float64"),
+    }, columns=CANONICAL_FRAME_COLUMNS)
+    if frame.duplicated(["date", "ticker", "broker_code"]).any():
+        raise BrokerFlowInputError("canonical broker flow holds a (session, ticker, broker_code) "
+                                   "more than once; refusing to aggregate it")
+    return frame
+
+
+def broker_flow_provenance(canonical):
+    """Which broker-flow snapshot a panel was built from. Not a feature."""
+    return {
+        "db_path": canonical.db_path,
+        "db_sha256": canonical.db_sha256,
+        "manifest_path": canonical.manifest_path,
+        "manifest_sha256": canonical.manifest_sha256,
+        "manifest_snapshot": canonical.snapshot,
+        "source_commit": canonical.source_commit,
+        "audited_manifest": canonical.audited,
+        "canonical_sessions": len(canonical.sessions),
+        "canonical_rows": len(canonical.rows),
+        "accounting": dict(canonical.accounting),
+        "quarantined_sessions": [q.canonical_session_date for q in canonical.quarantined],
+        "excluded_records": len(canonical.excluded),
+        "point_in_time": "NOT PROVEN: canonical_session_date is the session a row belongs "
+                         "to, not when it was known",
+    }
+
+
+def format_broker_flow_provenance(prov):
+    return "\n".join([
+        f"broker flow: canonical (broker_flow_canonical), {prov['canonical_rows']} rows / "
+        f"{prov['canonical_sessions']} sessions; quarantined {prov['quarantined_sessions']}; "
+        f"{prov['excluded_records']} excluded records",
+        f"  db        {prov['db_sha256']}  {prov['db_path']}",
+        f"  manifest  {prov['manifest_sha256']}  {prov['manifest_path']}",
+        f"  snapshot  {prov['manifest_snapshot']}  source_commit {prov['source_commit']}  "
+        f"audited {prov['audited_manifest']}",
+        f"  point-in-time: {prov['point_in_time']}",
+    ])
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _price_db_file(conn):
+    """The database file `conn` reads price_history from. Refuses an in-memory
+    or temporary database, attached databases, temp tables that would shadow
+    the price tables, and an open transaction (its uncommitted writes are
+    visible to `conn` but not in the file): the file is what gets compared
+    with the broker flow snapshot, so the prices must come from it and
+    nowhere else."""
+    if conn.in_transaction:
+        raise BrokerFlowSnapshotMismatch("the price connection has an open transaction; its "
+                                         "uncommitted writes are not in the database file")
+    dbs = conn.execute("PRAGMA database_list").fetchall()
+    main = [path for _, name, path in dbs if name == "main"]
+    if not main or not main[0]:
+        raise BrokerFlowSnapshotMismatch(
+            "the price connection is not file-backed (in-memory or temporary database); "
+            "build_panel() needs the database file the broker-flow manifest describes")
+    other = [name for _, name, path in dbs if name != "main" and (name != "temp" or path)]
+    if other:
+        raise BrokerFlowSnapshotMismatch(f"the price connection has attached databases {other}; "
+                                         "prices must come from the one database file")
+    shadowed = [n for (n,) in conn.execute(
+        "SELECT name FROM sqlite_temp_master WHERE name IN ('price_history', 'price_quarantine')")]
+    if shadowed:
+        raise BrokerFlowSnapshotMismatch(f"temp objects {shadowed} shadow the price tables")
+    return main[0]
+
+
+def _after_withheld_session(price_sessions, covered_sessions):
+    """Price sessions whose previous price session holds no trusted broker
+    rows at all (quarantined, only INFERRED_ONLY/MIXED evidence, or never
+    captured). _broker_correlation_1d compares a ticker's session with the
+    ticker's previous broker-flow date, which there is an older session on the
+    far side of the hole the canonical reader withheld; the one-day feature is
+    undefined there, not borrowed from further back. A ticker missing from a
+    covered session keeps the helper's existing behaviour."""
+    return {s for prev, s in zip(price_sessions, price_sessions[1:])
+            if prev not in covered_sessions}
+
+
+def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
+    """Feature/target panel: clean prices from `conn`, broker features from the
+    canonical broker flow of broker_flow_db_path under broker_flow_manifest_path.
+
+    Both broker-flow arguments are required; there is no default manifest.
+    `conn` must read the same database snapshot: its main database file must
+    be byte-identical (sha256) to the file the canonical reader verified,
+    checked after the prices are read. Raises BrokerFlowInputError subclasses,
+    and lets broker_flow_canonical's ManifestInvalid / ManifestMismatch /
+    SourceStateError through unchanged. Provenance: panel.attrs["broker_flow"]."""
+    # Imported here, not at module level: callers that only reuse the split and
+    # aggregate helpers (experiment_1f_gate_b.HELPER_FILES) keep their
+    # repo-local module closure.
+    import broker_flow_canonical as bfc
+
+    if broker_flow_manifest_path is None or not os.fspath(broker_flow_manifest_path).strip():
+        raise BrokerFlowManifestRequired(MANIFEST_REQUIRED.format(db=broker_flow_db_path or "<db>"))
+    if broker_flow_db_path is None or not os.fspath(broker_flow_db_path).strip():
+        raise BrokerFlowSnapshotMismatch("broker_flow_db_path is required: the database file "
+                                         "the manifest describes")
+    price_db = _price_db_file(conn)
+    canonical = bfc.load_canonical_broker_flow(broker_flow_db_path, broker_flow_manifest_path)
+
     px = clean_panel(conn, horizons=(1,), lags=(1, 5), open_anchored=True)
-    bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
+    price_sha = _file_sha256(price_db)
+    if price_sha != canonical.db_sha256:
+        raise BrokerFlowSnapshotMismatch(
+            f"prices were read from {price_db} (sha256 {price_sha[:12]}), broker flow from "
+            f"{canonical.db_path} (sha256 {canonical.db_sha256[:12]}): not one database "
+            "snapshot. Backfilled netval is lot x close of its own database's prices.")
+
+    bf = canonical_broker_flow_frame(canonical)
+    if bf.empty:
+        raise BrokerFlowUnavailable("the canonical broker flow has no trusted rows")
     # Backfilled netval was derived from the same close that was contaminated.
     # Dropping bad price keys from y but retaining their broker rows in X would
     # only move the defect from the target into the features.
     bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")
+    if bf.empty:
+        raise BrokerFlowUnavailable("no canonical broker-flow session meets a clean price "
+                                    "(ticker, session)")
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
@@ -266,9 +471,13 @@ def build_panel(conn):
     panel = agg.merge(pxf, on=["ticker", "date"], how="inner")
     # Correlation is a one-day feature too. If the price lag says a quarantine
     # or suspension made the day non-contiguous, do not compare broker vectors
-    # across that same hole.
+    # across that same hole; nor across a session the canonical reader
+    # withheld (_after_withheld_session).
     panel.loc[panel["momentum_1d"].isna(), "broker_correlation_1d"] = np.nan
+    withheld = _after_withheld_session(sorted(px["date"].unique()), canonical.sessions)
+    panel.loc[panel["date"].isin(withheld), "broker_correlation_1d"] = np.nan
     panel = panel.dropna(subset=["target"]).sort_values("date").reset_index(drop=True)
+    panel.attrs["broker_flow"] = broker_flow_provenance(canonical)
     return panel
 
 
@@ -468,11 +677,51 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3,
     return pd.DataFrame(results), pooled_stats, trade_log
 
 
-if __name__ == "__main__":
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_panel(conn)
-    conn.close()
+CLI_EPILOG = """\
+Broker flow is read only through broker_flow_canonical, under an explicit
+manifest for this exact database. Two steps:
 
+  1. python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
+  2. python walk_forward_backtest.py --broker-flow-manifest <manifest>
+
+Generated manifests are not committed. canonical_session_date is the session a
+row belongs to, not when it was known: the result is session-aligned, not
+point-in-time proven."""
+
+
+def connect_price_db(db_path):
+    """Read-only connection to the database file build_panel() reads prices from."""
+    return sqlite3.connect(Path(db_path).resolve(strict=True).as_uri() + "?mode=ro", uri=True)
+
+
+def parse_cli(argv=None, description=None):
+    """--db / --broker-flow-manifest for this module and the research scripts
+    that call build_panel(); a missing manifest is a usage error."""
+    ap = argparse.ArgumentParser(description=description or "XGBoost walk-forward backtest "
+                                 "(Roadmap #2) on the canonical broker-flow panel.",
+                                 epilog=CLI_EPILOG,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=DB_PATH,
+                    help="the database read for prices AND broker flow (default: neobdm.db)")
+    ap.add_argument("--broker-flow-manifest", default=None, metavar="PATH",
+                    help="REQUIRED: a broker_flow evidence manifest describing --db "
+                         "(broker_flow_manifest_refresh.py --db ... --out PATH)")
+    args = ap.parse_args(argv)
+    if not args.broker_flow_manifest:
+        ap.error("--broker-flow-manifest is required.\n" + MANIFEST_REQUIRED.format(db=args.db))
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_cli()
+    conn = connect_price_db(args.db)
+    try:
+        panel = build_panel(conn, broker_flow_db_path=args.db,
+                            broker_flow_manifest_path=args.broker_flow_manifest)
+    finally:
+        conn.close()
+
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
     print(f"Panel: {len(panel)} ticker-day rows, {panel['date'].nunique()} dates, "
           f"{panel['ticker'].nunique()} tickers")
 
@@ -503,5 +752,7 @@ if __name__ == "__main__":
         "42.8%. No Sharpe appears here any more - the one this module used was wrong "
         "twice over, see signal_metrics.py. SHAP/ablation trace whatever signal exists "
         "to price momentum rather than broker flow; see this module's docstring before "
-        "treating any of it as progress toward the actual thesis."
+        "treating any of it as progress toward the actual thesis. Broker features are "
+        "session-aligned (canonical_session_date), not point-in-time proven: the session a "
+        "row belongs to is not when it was known."
     )

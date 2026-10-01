@@ -1452,6 +1452,7 @@ Hanya pembaca. Tidak ada tabel/DB sidecar, migrasi, atau baris yang diubah.
 **Belum ada konsumen yang dimigrasikan**: `walk_forward_backtest`,
 `horizon_scan`, `ml_v2_experiment_1`, `multiday_features` dll. masih membaca
 `broker_flow.date` langsung (dua rezim tanggal, `fillna(0)`). Itu PR berikutnya.
+(Update: `walk_forward_backtest.build_panel()` sudah dimigrasikan, Lampiran V.)
 
 ### Aturan
 
@@ -1725,3 +1726,157 @@ Tes: `test_broker_flow_manifest_refresh.py` (pytest). Fixture sintetis =
 fixture `test_broker_flow_canonical.py` + top-up + capture 10-01. Tes data nyata
 membaca `neobdm.db` 6f21a72 dan 1aeca53 dari git; kalau di-skip, artinya tidak
 berjalan. Belum masuk daftar CI `check_ml_health`.
+
+## Lampiran V — konsumen referensi: `walk_forward_backtest.build_panel()` membaca broker flow kanonis (2026-10-01)
+
+Satu konsumen riset dimigrasikan, sebagai pola untuk migrasi berikutnya:
+`walk_forward_backtest.build_panel()` tidak lagi membaca tabel `broker_flow`.
+Fitur broker hanya berasal dari `broker_flow_canonical.load_canonical_broker_flow()`
+(Lampiran T) di bawah manifest **eksplisit** yang menggambarkan DB yang dibaca.
+`neobdm.db`, manifest bukti, `broker_flow_canonical.py`,
+`broker_flow_manifest_refresh.py`, `broker_flow_regime.py`, capture, dan workflow
+**tidak diubah**. Konsumen lain tidak dimigrasikan (daftar di bawah).
+
+Alur (dua langkah, dua lapis terpisah; manifest hasil refresh tidak di-commit):
+
+    python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
+    python walk_forward_backtest.py --broker-flow-manifest <manifest>
+
+### Kontrak
+
+    build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path)
+
+- **Manifest wajib.** Tidak ada default (juga bukan manifest teraudit, yang
+  hanya menggambarkan DB 1aeca53). `None`/kosong → `BrokerFlowManifestRequired`
+  dengan pesan yang menunjuk `broker_flow_manifest_refresh.py`; tanpa argumen →
+  `TypeError`. CLI tanpa `--broker-flow-manifest` → exit 2. `build_panel` tidak
+  pernah membuat manifest sendiri.
+- **Adapter** `canonical_broker_flow_frame(canonical)`: satu baris per
+  `CanonicalRow`, kolom persis yang dibaca helper fitur:
+
+| kolom frame | dari `CanonicalRow` |
+|---|---|
+| `date` | `canonical_session_date` (**bukan** `acquisition_date`) |
+| `ticker`, `broker_code` | apa adanya |
+| `netval` | apa adanya; NULL → NaN (float64) |
+
+  Tidak ada baris sintetis, tidak ada penjumlahan salinan (pembaca sudah
+  dedupe), tidak ada `fillna(0)`. Hanya baris PROVEN: INFERRED_ONLY/MIXED
+  dikecualikan, sesi karantina (07-03) tidak menyumbang apa pun.
+- **Satu snapshot.** `conn` harus membaca file DB yang **byte-identik** dengan
+  yang diverifikasi pembaca kanonis: sha256 file `main` milik `conn` (dari
+  `PRAGMA database_list`) = `canonical.db_sha256`, dicek **setelah** harga
+  dibaca. Harga DB A + broker flow DB B → `BrokerFlowSnapshotMismatch` (juga
+  kalau broker_flow-nya sama tapi harganya beda); salinan byte-identik diterima
+  (identitas isi, bukan path). Koneksi in-memory/temporary, database
+  ter-ATTACH, tabel temp yang membayangi `price_history`/`price_quarantine`, atau
+  transaksi terbuka (tulisan yang belum di-commit terlihat oleh `conn` tapi tidak
+  ada di file) → ditolak. Alasan: netval backfill = lot × close dari `price_history` DB itu.
+- **Gagal tertutup.** `ManifestInvalid`, `ManifestMismatch` (termasuk bukti scan
+  tidak valid), `SourceStateError` (sumber tidak diam, kunci mentah ganda)
+  diteruskan apa adanya; file manifest tidak ada → `FileNotFoundError`. Tidak
+  ada baris kanonis, atau tidak ada sesi kanonis yang bertemu harga bersih →
+  `BrokerFlowUnavailable`. Tidak ada jalur baca `broker_flow` mentah.
+- **Join harga tidak berubah**: `clean_panel(conn, horizons=(1,), lags=(1, 5),
+  open_anchored=True)`, inner join pada `(ticker, canonical session)`; kunci
+  harga terkarantina tetap membuang baris broker-nya sebelum agregasi.
+- **Helper fitur tidak diubah.** `_broker_day_aggregates`: baris NULL tetap
+  dihitung `n_brokers` (broker teramati), `net_flow_total` skipna;
+  `_broker_correlation_1d`: NULL dan absen sama-sama keluar dari vektor.
+  **Satu aturan baru di konsumen:** `broker_correlation_1d` = NaN pada sesi yang
+  sesi harga sebelumnya **tidak punya baris trusted sama sekali** (karantina,
+  hanya INFERRED_ONLY/MIXED, atau tidak pernah tertangkap). Tanpa itu helper
+  membandingkan dengan sesi yang lebih lama di seberang lubang (07-06 vs 07-02
+  melewati 07-03). Ticker yang absen di sesi yang tercakup tetap memakai
+  perilaku helper lama.
+- **Provenance** (bukan fitur): `panel.attrs["broker_flow"]` = `db_path`,
+  `db_sha256`, `manifest_path`, `manifest_sha256`, `manifest_snapshot`,
+  `source_commit`, `audited_manifest`, jumlah sesi/baris, akuntansi, sesi
+  karantina, record yang dikecualikan, dan catatan point-in-time. CLI,
+  `check_ml_health`, dan job summary `run_ml_reports` mencetak hash-nya.
+- `broker_flow_canonical` di-import **di dalam** `build_panel`, bukan di level
+  modul: modul yang hanya memakai helper split/agregat
+  (`experiment_1f_gate_b.HELPER_FILES`) tetap punya closure modul lokal yang sama.
+
+### Point-in-time: TIDAK terbukti
+
+`canonical_session_date` = sesi pasar **milik** observasi, **bukan** timestamp
+`known_at`. Migrasi ini memperbaiki penjajaran sesi, filter kepercayaan, dan
+dedupe; **bukan** ketersediaan pada EOD(T). Backtest ini tidak boleh disebut
+"bebas leakage" hanya karena memakai pembaca kanonis.
+
+Temuan konkret (data nyata di bawah): untuk 27 sesi 07-14..08-21, panel lama
+memakai baris akuisisi `d` yang isinya sesi bursa sebelumnya (fitur **basi
+satu sesi**).
+Panel baru menaruh data sesi `d` di `d`, tetapi data itu baru diakuisisi pada
+tanggal akuisisi berikutnya (scrape pra-buka menurut Lampiran E, tidak terbukti
+per baris). Jadi dibanding EOD(T), fitur baru di periode itu **lebih maju** dari
+fitur lama; target `open(T+1)→open(T+2)` dan waktu capture yang sebenarnya
+menentukan apakah itu tersedia sebelum entry, dan itu belum dibuktikan. Baris
+backfill tidak membawa waktu capture historis sama sekali. Kontrak
+`known_at`/episode = tugas berikutnya.
+
+### Pemanggil `build_panel`
+
+| pemanggil | perubahan |
+|---|---|
+| `walk_forward_backtest.py` CLI | `--broker-flow-manifest` wajib, `--db` (default `neobdm.db`), koneksi harga read-only |
+| `strategy_variants.py`, `shap_analysis.py`, `ara_arb_simulation.py`, `regime_gated_momentum.py` | CLI sama (`parse_cli`); `run_ara_arb_check(..., broker_flow_manifest_path=...)`, `load_neobdm(manifest, db)` |
+| `check_ml_health.py` (CI ml-health) | `--broker-flow-manifest PATH`; tanpa itu menjalankan **langkah 1 secara eksplisit** (`broker_flow_manifest_refresh.refresh(neobdm.db, backtest_out/ml_health/broker_flow_manifest.json)`), lalu `build_panel`. Refresh ditolak = problem kesehatan, bukan fallback |
+| `run_ml_reports.py` (ml-daily-report) | sama: `--broker-flow-manifest` atau refresh eksplisit ke `backtest_out/ml_reports/`; hash masuk job summary |
+| `test_pipeline.py` | fixture kontaminasi jadi file DB + manifest dari generator PR #74; dua penjaga baru (manifest wajib, tanpa SQL `broker_flow` di koneksi harga) yang ikut jalan di CI |
+
+Orkestrator (`check_ml_health`, `run_ml_reports`) menjalankan dua lapis berurutan
+karena workflow-nya tidak diubah di PR ini; konsumen riset sendiri tidak pernah
+me-refresh.
+
+### Data nyata: lama (mentah) vs baru (kanonis)
+
+`neobdm.db` blob `c2f839ad` (master 6f21a72, era PR #76, sha256 `df3d94af…`),
+manifest refresh `audited-anchor-refresh-v1` dengan `source_commit` 6f21a72,
+sha256 isi `0188cf97…8660` (deterministik). Dikunci di
+`test_walk_forward_canonical.py::test_real_*`.
+
+| | lama | baru |
+|---|---|---|
+| baris broker | 233.549 mentah; 221.685 setelah join harga | 221.399 kanonis; 216.378 setelah join harga |
+| tanggal | 306 tanggal akuisisi (278 terpakai) | 251 sesi kanonis (251 terpakai) |
+| baris panel | 10.756 (276 tanggal, 45 ticker) | 9.990 (249 tanggal, 45 ticker) |
+
+- Dikecualikan: INFERRED_ONLY 35 record / 6.655 baris; MIXED 08-12, 08-27 / 601
+  baris. Karantina: 07-03, 1.252 baris (CAPTURE_CLASSES_DIFFER +
+  VALUES_CONFLICT, 168 kunci). Salinan identik digabung: 3.642.
+- Pindah sesi: 45 pasangan (akuisisi → sesi), 12.039 baris trusted, semuanya
+  LIVE sesi-sebelumnya (07-08..08-24 CONTENT_MATCHED, 09-30→09-29 dan
+  10-01→09-30 SCAN_VERIFIED). Lima akuisisi Juli hari-sama (07-06/07/09/10/13)
+  tetap di sesinya sendiri; agregatnya identik lama vs baru (129 baris panel).
+- Tanggal panel yang hilang (28): 07-03 (karantina), 07-08, 08-11, 08-24 (tidak
+  ada baris trusted untuk sesi itu; baris akuisisinya pindah ke 07-07, 08-10,
+  08-21), dan 24 hari kerja 08-26..09-28 (hanya INFERRED_ONLY/MIXED). Muncul: 08-10
+  (dari akuisisi 08-11).
+- Kunci bersama 9.899 (lama saja 857, baru saja 91). Fitur harga dan target: 0
+  berubah. Agregat broker berubah di 642 kunci pada 26 tanggal; semuanya
+  re-key di 07-14..08-21 (+ dedupe untuk 07-17, 07-24, 07-31, 08-07, 08-14,
+  08-21; + eksklusi MIXED akuisisi 08-12 untuk sesi 08-12). Hanya `broker_correlation_1d` yang berubah di 25 kunci
+  (07-06: 14, 07-09: 11): sesi sebelumnya 07-03 dikarantina dan 07-08 tidak
+  tertangkap (aturan sesi tertahan). Tidak ada perubahan yang tak terjelaskan.
+- 08-21: 211 baris, satu per kunci (202 dari akuisisi 08-22 + 9 dari 08-23;
+  salinan 08-22/08-23/08-24 = 202/211/211), nilai = salinan yang bertahan, tidak
+  dijumlah.
+
+### Konsumen `broker_flow` mentah yang tersisa (belum dimigrasikan)
+
+`ml_v2_experiment_1`, `horizon_scan`, `multiday_features`, `ddqn_entry_exit`
+(`build_episode_frame`), `smart_money_divergence`, `feature_ablation`,
+`ara_arb_scan`, `experiment_1f_universe_gate`, `analyze_ticker_patterns`,
+`macro_analysis`. Import helper `_broker_day_aggregates` /
+`_broker_correlation_1d` / `FEATURES` / `XGB_PARAMS` dari `walk_forward_backtest`
+**tidak** membuat modul itu termigrasi. (`neobdm_scraper` dan `price_audit` membaca
+`broker_flow` untuk capture/audit, bukan fitur.)
+
+Tes: `test_walk_forward_canonical.py` (pytest; sintetis = fixture
+`test_broker_flow_canonical.Synth` + tabel harga, dan DB backfill kecil dengan
+manifest dari generator; data nyata = blob git `c2f839ad` + refresh, di-skip
+hanya bila objek git tidak ada, artinya tidak berjalan). Belum masuk daftar CI
+`check_ml_health` (CI tidak memasang pytest); dua penjaga intinya ada di
+`test_pipeline.py`, yang ikut CI.

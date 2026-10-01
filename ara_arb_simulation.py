@@ -39,10 +39,10 @@ the winning strategy's historical Sharpe was reported both including and excludi
 adjustment for direct comparison.
 """
 
-import sqlite3
 import numpy as np
 import pandas as pd
-from walk_forward_backtest import build_panel, DB_PATH
+from walk_forward_backtest import (build_panel, DB_PATH, connect_price_db,
+                                   format_broker_flow_provenance, parse_cli)
 from strategy_variants import get_walk_forward_predictions
 from signal_metrics import trade_stats, format_trade_stats
 
@@ -100,11 +100,13 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
     return (exit_price - entry_price) / entry_price, (j - i0)
 
 
-def run_ara_arb_check(threshold=0.020):
+def run_ara_arb_check(threshold=0.020, *, broker_flow_manifest_path, db_path=DB_PATH):
     from price_audit import clean_panel
 
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_panel(conn)
+    conn = connect_price_db(db_path)
+    panel = build_panel(conn, broker_flow_db_path=db_path,
+                        broker_flow_manifest_path=broker_flow_manifest_path)
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
     px = clean_panel(conn, horizons=(1,), lags=(1,))
     conn.close()
 
@@ -156,7 +158,9 @@ def run_ara_arb_check(threshold=0.020):
 
 
 if __name__ == "__main__":
-    result = run_ara_arb_check(threshold=0.020)
+    args = parse_cli(description="ARA/ARB fill simulation of the walk-forward signal.")
+    result = run_ara_arb_check(threshold=0.020, broker_flow_manifest_path=args.broker_flow_manifest,
+                               db_path=args.db)
     print(f"Winning strategy (>2% threshold): {result['n_signals']} raw signals")
     print(f"  Entry-blocked (stuck at ARA, excluded): {result['n_entry_blocked']} "
           f"({result['n_entry_blocked']/result['n_signals']:.1%})")

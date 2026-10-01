@@ -60,12 +60,12 @@ below). Every VARIANTS entry already satisfies this (hold_days is 1, 3, or
 hold without that assertion failing loudly.
 """
 
-import sqlite3
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from walk_forward_backtest import (
     build_panel, FEATURES, XGB_PARAMS, DB_PATH, make_walk_forward_splits,
+    connect_price_db, format_broker_flow_provenance, parse_cli,
 )
 from price_audit import clean_panel
 from signal_metrics import trade_stats
@@ -252,8 +252,11 @@ def run_strategy_search(panel, px, search_frac=0.7):
 
 
 if __name__ == "__main__":
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_panel(conn)
+    args = parse_cli(description="Exit-strategy variants on the walk-forward signal.")
+    conn = connect_price_db(args.db)
+    panel = build_panel(conn, broker_flow_db_path=args.db,
+                        broker_flow_manifest_path=args.broker_flow_manifest)
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
     # open_anchored=True is mandatory: simulate_trade() now requires the
     # gap_1 certificate to validate the decision->entry open, not just a
     # raw `open` column with no ARA/ARB or contiguity guard behind it.
