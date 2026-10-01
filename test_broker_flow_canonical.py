@@ -419,6 +419,11 @@ INF, MIX = ("2026-09-01", bfr.LIVE), ("2026-08-12", bfr.LIVE)
     # unproven classes never carry a canonical session
     (_set(INF, canonical_session_date="2026-08-31"), "canonical_session_date"),
     (_set(MIX, canonical_session_date="2026-08-11"), "canonical_session_date"),
+    # inferred_session_date is either NULL or one strict ISO date string
+    (_set(INF, inferred_session_date={}), "inferred_session_date"),
+    (_set(INF, inferred_session_date=[]), "inferred_session_date"),
+    (_set(INF, inferred_session_date="not-a-date"), "inferred_session_date"),
+    (_set(INF, inferred_session_date="20260901"), "inferred_session_date"),
     # proven classes always do, strictly ISO, consistent with their evidence
     (_set(L06, canonical_session_date=None), "canonical_session_date"),
     (_set(L06, canonical_session_date="2026-07-07"), "canonical_session_date"),
@@ -632,14 +637,40 @@ def test_a_manifest_rebuilt_for_a_newer_db_is_read_with_its_claims_reverified(sy
     assert not cf.audited
     assert cf.sessions["2026-09-30"] == bfr.FULL_CALLBACK
     assert [r for r in cf.rows if r.canonical_session_date != "2026-09-30"] == list(before.rows)
-    # built without the parquet, the content-matched dates fall to INFERRED_ONLY. The
-    # only rows that appear are backfill sessions no longer contested by a proven live copy.
+    # Built without the parquet, content-matched dates fall to INFERRED_ONLY. Exact
+    # audited conflict groups remain quarantined even though one side lost PROVEN status.
     weaker = synth.write(bfr.build_manifest(db, None), "no_parquet.json")
     thin = synth.load(weaker, db=db)
     assert {r.date_class for r in thin.rows} == {bfr.SOURCE_DATED_BACKFILL, bfr.SCAN_VERIFIED}
-    extra = set(thin.rows) - set(cf.rows)
-    assert {r.canonical_session_date for r in extra} == {"2026-07-02", "2026-07-03"}
-    assert {r.date_class for r in extra} == {bfr.SOURCE_DATED_BACKFILL}
+    assert set(thin.sessions) == {"2026-07-01", "2026-09-29", "2026-09-30"}
+    assert {q.canonical_session_date for q in thin.quarantined} == \
+        {"2026-07-02", "2026-07-03", "2026-07-14"}
+
+
+def test_downgrading_one_side_does_not_clear_an_anchored_quarantine(synth):
+    def downgrade(recs, m):
+        recs[("2026-07-05", bfr.LIVE)].update(
+            date_class=bfr.INFERRED_ONLY, evidence_level="INFERRED",
+            capture_class=bfr.DOM_TOP15, evidence_kind="idx_calendar_inference",
+            canonical_session_date=None)
+
+    path = synth.edited(downgrade, "downgraded_conflict.json")
+    cf = synth.load(path)
+    [q] = [q for q in cf.quarantined if q.canonical_session_date == "2026-07-03"]
+    assert [(d, regime) for d, regime, *_ in q.records] == \
+        [("2026-07-03", bfr.BACKFILL), ("2026-07-05", bfr.LIVE)]
+    assert "2026-07-03" not in cf.sessions
+    with pytest.raises(bfc.SessionNotCovered) as error:
+        cf.get("2026-07-03", "AAAA", "AK")
+    assert error.value.status == bfc.QUARANTINED
+    affected = [r for r in synth.inspect(path) if r.acquisition_date in
+                ("2026-07-03", "2026-07-05")]
+    assert affected and {r.status for r in affected} == {bfc.QUARANTINED}
+    assert {r.date_class for r in affected if r.acquisition_date == "2026-07-05"} == \
+        {bfr.INFERRED_ONLY}
+    assert not [e for e in cf.excluded if e.acquisition_date == "2026-07-05"]
+    assert cf.get("2026-07-01", "AAAA", "AK") is not None
+    assert sum(v for k, v in cf.accounting.items() if k != "raw") == cf.accounting["raw"]
 
 
 def test_a_date_proven_by_a_scan_run_must_be_labelled_scan_verified(synth):
@@ -993,6 +1024,32 @@ def test_a_database_that_is_not_quiescent_is_refused(synth, suffix):
         synth.load()
 
 
+def test_a_hard_link_alias_cannot_hide_a_live_wal(synth):
+    writer = synth.db_copy("writer.db")
+    alias = str(synth.dir / "alias.db")
+    try:
+        os.link(writer, alias)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"hard links unavailable: {e}")
+    con = sqlite3.connect(writer)
+    try:
+        assert con.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        con.execute("CREATE TABLE wal_only (value INTEGER)")
+        con.execute("INSERT INTO wal_only VALUES (1)")
+        con.commit()
+        assert os.path.exists(writer + "-wal")
+        assert not os.path.exists(alias + "-wal")
+        with pytest.raises(bfc.SourceStateError, match="hard links"):
+            synth.load(db=alias)
+    finally:
+        con.close()
+
+
+def test_a_single_link_quiescent_database_is_accepted(synth):
+    assert os.stat(synth.db).st_nlink == 1
+    assert synth.load().rows
+
+
 def test_a_database_that_changes_while_it_is_read_is_refused(synth, monkeypatch):
     real = bfr._scan_rows
 
@@ -1048,6 +1105,35 @@ def test_a_file_that_is_not_sqlite_is_refused(synth):
     path.write_bytes(b"x" * 200)
     with pytest.raises(bfc.SourceStateError, match="SQLite"):
         synth.load(db=str(path))
+
+
+def duplicate_raw_key_db(synth, name, conflicting):
+    db = synth.db_copy(name)
+    con = sqlite3.connect(db)
+    try:
+        con.execute("ALTER TABLE broker_flow RENAME TO broker_flow_with_pk")
+        con.execute("""CREATE TABLE broker_flow (
+            date TEXT NOT NULL, ticker TEXT NOT NULL, broker_code TEXT NOT NULL,
+            bval REAL, sval REAL, netval REAL, bavg REAL, savg REAL)""")
+        con.execute("INSERT INTO broker_flow SELECT * FROM broker_flow_with_pk")
+        con.execute("DROP TABLE broker_flow_with_pk")
+        row = con.execute("SELECT * FROM broker_flow WHERE date = '2026-07-01' "
+                          "AND ticker = 'AAAA' AND broker_code = 'AK'").fetchone()
+        if conflicting:
+            row = (*row[:5], row[5] + 1, *row[6:])
+        con.execute("INSERT INTO broker_flow VALUES (?,?,?,?,?,?,?,?)", row)
+        con.commit()
+    finally:
+        con.close()
+    manifest = synth.write(bfr.build_manifest(db, synth.pq), name + ".json")
+    return db, manifest
+
+
+@pytest.mark.parametrize("conflicting", [False, True], ids=["identical", "conflicting"])
+def test_duplicate_raw_source_keys_are_refused(synth, conflicting):
+    db, manifest = duplicate_raw_key_db(synth, "duplicate.db", conflicting)
+    with pytest.raises(bfc.SourceStateError, match="duplicate raw keys"):
+        synth.load(manifest, db=db)
 
 
 # --------------------------------------------------------------------------
@@ -1156,6 +1242,29 @@ def test_real_exclusions_and_quarantine(audited):
     assert len([r for r in inspected if r.status == bfc.QUARANTINED]) == 1_034 + 218
     with pytest.raises(bfc.SessionNotCovered):
         cf.get("2026-07-03", "BNBR", "AK")
+
+
+def test_real_manifest_rebuilt_without_parquet_keeps_the_audited_quarantine(
+        audited, baseline_db, tmp_path):
+    manifest = bfr.build_manifest(baseline_db, None,
+                                  source_commit=bfr.AUDITED_SNAPSHOT["source_commit"])
+    path = str(tmp_path / "real-no-parquet.json")
+    bfr.write_manifest(manifest, path)
+    cf = bfc.load_canonical_broker_flow(baseline_db, path)
+    inspected = bfc.inspect_broker_flow_evidence(baseline_db, path)
+    [q] = cf.quarantined
+    assert (q.canonical_session_date, q.rows) == ("2026-07-03", 1_252)
+    assert "2026-07-03" not in cf.sessions
+    with pytest.raises(bfc.SessionNotCovered) as error:
+        cf.get("2026-07-03", "BNBR", "AK")
+    assert error.value.status == bfc.QUARANTINED
+    assert {r.status for r in inspected if r.acquisition_date in
+            ("2026-07-03", "2026-07-05")} == {bfc.QUARANTINED}
+    unrelated = next(r for r in cf.rows if r.canonical_session_date == "2026-07-02")
+    assert cf.get("2026-07-02", unrelated.ticker, unrelated.broker_code) is unrelated
+    assert cf.accounting == {"canonical": 212_770, "duplicate": 0,
+                             "quarantined": 1_252, "excluded": 18_471,
+                             "raw": REAL["raw_rows"]}
 
 
 def test_real_mixed_dates_never_reach_the_trusted_view(audited):

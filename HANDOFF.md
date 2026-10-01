@@ -1485,6 +1485,14 @@ Hanya pembaca. Tidak ada tabel/DB sidecar, migrasi, atau baris yang diubah.
   Bukan per kunci: membuang kunci yang konflik saja menyisakan penampang yang
   justru kehilangan aliran terbesar yang dilihat kedua capture; memilih satu
   record = ranking karangan.
+- **Karantina teraudit tidak hilang saat bukti diturunkan.** Bila manifest baru
+  menurunkan salah satu record konflik ke INFERRED_ONLY, pembaca tetap
+  mengarantina sesi selama seluruh kunci grup akuisisi, `row_count`, dan
+  `rows_sha256` yang membentuk konflik teraudit masih hadir persis. Ini bukan
+  promosi bukti: record yang diturunkan tetap membawa kelas bukti manifest baru
+  saat inspeksi, tetapi status semua baris grup konflik = QUARANTINED dan tidak
+  ada sisi yang bocor ke view kanonis. Grup yang hash-nya berubah tidak memakai
+  jangkar lama.
 - **Absen ≠ nol.** Tidak ada baris sintetis, tidak ada `fillna`, NULL tetap
   `None`. `get(sesi, ticker, broker)` → `None` hanya untuk broker yang tidak
   teramati di sesi yang tercakup; sesi tanpa baris trusted →
@@ -1577,14 +1585,22 @@ klaim PROVEN di manifest mana pun dicek ulang:
 
 Turun ke INFERRED_ONLY boleh; menaikkan yang tak bisa dicek tidak pernah.
 
-**Sumber harus diam (quiescent).** Tidak boleh ada -wal/-shm/-journal, format
-header harus dikenal, dan identitas file (ukuran, mtime_ns, sha256) harus sama
-sebelum dan sesudah dibaca (konvensi `targeted_actor_observations`); kalau
-tidak → `SourceStateError`. Koneksi `bfr.connect_readonly`
+**Sumber harus diam (quiescent).** Tidak boleh ada -wal/-shm/-journal, file DB
+dengan `st_nlink > 1` ditolak karena alias hard link bisa menyembunyikan sidecar,
+format header harus dikenal, dan identitas file (ukuran, mtime_ns, sha256) harus
+sama sebelum dan sesudah dibaca (konvensi `targeted_actor_observations`); kalau
+tidak → `SourceStateError`. Setiap kunci mentah `(date, ticker, broker_code)`
+wajib unik meskipun schema sumber rusak dan kehilangan PK; duplikat identik
+maupun konflik ditolak, tidak di-dedupe. Koneksi `bfr.connect_readonly`
 (`mode=ro&immutable=1`); setiap statement berupa SELECT atau
 PRAGMA table_info. Hasil membawa `db_path`, `db_sha256`, `manifest_sha256`
 dan `audited`. Konsumen sebaiknya membaca harga dari file DB yang sama, karena
 netval backfill = lot × close dari `price_history` DB itu.
+
+`inferred_session_date` pada setiap record wajib NULL atau string tanggal ISO
+ketat `YYYY-MM-DD`; object, array, angka, format ringkas, dan string bukan
+tanggal ditolak sebagai `ManifestInvalid`. Aturan MIXED yang mewajibkan NULL
+tetap berlaku.
 
 Tes: `test_broker_flow_canonical.py` (pytest). Fixture sintetis diklasifikasi
 oleh generator PR #74 yang asli. Tes data nyata membaca DB 1aeca53 dari git;

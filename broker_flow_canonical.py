@@ -27,8 +27,9 @@ fails closed (nothing is returned) and nothing is ever guessed:
                     the nightly top-up rewrites backfill values); .diff lists them
                     with bfr.verify_manifest's keys. Also a broker_flow_scan run
                     that no longer proves its record.
-  SourceStateError  the database file is not quiescent (-wal/-shm/-journal beside
-                    it, unknown format) or changed while it was read
+  SourceStateError  the database file is multiply linked, not quiescent
+                    (-wal/-shm/-journal beside it, unknown format), contains
+                    duplicate raw keys, or changed while it was read
 So the committed audited manifest reads neobdm.db exactly as the audit saw it
 (git show 1aeca53:neobdm.db); a later, frozen database needs a manifest built
 for it (broker_flow_regime.py build --new-snapshot --out ..., with the audited
@@ -50,10 +51,16 @@ line-ending independent). Every PROVEN claim of any manifest is re-verified:
                          own record (same date, canonical, row_count, rows_sha256)
   MIXED                  exactly the AUDITED_MIXED dates, in both directions
 Downgrades to INFERRED_ONLY are allowed; nothing unverifiable is upgraded.
+An exact audited conflict remains quarantined while all of its raw group keys,
+row counts and row hashes remain present, even if a later manifest downgrades
+one side. The anchor preserves a known conflict; it does not promote the
+downgraded record into the canonical view.
 
 TRUST. INFERRED_ONLY (a calendar guess) and MIXED (rows of two sessions) never
-enter the trusted view: listed in .excluded, visible in inspection with
-canonical_session_date None.
+enter the trusted view: normally listed in .excluded and visible in inspection
+with canonical_session_date None. A downgraded record that belongs to an
+unchanged anchored conflict is instead marked QUARANTINED with the other raw
+conflict records, so accounting remains mutually exclusive.
 
 DEDUPE. One session can be held by several acquisition dates (weekend/holiday
 copies; session 2026-07-03 by BACKFILL 07-03 and LIVE 07-05). Per session:
@@ -85,8 +92,10 @@ observed value below 0.05bn; a side with value 0 AND average 0 is a side the
 table did not show (unknown under DOM_TOP15, not an observed zero).
 
 READ-ONLY. bfr.connect_readonly (mode=ro&immutable=1): no lock, journal, WAL
-or write. The file's (size, mtime_ns, sha256) is checked before and after the
-read (the targeted_actor_observations convention). The manifest is only read.
+or write. Multiply linked database files are refused because an alias can hide
+sidecars. Raw (date, ticker, broker_code) keys must be unique. The file's
+(size, mtime_ns, sha256) is checked before and after the read (the
+targeted_actor_observations convention). The manifest is only read.
 
 Usage (a debug summary for verification):
   py -3 broker_flow_canonical.py --db DB [--manifest PATH]
@@ -235,7 +244,7 @@ class ExcludedRecord:
 @dataclass(frozen=True)
 class QuarantinedSession:
     canonical_session_date: str
-    records: tuple      # (acquisition_date, regime, date_class, capture_class, row_count), sorted
+    records: tuple      # (acquisition_date, regime, anchoring date/capture classes, row_count)
     reasons: tuple      # CAPTURE_CLASSES_DIFFER and/or VALUES_CONFLICT
     conflicting_keys: int
     sample_keys: tuple  # up to 5 conflicting (ticker, broker_code), sorted
@@ -310,6 +319,7 @@ def load_canonical_broker_flow(db_path, manifest_path=DEFAULT_MANIFEST, *, trust
         raise ValueError(f"trust={trust!r}: the canonical view is PROVEN rows only; "
                          "use inspect_broker_flow_evidence to look at excluded rows")
     r = _read(db_path, manifest_path)
+    quarantined_keys = _quarantined_record_keys(r.quarantined)
     rows = []
     for (session, ticker, broker), copies in sorted(r.survivors.items()):
         acq, regime, values = copies[0]
@@ -320,7 +330,8 @@ def load_canonical_broker_flow(db_path, manifest_path=DEFAULT_MANIFEST, *, trust
     excluded = tuple(ExcludedRecord(d, regime, rec["date_class"], rec["evidence_level"],
                                     rec["capture_class"], rec["row_count"])
                      for (d, regime), rec in sorted(r.records.items())
-                     if rec["date_class"] not in TRUSTED_CLASSES)
+                     if rec["date_class"] not in TRUSTED_CLASSES
+                     and (d, regime) not in quarantined_keys)
     return CanonicalBrokerFlow(
         rows=tuple(rows), sessions=r.sessions, excluded=excluded, quarantined=r.quarantined,
         accounting=r.accounting, db_path=r.db_path, db_sha256=r.db_sha256,
@@ -334,7 +345,7 @@ def inspect_broker_flow_evidence(db_path, manifest_path=DEFAULT_MANIFEST):
     sorted by (acquisition_date, regime, ticker, broker_code). The same checks
     as load_canonical_broker_flow; nothing is filtered, merged or upgraded."""
     r = _read(db_path, manifest_path)
-    quarantined = {q.canonical_session_date for q in r.quarantined}
+    quarantined_keys = _quarantined_record_keys(r.quarantined)
     out = []
     for key in sorted(r.groups):
         d, regime = key
@@ -342,10 +353,10 @@ def inspect_broker_flow_evidence(db_path, manifest_path=DEFAULT_MANIFEST):
         session = rec["canonical_session_date"]
         for ticker, broker, values in r.groups[key]:
             survivor = None
-            if rec["date_class"] not in TRUSTED_CLASSES:
-                status = EXCLUDED
-            elif session in quarantined:
+            if key in quarantined_keys:
                 status = QUARANTINED
+            elif rec["date_class"] not in TRUSTED_CLASSES:
+                status = EXCLUDED
             else:
                 survivor = r.survivors[(session, ticker, broker)][0][0]
                 status = CANONICAL if survivor == d else DUPLICATE
@@ -398,15 +409,18 @@ def _read(db_path, manifest_path):
     if _source_identity(db_path) != before:
         raise SourceStateError(f"{db_path} changed while it was read; nothing returned")
 
+    _check_raw_keys_unique(flow)
     groups = _check_groups(flow, records)
     _check_scans(scan, records, groups)
     survivors, sessions, quarantined = _collapse(records, groups)
+    quarantined_keys = _quarantined_record_keys(quarantined)
     accounting = {
         "canonical": len(survivors),
         "duplicate": sum(len(c) - 1 for c in survivors.values()),
         "quarantined": sum(q.rows for q in quarantined),
-        "excluded": sum(rec["row_count"] for rec in records.values()
-                        if rec["date_class"] not in TRUSTED_CLASSES),
+        "excluded": sum(rec["row_count"] for key, rec in records.items()
+                        if rec["date_class"] not in TRUSTED_CLASSES
+                        and key not in quarantined_keys),
         "raw": len(flow),
     }
     if sum(v for k, v in accounting.items() if k != "raw") != accounting["raw"]:
@@ -417,8 +431,12 @@ def _read(db_path, manifest_path):
 
 def _source_identity(path):
     """(size, mtime_ns, sha256) of a quiescent SQLite file, else SourceStateError.
-    Refuses -wal/-shm/-journal beside it (a live or crashed writer: immutable=1
-    would ignore them) and unknown header formats. Reads only."""
+    Refuses hard links, -wal/-shm/-journal beside it (a live or crashed writer:
+    immutable=1 would ignore them), and unknown header formats. Reads only."""
+    st = os.stat(path)
+    if st.st_nlink > 1:
+        raise SourceStateError(f"{path}: SQLite source has {st.st_nlink} hard links; "
+                               "sidecars cannot be checked safely through an alias")
     with open(path, "rb") as f:
         data = f.read()
     if len(data) < 100 or not data.startswith(_SQLITE_MAGIC):
@@ -430,7 +448,23 @@ def _source_identity(path):
     if (data[18], data[19]) not in ((1, 1), (2, 2)):
         raise SourceStateError(f"{path}: unknown file format {(data[18], data[19])}")
     st = os.stat(path)
+    if st.st_nlink > 1:
+        raise SourceStateError(f"{path}: SQLite source has {st.st_nlink} hard links; "
+                               "sidecars cannot be checked safely through an alias")
     return st.st_size, st.st_mtime_ns, hashlib.sha256(data).hexdigest()
+
+
+def _check_raw_keys_unique(flow):
+    """Raw identity is (date, ticker, broker_code); duplicates are corruption."""
+    seen, duplicates = set(), set()
+    for row in flow:
+        key = tuple(row[:3])
+        if key in seen:
+            duplicates.add(key)
+        seen.add(key)
+    if duplicates:
+        keys = sorted(duplicates)
+        raise SourceStateError(f"broker_flow contains duplicate raw keys {_few(keys)}")
 
 
 def _check_groups(flow, records):
@@ -491,8 +525,8 @@ def _check_scans(scan, records, groups):
             raise mismatch(f"run proves {got}, the record says {want}")
 
 
-def _collapse(records, groups):
-    """Trusted rows per canonical session (module docstring, DEDUPE)."""
+def _collapse_records(records, groups):
+    """Collapse the trusted records supplied by the caller."""
     by_session = defaultdict(list)
     for key, rec in records.items():
         if rec["date_class"] in TRUSTED_CLASSES:
@@ -519,6 +553,57 @@ def _collapse(records, groups):
         for (ticker, broker), cs in copies.items():
             survivors[(session, ticker, broker)] = cs   # (acquisition_date, regime) order
     return survivors, sessions, tuple(quarantined)
+
+
+def _anchored_quarantine_records(records, groups):
+    """Audited conflict records whose exact raw groups are still present.
+
+    A later manifest may downgrade evidence, but matching acquisition keys,
+    row counts, and row hashes still prove that the audited conflict groups
+    themselves have not changed. Only sessions that conflict under those
+    audited records are returned.
+    """
+    anchor = _audited_records()
+    unchanged = {
+        key: anchored for key, anchored in anchor.items()
+        if key in records
+        and (records[key]["row_count"], records[key]["rows_sha256"])
+        == (anchored["row_count"], anchored["rows_sha256"])
+    }
+    _, _, quarantined = _collapse_records(unchanged, groups)
+    return {
+        q.canonical_session_date: {
+            (d, regime): unchanged[(d, regime)] for d, regime, *_ in q.records
+        }
+        for q in quarantined
+    }
+
+
+def _collapse(records, groups):
+    """Trusted rows per canonical session, retaining unchanged audited conflicts."""
+    survivors, sessions, quarantined = _collapse_records(records, groups)
+    quarantined = list(quarantined)
+    for session, anchored in _anchored_quarantine_records(records, groups).items():
+        combined = {
+            key: rec for key, rec in records.items()
+            if rec["date_class"] in TRUSTED_CLASSES
+            and rec["canonical_session_date"] == session
+        }
+        for key, rec in anchored.items():
+            combined.setdefault(key, rec)
+        _, _, forced = _collapse_records(combined, groups)
+        if not forced:
+            raise RuntimeError(f"anchored quarantine for {session} no longer conflicts")
+        survivors = {key: copies for key, copies in survivors.items() if key[0] != session}
+        sessions.pop(session, None)
+        quarantined = [q for q in quarantined if q.canonical_session_date != session]
+        quarantined.extend(forced)
+    return survivors, sessions, tuple(sorted(quarantined,
+                                              key=lambda q: q.canonical_session_date))
+
+
+def _quarantined_record_keys(quarantined):
+    return {(d, regime) for q in quarantined for d, regime, *_ in q.records}
 
 
 def _few(keys, n=5):
@@ -657,6 +742,9 @@ def _check_record(r, m):
         raise bad(f"row_count {n!r} is not a positive integer")
     if not isinstance(r["rows_sha256"], str) or not _SHA256.fullmatch(r["rows_sha256"]):
         raise bad(f"rows_sha256 {r['rows_sha256']!r} is not a sha256")
+    inferred = r["inferred_session_date"]
+    if inferred is not None and not _iso(inferred):
+        raise bad(f"inferred_session_date must be NULL or a strict ISO date, got {inferred!r}")
 
     # MIXED is exactly AUDITED_MIXED, both ways (the generator's first LIVE rule)
     audited_mixed = bfr.AUDITED_MIXED.get(d) if regime == bfr.LIVE else None
