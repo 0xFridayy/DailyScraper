@@ -1423,16 +1423,17 @@ def test_build_panel_never_reads_raw_broker_flow():
 
 def test_ml_health_workflow_runs_the_canonical_migration_suite():
     # test_pipeline runs inside ml-health's health check, so dropping the step
-    # that runs test_walk_forward_canonical.py (or pytest itself) fails here.
+    # that runs test_walk_forward_canonical.py / test_ddqn_canonical.py (or
+    # pytest itself) fails here.
     import re
     here = os.path.dirname(os.path.abspath(__file__))
     wf = open(os.path.join(here, ".github", "workflows", "ml-health.yml"), encoding="utf-8").read()
     runs = re.findall(r"^\s*run:\s*(.+)$", wf, flags=re.M)
     assert any("pip install" in r and re.search(r"\bpytest\b", r) for r in runs), \
         "ml-health must install pytest for the canonical migration suite"
-    assert any(re.search(r"\bpytest\b", r) and "test_walk_forward_canonical.py" in r
-               and "pip" not in r for r in runs), \
-        "ml-health must run test_walk_forward_canonical.py"
+    for suite in ("test_walk_forward_canonical.py", "test_ddqn_canonical.py"):
+        assert any(re.search(r"\bpytest\b", r) and suite in r and "pip" not in r for r in runs), \
+            f"ml-health must run {suite}"
     assert any("check_ml_health.py" in r for r in runs)
     print("test_ml_health_workflow_runs_the_canonical_migration_suite passed")
 
@@ -1635,7 +1636,7 @@ def test_all_tracked_model_price_consumers_use_clean_panel():
     import os as _os
     here = _os.path.dirname(_os.path.abspath(__file__))
     consumers = [
-        "walk_forward_backtest.py", "ddqn_entry_exit.py", "feature_ablation.py",
+        "walk_forward_backtest.py", "ddqn_entry_exit.py", "ddqn_episode_data.py", "feature_ablation.py",
         "multiday_features.py", "smart_money_divergence.py", "strategy_variants.py",
         "ara_arb_simulation.py", "run_ml_reports.py", "horizon_scan.py",
     ]

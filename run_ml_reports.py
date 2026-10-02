@@ -39,8 +39,11 @@ import requests
 from walk_forward_backtest import (build_panel, run_walk_forward, DB_PATH,
                                    format_broker_flow_provenance, PIT_WARNING)
 from strategy_variants import run_strategy_search
+# The episode frame comes from the torch-free module (ddqn_entry_exit re-exports
+# the same function), so the DDQN input wiring is testable without torch.
+from ddqn_episode_data import build_episode_frame
 from ddqn_entry_exit import (
-    build_episode_frame, split_search_holdout, fit_normalizer,
+    split_search_holdout, fit_normalizer,
     normalize_features, make_envs, train_ddqn, evaluate_policy,
     evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
 )
@@ -120,8 +123,11 @@ def run_strategy_variants_report(conn, broker_flow_manifest_path, db_path=DB_PAT
     )
 
 
-def run_ddqn_report(conn):
-    panel = build_episode_frame(conn)
+def run_ddqn_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
+    """DDQN on the canonical episode frame, under the SAME manifest and
+    database the XGBoost/strategy panels were built from; never refreshes."""
+    panel = build_episode_frame(conn, broker_flow_db_path=db_path,
+                                broker_flow_manifest_path=broker_flow_manifest_path)
     search_df, holdout_df = split_search_holdout(panel)
     mean, std = fit_normalizer(search_df)
     search_df, holdout_df = search_df.copy(), holdout_df.copy()
@@ -143,8 +149,28 @@ def run_ddqn_report(conn):
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
         search=evaluate_policy(net, train_envs), holdout=evaluate_policy(net, holdout_envs),
-        recent_holdout_trades=recent,
+        recent_holdout_trades=recent, broker_flow=panel.attrs["broker_flow"],
     )
+
+
+#: What makes two panels "the same broker-flow snapshot": the database file the
+#: canonical reader verified, the SQLite image the prices were read from, and
+#: the manifest content.
+SNAPSHOT_KEYS = ("db_sha256", "image_sha256", "manifest_sha256")
+
+
+def ddqn_snapshot_note(xgb, ddqn):
+    """One line on whether DDQN read the same canonical snapshot as XGBoost."""
+    a, b = xgb.get("broker_flow"), ddqn.get("broker_flow")
+    if not a or not b:
+        return "DDQN broker flow: provenance missing"
+    if all(a[k] == b[k] for k in SNAPSHOT_KEYS):
+        return (f"DDQN broker flow: same canonical snapshot as XGBoost (db {b['db_sha256'][:12]}, "
+                f"manifest {b['manifest_sha256'][:12]})")
+    return (f"DDQN broker flow: NOT the XGBoost snapshot - DDQN db {b['db_sha256'][:12]} image "
+            f"{b['image_sha256'][:12]} manifest {b['manifest_sha256'][:12]}, XGBoost db "
+            f"{a['db_sha256'][:12]} image {a['image_sha256'][:12]} manifest "
+            f"{a['manifest_sha256'][:12]}")
 
 
 def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
@@ -269,6 +295,7 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         f"DDQN entry/exit ({ddqn['n_dates']}d, {ddqn['n_tickers']} tickers):\n"
         f"  search  {format_trade_stats(ddqn['search']['trades'])}\n"
         f"  holdout {format_trade_stats(ddqn['holdout']['trades'])}\n"
+        f"  {ddqn_snapshot_note(xgb, ddqn)}\n"
         f"{konglo_section}\n\n"
         f"{bar_line}\n"
         f"{PIT_WARNING}\n"
@@ -335,6 +362,14 @@ def write_step_summary(xgb, strat, ddqn, konglo):
 
         f.write(f"## DDQN entry/exit\n\n")
         f.write(f"{ddqn['n_dates']} dates ({ddqn['date_min']} to {ddqn['date_max']}), {ddqn['n_tickers']} tickers\n\n")
+        dbf = ddqn.get("broker_flow")
+        f.write(f"{ddqn_snapshot_note(xgb, ddqn)}.")
+        if dbf:
+            f.write(f" Canonical (broker_flow_canonical), db sha256 `{dbf['db_sha256']}`, "
+                    f"image sha256 `{dbf['image_sha256']}`, manifest sha256 "
+                    f"`{dbf['manifest_sha256']}`; episodes split at every session a ticker has "
+                    f"no canonical row for. Session-aligned, not point-in-time proven.")
+        f.write("\n\n")
         f.write("| Split | Mean/trade | Median | Hit rate | ret/risk | n |\n|---|---|---|---|---|---|\n")
         for name, d in (("Search (train)", xt), ("Holdout", ht)):
             rpr = "n/a" if pd.isna(d["ret_per_risk"]) else f"{d['ret_per_risk']:.2f}"
@@ -403,21 +438,28 @@ def write_step_summary(xgb, strat, ddqn, konglo):
         f.write("\n")
 
 
-if __name__ == "__main__":
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Daily ML report (see ml-daily-report.yml).")
     ap.add_argument("--broker-flow-manifest", default=None, metavar="PATH",
                     help="a broker_flow evidence manifest describing neobdm.db; without it the "
                          "report first runs broker_flow_manifest_refresh explicitly (step 1)")
-    args = ap.parse_args()
-    manifest = args.broker_flow_manifest or refresh_broker_flow_manifest(DB_PATH)
+    args = ap.parse_args(argv)
+    # The one manifest of this report: refreshed at most once, here, then given
+    # to XGBoost, the strategy search and DDQN alike. An explicit (even empty)
+    # --broker-flow-manifest is used as given, never replaced by a refresh.
+    manifest = (refresh_broker_flow_manifest(DB_PATH) if args.broker_flow_manifest is None
+                else args.broker_flow_manifest)
 
     conn = sqlite3.connect(DB_PATH)
-    xgb_result = run_xgboost_report(conn, manifest)
-    print(format_broker_flow_provenance(xgb_result["broker_flow"]))
-    strat_result = run_strategy_variants_report(conn, manifest)
-    ddqn_result = run_ddqn_report(conn)
-    konglo_result = run_konglo_watch_report(conn)
-    conn.close()
+    try:
+        xgb_result = run_xgboost_report(conn, manifest)
+        print(format_broker_flow_provenance(xgb_result["broker_flow"]))
+        strat_result = run_strategy_variants_report(conn, manifest)
+        ddqn_result = run_ddqn_report(conn, manifest)
+        print(ddqn_snapshot_note(xgb_result, ddqn_result))
+        konglo_result = run_konglo_watch_report(conn)
+    finally:
+        conn.close()
 
     message = format_telegram_message(xgb_result, strat_result, ddqn_result, konglo_result)
     print(message)
@@ -426,3 +468,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Telegram delivery failed (job summary below still ran): {e}")
     write_step_summary(xgb_result, strat_result, ddqn_result, konglo_result)
+
+
+if __name__ == "__main__":
+    main()

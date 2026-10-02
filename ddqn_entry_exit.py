@@ -19,10 +19,26 @@ XGBoost, not less - ~46 tickers x ~220 days is a small dataset for RL. Read
 every result from this file with that discount in mind, same as every other
 script in this repo.
 
+BROKER FLOW INPUT (HANDOFF Lampiran W, 2026-10-02). build_episode_frame()
+lives in ddqn_episode_data.py (torch-free, so CI tests it) and reads broker
+flow only through broker_flow_canonical under an EXPLICIT manifest, via the
+same load_canonical_inputs() snapshot contract as walk_forward_backtest
+.build_panel(). No raw broker_flow read, no fallback, no refresh here:
+
+    python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
+    python ddqn_entry_exit.py --broker-flow-manifest <manifest>
+
+Episodes split at every session a ticker has no row for, including sessions
+the canonical reader withheld, so no environment steps across a hole.
+POINT-IN-TIME: NOT PROVEN - canonical_session_date is the session a row
+belongs to, not when it was known; the state is session-aligned, not thereby
+leakage-free or a live-tradable EOD(T) state.
+
 State (12-dim, z-scored on the training split only to avoid leakage):
   - The same 8 features walk_forward_backtest.FEATURES uses (broker_flow
-    aggregates + momentum_1d + volume_ratio) - all already validated
-    no-leakage in test_pipeline.py.
+    aggregates + momentum_1d + volume_ratio). The price features are
+    validated no-leakage in test_pipeline.py; the broker features are
+    session-aligned, their point-in-time availability is not proven (above).
   - position (0/1): the agent's own current holding, known at decision time.
   - days_in_position: consecutive days held so far.
   - unrealized_return: cumulative return since entry (0 if flat).
@@ -104,7 +120,6 @@ either direction.
 """
 
 import random
-import sqlite3
 from collections import deque
 
 import numpy as np
@@ -112,9 +127,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from walk_forward_backtest import FEATURES, DB_PATH, _broker_day_aggregates, _broker_correlation_1d
-from ara_arb_simulation import annotate_limits
-from price_audit import clean_panel
+from walk_forward_backtest import FEATURES, connect_price_db, format_broker_flow_provenance
+# The episode frame (canonical broker flow, HANDOFF Lampiran W) is built in the
+# torch-free ddqn_episode_data so CI can test it; re-exported here unchanged.
+from ddqn_episode_data import build_episode_frame, parse_cli
 from signal_metrics import trade_stats, format_trade_stats
 
 TRANSACTION_COST = 0.0015   # one-way; ~0.3% round trip, conservative IDX retail placeholder
@@ -122,47 +138,6 @@ LOSS_AVERSION = 1.5         # multiplier on negative daily P&L only ("cut losses
 GAMMA = 0.97
 MAX_HOLD_DAYS = 7           # explicit user ceiling (1-7 trading days) - hard cap, not left to the agent to learn
 STATE_EXTRA = ["position", "days_in_position", "unrealized_return"]
-
-
-def build_episode_frame(conn):
-    """Like walk_forward_backtest.build_panel(), but keeps daily_return and
-    ARA/ARB flags per ticker/date instead of collapsing to an aggregated
-    Sharpe - the DDQN environment needs to step through days in order."""
-    px = clean_panel(conn, horizons=(), lags=(1, 5))
-    bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
-    bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")
-
-    agg = _broker_day_aggregates(bf)
-    corr = _broker_correlation_1d(bf)
-    agg = agg.merge(corr, on=["ticker", "date"], how="left")
-
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["momentum_1d"] = px["lag_1"]
-    px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
-    px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
-    px["volume_ratio"] = px["volume"] / px["vol_ma5"]
-    px["daily_return"] = px["momentum_1d"]  # today's close-over-close return, same quantity walk_forward_backtest calls "target" one day earlier
-    px = annotate_limits(px)  # adds at_ara / at_arb, using the same tiered/flat bounds as ara_arb_simulation.py
-
-    # An environment must never step from the last clean row before a hole to
-    # the first clean row after it. Segment each ticker on the unfiltered market
-    # date axis; make_envs() below turns every segment into its own episode.
-    all_dates = sorted(px["date"].unique())
-    date_pos = {date: i for i, date in enumerate(all_dates)}
-    px["_date_pos"] = px["date"].map(date_pos)
-    date_gap = px.groupby("ticker")["_date_pos"].diff().ne(1)
-    # A corporate action is masked from lag_1 just like an impossible target.
-    # It also starts a new episode, otherwise dropping that row below would let
-    # the environment step straight across the split.
-    px["episode_id"] = (date_gap | px["lag_1"].isna()).groupby(px["ticker"]).cumsum()
-
-    panel = agg.merge(
-        px[["ticker", "date", "momentum_1d", "volume_ratio", "daily_return",
-            "at_ara", "at_arb", "episode_id"]],
-        on=["ticker", "date"], how="inner",
-    )
-    panel = panel.dropna(subset=["daily_return"]).sort_values(["ticker", "date"]).reset_index(drop=True)
-    return panel
 
 
 def split_search_holdout(panel, search_frac=0.7):
@@ -456,10 +431,15 @@ def evaluate_policy_with_trade_log(net, envs, top_k_features=3):
 
 
 if __name__ == "__main__":
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_episode_frame(conn)
-    conn.close()
+    args = parse_cli()
+    conn = connect_price_db(args.db)
+    try:
+        panel = build_episode_frame(conn, broker_flow_db_path=args.db,
+                                    broker_flow_manifest_path=args.broker_flow_manifest)
+    finally:
+        conn.close()
 
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
     print(f"Panel: {len(panel)} rows, {panel['ticker'].nunique()} tickers, "
           f"{panel['date'].min()} to {panel['date'].max()}")
 

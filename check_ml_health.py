@@ -65,7 +65,7 @@ BROKER_FLOW_MANIFEST_OUT = os.path.join(HERE, "backtest_out", "ml_health", "brok
 # Modules that must import and stay importable. ddqn_entry_exit needs torch,
 # which is heavy; it is checked but a missing torch downgrades to a note rather
 # than failing, so this check stays runnable in a light environment.
-CORE_MODULES = ["price_audit", "walk_forward_backtest", "strategy_variants",
+CORE_MODULES = ["price_audit", "walk_forward_backtest", "ddqn_episode_data", "strategy_variants",
                 "feature_ablation", "multiday_features", "smart_money_divergence",
                 "shap_analysis", "kelly_sizing", "ara_arb_simulation",
                 "horizon_scan", "evaluate_signals", "ml_v2_experiment_1",
