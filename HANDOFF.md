@@ -1882,6 +1882,8 @@ sha256 isi `0188cf97…8660` (deterministik). Dikunci di
 
 ### Konsumen `broker_flow` mentah yang tersisa (belum dimigrasikan)
 
+(Update: `ddqn_entry_exit.build_episode_frame` sudah dimigrasikan, Lampiran W.)
+
 `ml_v2_experiment_1`, `horizon_scan`, `multiday_features`, `ddqn_entry_exit`
 (`build_episode_frame`), `smart_money_divergence`, `feature_ablation`,
 `ara_arb_scan`, `experiment_1f_universe_gate`, `analyze_ticker_patterns`,
@@ -1901,3 +1903,180 @@ jadi tes data nyata di CI bisa ter-skip (terlihat di `-rs`); tes sintetis tetap
 menangkap substitusi `acquisition_date`, penjumlahan salinan, karantina, dan
 bukti yang dikecualikan. `test_pipeline.py` (ikut health check) memeriksa bahwa
 langkah pytest itu masih ada di workflow, plus dua penjaga inti.
+
+## Lampiran W — DDQN `build_episode_frame()` membaca broker flow kanonis; episode tidak melompati lubang (2026-10-02)
+
+Migrasi konsumen terakhir yang disengaja sebelum kembali ke roadmap utama
+(Inventory/LPM → Bandarmology Order Detail terarah → microscope mikrostruktur →
+MI Episode / Expectation). Hanya jalur aktif `run_ml_reports.py →
+run_ddqn_report() → build_episode_frame()`. `neobdm.db`, manifest bukti,
+`broker_flow_canonical.py`, `broker_flow_manifest_refresh.py`,
+`broker_flow_regime.py`, capture, MI, SPECTRA, dan konsumen mentah lain **tidak
+diubah**. Model, reward, biaya transaksi, loss aversion, `MAX_HOLD_DAYS`, ARA/ARB,
+normalisasi, split search/holdout, jaringan, replay buffer, optimizer, epoch, dan
+evaluasi DDQN **tidak diubah**.
+
+    python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
+    python ddqn_entry_exit.py --broker-flow-manifest <manifest>
+
+### Satu kontrak input bersama, bukan salinan
+
+`walk_forward_backtest.load_canonical_inputs(conn, *, broker_flow_db_path,
+broker_flow_manifest_path, **clean_panel_kwargs)` = blok yang dulu ada di dalam
+`build_panel()`, dipindah apa adanya dan dalam urutan yang sama: validasi argumen,
+`_price_db_file` (in-memory, ATTACH, transaksi terbuka, TABLE/VIEW temp
+pembayang), pembaca kanonis, image SQLite kanonis, satu transaksi baca dengan cek
+image sebelum/sesudah `clean_panel`, adapter `canonical_broker_flow_frame`, inner
+join `(ticker, sesi)` ke harga bersih, `BrokerFlowUnavailable`. Mengembalikan
+`CanonicalInputs(px, broker_flow, canonical, image_sha256)`; fitur tetap dibangun
+pemanggil.
+
+| pemanggil | parameter `clean_panel` (tidak berubah) |
+|---|---|
+| `build_panel()` | `horizons=(1,), lags=(1, 5), open_anchored=True` |
+| DDQN `build_episode_frame()` | `horizons=(), lags=(1, 5)` |
+
+Perilaku `build_panel()` tidak berubah (64 tes PR #77 tetap hijau). Pesan error
+yang dulu menyebut `build_panel()` kini netral; `CLI_EPILOG` memakai `%(prog)s`
+agar CLI DDQN (pakai `parse_cli` yang sama) tidak menyebut
+`walk_forward_backtest.py`.
+
+### `ddqn_episode_data.py` (tanpa torch)
+
+CI ml-health sengaja tidak memasang torch, jadi `build_episode_frame` pindah ke
+modul kecil `ddqn_episode_data.py` (pandas/numpy). `ddqn_entry_exit.py`
+me-re-export fungsi yang sama (`is`), sehingga import lama tetap jalan; sisa
+modul itu tidak diubah.
+
+    build_episode_frame(conn, *, broker_flow_db_path, broker_flow_manifest_path)
+
+- Kedua argumen wajib: tanpa argumen → `TypeError`; `None`/kosong →
+  `BrokerFlowManifestRequired` yang menunjuk `broker_flow_manifest_refresh.py`.
+  Tidak ada fallback mentah; tidak pernah membuat atau me-refresh manifest.
+- Kontrak kanonis = Lampiran V: `date` = `canonical_session_date` (bukan
+  `acquisition_date`); INFERRED_ONLY/MIXED dikecualikan; sesi karantina tidak
+  menyumbang; salinan identik tidak dijumlah; absen tetap absen, nol teramati
+  tetap nol, NULL tetap NaN; tidak ada baris sintetis.
+- Harga tidak berubah: `momentum_1d`, `volume_ratio`, `daily_return`,
+  `annotate_limits()` (`at_ara` / `at_arb`).
+- CLI `ddqn_entry_exit.py`: `--broker-flow-manifest` wajib (exit 2 + pesan
+  refresh), `--db` (default `neobdm.db`), koneksi harga read-only, provenance
+  dicetak, alur training sesudahnya sama.
+
+### Kontinuitas episode
+
+Masalah lama: `episode_id` dihitung pada sumbu harga bersih **sebelum** join
+broker. Sesi yang lalu hilang karena broker (karantina, hanya
+INFERRED_ONLY/MIXED, tidak tertangkap, atau ticker tanpa baris kanonis di sesi
+yang tercakup) tidak memutus episode, sehingga `TickerEnv` melangkah dari baris
+sebelum lubang ke baris sesudahnya seolah bersebelahan (`days_in_position`,
+waktu reward, ARA/ARB sesi yang hilang).
+
+Satu aturan deterministik (`ddqn_episode_data.session_episode_ids`):
+`episode_id` diberikan pada **frame akhir**, setelah join broker dan
+`dropna(daily_return)`. Baris yang baris sebelumnya untuk ticker itu bukan sesi
+sebelumnya pada sumbu sesi harga bersih (semua tanggal yang dikembalikan
+`clean_panel` untuk ticker mana pun) memulai episode baru. Itu memutus di gap
+harga/aksi korporasi (barisnya tanpa `daily_return`, dibuang), sesi yang ditahan
+untuk semua ticker, dan sesi tanpa baris kanonis untuk satu ticker. Akhir pekan
+dan libur bursa tidak ada di sumbu, jadi bukan lubang. Tidak ada yang diisi nol.
+Segmentasi baru adalah **penghalusan** segmentasi harga lama: tidak ada batas
+harga yang hilang (dicek di data nyata).
+
+### `broker_correlation_1d`
+
+Untuk DDQN: korelasi hanya dipertahankan bila tanggal broker-flow sebelumnya
+untuk ticker itu adalah sesi harga sebelumnya; selain itu NaN. Itu mencakup
+aturan sesi-tertahan PR #77 dan juga lubang milik satu ticker (yang di
+`build_panel` sengaja tetap memakai perilaku helper, PR #77, tidak diubah):
+episode sekuensial tidak boleh membaca korelasi dengan sesi yang lebih lama
+sebagai "kemarin". Di data nyata aturan tambahan ini hanya mengenai 2 baris.
+
+### Point-in-time: TIDAK terbukti
+
+Sama dengan Lampiran V. DDQN tidak boleh disebut bebas leakage, PIT, atau
+diketahui pada EOD(T) hanya karena memakai broker flow kanonis.
+`panel.attrs["broker_flow"]` = kontrak provenance `build_panel` (dict identik
+untuk DB + manifest yang sama, termasuk `point_in_time`). Docstring
+`ddqn_entry_exit` kini membatasi klaim "validated no-leakage" ke fitur harga.
+
+### `run_ml_reports.py`
+
+- `main(argv)` (dulu blok `__main__`): manifest di-refresh **paling banyak
+  sekali**, hanya bila `--broker-flow-manifest` tidak ada (yang eksplisit,
+  termasuk kosong, dipakai apa adanya, sama seperti `check_ml_health`; dulu `or`
+  memperlakukan kosong sebagai tidak ada), lalu manifest yang sama diberikan ke
+  XGBoost, strategy search, dan DDQN.
+- `run_ddqn_report(conn, broker_flow_manifest_path, db_path=DB_PATH)`: manifest
+  wajib, tidak pernah me-refresh, mengembalikan `broker_flow`.
+- `ddqn_snapshot_note()`: Telegram dan job summary menyatakan apakah DDQN
+  membaca snapshot yang sama dengan XGBoost (`db_sha256`, `image_sha256`,
+  `manifest_sha256`) atau **tidak**; summary mencetak ketiga hash DDQN dan
+  "Session-aligned, not point-in-time proven."
+- `build_episode_frame` di-import dari `ddqn_episode_data`, jadi wiring DDQN
+  teruji di CI tanpa torch. `check_ml_health` meng-import `ddqn_episode_data`
+  sebagai modul inti.
+
+### Data nyata: lama (mentah) vs baru (kanonis), master a4c7511 (2026-10-02)
+
+`neobdm.db` blob `32565412` (sha256 `76eb8411…8df4`, sama dengan file kerja),
+manifest **baru** dari `broker_flow_manifest_refresh.py` (`audited-anchor-refresh-v1`,
+`source_commit` a4c7511, sha256 isi `5a9f104d…1a3c`, deterministik, tidak
+di-commit; bukan manifest PR #77). Dikunci di `test_ddqn_canonical.py::test_real_*`.
+
+| | lama | baru |
+|---|---|---|
+| baris broker | 234.458 mentah (307 tanggal); 221.685 setelah join harga (278) | 222.308 kanonis (252 sesi); 216.378 setelah join harga (251) |
+| baris frame | 10.887 (278 tanggal, 45 ticker) | 10.124 (251 tanggal, 45 ticker) |
+| search / holdout | 2025-08-04..2026-05-26 (194) / 05-29..09-30 (84) | 2025-08-04..2026-04-24 (175) / 04-27..09-30 (76) |
+| grup (ticker, episode) | 95 | 287 |
+| langkah melompati lubang | **192** | **0** |
+| `make_envs` (≥ 10 baris), search | 78 env; 8.114 dari 8.134 baris | 76 env; 7.259 dari 7.279 |
+| `make_envs` (≥ 10 baris), holdout | 51 env; 2.731 dari 2.753 | 69 env (dari 248 episode); 2.350 dari 2.845 |
+
+- Akuntansi kanonis: 222.308 + 3.642 salinan + 1.252 karantina + 7.256
+  dikecualikan = 234.458. Dibanding PR #77 ada sesi 10-01 (SCAN_VERIFIED, dari
+  akuisisi 10-02) yang belum punya harga. Karantina: hanya 07-03 (1.252 baris,
+  168 kunci). Dikecualikan: INFERRED_ONLY 35 record / 6.655 baris, MIXED 08-12 +
+  08-27 / 601 baris.
+- Tanggal hilang (28): 07-03 (karantina), 07-08, 08-11, 08-24 (tidak tercakup),
+  24 hari kerja 08-26..09-28 (eksklusi). Muncul: 08-10 (re-key). Sama dengan
+  PR #77. Sumbu sesi harga: 280 sesi, 0 akhir pekan.
+- Kunci bersama 10.021 (lama saja 866, baru saja 103). Fitur harga
+  (`momentum_1d`, `volume_ratio`, `daily_return`, `at_ara`, `at_arb`): **0
+  berubah**. Agregat broker berubah di 724 kunci pada 28 tanggal, semuanya
+  re-key (20 tanggal), dedupe + re-key (6), eksklusi + re-key (2); lebih banyak
+  dari 642 / 26 di PR #77 karena frame DDQN tidak membuang baris tanpa target
+  `fwd_oo_1` (09-29 dan 09-30 ikut). Hanya `broker_correlation_1d` yang berubah
+  di 25 kunci (07-06: 14 setelah karantina 07-03; 07-09: 11 setelah 07-08 yang
+  tak tercakup). Tidak ada perubahan yang tak terjelaskan.
+- Agregat broker DDQN = agregat `build_panel` di 9.948 kunci bersama (0 beda);
+  korelasi beda di 2 kunci (aturan lubang ticker).
+- **Episode.** Frame lama melompati lubang di 192 langkah (terbanyak 08-11: 27,
+  09-30: 12); frame baru 0. Grup bertambah 287 − 95 = 192, tepat jumlah lompatan
+  lama. Lubang penyebab batas baru: sesi tak tercakup (07-08, 08-11, 08-24),
+  karantina 07-03, eksklusi 08-26..09-28, dan ticker tanpa baris kanonis di sesi
+  yang tercakup (terutama 07-10..08-20, capture DOM_TOP15). 07-03: 25 ticker
+  punya baris 07-02 dan 07-06; lama ke-25-nya satu episode, baru 0.
+- **Akibat ke training (tidak di-tuning, tidak harus sama):** split 70/30
+  bergeser ke 04-24 / 04-27 karena 27 tanggal yang hilang semuanya di
+  Juli–September. Di holdout baru, 495 dari 2.845 baris ada di potongan < 10
+  sesi dan dibuang oleh minimum `make_envs` (tidak diubah).
+- Lima akuisisi Juli hari-sama (07-06/07/09/10/13): 128 baris, agregat dan fitur
+  harga identik. 08-21: 211 baris kanonis (202 dari 08-22 + 9 dari 08-23);
+  `n_brokers` DDQN per ticker = jumlah kunci, tidak dijumlah (frame lama: 181
+  baris akuisisi 08-21, yaitu sesi 08-20).
+
+### Konsumen `broker_flow` mentah yang tersisa (sengaja tidak dimigrasikan)
+
+`ml_v2_experiment_1`, `horizon_scan`, `multiday_features`,
+`smart_money_divergence`, `feature_ablation`, `ara_arb_scan`,
+`experiment_1f_universe_gate`, `analyze_ticker_patterns`, `macro_analysis`.
+Bukan jalur laporan aktif.
+
+Tes: `test_ddqn_canonical.py` (pytest, tanpa torch; dua tes yang meng-import
+`ddqn_entry_exit` di-skip tanpa torch dan terlihat di `-rs`). **Jalan di CI**:
+langkah pytest ml-health kini `test_walk_forward_canonical.py
+test_ddqn_canonical.py`; `test_pipeline.py` memeriksa keduanya masih ada di
+workflow. Tes data nyata membaca blob `32565412`; checkout dangkal tanpa blob
+itu men-skip-nya.

@@ -61,11 +61,14 @@ jobs:
       - name: Check ML health
         run: python check_ml_health.py ${{ github.event_name == 'schedule' && '--telegram' || '' }}
 
-      # walk_forward_backtest.build_panel() reads broker flow only through
-      # broker_flow_canonical (HANDOFF Lampiran V); this suite is what fails on a
-      # raw-date, duplicate-sum, quarantine or excluded-evidence regression. Runs
-      # even when the health check failed. The real-data tests need the pinned
-      # neobdm.db blob, which a shallow checkout may lack: -rs prints the skip.
+      # walk_forward_backtest.build_panel() and the DDQN episode frame
+      # (ddqn_episode_data, torch-free) read broker flow only through
+      # broker_flow_canonical (HANDOFF Lampiran V, W); these suites are what fail
+      # on a raw-date, duplicate-sum, quarantine or excluded-evidence regression,
+      # or a DDQN episode stepping across a hole. Runs even when the health check
+      # failed. The real-data tests need pinned neobdm.db blobs, which a shallow
+      # checkout may lack, and the few DDQN tests that import torch skip here:
+      # -rs prints every skip.
       - name: Canonical broker-flow migration tests
         if: ${{ !cancelled() }}
-        run: python -m pytest -q -rs -p no:cacheprovider test_walk_forward_canonical.py
+        run: python -m pytest -q -rs -p no:cacheprovider test_walk_forward_canonical.py test_ddqn_canonical.py

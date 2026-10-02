@@ -34,6 +34,8 @@ manifest that describes the exact database being read:
     a non-quiescent database, or a price connection that is not the same
     database snapshot -> refused. There is no raw broker_flow fallback, and
     this module never generates a manifest (that is a separate layer).
+  - the manifest + snapshot checks live in load_canonical_inputs(), which the
+    DDQN episode frame (ddqn_episode_data.py, HANDOFF Lampiran W) shares.
 
 POINT-IN-TIME: NOT PROVEN. canonical_session_date is the market session a
 broker-flow observation BELONGS TO; it is not a known_at timestamp. The
@@ -155,6 +157,7 @@ import hashlib
 import os
 import sqlite3
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -285,8 +288,9 @@ def _price_features_and_target(px):
 
 
 class BrokerFlowInputError(ValueError):
-    """build_panel() cannot stand behind its broker-flow input. Never answered
-    by reading raw broker_flow instead."""
+    """A canonical broker-flow consumer (build_panel(), the DDQN episode frame)
+    cannot stand behind its broker-flow input. Never answered by reading raw
+    broker_flow instead."""
 
 
 class BrokerFlowManifestRequired(BrokerFlowInputError):
@@ -303,7 +307,7 @@ class BrokerFlowUnavailable(BrokerFlowInputError):
 
 
 MANIFEST_REQUIRED = (
-    "build_panel() reads broker flow only through broker_flow_canonical, under an explicit "
+    "Broker features are read only through broker_flow_canonical, under an explicit "
     "evidence manifest that describes this exact database. Generate one first:\n"
     "    python broker_flow_manifest_refresh.py --db {db} --out <manifest>\n"
     "then pass it (--broker-flow-manifest <manifest>). The committed audited manifest "
@@ -393,17 +397,20 @@ def _price_db_file(conn):
     """The database file `conn` reads price_history from. Refuses an in-memory
     or temporary database, attached databases, temp tables or views that would
     shadow the price tables (SQLite resolves names case-insensitively), and an
-    open transaction (build_panel opens the read transaction it validates):
-    the prices must come from the main database image and nowhere else."""
+    open transaction (load_canonical_inputs opens the read transaction it
+    validates): the prices must come from the main database image and nowhere
+    else."""
     if conn.in_transaction:
         raise BrokerFlowSnapshotMismatch("the price connection has an open transaction; "
-                                         "build_panel() needs to open its own read snapshot")
+                                         "load_canonical_inputs() needs to open its own read "
+                                         "snapshot")
     dbs = conn.execute("PRAGMA database_list").fetchall()
     main = [path for _, name, path in dbs if name == "main"]
     if not main or not main[0]:
         raise BrokerFlowSnapshotMismatch(
             "the price connection is not file-backed (in-memory or temporary database); "
-            "build_panel() needs the database file the broker-flow manifest describes")
+            "load_canonical_inputs() needs the database file the broker-flow manifest "
+            "describes")
     other = [name for _, name, path in dbs if name != "main" and (name != "temp" or path)]
     if other:
         raise BrokerFlowSnapshotMismatch(f"the price connection has attached databases {other}; "
@@ -459,20 +466,31 @@ def _after_withheld_session(price_sessions, covered_sessions):
             if prev not in covered_sessions}
 
 
-def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
-    """Feature/target panel: clean prices from `conn`, broker features from the
-    canonical broker flow of broker_flow_db_path under broker_flow_manifest_path.
+class CanonicalInputs(NamedTuple):
+    """What load_canonical_inputs() read, all from one verified snapshot."""
+    px: pd.DataFrame            # clean_panel(conn, **caller's parameters)
+    broker_flow: pd.DataFrame   # canonical_broker_flow_frame, inner-joined to px (ticker, session)
+    canonical: object           # the broker_flow_canonical.CanonicalBrokerFlow it came from
+    image_sha256: str           # the SQLite main image px was read from
+
+
+def load_canonical_inputs(conn, *, broker_flow_db_path, broker_flow_manifest_path,
+                          **clean_panel_kwargs):
+    """Clean prices from `conn` and the canonical broker flow of
+    broker_flow_db_path under broker_flow_manifest_path, as ONE database
+    snapshot. The shared input contract of build_panel() and the DDQN episode
+    frame (ddqn_episode_data); each caller passes its own clean_panel
+    parameters and builds its own features from the result.
 
     Both broker-flow arguments are required; there is no default manifest.
-    `conn` must read the same database snapshot. build_panel opens one read
+    `conn` must read the same database snapshot. This opens one read
     transaction on `conn` (so `conn` must not already be in one), checks that
     the SQLite main image visible in it is the image of the file the canonical
     reader verified (_snapshot_image_sha256, identical serialization on both
     sides), runs clean_panel inside that same transaction, checks the image
     again, and ends only that transaction. Raises BrokerFlowInputError
     subclasses, and lets broker_flow_canonical's ManifestInvalid /
-    ManifestMismatch / SourceStateError through unchanged. Provenance:
-    panel.attrs["broker_flow"]."""
+    ManifestMismatch / SourceStateError through unchanged."""
     # Imported here, not at module level: callers that only reuse the split and
     # aggregate helpers (experiment_1f_gate_b.HELPER_FILES) keep their
     # repo-local module closure.
@@ -499,7 +517,7 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
                 f"canonical broker flow was read from {canonical.db_path} (image {want[:12]}, "
                 f"file sha256 {canonical.db_sha256[:12]}): not one database snapshot. "
                 "Backfilled netval is lot x close of its own database's prices.")
-        px = clean_panel(conn, horizons=(1,), lags=(1, 5), open_anchored=True)
+        px = clean_panel(conn, **clean_panel_kwargs)
         if not conn.in_transaction or _snapshot_image_sha256(conn) != image:
             raise BrokerFlowSnapshotMismatch("the price snapshot did not hold while clean_panel "
                                              "read it")
@@ -517,6 +535,18 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
     if bf.empty:
         raise BrokerFlowUnavailable("no canonical broker-flow session meets a clean price "
                                     "(ticker, session)")
+    return CanonicalInputs(px, bf, canonical, image)
+
+
+def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
+    """Feature/target panel: clean prices from `conn`, broker features from the
+    canonical broker flow of broker_flow_db_path under broker_flow_manifest_path,
+    read as one snapshot by load_canonical_inputs() (see there for the checks
+    and what it raises). Provenance: panel.attrs["broker_flow"]."""
+    px, bf, canonical, image = load_canonical_inputs(
+        conn, broker_flow_db_path=broker_flow_db_path,
+        broker_flow_manifest_path=broker_flow_manifest_path,
+        horizons=(1,), lags=(1, 5), open_anchored=True)
 
     agg = _broker_day_aggregates(bf)
     corr = _broker_correlation_1d(bf)
@@ -737,7 +767,7 @@ Broker flow is read only through broker_flow_canonical, under an explicit
 manifest for this exact database. Two steps:
 
   1. python broker_flow_manifest_refresh.py --db neobdm.db --out <manifest>
-  2. python walk_forward_backtest.py --broker-flow-manifest <manifest>
+  2. python %(prog)s --broker-flow-manifest <manifest>
 
 Generated manifests are not committed. canonical_session_date is the session a
 row belongs to, not when it was known: the result is session-aligned, not
