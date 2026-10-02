@@ -18,12 +18,12 @@ walk_forward_backtest.py's docstring for the 2026-07-07 result on the full
 8 — momentum_1d dominates instead).
 """
 
-import sqlite3
 import numpy as np
 import pandas as pd
 import shap
 from xgboost import XGBRegressor
-from walk_forward_backtest import build_panel, FEATURES, DB_PATH
+from walk_forward_backtest import (build_panel, FEATURES, DB_PATH, connect_price_db,
+                                   format_broker_flow_provenance, parse_cli)
 
 
 def run_shap_analysis(panel):
@@ -47,9 +47,14 @@ def run_shap_analysis(panel):
 
 
 if __name__ == "__main__":
-    conn = sqlite3.connect(DB_PATH)
-    panel = build_panel(conn)
-    conn.close()
+    args = parse_cli(description="SHAP feature importance on the walk-forward panel.")
+    conn = connect_price_db(args.db)
+    try:
+        panel = build_panel(conn, broker_flow_db_path=args.db,
+                            broker_flow_manifest_path=args.broker_flow_manifest)
+    finally:
+        conn.close()
+    print(format_broker_flow_provenance(panel.attrs["broker_flow"]))
 
     print(f"Panel: {len(panel)} rows, {panel['date'].nunique()} dates, {panel['ticker'].nunique()} tickers")
 

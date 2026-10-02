@@ -1317,14 +1317,22 @@ def test_multi_day_windows_cannot_cross_a_corporate_action():
     print("test_multi_day_windows_cannot_cross_a_corporate_action passed")
 
 
-def _contaminated_test_db():
-    conn = sqlite3.connect(":memory:")
+def _contaminated_test_db(directory):
+    """A file-backed database plus the broker_flow evidence manifest the real
+    PR #74 generator builds for it: build_panel() reads broker flow only
+    through broker_flow_canonical, which needs both. Every broker row is
+    backfill-shaped (bval NULL, dated <= BACKFILL_END), so each date is its own
+    SOURCE_DATED_BACKFILL session."""
+    import broker_flow_regime as bfr
+    path = os.path.join(directory, "neobdm.db")
+    conn = sqlite3.connect(path)
     conn.execute("""CREATE TABLE price_history (
         date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
     )""")
     conn.execute("CREATE TABLE price_quarantine (date TEXT, ticker TEXT)")
     conn.execute("""CREATE TABLE broker_flow (
-        date TEXT, ticker TEXT, broker_code TEXT, netval REAL
+        date TEXT NOT NULL, ticker TEXT NOT NULL, broker_code TEXT NOT NULL, bval REAL,
+        sval REAL, netval REAL, bavg REAL, savg REAL, PRIMARY KEY (date, ticker, broker_code)
     )""")
     dates = [f"2026-01-{d:02d}" for d in range(1, 9)]
     closes = {"AAA": [100, 110, 1000, 500, 505, 510, 515, 520],
@@ -1334,24 +1342,99 @@ def _contaminated_test_db():
             conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
                          (date, ticker, close, close, close, close, 1000))
             for code, netval in (("AK", 10.0), ("BK", -5.0), ("CC", 2.0)):
-                conn.execute("INSERT INTO broker_flow VALUES (?,?,?,?)",
+                conn.execute("INSERT INTO broker_flow VALUES (?,?,?,NULL,NULL,?,NULL,NULL)",
                              (date, ticker, code, netval))
     # Removing AAA d3 makes a naive shift join d2=110 to d4=500 (+354.5%).
     conn.execute("INSERT INTO price_quarantine VALUES (?,?)", (dates[2], "AAA"))
     conn.commit()
-    return conn
+    conn.close()
+    manifest = os.path.join(directory, "broker_flow_manifest.json")
+    bfr.write_manifest(bfr.build_manifest(path), manifest)
+    return path, manifest
 
 
 def test_build_panel_cannot_recreate_impossible_target_returns():
-    conn = _contaminated_test_db()
-    panel = build_panel(conn)
-    conn.close()
+    import tempfile
+    from walk_forward_backtest import connect_price_db
+    with tempfile.TemporaryDirectory() as tmp:
+        db, manifest = _contaminated_test_db(tmp)
+        conn = connect_price_db(db)
+        try:
+            panel = build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=manifest)
+        finally:
+            conn.close()
     aaa = panel[panel["ticker"] == "AAA"].set_index("date")
     assert "2026-01-02" not in aaa.index, \
         "the row before quarantine must lose its target, not bridge to the next clean bar"
     assert not ((panel["target"] > 0.35) | (panel["target"] < -0.15)).any(), \
         "an impossible ARA/ARB target reappeared in the production panel"
     print("test_build_panel_cannot_recreate_impossible_target_returns passed")
+
+
+def test_build_panel_requires_an_explicit_broker_flow_manifest():
+    # HANDOFF Lampiran V: no default manifest, no raw fallback. Full coverage
+    # lives in test_walk_forward_canonical.py (pytest); this keeps the contract
+    # inside the suite ml-health runs.
+    import tempfile
+    import walk_forward_backtest as wfb
+    with tempfile.TemporaryDirectory() as tmp:
+        db, manifest = _contaminated_test_db(tmp)
+        conn = wfb.connect_price_db(db)
+        try:
+            try:
+                build_panel(conn)
+                assert False, "build_panel() must not run without broker-flow arguments"
+            except TypeError:
+                pass
+            try:
+                build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=None)
+                assert False, "a missing manifest must be refused"
+            except wfb.BrokerFlowManifestRequired as e:
+                assert "broker_flow_manifest_refresh.py" in str(e)
+        finally:
+            conn.close()
+    print("test_build_panel_requires_an_explicit_broker_flow_manifest passed")
+
+
+def test_build_panel_never_reads_raw_broker_flow():
+    import re
+    import tempfile
+    import walk_forward_backtest as wfb
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = open(os.path.join(here, "walk_forward_backtest.py"), encoding="utf-8").read()
+    assert not re.search(r"(?i)\bfrom\s+broker_flow\b", source), \
+        "walk_forward_backtest.py reads raw broker_flow again; use broker_flow_canonical"
+    with tempfile.TemporaryDirectory() as tmp:
+        db, manifest = _contaminated_test_db(tmp)
+        conn = wfb.connect_price_db(db)
+        seen = []
+        conn.set_trace_callback(seen.append)
+        try:
+            panel = build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=manifest)
+        finally:
+            conn.close()
+    assert any("price_history" in s for s in seen)
+    assert not [s for s in seen if "broker_flow" in s.lower()], \
+        "build_panel() queried broker_flow on the price connection"
+    prov = panel.attrs["broker_flow"]
+    assert len(prov["db_sha256"]) == 64 and len(prov["manifest_sha256"]) == 64
+    print("test_build_panel_never_reads_raw_broker_flow passed")
+
+
+def test_ml_health_workflow_runs_the_canonical_migration_suite():
+    # test_pipeline runs inside ml-health's health check, so dropping the step
+    # that runs test_walk_forward_canonical.py (or pytest itself) fails here.
+    import re
+    here = os.path.dirname(os.path.abspath(__file__))
+    wf = open(os.path.join(here, ".github", "workflows", "ml-health.yml"), encoding="utf-8").read()
+    runs = re.findall(r"^\s*run:\s*(.+)$", wf, flags=re.M)
+    assert any("pip install" in r and re.search(r"\bpytest\b", r) for r in runs), \
+        "ml-health must install pytest for the canonical migration suite"
+    assert any(re.search(r"\bpytest\b", r) and "test_walk_forward_canonical.py" in r
+               and "pip" not in r for r in runs), \
+        "ml-health must run test_walk_forward_canonical.py"
+    assert any("check_ml_health.py" in r for r in runs)
+    print("test_ml_health_workflow_runs_the_canonical_migration_suite passed")
 
 
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
@@ -1756,10 +1839,10 @@ def test_strategy_report_builds_the_open_anchored_price_frame():
             return dict(winner_label="stub", winner_search_mean=0.0, winner_holdout_mean=0.0,
                         winner_holdout_n=0, search_results=pd.DataFrame(), holdout_results=pd.DataFrame())
 
-        rmr.build_panel = lambda c: pd.DataFrame()
+        rmr.build_panel = lambda c, **broker_flow: pd.DataFrame()
         rmr.run_strategy_search = capture_search
         try:
-            rmr.run_strategy_variants_report(conn)
+            rmr.run_strategy_variants_report(conn, "stubbed-broker-flow-manifest.json")
         finally:
             rmr.build_panel, rmr.run_strategy_search = original
         plain = rmr.clean_panel(conn, horizons=(1,), lags=(1,))
@@ -2772,6 +2855,9 @@ if __name__ == "__main__":
     test_one_day_features_mask_corporate_actions_too()
     test_multi_day_windows_cannot_cross_a_corporate_action()
     test_build_panel_cannot_recreate_impossible_target_returns()
+    test_build_panel_requires_an_explicit_broker_flow_manifest()
+    test_build_panel_never_reads_raw_broker_flow()
+    test_ml_health_workflow_runs_the_canonical_migration_suite()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
     test_hold_days_one_uses_entry_session_high_low_and_close()
     test_tp_and_sl_hit_on_entry_session_are_detected()

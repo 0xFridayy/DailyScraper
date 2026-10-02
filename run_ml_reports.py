@@ -29,13 +29,15 @@ purpose - importing that module pulls in Playwright and requires NEOBDM
 login credentials, neither of which this report needs.
 """
 
+import argparse
 import os
 import sqlite3
 
 import pandas as pd
 import requests
 
-from walk_forward_backtest import build_panel, run_walk_forward, DB_PATH
+from walk_forward_backtest import (build_panel, run_walk_forward, DB_PATH,
+                                   format_broker_flow_provenance, PIT_WARNING)
 from strategy_variants import run_strategy_search
 from ddqn_entry_exit import (
     build_episode_frame, split_search_holdout, fit_normalizer,
@@ -73,19 +75,39 @@ def _format_features(pairs):
     return ", ".join(f"{name}({val:+.4f})" for name, val in pairs)
 
 
-def run_xgboost_report(conn):
-    panel = build_panel(conn)
+#: Where this orchestrator writes the manifest it refreshes (gitignored).
+BROKER_FLOW_MANIFEST_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "backtest_out", "ml_reports", "broker_flow_manifest.json")
+
+
+def refresh_broker_flow_manifest(db_path=DB_PATH, out=BROKER_FLOW_MANIFEST_OUT):
+    """Step 1 of the two-step flow, run explicitly by this orchestrator when no
+    --broker-flow-manifest is given: broker_flow_manifest_refresh (HANDOFF
+    Lampiran U) for db_path, written to `out` and printed. build_panel() itself
+    never makes a manifest. A refused refresh stops the report."""
+    import broker_flow_manifest_refresh as bfmr
+
+    manifest, view = bfmr.refresh(db_path, out)
+    print(f"broker flow manifest refreshed: {out} (sha256 {bfmr.manifest_sha256(manifest)}, "
+          f"db sha256 {view.db_sha256})")
+    return out
+
+
+def run_xgboost_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
+    panel = build_panel(conn, broker_flow_db_path=db_path,
+                        broker_flow_manifest_path=broker_flow_manifest_path)
     _, pooled, trade_log = run_walk_forward(panel)
     recent = trade_log.tail(RECENT_TRADES_SHOWN).to_dict("records")
     return dict(
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
-        pooled=pooled, recent_trades=recent,
+        pooled=pooled, recent_trades=recent, broker_flow=panel.attrs["broker_flow"],
     )
 
 
-def run_strategy_variants_report(conn):
-    panel = build_panel(conn)
+def run_strategy_variants_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
+    panel = build_panel(conn, broker_flow_db_path=db_path,
+                        broker_flow_manifest_path=broker_flow_manifest_path)
     px = clean_panel(conn, horizons=(1,), lags=(1,), open_anchored=True)
     result = run_strategy_search(panel, px)
     return dict(
@@ -249,6 +271,7 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
         f"  holdout {format_trade_stats(ddqn['holdout']['trades'])}\n"
         f"{konglo_section}\n\n"
         f"{bar_line}\n"
+        f"{PIT_WARNING}\n"
         f"Full run in GitHub Actions."
     )
 
@@ -271,6 +294,12 @@ def write_step_summary(xgb, strat, ddqn, konglo):
     ht = ddqn["holdout"]["trades"]
     with open(path, "a") as f:
         f.write("# Daily ML Report\n\n")
+        bf = xgb.get("broker_flow")
+        if bf:
+            f.write(f"Broker flow: canonical (broker_flow_canonical), db sha256 `{bf['db_sha256']}`, "
+                    f"manifest sha256 `{bf['manifest_sha256']}` ({bf['manifest_snapshot']}, "
+                    f"source_commit {bf['source_commit']}). Session-aligned, not point-in-time "
+                    f"proven.\n\n")
         f.write(f"## XGBoost walk-forward (default strategy: >0.5% threshold, 1d hold, no TP/SL)\n\n")
         f.write(f"{xgb['n_dates']} dates ({xgb['date_min']} to {xgb['date_max']}), {xgb['n_tickers']} tickers\n\n")
         p = xgb["pooled"]
@@ -375,9 +404,17 @@ def write_step_summary(xgb, strat, ddqn, konglo):
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Daily ML report (see ml-daily-report.yml).")
+    ap.add_argument("--broker-flow-manifest", default=None, metavar="PATH",
+                    help="a broker_flow evidence manifest describing neobdm.db; without it the "
+                         "report first runs broker_flow_manifest_refresh explicitly (step 1)")
+    args = ap.parse_args()
+    manifest = args.broker_flow_manifest or refresh_broker_flow_manifest(DB_PATH)
+
     conn = sqlite3.connect(DB_PATH)
-    xgb_result = run_xgboost_report(conn)
-    strat_result = run_strategy_variants_report(conn)
+    xgb_result = run_xgboost_report(conn, manifest)
+    print(format_broker_flow_provenance(xgb_result["broker_flow"]))
+    strat_result = run_strategy_variants_report(conn, manifest)
     ddqn_result = run_ddqn_report(conn)
     konglo_result = run_konglo_watch_report(conn)
     conn.close()
