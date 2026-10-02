@@ -214,6 +214,36 @@ SCHEMA = [
         ON selection_membership (broker, ticker, discovery_as_of)""",
 ]
 
+# Independently versioned, additive extension. panel_meta and every v1 table
+# retain their exact meaning, so old readers keep working. No live collector
+# invokes these APIs. Acceptance markers are written AFTER the source/body
+# transaction commits; a missing marker is unknown availability, not recorded_utc.
+INVENTORY_EVIDENCE_VERSION = "1"
+SCHEMA += [
+    """CREATE TABLE IF NOT EXISTS inventory_snapshot_acceptances (
+        ticker TEXT NOT NULL, discovery_as_of TEXT NOT NULL,
+        content_sha256 TEXT NOT NULL, durable_accepted_at TEXT NOT NULL,
+        extension_version TEXT NOT NULL CHECK (extension_version = '1'),
+        PRIMARY KEY (ticker, discovery_as_of),
+        FOREIGN KEY (ticker, discovery_as_of) REFERENCES panel_snapshots (ticker, discovery_as_of))""",
+    """CREATE TABLE IF NOT EXISTS inventory_evidence_revisions (
+        ticker TEXT NOT NULL, anchor TEXT NOT NULL, cutoff TEXT NOT NULL,
+        observation_revision INTEGER NOT NULL CHECK (observation_revision > 0),
+        parent_revision INTEGER, evidence_schema_version TEXT NOT NULL CHECK (evidence_schema_version = '1'),
+        availability_cutoff TEXT NOT NULL, content_sha256 TEXT NOT NULL, observation_json TEXT NOT NULL,
+        PRIMARY KEY (ticker, anchor, cutoff, observation_revision))""",
+    """CREATE TABLE IF NOT EXISTS inventory_evidence_acceptances (
+        ticker TEXT NOT NULL, anchor TEXT NOT NULL, cutoff TEXT NOT NULL,
+        observation_revision INTEGER NOT NULL, durable_accepted_at TEXT NOT NULL,
+        PRIMARY KEY (ticker, anchor, cutoff, observation_revision),
+        FOREIGN KEY (ticker, anchor, cutoff, observation_revision)
+          REFERENCES inventory_evidence_revisions (ticker, anchor, cutoff, observation_revision))""",
+]
+for _table in ("inventory_snapshot_acceptances", "inventory_evidence_revisions", "inventory_evidence_acceptances"):
+    for _action in ("UPDATE", "DELETE"):
+        SCHEMA.append(f"CREATE TRIGGER IF NOT EXISTS immutable_{_table}_{_action.lower()} "
+                      f"BEFORE {_action} ON {_table} BEGIN SELECT RAISE(ABORT, 'immutable inventory evidence'); END")
+
 META = {"product": PRODUCT, "schema_version": SCHEMA_VERSION,
         "collection_mode": COLLECTION_MODE, "coverage_scope": COVERAGE_SCOPE,
         "full_universe": "false"}
@@ -526,3 +556,127 @@ def coverage(conn, ticker, discovery_as_of, broker, session_date):
         return {"state": UNOBSERVED, "values": None}
     row = rows[0]
     return {"state": row.pop("coverage"), "values": row}
+
+
+def accept_inventory_snapshot(conn, ticker, discovery_as_of):
+    """Attest availability now, after a committed v1 source snapshot.
+
+    Never backfill an acceptance marker from recorded_utc or the market date.
+    Repeated acceptance preserves the first marker. Historical v1 sources with
+    no marker are unavailable to the evidence reader until explicitly accepted.
+    """
+    import inventory_evidence as ie
+    if conn.in_transaction:
+        raise ValueError("commit the source snapshot before accepting it")
+    snap = snapshot(conn, ticker, discovery_as_of)
+    if snap is None:
+        raise KeyError("no source snapshot")
+    accepted = ie.utc_text(utc_now())
+    if ie.timestamp(accepted) < max([ie.timestamp(snap["recorded_utc"])] +
+                                  [ie.timestamp(c["captured_at"]) for c in snap["captures"]]):
+        raise ValueError("acceptance precedes source recording/response")
+    with conn:
+        conn.execute("INSERT OR IGNORE INTO inventory_snapshot_acceptances VALUES (?, ?, ?, ?, ?)",
+                     (ticker, discovery_as_of, snap["content_sha256"], accepted, INVENTORY_EVIDENCE_VERSION))
+    return conn.execute("SELECT durable_accepted_at FROM inventory_snapshot_acceptances "
+                        "WHERE ticker = ? AND discovery_as_of = ?", (ticker, discovery_as_of)).fetchone()[0]
+
+
+def record_inventory_evidence(conn, doc):
+    """Append an immutable evidence revision; finalize availability after commit.
+
+    An interruption between commits leaves an unconfirmed body that readers
+    exclude. Retrying identical content confirms it at the retry time. Same
+    revision/different content is refused. Corrections require a new revision
+    linked to the immediately preceding revision of this ticker/anchor/cutoff.
+    """
+    import inventory_evidence as ie
+    ie.validate_document(doc)
+    if any(row["scope"] is not None and row["scope"]["capture_scope"] != COVERAGE_SCOPE
+           for broker in doc["brokers"].values() for row in broker["series"]):
+        raise ValueError("targeted store accepts selector-union evidence only; explicit follow-up is deferred")
+    if conn.in_transaction:
+        raise ValueError("commit other writes before appending evidence")
+    text, digest = ie.canonical_json(doc), ie.content_hash(doc)
+    key = (doc["ticker"], doc["axis"]["start"], doc["axis"]["cutoff"])
+    revision = doc["observation_revision"]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        previous = conn.execute("SELECT observation_revision, content_sha256 FROM inventory_evidence_revisions "
+                                "WHERE ticker = ? AND anchor = ? AND cutoff = ? ORDER BY observation_revision", key).fetchall()
+        existing = dict(previous).get(revision)
+        if existing is not None:
+            if existing != digest:
+                raise ValueError("immutable evidence revision conflict")
+            result = "identical"
+        else:
+            parent = previous[-1][0] if previous else None
+            if doc["parent_revision"] != parent or revision != (parent or 0) + 1:
+                raise ValueError("revision must link to the immediately preceding revision")
+            if previous:
+                if conn.execute("SELECT 1 FROM inventory_evidence_acceptances WHERE ticker = ? AND anchor = ? "
+                                "AND cutoff = ? AND observation_revision = ?", (*key, parent)).fetchone() is None:
+                    raise ValueError("parent revision is not durably confirmed")
+                last = json.loads(conn.execute("SELECT observation_json FROM inventory_evidence_revisions "
+                                               "WHERE ticker = ? AND anchor = ? AND cutoff = ? AND observation_revision = ?",
+                                               (*key, parent)).fetchone()[0])
+                if ie.timestamp(doc["availability_cutoff"]) < ie.timestamp(last["availability_cutoff"]):
+                    raise ValueError("revision availability cannot move backwards")
+            conn.execute("INSERT INTO inventory_evidence_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (*key, revision, parent, ie.VERSION, doc["availability_cutoff"], digest, text))
+            result = "inserted"
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    # The body is now durable. No availability timestamp was assigned before it.
+    accepted = ie.utc_text(utc_now())
+    if doc["known_at"] is not None and ie.timestamp(accepted) < ie.timestamp(doc["known_at"]):
+        raise ValueError("product acceptance precedes an input's availability")
+    if doc["parent_revision"] is not None:
+        parent_accepted = conn.execute("SELECT durable_accepted_at FROM inventory_evidence_acceptances "
+                                       "WHERE ticker = ? AND anchor = ? AND cutoff = ? AND observation_revision = ?",
+                                       (*key, doc["parent_revision"])).fetchone()[0]
+        if ie.timestamp(accepted) < ie.timestamp(parent_accepted):
+            raise ValueError("product acceptance precedes parent revision")
+    with conn:
+        conn.execute("INSERT OR IGNORE INTO inventory_evidence_acceptances VALUES (?, ?, ?, ?, ?)",
+                     (*key, revision, accepted))
+    return result
+
+
+def inventory_evidence_as_of(conn, ticker, anchor, cutoff, availability_cutoff):
+    """Latest confirmed revision available by a timezone-aware cutoff.
+
+    The envelope's known_at is product durability; evidence.known_at is input
+    availability. Return None for an old v1 database without this extension.
+    """
+    import inventory_evidence as ie
+    if "inventory_evidence_acceptances" not in _tables(conn):
+        return None
+    available = ie.utc_text(availability_cutoff)
+    row = conn.execute("SELECT r.observation_json, r.content_sha256, a.durable_accepted_at "
+                       "FROM inventory_evidence_revisions r JOIN inventory_evidence_acceptances a "
+                       "USING (ticker, anchor, cutoff, observation_revision) "
+                       "WHERE ticker = ? AND anchor = ? AND cutoff = ? AND a.durable_accepted_at <= ? "
+                       "AND r.availability_cutoff <= ? ORDER BY observation_revision DESC LIMIT 1",
+                       (ticker, anchor, cutoff, available, available)).fetchone()
+    if row is None:
+        return None
+    return {"view": "AS_OF", "evidence": json.loads(row[0]), "content_sha256": row[1], "known_at": row[2],
+            "durable_accepted_at": row[2], "evidence_schema_version": INVENTORY_EVIDENCE_VERSION}
+
+
+def latest_inventory_evidence(conn, ticker, anchor, cutoff):
+    """Explicit retrospective view; never a substitute for historical as-of truth."""
+    if "inventory_evidence_acceptances" not in _tables(conn):
+        return None
+    row = conn.execute("SELECT r.observation_json, r.content_sha256, a.durable_accepted_at "
+                       "FROM inventory_evidence_revisions r JOIN inventory_evidence_acceptances a "
+                       "USING (ticker, anchor, cutoff, observation_revision) "
+                       "WHERE ticker = ? AND anchor = ? AND cutoff = ? "
+                       "ORDER BY observation_revision DESC LIMIT 1", (ticker, anchor, cutoff)).fetchone()
+    if row is None:
+        return None
+    return {"view": "LATEST_RETROSPECTIVE", "evidence": json.loads(row[0]), "content_sha256": row[1],
+            "known_at": row[2], "durable_accepted_at": row[2], "evidence_schema_version": INVENTORY_EVIDENCE_VERSION}

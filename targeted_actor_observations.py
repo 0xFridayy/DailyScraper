@@ -507,6 +507,95 @@ def observation_json(doc):
     return json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cutoff,
+                               broker_codes, scope, basis_reference_known_at,
+                               discovery_as_of=None, observation_revision=1,
+                               parent_revision=None, windows=(5, 20), market_observations=()):
+    """Additive inventory_evidence v1 reader; observe() keeps its exact v1 output.
+
+    Broker codes and market scope are explicitly supplied, never inferred from
+    future selector membership. Only snapshots with a post-commit acceptance
+    marker contribute. Old snapshots lacking a marker remain UNOBSERVED.
+    The caller attests the basis reference's availability timestamp; its content
+    hash must be scope.basis_version. A reference not yet available contributes
+    no evidence. Unit/market metadata absent from v1 is declared in Scope, not
+    invented from the OHLC arrays. Market volumes require separately validated
+    MarketObservation inputs; stored inventory volume_sma20 is never used.
+    """
+    import inventory_evidence as ie
+    _check_ticker(ticker)
+    if not isinstance(scope, ie.Scope) or scope.capture_scope != tdb.COVERAGE_SCOPE:
+        raise ValueError("this reader supports only declared TARGETED_SELECTOR_UNION scope")
+    axis = ie.idx_session_axis(anchor, cutoff)
+    available = ie.timestamp(availability_cutoff)
+    parameters = dict(ticker=ticker, broker_codes=broker_codes, axis=axis,
+                      availability_cutoff=availability_cutoff, observation_revision=observation_revision,
+                      parent_revision=parent_revision, windows=windows, market_observations=market_observations)
+    with _reading(conn):
+        _panel_meta(conn)
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "inventory_snapshot_acceptances" not in tables:
+            accepted = []
+        else:
+            accepted = _rows(conn, "SELECT ticker, discovery_as_of, content_sha256, durable_accepted_at "
+                                  "FROM inventory_snapshot_acceptances WHERE ticker = ?", (ticker,))
+        accepted = [r for r in accepted if ie.timestamp(r["durable_accepted_at"]) <= available
+                    and (discovery_as_of is None or r["discovery_as_of"] == discovery_as_of)]
+        chosen = max(accepted, key=lambda r: r["discovery_as_of"]) if accepted else None
+        stored = _load(conn, ticker, chosen["discovery_as_of"]) if chosen else None
+    if stored is None or ie.timestamp(basis_reference_known_at) > available:
+        return ie.build_inventory_evidence([], **parameters)
+    panel = _checked(stored)
+    snap = panel["snapshot"]
+    if snap["content_sha256"] != chosen["content_sha256"] or snap["investor_type"] != scope.investor_type:
+        raise PanelIntegrityError("inventory evidence acceptance/scope disagrees with source snapshot")
+    basis = _basis_reference()
+    if scope.basis_version != basis["canonical_json_sha256"]:
+        raise ValueError("scope.basis_version must identify the exact supplied basis reference")
+    basis_capture = ie.Capture(BASIS_SOURCE_ID, basis["canonical_json_sha256"], basis_reference_known_at,
+                              basis_reference_known_at, basis["canonical_json_sha256"],
+                              content_hash_kind="CANONICAL_JSON_SHA256")
+    captures = {}
+    for c in snap["captures"]:
+        digest = c["response_sha256"] or c["response_text_sha256"]
+        if not digest or not c["captured_at"]:
+            raise PanelIntegrityError("capture lacks response availability/content hash")
+        params = (("symbol", ticker), ("start_date", snap["requested_start_date"]),
+                  ("end_date", snap["requested_end_date"]), ("investor_type", snap["investor_type"]))
+        captures[c["request_group"]] = ie.Capture(
+            "neobdm:/api/inventory", c["capture_id"], c["captured_at"], chosen["durable_accepted_at"], digest,
+            request_parameters=params, requested_selectors=tuple(c["selector_tokens"]),
+            returned_brokers=tuple(c["expanded_brokers"]), query_sha256=c["query_sha256"],
+            content_hash_kind="RESPONSE_BYTES_SHA256" if c["response_sha256"] else "RESPONSE_TEXT_UTF8_SHA256")
+    field_map = dict(zip(ie.FLOW_FIELDS, ("blot", "slot", "nlot", "bval", "sval", "nval")))
+    observations = []
+    for b in panel["codes"]:
+        for i, d in enumerate(panel["dates"]):
+            if not anchor <= d <= cutoff:
+                continue
+            conflict = any(first <= d <= last for first, last in basis["intervals"].get(ticker, []))
+            for group in panel["returned"][b]:
+                observations.append(ie.Observation(
+                    ticker, b, d, observation_revision, scope, captures[group],
+                    **{f: panel["series"][b][source][i] for f, source in field_map.items()},
+                    coverage=ie.QUARANTINED if conflict else panel["series"][b]["coverage"][i],
+                    null_reason="KNOWN_BASIS_CONFLICT" if conflict else None))
+    return ie.build_inventory_evidence(observations, reference_captures=(basis_capture,), **parameters)
+
+
+def inventory_evidence_revision(conn, ticker, anchor, cutoff, availability_cutoff=None):
+    """Read a confirmed stored revision with the v1 reader's quiescence guards.
+
+    A timestamp requests AS_OF; None explicitly requests LATEST_RETROSPECTIVE.
+    """
+    _check_ticker(ticker)
+    with _reading(conn):
+        _panel_meta(conn)
+        if availability_cutoff is None:
+            return tdb.latest_inventory_evidence(conn, ticker, anchor, cutoff)
+        return tdb.inventory_evidence_as_of(conn, ticker, anchor, cutoff, availability_cutoff)
+
+
 def _resolve(conn, ticker, discovery_as_of):
     """The stored discovery_as_of that (ticker, discovery_as_of) names, the
     latest when it is None."""
