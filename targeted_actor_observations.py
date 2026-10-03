@@ -556,6 +556,11 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
     snap = panel["snapshot"]
     if snap["content_sha256"] != chosen["content_sha256"] or snap["investor_type"] != scope.investor_type:
         raise PanelIntegrityError("inventory evidence acceptance/scope disagrees with source snapshot")
+    accepted_at = chosen["durable_accepted_at"]
+    if accepted_at != ie.utc_text(accepted_at) or ie.timestamp(accepted_at) < max(
+            [ie.timestamp(snap["recorded_utc"])] +
+            [ie.timestamp(c["captured_at"]) for c in snap["captures"]]):
+        raise PanelIntegrityError("inventory evidence acceptance precedes source recording/response or is not canonical")
     if (basis_reference_known_at is not None
             and ie.timestamp(basis_reference_known_at) != ie.timestamp(basis_record["durable_accepted_at"])):
         raise ValueError("basis_reference_known_at must equal the stored durable basis acceptance")

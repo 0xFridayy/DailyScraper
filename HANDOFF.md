@@ -2085,7 +2085,9 @@ itu men-skip-nya.
 
 Implemented on `feat/inventory-evidence-kernel-v1`, based on master `97b773f`.
 The delta from reviewed head `72de93e` fixes revision identity, availability,
-immutability, daily-session finality and the confirmed validation/test gaps.
+immutability and daily-session finality. Final narrow fixes after delta review
+of `69f25f1` pin the integration fixture clock, require declared compatibility
+scopes, harden acceptance insertion and protect the remaining contract guards.
 This is the contract/kernel extension after the Inventory/LPM audit, before
 any live pilot. DailyScraper produces deterministic evidence; actor hypotheses
 belong to Market Intelligence, validation/lift/decay to SPECTRA, and freshness,
@@ -2156,16 +2158,24 @@ IDX calendar. Its typed inputs are `Observation`, `Capture`, `Scope`,
 `MarketObservation` and `SessionAxis`. The public entry point is
 `build_inventory_evidence(observations, ticker=..., broker_codes=..., axis=...,
 availability_cutoff=..., observation_revision=..., parent_revision=...,
-windows=(5, 20), acceleration_half_window=5, market_observations=...)`.
+compatibility_scopes=..., windows=(5, 20), acceleration_half_window=5,
+market_observations=...)`.
 It performs no network, file or database I/O and uses a private fixed Decimal
-context. Canonical JSON has sorted keys/lists where order is not source evidence,
+context. `compatibility_scopes` is required and must be a nonempty set of supported,
+explicit scopes. The kernel canonicalizes the declared set rather than deriving
+it from observation contents. Only rows visible at the availability cutoff and
+eligible for the requested revision are checked against that declaration.
+Future captures and higher-revision rows cannot change the request digest or
+make a historical build fail scope validation. Visible undeclared scopes are
+refused. Canonical JSON has sorted keys/lists where order is not source evidence,
 no generation clock, and no NaN/infinity. Request token order is preserved.
 
 Broker inputs validate request symbol, investor type, declared market and
 start/end dates against the observation. Supported kernel capture scopes are
 `TARGETED_SELECTOR_UNION` and `EXPLICIT_FOLLOWUP`; explicit captures must actually
-request that broker. Market inputs validate any declared request symbol, market
-and date range, plus OHLC contract, basis and unit compatibility. Another ticker's
+request that broker. Market inputs require a request symbol equal to the
+`MarketObservation` ticker, and validate market and date range, plus OHLC
+contract, basis and unit compatibility. A missing symbol or another ticker's
 request cannot supply this ticker's ADV. Scope and coverage participate in
 same-revision conflict detection. Market duplicate handling is independent of
 input order, and relevant references retain source, capture and content identity.
@@ -2252,15 +2262,28 @@ tables in the existing targeted SQLite store:
   transaction commits. An interrupted body without a marker is unavailable;
   an identical retry confirms it at the retry time.
 - `inventory_basis_references`: immutable canonical basis content, keyed by
-  source ID and computed content hash.
+  source ID and computed content hash. `body_recorded_at` retains the writer's
+  recording lower bound; it never establishes durable availability.
 - `inventory_basis_acceptances`: a post-content-commit acceptance marker for
   the exact source/hash pair, sampled by the writer rather than supplied by a caller.
 
 UPDATE, DELETE and same-key INSERT are refused by triggers on all five tables,
-including `INSERT OR REPLACE` and `REPLACE INTO`. Idempotency is implemented in
-the application by checking existing identical content and retaining its original
-acceptance marker. Raw replacement SQL cannot backdate an acceptance or change a
-stored body/hash. The superseded unshipped inventory extension key is refused;
+including `INSERT OR REPLACE` and `REPLACE INTO`. Idempotency requires both the
+stored content hash and the exact canonical JSON body to match. A pre-inserted
+row with a legitimate digest field but different body bytes is refused.
+Acceptance insertion triggers require the matching evidence or basis body row,
+even when a raw SQLite connection has foreign-key enforcement disabled.
+Readers verify canonical body/hash consistency before returning evidence.
+Both idempotent adoption and readers cross-check the SQL parent revision,
+schema version and availability cutoff against the canonical body; matching
+body/hash text cannot conceal conflicting row metadata.
+Writers validate an existing acceptance against its body and temporal constraints;
+an impossible pre-seeded timestamp is refused rather than adopted. These checks
+extend the earlier replacement-only protection to malicious pre-insertion;
+they do not claim protection against arbitrary database or trigger tampering.
+Basis acceptance must not precede the stored body-recording lower bound and is
+sampled only after its body commits, verified through a second connection. The
+superseded unshipped inventory extension key or basis-table shape is refused;
 there is no evidence migration and no change to targeted v1 snapshot semantics.
 
 `observe_inventory_evidence` uses the same read-only, quiescent-source guards as
@@ -2276,7 +2299,11 @@ stored acceptance marker and cannot establish availability. Existing v1
 `observe()` continues to use its original basis-file behavior.
 If no discovery date is specified, the adapter picks the greatest discovery date
 among accepted source snapshots available at the requested cutoff. It does not
-union historical selector memberships across snapshots. Source timestamps,
+union historical selector memberships across snapshots. Before using a source
+snapshot, the adapter checks that its acceptance timestamp is canonical and
+does not precede the snapshot's `recorded_utc` or any capture response.
+Impossible pre-seeded source acceptance timestamps are refused by the reader.
+Source timestamps,
 request parameters, exact ordered selector tokens, returned sets, response
 byte/text hash kinds, query hash and source/capture IDs are serialized.
 
@@ -2286,12 +2313,16 @@ verified/unsupported session axis and market measurement contract.
 `request_contract_sha256` hashes its canonical JSON. Availability cutoff and
 input content may advance as the same question is corrected; changing brokers,
 windows, acceleration or scope is a different question with a distinct digest.
-A different basis version also creates a distinct request identity.
+A different basis version also creates a distinct request identity. The session
+axis remains part of that identity even for unsupported calendar ranges.
 
 `record_inventory_evidence(conn, doc)` appends revision 1 or exactly parent + 1
 within that digest's chain. A changed request cannot enter as a child of the
 old chain; an independent request starts its own revision 1. Identical
 content/revision is idempotent; different content at the same revision is refused.
+The builder and document validator also require revision 1 when
+`parent_revision` is null. Selector-union storage refuses an identity that
+declares an `EXPLICIT_FOLLOWUP` compatibility scope, including empty-row products.
 Source provenance, not just surviving rows, is checked before selector-union
 storage. Availability cannot move backward. Product acceptance cannot precede
 input or parent acceptance, and an availability cutoff later than product
@@ -2299,9 +2330,11 @@ acceptance is refused before it can occupy an immutable revision slot.
 
 JSON formation is pure; product availability is separately confirmed after
 durable storage. The inner document uses `max_input_known_at` for the maximum
-contributing input acceptance. Only the persisted envelope uses `known_at` and
-`durable_accepted_at` for evidence-product availability. Durable timestamps
-preserve microseconds. An early-input document confirmed late is invisible at an
+contributing input acceptance. The persisted envelope's `known_at` and
+`durable_accepted_at` describe evidence-product availability. Provenance capture
+entries retain their own `known_at` and `durable_accepted_at` source/capture
+availability timestamps; those timestamps do not establish product durability.
+Durable timestamps preserve microseconds. An early-input document confirmed late is invisible at an
 intermediate as-of cutoff; historical market dates do not backdate either clock.
 
 `inventory_evidence_revision(reader, ticker, anchor, cutoff, availability_cutoff)`
@@ -2320,8 +2353,8 @@ snapshot. No legacy snapshot is rewritten or migrated.
 
 ### Verification and scope
 
-`python test_inventory_evidence.py`: 78 offline tests, including adversarial
-null/bool/string/nonfinite values, completeness, duplicate captures, revision
+`python test_inventory_evidence.py`: 104 offline tests pass,
+including adversarial null/bool/string/nonfinite values, completeness, duplicate captures, revision
 immutability and the actual FakeVendor -> targeted SQLite -> read-only evidence
 -> immutable stored JSON -> as-of/retrospective reader path. Source database
 hashes and v1 JSON are unchanged by reading. Schema upgrade preserves v1 meta.
@@ -2331,6 +2364,46 @@ withheld rotation lists, raw SQL replacement attempts, microsecond visibility,
 late product acceptance, interrupted-body retry, temporal monotonicity and
 durably stored basis history. These are behavioral checks rather than
 source-string assertions.
+The targeted-store integration fixture now supplies an explicit collector clock,
+matching its fixed source-response and acceptance timestamps. The earlier
+78-test inventory and 588-test health results at `69f25f1` depended on the real
+wall clock: after `2026-10-03T10:00Z`, the fixture's source recording could be
+later than its fixed acceptance, and the production temporal guard correctly
+refused it. The clock fix does not relax production temporal guards. All 104
+tests pass both natively and under simulated `2029-01-04T12:00:00Z` and
+`2035-12-03T12:00:00Z` wall clocks. The failing fixture at
+`69f25f1` was reproduced separately under the 2029 clock. An actual master-created
+v1 targeted store was upgraded additively in an isolated probe, preserving its
+v1 metadata and tables.
+New behavioral checks cover mandatory compatibility scopes, invisible-row
+identity stability, exact-body idempotency, foreign-keys-off orphan acceptance
+attempts, impossible pre-seeded acceptance timestamps, root revision 1,
+explicit-follow-up storage refusal, rotation list/count agreement, basis
+conflicts, session-axis identity and post-body-commit basis acceptance.
+Additional pre-insertion checks cover SQL/body metadata consistency and source
+snapshot acceptance canonicality and temporal lower bounds.
+Market capture tests cover matching, mismatched and missing request symbols.
+
+| Required new mutation | Result |
+|---|---|
+| Remove fixture clock pin | Killed |
+| Restore automatic compatibility-scope derivation | Killed |
+| Add invisible/future scopes to request identity | Killed |
+| Compare identical revisions by digest only | Killed |
+| Allow orphan acceptance | Killed |
+| Allow root revision other than 1 | Killed |
+| Remove explicit-follow-up storage refusal | Killed |
+| Remove rotation list/count agreement | Killed |
+| Remove basis-conflict quarantine | Killed |
+| Remove session axis from request identity | Killed |
+| Stamp basis acceptance before body commit | Killed |
+| Allow market capture without symbol | Killed |
+
+The additional basis-content hash-conflict refusal mutation is also killed.
+SQL/body metadata adoption and source-acceptance reader mutations are also killed.
+Every kill includes a behavioral assertion failure. Backward-availability and
+unconfirmed-body visibility mutations were adapted to the strengthened reader
+checks while preserving the same failure behavior.
 Pure cases can run with `python -m unittest test_inventory_evidence.KernelTests`.
 
 `check_ml_health.py` registers the inventory suite in its normal behavioral path,
@@ -2344,7 +2417,11 @@ weekend-as-hole, backdated availability, duplicate flow summation, subset called
 full-market, emitted actual cost basis, attached actor identity, removed window
 completeness, and ADV derived from selected brokers. Mutated copies lived only
 under `/tmp`; no mutant or generated capture is committed.
-Delta mutation results: 36/36 killed: builder 11/11, reconstructed review behavior gates 11/11, and 14 additional contract guards. The required temporal/storage
+The earlier delta run killed 36/36 reconstructed mutations: builder 11/11,
+review behavior gates 11/11 and 14 additional contract guards. Final narrow-fix
+mutation results: 51/51 killed: all 36 prior families, the 12 required
+new mutations, the basis-content hash-conflict guard, SQL/body metadata
+adoption, and source-acceptance reader validation. The required temporal/storage
 mutants exercise SQL as-of acceptance, request identity, exact revision numbering,
 immutability replacement, input/product availability distinction and historical
 basis acceptance, alongside source-conflict and market-order behavior. The
@@ -2369,10 +2446,13 @@ Regression commands: native scripts `test_targeted_actor_panel.py`,
 `test_broker_collect.py` (coverage guards), `test_broker_book.py`,
 `test_broker_learning.py`, `test_broker_learning_run.py`, `test_pipeline.py`,
 `python -m pytest test_idx_calendar.py -q` (40 cases), and
-`check_ml_health.py --quick`. All pass both base and final. Broker cache
+`check_ml_health.py --quick`. The earlier claim that all passed both base and
+final omitted the wall-clock-dependent integration failure described above.
+All required regression commands pass on the final code. These results apply to
+the pinned-clock fixtures. Broker cache
 tests retain their five pre-existing skips because `inventory_raw` is absent;
-pipeline retains its absent candidate-artifact skip. ML health reports 509
-tests at reviewed head and 588 after suite registration, with
+pipeline retains its absent candidate-artifact skip. Final ML health reports
+614 passing tests and 30 module imports, with
 the same 10,033-row/250-session/45-ticker panel;
 two existing optional/credential-dependent modules are compile-only. No model
 training is performed. Run these test scripts in separate processes: their

@@ -450,7 +450,7 @@ def _market_by_date(market):
 
 def _market_request_issue(row):
     params = dict(row.capture.request_parameters)
-    if (("symbol" in params and params["symbol"] != row.ticker)
+    if (params.get("symbol") != row.ticker
             or ("market" in params and params["market"] != row.market_scope)):
         return "REQUEST_SCOPE_MISMATCH"
     return _request_issue(row)
@@ -556,10 +556,9 @@ def _metrics(rows, axis, n, market, offset=0):
     return result
 
 
-def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, availability_cutoff,
+def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, availability_cutoff, compatibility_scopes,
                               observation_revision=1, parent_revision=None, windows=(5, 20),
-                              acceleration_half_window=5, market_observations=(), reference_captures=(),
-                              compatibility_scopes=None):
+                              acceleration_half_window=5, market_observations=(), reference_captures=()):
     """Build one as-of revision. Missing rows become unknown coverage, never flows.
 
     Inputs with revisions above observation_revision or acceptance after the
@@ -575,6 +574,8 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
         _positive_int(parent_revision, "parent_revision")
         if parent_revision + 1 != observation_revision:
             raise ValueError("child revision must equal parent + 1")
+    elif observation_revision != 1:
+        raise ValueError("a request chain must start at revision 1")
     _positive_int(acceleration_half_window, "acceleration_half_window")
     windows = tuple(sorted(set(windows)))
     if not windows:
@@ -591,21 +592,23 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
         raise ValueError("observations must be typed rows of this ticker")
     if any(not isinstance(o, MarketObservation) or o.ticker != ticker for o in market_observations):
         raise ValueError("market observations must be typed rows of this ticker")
-    declared_scopes = tuple(compatibility_scopes) if compatibility_scopes is not None else tuple(
-        o.scope for o in observations if o.broker_code in codes and axis.start <= o.canonical_session_date <= axis.cutoff)
-    if any(not isinstance(s, Scope) for s in declared_scopes):
-        raise ValueError("compatibility scopes must be typed scopes")
+    declared_scopes = tuple(compatibility_scopes)
+    if not declared_scopes or any(not isinstance(s, Scope) for s in declared_scopes):
+        raise ValueError("nonempty typed compatibility scopes are required")
+    if any(s.source_measurement_contract != MEASUREMENT_CONTRACT or
+           any(v.upper() in ("UNKNOWN", "UNSPECIFIED", "UNSUPPORTED") for v in asdict(s).values())
+           for s in declared_scopes):
+        raise ValueError("unsupported declared compatibility scope")
     scopes = sorted({canonical_json(asdict(s)): asdict(s) for s in declared_scopes}.values(), key=canonical_json)
-    if any(asdict(o.scope) not in scopes for o in observations if o.broker_code in codes
-           and axis.start <= o.canonical_session_date <= axis.cutoff):
+    visible = [o for o in observations if axis.start <= o.canonical_session_date <= axis.cutoff
+               and o.observation_revision <= observation_revision and timestamp(o.capture.known_at) <= cutoff]
+    if any(asdict(o.scope) not in scopes for o in visible if o.broker_code in codes):
         raise ValueError("row scope outside declared compatibility contract")
     identity = {"evidence_schema_version": VERSION, "ticker": ticker, "anchor": axis.start,
                 "cutoff": axis.cutoff, "requested_evidence_brokers": codes,
                 "declared_windows": list(windows), "acceleration_half_window": acceleration_half_window,
                 "compatibility_scopes": scopes, "session_axis": asdict(axis),
                 "market_measurement_contract": MARKET_CONTRACT}
-    visible = [o for o in observations if axis.start <= o.canonical_session_date <= axis.cutoff
-               and o.observation_revision <= observation_revision and timestamp(o.capture.known_at) <= cutoff]
     market = [o for o in market_observations if o.canonical_session_date <= axis.cutoff and
               timestamp(o.capture.known_at) <= cutoff]
     if axis.status == "VERIFIED" and any(o.canonical_session_date not in axis.sessions for o in visible):
@@ -730,6 +733,8 @@ def validate_document(doc):
         _positive_int(doc["parent_revision"], "parent_revision")
         if doc["parent_revision"] + 1 != doc["observation_revision"]:
             raise ValueError("child revision must equal parent + 1")
+    elif doc["observation_revision"] != 1:
+        raise ValueError("a request chain must start at revision 1")
     cutoff = timestamp(doc["availability_cutoff"])
     if doc["availability_cutoff"] != utc_text(doc["availability_cutoff"]):
         raise ValueError("availability cutoff must be canonical UTC text")
@@ -755,11 +760,14 @@ def validate_document(doc):
                      "market_measurement_contract"})
     _positive_int(identity["acceleration_half_window"], "acceleration_half_window")
     scopes = identity["compatibility_scopes"]
-    if not isinstance(scopes, list):
-        raise ValueError("compatibility scopes must be a declared list")
+    if not isinstance(scopes, list) or not scopes:
+        raise ValueError("compatibility scopes must be a nonempty declared list")
     for scope in scopes:
         exact(scope, Scope.__dataclass_fields__)
         Scope(**scope)
+        if (scope["source_measurement_contract"] != MEASUREMENT_CONTRACT or
+                any(v.upper() in ("UNKNOWN", "UNSPECIFIED", "UNSUPPORTED") for v in scope.values())):
+            raise ValueError("unsupported declared compatibility scope")
     if scopes != sorted({canonical_json(s): s for s in scopes}.values(), key=canonical_json):
         raise ValueError("compatibility scopes must be sorted and unique")
     expected_identity = {"evidence_schema_version": VERSION, "ticker": doc["ticker"], "anchor": axis.start,
