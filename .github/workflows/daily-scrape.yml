@@ -2,9 +2,13 @@ name: NeoBDM Daily Scrape
 
 on:
   schedule:
-    # 23:00 UTC == 07:00 Asia/Kuala_Lumpur (UTC+8, no DST).
-    # Note: GitHub may delay scheduled runs by a few minutes under load.
-    - cron: "0 23 * * *"
+    # 22:00 UTC == 05:00 Asia/Jakarta (UTC+7, no DST) == 06:00 Asia/Kuala_Lumpur.
+    # Note: GitHub may start scheduled runs late, by hours rather than minutes
+    # (the old 23:00 UTC slot started 07:38-09:28 WIB, 2026-09-19..10-03). A run
+    # that starts after the 09:00 WIB IDX open stores nothing date-keyed
+    # (neobdm_scraper._offset_safe), so the morning picks go stale; the earlier
+    # slot leaves more room before the open.
+    - cron: "0 22 * * *"
   workflow_dispatch:  # lets you trigger a run manually from the Actions tab
 
 permissions:
