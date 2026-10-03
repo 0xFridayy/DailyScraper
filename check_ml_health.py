@@ -33,7 +33,7 @@ routed through price_audit.clean_panel().
 
 Run:  py check_ml_health.py            -> print status
       py check_ml_health.py --telegram -> also send it
-      py check_ml_health.py --quick    -> skip the model fit (imports + data only)
+      py check_ml_health.py --quick    -> skip the model fit (imports, tests, data)
       py check_ml_health.py --broker-flow-manifest PATH
                                        -> build the panel under that manifest
 Exit code is non-zero when unhealthy.
@@ -49,6 +49,7 @@ refused refresh is a health problem, never a reason to read raw broker_flow.
 import argparse
 import ast
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -196,6 +197,9 @@ def check_unit_tests(problems, stats):
     factor arithmetic. It lives in its own file so a candidate rule can never be
     satisfied by relaxing a production test, and it runs here so the separation
     does not become an excuse for it to stop running.
+
+    test_inventory_evidence.py guards finite-anchor flow, coverage, revision and
+    availability semantics. It runs in a separate process, including in --quick.
     """
     passed = 0
     for name in ("test_pipeline.py", "test_experiment_1f_phase2.py", "test_daily_picks.py",
@@ -203,10 +207,16 @@ def check_unit_tests(problems, stats):
                  "test_broker_dashboard.py", "test_broker_collect.py",
                  "test_broker_learning_run.py", "test_inventory_capture.py",
                  "test_targeted_actor_panel.py", "test_arb_veto.py",
-                 "test_targeted_actor_observations.py", "test_morning.py"):
+                 "test_targeted_actor_observations.py", "test_inventory_evidence.py",
+                 "test_morning.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
-        passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
+        unittest_summary = re.search(r"^Ran (\d+) tests? in ", r.stderr, flags=re.M)
+        if unittest_summary:
+            if r.returncode == 0:
+                passed += int(unittest_summary.group(1))
+        else:
+            passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
         if r.returncode != 0:
             tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
             problems.append(f"{name} FAILED — " + " | ".join(tail))
