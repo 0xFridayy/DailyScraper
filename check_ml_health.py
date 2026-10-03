@@ -200,6 +200,9 @@ def check_unit_tests(problems, stats):
 
     test_inventory_evidence.py guards finite-anchor flow, coverage, revision and
     availability semantics. It runs in a separate process, including in --quick.
+
+    test_bandarmolony_trade_capture.py checks offline trade normalization, private
+    output, immutable captures, and verification. It also runs in --quick.
     """
     passed = 0
     for name in ("test_pipeline.py", "test_experiment_1f_phase2.py", "test_daily_picks.py",
@@ -208,6 +211,7 @@ def check_unit_tests(problems, stats):
                  "test_broker_learning_run.py", "test_inventory_capture.py",
                  "test_targeted_actor_panel.py", "test_arb_veto.py",
                  "test_targeted_actor_observations.py", "test_inventory_evidence.py",
+                 "test_bandarmolony_trade_capture.py",
                  "test_morning.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
