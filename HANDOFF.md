@@ -2278,9 +2278,13 @@ Both idempotent adoption and readers cross-check the SQL parent revision,
 schema version and availability cutoff against the canonical body; matching
 body/hash text cannot conceal conflicting row metadata.
 Writers validate an existing acceptance against its body and temporal constraints;
-an impossible pre-seeded timestamp is refused rather than adopted. These checks
-extend the earlier replacement-only protection to malicious pre-insertion;
-they do not claim protection against arbitrary database or trigger tampering.
+an impossible pre-seeded timestamp below the applicable temporal lower bound is
+refused rather than adopted. The protections refuse orphan acceptance,
+forged or mismatched canonical bodies, below-lower-bound timestamps and raw
+replacement, UPDATE and DELETE. They do not prevent every malicious pre-insertion
+or arbitrary database or trigger tampering. A pre-seeded body plus acceptance at
+an otherwise plausible valid time cannot be distinguished from a legitimate
+earlier durable write without an external trusted time or attestation source.
 Basis acceptance must not precede the stored body-recording lower bound and is
 sampled only after its body commits, verified through a second connection. The
 superseded unshipped inventory extension key or basis-table shape is refused;
@@ -2302,7 +2306,10 @@ among accepted source snapshots available at the requested cutoff. It does not
 union historical selector memberships across snapshots. Before using a source
 snapshot, the adapter checks that its acceptance timestamp is canonical and
 does not precede the snapshot's `recorded_utc` or any capture response.
-Impossible pre-seeded source acceptance timestamps are refused by the reader.
+Noncanonical source acceptance timestamps and timestamps below those lower
+bounds are refused by the reader. A future pre-seeded snapshot marker currently
+fails closed by delaying visibility until its acceptance time; it is deferred,
+not rejected. No new production upper-bound rule is introduced here.
 Source timestamps,
 request parameters, exact ordered selector tokens, returned sets, response
 byte/text hash kinds, query hash and source/capture IDs are serialized.
@@ -2353,7 +2360,7 @@ snapshot. No legacy snapshot is rewritten or migrated.
 
 ### Verification and scope
 
-`python test_inventory_evidence.py`: 104 offline tests pass,
+`python test_inventory_evidence.py`: 106 offline tests pass on Linux,
 including adversarial null/bool/string/nonfinite values, completeness, duplicate captures, revision
 immutability and the actual FakeVendor -> targeted SQLite -> read-only evidence
 -> immutable stored JSON -> as-of/retrospective reader path. Source database
@@ -2369,9 +2376,12 @@ matching its fixed source-response and acceptance timestamps. The earlier
 78-test inventory and 588-test health results at `69f25f1` depended on the real
 wall clock: after `2026-10-03T10:00Z`, the fixture's source recording could be
 later than its fixed acceptance, and the production temporal guard correctly
-refused it. The clock fix does not relax production temporal guards. All 104
-tests pass both natively and under simulated `2029-01-04T12:00:00Z` and
-`2035-12-03T12:00:00Z` wall clocks. The failing fixture at
+refused it. The clock fix does not relax production temporal guards. All 106
+tests pass on Linux with the real wall clock and under simulated
+`2029-01-04T12:00:00Z` and `2035-12-03T12:00:00Z` wall clocks.
+The three affected raw SQLite test contexts explicitly close their connections
+while preserving transaction commit/rollback. Native Windows validation remains
+pending because this workspace has no Windows runner. The failing fixture at
 `69f25f1` was reproduced separately under the 2029 clock. An actual master-created
 v1 targeted store was upgraded additively in an isolated probe, preserving its
 v1 metadata and tables.
@@ -2383,6 +2393,13 @@ conflicts, session-axis identity and post-body-commit basis acceptance.
 Additional pre-insertion checks cover SQL/body metadata consistency and source
 snapshot acceptance canonicality and temporal lower bounds.
 Market capture tests cover matching, mismatched and missing request symbols.
+Two additional regression tests reject empty compatibility scopes with valid,
+visible rows, including an invisible future row, and reject a concurrent
+positive-broker list of `["ES"]` whose `observed_subset_positive_broker_count`
+value is forged to 2. Restoring automatic scope derivation and removing only
+`count["value"] != len(expected_positive)` are each killed by the corresponding
+new test with `ValueError not raised`. The previous guards survive those exact
+mutations, confirming coverage of the previously untested cases.
 
 | Required new mutation | Result |
 |---|---|
@@ -2448,11 +2465,12 @@ Regression commands: native scripts `test_targeted_actor_panel.py`,
 `python -m pytest test_idx_calendar.py -q` (40 cases), and
 `check_ml_health.py --quick`. The earlier claim that all passed both base and
 final omitted the wall-clock-dependent integration failure described above.
-All required regression commands pass on the final code. These results apply to
-the pinned-clock fixtures. Broker cache
+All required regression commands pass on Linux on the final code. These results
+apply to the pinned-clock fixtures. Broker cache
 tests retain their five pre-existing skips because `inventory_raw` is absent;
 pipeline retains its absent candidate-artifact skip. Final ML health reports
-614 passing tests and 30 module imports, with
+616 passing tests, up from 614 solely from the two added inventory tests, and
+30 module imports, with
 the same 10,033-row/250-session/45-ticker panel;
 two existing optional/credential-dependent modules are compile-only. No model
 training is performed. Run these test scripts in separate processes: their

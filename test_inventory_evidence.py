@@ -1337,6 +1337,18 @@ class FinalKernelGuardsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonempty declared"):
             ie.validate_document(empty)
 
+    def test_empty_compatibility_scopes_refuse_visible_rows(self):
+        axis = axis_n(5)
+        visible = [row(d) for d in axis.sessions]
+        valid = build(visible, axis, availability_cutoff=EARLY)
+        self.assertEqual([r["coverage"] for r in series(valid)], [ie.OBSERVED_NONZERO] * 5)
+        future = row(axis.cutoff, scope=replace(SCOPE, basis_version="basis-v2"),
+                     cap=capture("future-scope", accepted=LATE))
+        for rows in (visible, visible + [future]):
+            with self.subTest(includes_future=len(rows) > len(visible)):
+                with self.assertRaisesRegex(ValueError, "nonempty typed compatibility scopes"):
+                    build(rows, axis, availability_cutoff=EARLY, compatibility_scopes=())
+
     def test_invisible_future_and_higher_revision_scopes_do_not_change_historical_request(self):
         axis = axis_n(5)
         visible = [row(d) for d in axis.sessions]
@@ -1389,6 +1401,17 @@ class FinalKernelGuardsTests(unittest.TestCase):
         forged = copy.deepcopy(original)
         forged["rotation_evidence"]["concurrent_positive_brokers"]["value"] = []
         with self.assertRaisesRegex(ValueError, "differs from the observed subset"):
+            ie.validate_document(forged)
+
+    def test_rotation_count_value_must_equal_positive_list_length(self):
+        axis = axis_n(5)
+        original = build([row(d) for d in axis.sessions], axis)
+        ie.validate_document(original)
+        self.assertEqual(original["rotation_evidence"]["concurrent_positive_brokers"]["value"], ["ES"])
+        self.assertEqual(original["rotation_evidence"]["observed_subset_positive_broker_count"]["value"], 1)
+        forged = copy.deepcopy(original)
+        forged["rotation_evidence"]["observed_subset_positive_broker_count"]["value"] = 2
+        with self.assertRaisesRegex(ValueError, "concurrent buying evidence differs from the observed subset"):
             ie.validate_document(forged)
 
     def test_session_axis_is_part_of_request_identity_and_is_validator_pinned(self):
@@ -1476,7 +1499,7 @@ class StorageHardeningTests(unittest.TestCase):
             with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as tmp:
                 path = os.path.join(tmp, "metadata.db")
                 with closing(tdb.connect(path)) as writer:
-                    with sqlite3.connect(path) as raw:
+                    with closing(sqlite3.connect(path)) as raw, raw:
                         raw.execute("PRAGMA foreign_keys=OFF")
                         raw.execute("INSERT INTO inventory_evidence_revisions VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (*self.key(), 1, *metadata, ie.content_hash(self.doc), ie.canonical_json(self.doc)))
@@ -1644,7 +1667,7 @@ class StorageHardeningTests(unittest.TestCase):
         samples = []
 
         def clock():
-            with sqlite3.connect(self.path) as second_reader:
+            with closing(sqlite3.connect(self.path)) as second_reader, second_reader:
                 body = second_reader.execute("SELECT body_recorded_at FROM inventory_basis_references "
                                              "WHERE source_id=? AND content_sha256=?", ("basis", digest)).fetchone()
                 marker = second_reader.execute("SELECT 1 FROM inventory_basis_acceptances "
@@ -1699,7 +1722,7 @@ class SourceAcceptanceHardeningTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _preseed(self, accepted):
-        with sqlite3.connect(self.path) as raw:
+        with closing(sqlite3.connect(self.path)) as raw, raw:
             raw.execute("PRAGMA foreign_keys = OFF")
             self.assertEqual(raw.execute("PRAGMA foreign_keys").fetchone()[0], 0)
             raw.execute("INSERT INTO inventory_snapshot_acceptances VALUES (?,?,?,?,?)",
