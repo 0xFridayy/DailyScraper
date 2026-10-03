@@ -21,6 +21,9 @@ average-cost book, profitability, actor labels or research rules. Existing
 successful collection runs do not establish full-universe inventory coverage.
 There is no daily Inventory/LPM launch or new collection schedule in this
 extension. See [HANDOFF.md, Inventory Evidence v1](HANDOFF.md#lampiran-x-inventory-evidence-v1-2026-10-02).
+The review-fix delta pins evidence request identity, product/input availability,
+immutable basis history and session-complete capture semantics. It keeps the
+existing Broker Learning rules and full-universe guards unchanged.
 
 ---
 

@@ -508,7 +508,7 @@ def observation_json(doc):
 
 
 def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cutoff,
-                               broker_codes, scope, basis_reference_known_at,
+                               broker_codes, scope, basis_reference_known_at=None,
                                discovery_as_of=None, observation_revision=1,
                                parent_revision=None, windows=(5, 20), market_observations=()):
     """Additive inventory_evidence v1 reader; observe() keeps its exact v1 output.
@@ -516,9 +516,13 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
     Broker codes and market scope are explicitly supplied, never inferred from
     future selector membership. Only snapshots with a post-commit acceptance
     marker contribute. Old snapshots lacking a marker remain UNOBSERVED.
-    The caller attests the basis reference's availability timestamp; its content
-    hash must be scope.basis_version. A reference not yet available contributes
-    no evidence. Unit/market metadata absent from v1 is declared in Scope, not
+    Basis content and its post-commit acceptance must already be stored through
+    targeted_actor_db.accept_inventory_basis_reference(). scope.basis_version
+    selects that immutable content hash; the current basis file is never read.
+    A reference not durably available by the cutoff contributes no evidence.
+    The optional legacy basis_reference_known_at argument is only an equality
+    assertion against that acceptance; it cannot establish availability.
+    Unit/market metadata absent from v1 is declared in Scope, not
     invented from the OHLC arrays. Market volumes require separately validated
     MarketObservation inputs; stored inventory volume_sma20 is never used.
     """
@@ -530,7 +534,8 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
     available = ie.timestamp(availability_cutoff)
     parameters = dict(ticker=ticker, broker_codes=broker_codes, axis=axis,
                       availability_cutoff=availability_cutoff, observation_revision=observation_revision,
-                      parent_revision=parent_revision, windows=windows, market_observations=market_observations)
+                      parent_revision=parent_revision, windows=windows, market_observations=market_observations,
+                      compatibility_scopes=(scope,))
     with _reading(conn):
         _panel_meta(conn)
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -543,17 +548,23 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
                     and (discovery_as_of is None or r["discovery_as_of"] == discovery_as_of)]
         chosen = max(accepted, key=lambda r: r["discovery_as_of"]) if accepted else None
         stored = _load(conn, ticker, chosen["discovery_as_of"]) if chosen else None
-    if stored is None or ie.timestamp(basis_reference_known_at) > available:
+        basis_record = tdb.inventory_basis_reference_as_of(
+            conn, BASIS_SOURCE_ID, scope.basis_version, availability_cutoff)
+    if stored is None or basis_record is None:
         return ie.build_inventory_evidence([], **parameters)
     panel = _checked(stored)
     snap = panel["snapshot"]
     if snap["content_sha256"] != chosen["content_sha256"] or snap["investor_type"] != scope.investor_type:
         raise PanelIntegrityError("inventory evidence acceptance/scope disagrees with source snapshot")
-    basis = _basis_reference()
-    if scope.basis_version != basis["canonical_json_sha256"]:
-        raise ValueError("scope.basis_version must identify the exact supplied basis reference")
-    basis_capture = ie.Capture(BASIS_SOURCE_ID, basis["canonical_json_sha256"], basis_reference_known_at,
-                              basis_reference_known_at, basis["canonical_json_sha256"],
+    if (basis_reference_known_at is not None
+            and ie.timestamp(basis_reference_known_at) != ie.timestamp(basis_record["durable_accepted_at"])):
+        raise ValueError("basis_reference_known_at must equal the stored durable basis acceptance")
+    basis = _basis_reference_document(json.loads(basis_record["content_json"]))
+    if basis["canonical_json_sha256"] != scope.basis_version:
+        raise BasisReferenceError("accepted basis content disagrees with its immutable content hash")
+    basis_capture = ie.Capture(BASIS_SOURCE_ID, basis["canonical_json_sha256"],
+                              basis_record["durable_accepted_at"], basis_record["durable_accepted_at"],
+                              basis["canonical_json_sha256"],
                               content_hash_kind="CANONICAL_JSON_SHA256")
     captures = {}
     for c in snap["captures"]:
@@ -583,17 +594,20 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
     return ie.build_inventory_evidence(observations, reference_captures=(basis_capture,), **parameters)
 
 
-def inventory_evidence_revision(conn, ticker, anchor, cutoff, availability_cutoff=None):
+def inventory_evidence_revision(conn, ticker, anchor, cutoff, availability_cutoff=None,
+                                request_contract_sha256=None):
     """Read a confirmed stored revision with the v1 reader's quiescence guards.
 
     A timestamp requests AS_OF; None explicitly requests LATEST_RETROSPECTIVE.
+    Specify the immutable request digest when multiple request chains exist.
     """
     _check_ticker(ticker)
     with _reading(conn):
         _panel_meta(conn)
         if availability_cutoff is None:
-            return tdb.latest_inventory_evidence(conn, ticker, anchor, cutoff)
-        return tdb.inventory_evidence_as_of(conn, ticker, anchor, cutoff, availability_cutoff)
+            return tdb.latest_inventory_evidence(conn, ticker, anchor, cutoff, request_contract_sha256)
+        return tdb.inventory_evidence_as_of(conn, ticker, anchor, cutoff, availability_cutoff,
+                                          request_contract_sha256)
 
 
 def _resolve(conn, ticker, discovery_as_of):
@@ -943,6 +957,11 @@ def _basis_reference():
         raise BasisReferenceError(f"{BASIS_SOURCE_ID} cannot be read as JSON "
                                   f"({type(e).__name__}: {e}); no basis statement can be made "
                                   "without it") from None
+    return _basis_reference_document(doc)
+
+
+def _basis_reference_document(doc):
+    """Validate immutable reference content using the unchanged v1 interval rule."""
     regimes = doc.get("regimes") if isinstance(doc, dict) else None
     if not isinstance(regimes, list):
         raise BasisReferenceError(f"{BASIS_SOURCE_ID} has no regimes list")

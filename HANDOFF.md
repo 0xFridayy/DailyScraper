@@ -2084,6 +2084,8 @@ itu men-skip-nya.
 ## Lampiran X: Inventory Evidence v1 (2026-10-02)
 
 Implemented on `feat/inventory-evidence-kernel-v1`, based on master `97b773f`.
+The delta from reviewed head `72de93e` fixes revision identity, availability,
+immutability, daily-session finality and the confirmed validation/test gaps.
 This is the contract/kernel extension after the Inventory/LPM audit, before
 any live pilot. DailyScraper produces deterministic evidence; actor hypotheses
 belong to Market Intelligence, validation/lift/decay to SPECTRA, and freshness,
@@ -2101,8 +2103,10 @@ The document has ticker and evidence revision; each series row has broker code,
 canonical market-session date, segment ID and input observation revision.
 Compatibility is explicit in `Scope`: investor type, market scope, capture
 scope, source measurement contract and basis version. Unknown scope is invalid.
-Evidence documents declare `coverage_scope=OBSERVED_BROKER_SUBSET` and
-`full_universe=false`, so existing `coverage_guard.refuse_targeted` refuses them.
+Evidence documents declare `coverage_scope=OBSERVED_BROKER_SUBSET`; their contract
+pins `full_universe=false`. Storage envelopes declare
+`coverage_scope=TARGETED_SELECTOR_UNION` and `full_universe=false` at the top level.
+The existing `coverage_guard.refuse_targeted` refuses both representations.
 The targeted adapter and writer accept only `TARGETED_SELECTOR_UNION`; explicit follow-up
 capture is deferred rather than relabeled as selector-union evidence.
 
@@ -2114,9 +2118,12 @@ capture is deferred rather than relabeled as selector-union evidence.
 | `INVALID` | Present but malformed/null, inconsistent, unsupported units/scope, or not returned |
 | `QUARANTINED` | Conflicting equal revisions, explicit quarantine, or a known basis-conflict session |
 
-No omitted broker/session becomes a zero flow row. Suspension uncertainty is
-`UNOBSERVED`, not a zero-trading assumption. Invalid raw numeric tokens are
+No omitted broker/session becomes a zero flow row. The kernel can represent an
+explicit `UNOBSERVED` input with `SUSPENSION_UNCERTAIN`; the adapter cannot detect
+ticker suspension and does not automatically emit that reason. Invalid raw tokens are
 represented as null with a reason; nonfinite JSON is never emitted.
+`observed_brokers` includes only requested brokers with at least one emitted,
+valid observed session. Unrequested and exclusively quarantined brokers are excluded.
 
 ### Sessions, holes and segments
 
@@ -2126,6 +2133,13 @@ session. Weekends and official closures are excluded. Outside calendar coverage,
 the axis is `UNSUPPORTED`, raw observations remain available, every local row
 starts a separate segment and all continuity/window measurements are withheld.
 There is no extrapolated weekday calendar or unsupported-calendar zero fill.
+
+This is a session-complete daily contract. The repository has no authoritative
+exchange close-time contract, so a capture response's Asia/Jakarta date must be
+after its source market session. Same-day pre-open and intraday observations
+are `INVALID` with `SESSION_NOT_FINAL_AT_CAPTURE`; market measurements also
+withhold same-day inputs. A later acceptance cannot make an intraday response
+final. This rule does not establish a contract for future intraday products.
 
 For `+100, +30, UNKNOWN, -20, +40`, original-anchor cumulative lots are
 `100, 130, null, null, null`. Segment-local lots are
@@ -2146,6 +2160,20 @@ windows=(5, 20), acceleration_half_window=5, market_observations=...)`.
 It performs no network, file or database I/O and uses a private fixed Decimal
 context. Canonical JSON has sorted keys/lists where order is not source evidence,
 no generation clock, and no NaN/infinity. Request token order is preserved.
+
+Broker inputs validate request symbol, investor type, declared market and
+start/end dates against the observation. Supported kernel capture scopes are
+`TARGETED_SELECTOR_UNION` and `EXPLICIT_FOLLOWUP`; explicit captures must actually
+request that broker. Market inputs validate any declared request symbol, market
+and date range, plus OHLC contract, basis and unit compatibility. Another ticker's
+request cannot supply this ticker's ADV. Scope and coverage participate in
+same-revision conflict detection. Market duplicate handling is independent of
+input order, and relevant references retain source, capture and content identity.
+Document validation pins semantic constants, enums, censoring and controlled
+reason codes as well as object shape; strengthened transfer/full-universe claims
+and actor-like reason text are refused. Observed rows and market references
+are cross-checked against their capture request/session contract at persistence,
+so replacing provenance cannot bypass the builder's daily-finality checks.
 
 Raw buy/sell/net lots and buy/sell/net value in rupiah retain their measurement
 meaning. Lots are not shares; one reported lot is 100 shares. Inventory API
@@ -2189,8 +2217,13 @@ and Broker Learning full-universe guards are unchanged.
 
 `rotation_evidence` contains context, per-broker prior/recent complete-window
 facts, first observed activity and censoring, concurrent positive broker codes,
-and a covered-subset broker count with the measurement envelope. Price/ADV facts
-are carried in those windows. Concurrent buying is an absorption proxy only;
+and a covered-subset broker count. Both the broker list and count use the
+measurement envelope. If any required recent broker window is withheld, both
+have `value=null`, `status=WITHHELD` and
+`null_reason=INCOMPLETE_OBSERVED_SUBSET`. A calculated list is sorted; an empty
+calculated list therefore means a completely observed subset with no positive
+net flows. Price/ADV facts are carried in those windows. Concurrent buying is
+an absorption proxy only;
 there is no seller-to-buyer transaction linkage or `healthy_rotation` label.
 Concentration, drawdown/recovery statistics and ownership-disclosure joins are
 deferred. No metric named `market_concentration` is emitted.
@@ -2205,7 +2238,7 @@ support/weakening of an actor hypothesis remains future MI work.
 ### Targeted store, availability and revisions
 
 Existing `observe()` output and panel schema/meta version 1 are unchanged.
-`targeted_actor_db.ensure_schema` additively creates three extension-version-1
+`targeted_actor_db.ensure_schema` additively creates five extension-version-1
 tables in the existing targeted SQLite store:
 
 - `inventory_snapshot_acceptances`: a post-commit marker for a v1 source snapshot,
@@ -2213,47 +2246,97 @@ tables in the existing targeted SQLite store:
   records the current acceptance time; it never derives it from a market date or
   `recorded_utc`. Old v1 snapshots without markers remain unavailable.
 - `inventory_evidence_revisions`: immutable canonical JSON and content hash,
-  keyed by ticker, anchor, market cutoff and revision, with parent lineage.
+  keyed by ticker, anchor, market cutoff, request-contract digest and revision,
+  with parent lineage per request identity.
 - `inventory_evidence_acceptances`: product durability confirmed after the JSON
   transaction commits. An interrupted body without a marker is unavailable;
-  an identical retry confirms it at the retry time. UPDATE/DELETE are refused.
+  an identical retry confirms it at the retry time.
+- `inventory_basis_references`: immutable canonical basis content, keyed by
+  source ID and computed content hash.
+- `inventory_basis_acceptances`: a post-content-commit acceptance marker for
+  the exact source/hash pair, sampled by the writer rather than supplied by a caller.
+
+UPDATE, DELETE and same-key INSERT are refused by triggers on all five tables,
+including `INSERT OR REPLACE` and `REPLACE INTO`. Idempotency is implemented in
+the application by checking existing identical content and retaining its original
+acceptance marker. Raw replacement SQL cannot backdate an acceptance or change a
+stored body/hash. The superseded unshipped inventory extension key is refused;
+there is no evidence migration and no change to targeted v1 snapshot semantics.
 
 `observe_inventory_evidence` uses the same read-only, quiescent-source guards as
-v1. It requires explicit broker codes and scope, and a caller-attested
-`basis_reference_known_at`; `scope.basis_version` must be the exact current basis
-reference content hash. This assertion must come from the reference's acceptance
-record, never the market date or a guessed file timestamp. A future reference
-contributes no evidence; known conflict intervals quarantine their sessions.
+v1. It requires explicit broker codes and scope; `scope.basis_version` selects
+an immutable basis content hash accepted through
+`accept_inventory_basis_reference(conn, BASIS_SOURCE_ID, content)`. The adapter
+reads that stored content only when its durable acceptance is within the input
+availability cutoff. It never reads the current basis file. A missing or later
+reference leaves the broker evidence unobserved; known conflict intervals from
+an accepted reference quarantine their sessions. The optional legacy
+`basis_reference_known_at` parameter is only an equality assertion against the
+stored acceptance marker and cannot establish availability. Existing v1
+`observe()` continues to use its original basis-file behavior.
 If no discovery date is specified, the adapter picks the greatest discovery date
 among accepted source snapshots available at the requested cutoff. It does not
 union historical selector memberships across snapshots. Source timestamps,
 request parameters, exact ordered selector tokens, returned sets, response
 byte/text hash kinds, query hash and source/capture IDs are serialized.
 
-`record_inventory_evidence(conn, doc)` appends revision 1 or the next revision
-linked to the preceding revision. Identical content/revision is idempotent;
-different content at the same revision is refused. Availability cannot move
-backward. JSON formation is pure; product availability is separately confirmed
-after durable storage. The stored envelope's `known_at` is product acceptance;
-the inner evidence's `known_at` is maximum contributing input acceptance.
+`request_identity` pins schema version, ticker, anchor, cutoff, requested broker
+set, declared windows, acceleration half-window, compatibility scope set,
+verified/unsupported session axis and market measurement contract.
+`request_contract_sha256` hashes its canonical JSON. Availability cutoff and
+input content may advance as the same question is corrected; changing brokers,
+windows, acceleration or scope is a different question with a distinct digest.
+A different basis version also creates a distinct request identity.
+
+`record_inventory_evidence(conn, doc)` appends revision 1 or exactly parent + 1
+within that digest's chain. A changed request cannot enter as a child of the
+old chain; an independent request starts its own revision 1. Identical
+content/revision is idempotent; different content at the same revision is refused.
+Source provenance, not just surviving rows, is checked before selector-union
+storage. Availability cannot move backward. Product acceptance cannot precede
+input or parent acceptance, and an availability cutoff later than product
+acceptance is refused before it can occupy an immutable revision slot.
+
+JSON formation is pure; product availability is separately confirmed after
+durable storage. The inner document uses `max_input_known_at` for the maximum
+contributing input acceptance. Only the persisted envelope uses `known_at` and
+`durable_accepted_at` for evidence-product availability. Durable timestamps
+preserve microseconds. An early-input document confirmed late is invisible at an
+intermediate as-of cutoff; historical market dates do not backdate either clock.
 
 `inventory_evidence_revision(reader, ticker, anchor, cutoff, availability_cutoff)`
 returns `AS_OF`. Omitting that timestamp explicitly returns
 `LATEST_RETROSPECTIVE`. Earlier cutoffs continue to see the earlier hole or
 conflict after a correction. Market session and availability are separate:
 a historical date captured today is not evidence available yesterday.
+Readers accept `request_contract_sha256`; omitting it is permitted only when
+one eligible request chain matches, otherwise the read is refused as ambiguous.
+Later basis content may be used under its own request identity in an explicitly
+labeled retrospective view. It cannot change an earlier stored/as-of result,
+even if the current basis file changes.
 The v1 collector still refuses same-key source conflicts; a correction enters a
 new evidence revision from validated observations or a later accepted source
 snapshot. No legacy snapshot is rewritten or migrated.
 
 ### Verification and scope
 
-`python test_inventory_evidence.py`: 40 offline tests, including adversarial
+`python test_inventory_evidence.py`: 78 offline tests, including adversarial
 null/bool/string/nonfinite values, completeness, duplicate captures, revision
 immutability and the actual FakeVendor -> targeted SQLite -> read-only evidence
 -> immutable stored JSON -> as-of/retrospective reader path. Source database
 hashes and v1 JSON are unchanged by reading. Schema upgrade preserves v1 meta.
+The delta tests cover request identity, exact child numbering, source scope and
+coverage conflicts, shuffled market provenance, daily capture finality,
+withheld rotation lists, raw SQL replacement attempts, microsecond visibility,
+late product acceptance, interrupted-body retry, temporal monotonicity and
+durably stored basis history. These are behavioral checks rather than
+source-string assertions.
 Pure cases can run with `python -m unittest test_inventory_evidence.KernelTests`.
+
+`check_ml_health.py` registers the inventory suite in its normal behavioral path,
+including `--quick`, and counts its unittest summary. The pipeline guard checks
+that the health runner launches the suite exactly once, counts it and reports a
+failure; removing the registration is detectable without workflow changes.
 
 Isolated manual single-edit mutation checks were run against the kernel tests.
 All 11 were killed: unknown-as-zero, opening position zero, ignored hole,
@@ -2261,15 +2344,36 @@ weekend-as-hole, backdated availability, duplicate flow summation, subset called
 full-market, emitted actual cost basis, attached actor identity, removed window
 completeness, and ADV derived from selected brokers. Mutated copies lived only
 under `/tmp`; no mutant or generated capture is committed.
+Delta mutation results: 36/36 killed: builder 11/11, reconstructed review behavior gates 11/11, and 14 additional contract guards. The required temporal/storage
+mutants exercise SQL as-of acceptance, request identity, exact revision numbering,
+immutability replacement, input/product availability distinction and historical
+basis acceptance, alongside source-conflict and market-order behavior. The
+review patches were not attached; these are isolated reconstructions of the
+requested failure behaviors, not a replay of unavailable patch files. Each kill
+requires a behavioral assertion failure, rather than a syntax/import error.
+
+| Review behavior gate | Mutation killed |
+|---|---|
+| N1 | Remove product durable acceptance from as-of filtering |
+| N3 / N4 | Drop scope / coverage state from conflict signatures |
+| N5 | Permit revision-number gaps |
+| N6 / N7 | Accept before inputs / before parent |
+| N9 | Permit backward availability cutoff |
+| N10 | Expose an unconfirmed body |
+| N12 | Permit incompatible request market |
+| N13 | Select duplicate market provenance by input order |
+| N14 | Permit an unrequested explicit-follow-up broker |
 
 Regression commands: native scripts `test_targeted_actor_panel.py`,
 `test_targeted_actor_observations.py`, `test_inventory_capture.py`,
 `test_broker_collect.py` (coverage guards), `test_broker_book.py`,
 `test_broker_learning.py`, `test_broker_learning_run.py`, `test_pipeline.py`,
-and `check_ml_health.py --quick`. All pass both base and final. Broker cache
+`python -m pytest test_idx_calendar.py -q` (40 cases), and
+`check_ml_health.py --quick`. All pass both base and final. Broker cache
 tests retain their five pre-existing skips because `inventory_raw` is absent;
 pipeline retains its absent candidate-artifact skip. ML health reports 509
-tests, 30 module imports and the same 10,033-row/250-session/45-ticker panel;
+tests at reviewed head and 588 after suite registration, with
+the same 10,033-row/250-session/45-ticker panel;
 two existing optional/credential-dependent modules are compile-only. No model
 training is performed. Run these test scripts in separate processes: their
 offline import guards are incompatible with one combined pytest collection.

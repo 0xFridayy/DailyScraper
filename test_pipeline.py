@@ -1438,6 +1438,47 @@ def test_ml_health_workflow_runs_the_canonical_migration_suite():
     print("test_ml_health_workflow_runs_the_canonical_migration_suite passed")
 
 
+def test_ml_health_runs_and_counts_inventory_evidence_tests():
+    import subprocess
+    from unittest.mock import patch
+    import check_ml_health as health
+
+    launched = []
+
+    def successful_suite(args, **kwargs):
+        name = os.path.basename(args[1])
+        launched.append(name)
+        assert kwargs["cwd"] == health.HERE
+        if name == "test_inventory_evidence.py":
+            return subprocess.CompletedProcess(args, 0, "", "Ran 17 tests in 0.1s\n\nOK\n")
+        return subprocess.CompletedProcess(args, 0, "fixture passed\n", "")
+
+    with patch.object(health.subprocess, "run", side_effect=successful_suite), \
+            patch.object(health, "check_imports"), \
+            patch.object(health, "check_known_defects"), \
+            patch.object(health, "check_panel", return_value=None), \
+            patch.object(health, "check_model_runs") as model_fit:
+        problems, _, stats = health.check(quick=True)
+    model_fit.assert_not_called()
+    assert launched.count("test_inventory_evidence.py") == 1, \
+        "ml-health must run the inventory evidence behavioral suite exactly once"
+    assert not problems
+    assert stats["tests_passed"] == len(launched) - 1 + 17, \
+        "ml-health must include unittest's stderr summary in the reported count"
+
+    def failed_inventory_suite(args, **kwargs):
+        if os.path.basename(args[1]) == "test_inventory_evidence.py":
+            return subprocess.CompletedProcess(args, 1, "", "Ran 17 tests in 0.1s\n\nFAILED (failures=1)\n")
+        return successful_suite(args, **kwargs)
+
+    problems, stats = [], {}
+    with patch.object(health.subprocess, "run", side_effect=failed_inventory_suite):
+        health.check_unit_tests(problems, stats)
+    assert any("test_inventory_evidence.py FAILED" in problem for problem in problems), \
+        "inventory evidence failures must fail the health check"
+    print("test_ml_health_runs_and_counts_inventory_evidence_tests passed")
+
+
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
     # d2->d4's gap_1 is NaN for the same reason its fwd_1 is: d3 is missing,
     # so decision-at-d2 -> (positionally-next-but-calendar-discontiguous) d4
@@ -2859,6 +2900,7 @@ if __name__ == "__main__":
     test_build_panel_requires_an_explicit_broker_flow_manifest()
     test_build_panel_never_reads_raw_broker_flow()
     test_ml_health_workflow_runs_the_canonical_migration_suite()
+    test_ml_health_runs_and_counts_inventory_evidence_tests()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
     test_hold_days_one_uses_entry_session_high_low_and_close()
     test_tp_and_sl_hit_on_entry_session_are_detected()

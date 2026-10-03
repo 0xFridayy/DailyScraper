@@ -315,10 +315,10 @@ class KernelTests(unittest.TestCase):
         rows = [row(d, cap=capture(accepted=LATE)) for d in axis.sessions]
         earlier = build(rows, axis, availability_cutoff=EARLY)
         self.assertTrue(all(r["coverage"] == ie.UNOBSERVED and r["raw"] is None for r in series(earlier)))
-        self.assertIsNone(earlier["known_at"])
+        self.assertIsNone(earlier["max_input_known_at"])
         self.assertEqual(earlier["provenance"], [])
         later = build(rows, axis)
-        self.assertEqual(later["known_at"], ie.utc_text(LATE))
+        self.assertEqual(later["max_input_known_at"], ie.utc_text(LATE))
         self.assertEqual(later["provenance"][0]["response_at"], ie.utc_text(EARLY))
 
     def test_response_and_acceptance_order_and_timezone_are_checked(self):
@@ -460,7 +460,7 @@ class KernelTests(unittest.TestCase):
         self.assertGreater(seller["recent_window"]["price_flow_divergence"]["facts"]["price_return"]["market_window"]["end_close_rp_per_share"],
                            seller["prior_window"]["implied_buy_price"]["value"])
         self.assertGreater(seller["recent_window"]["price_flow_divergence"]["facts"]["price_return"]["value"], 0)
-        self.assertEqual(rotation["concurrent_positive_brokers"], ["CC"])
+        self.assertEqual(rotation["concurrent_positive_brokers"]["value"], ["CC"])
         self.assertEqual(rotation["observed_subset_positive_broker_count"]["value"], 1)
         self.assertEqual(rotation["broker_windows"]["CC"]["recent_window"]["persistence"]["value"], 1)
         self.assertEqual(seller["first_observed_activity"], axis.sessions[0])
@@ -485,6 +485,130 @@ class KernelTests(unittest.TestCase):
             DefaultContext.Emax = previous_emax
         self.assertEqual(json.loads(expected)["requested_evidence_brokers"], ["CC", "ES"])
         self.assertEqual(ie.canonical_json(json.loads(expected)), expected)
+
+    def test_rotation_list_is_withheld_with_incomplete_required_subset(self):
+        axis = axis_n(5)
+        for rows in ([], [row(d) for d in axis.sessions]):
+            doc = build(rows, axis, codes=("ES", "CC"))
+            measure = doc["rotation_evidence"]["concurrent_positive_brokers"]
+            self.assertIsNone(measure["value"])
+            self.assertEqual(measure["status"], "WITHHELD")
+            self.assertEqual(measure["null_reason"], "INCOMPLETE_OBSERVED_SUBSET")
+        rows = [row(d, broker=b) for b in ("ES", "CC") for d in axis.sessions]
+        measure = build(rows, axis, codes=("ES", "CC"))["rotation_evidence"]["concurrent_positive_brokers"]
+        self.assertEqual(measure["value"], ["CC", "ES"])
+        self.assertEqual(measure["status"], "CALCULATED")
+
+    def test_daily_session_finality_refuses_preopen_and_intraday(self):
+        axis = axis_n(1)
+        for response in ("2026-09-01T00:00:00Z", "2026-09-01T06:00:00Z", "2026-09-01T12:00:00Z"):
+            doc = build([row(axis.start, cap=capture(response=response))], axis, windows=(1,))
+            self.assertEqual(series(doc)[0]["coverage"], ie.INVALID)
+            self.assertEqual(series(doc)[0]["null_reason"], "SESSION_NOT_FINAL_AT_CAPTURE")
+            self.assertIsNone(metric(doc, "net_flow_slope", 1)["value"])
+        doc = build([row(axis.start, cap=capture(response="2026-09-01T17:00:00Z"))], axis, windows=(1,))
+        self.assertEqual(series(doc)[0]["coverage"], ie.OBSERVED_NONZERO)
+        self.assertEqual(metric(doc, "net_flow_slope", 1)["value"], 10)
+        markets = market_rows(axis_n(21))
+        last = markets[-1]
+        markets[-1] = replace(last, capture=capture("intraday-market", response=last.canonical_session_date + "T06:00:00Z"))
+        doc = build([row(d) for d in axis_n(21).sessions], axis_n(21), market_observations=markets)
+        self.assertIsNone(metric(doc, "flow_vs_adv")["value"])
+
+    def test_broker_request_date_market_and_capture_scope_are_checked(self):
+        axis = axis_n(1)
+        for params, reason in (
+            ((("symbol", "SINI"), ("investor_type", "A"), ("start_date", "2026-09-02")), "REQUEST_SESSION_OUT_OF_RANGE"),
+            ((("symbol", "SINI"), ("investor_type", "A"), ("end_date", "2026-08-31")), "REQUEST_SESSION_OUT_OF_RANGE"),
+            ((("symbol", "SINI"), ("investor_type", "A"), ("market", "NEGOTIATED")), "REQUEST_SCOPE_MISMATCH")):
+            doc = build([row(axis.start, cap=replace(capture(), request_parameters=params))], axis)
+            self.assertEqual(series(doc)[0]["coverage"], ie.INVALID)
+            self.assertEqual(series(doc)[0]["null_reason"], reason)
+        with self.assertRaises(ValueError):
+            replace(SCOPE, capture_scope="FULL_UNIVERSE")
+        with self.assertRaises(ValueError):
+            replace(capture(), request_parameters=(("start_date", "bad-date"),))
+
+    def test_market_provenance_must_match_ticker_request_market_and_range(self):
+        axis = axis_n(21)
+        rows = [row(d) for d in axis.sessions]
+        for changes in (
+            {"request_parameters": (("symbol", "BBCA"),)},
+            {"request_parameters": (("symbol", "SINI"), ("market", "NEGOTIATED"))},
+            {"request_parameters": (("symbol", "SINI"), ("end_date", "2026-08-31"))}):
+            markets = [replace(m, capture=replace(m.capture, **changes)) for m in market_rows(axis)]
+            doc = build(rows, axis, market_observations=markets)
+            self.assertIsNone(metric(doc, "flow_vs_adv")["value"])
+            self.assertIsNone(metric(doc, "price_flow_divergence")["value"])
+        for changes in ({"market_scope": "NEGOTIATED"}, {"basis_version": "basis-v2"},
+                        {"measurement_contract": "SELECTED_BROKER_TOTALS"}):
+            markets = [replace(m, **changes) for m in market_rows(axis)]
+            self.assertIsNone(metric(build(rows, axis, market_observations=markets), "flow_vs_adv")["value"])
+
+    def test_conflicts_include_scope_and_explicit_coverage_state(self):
+        axis = axis_n(1)
+        first = row(axis.start)
+        for conflict in (replace(first, scope=replace(SCOPE, basis_version="basis-v2"), capture=capture("scope-conflict")),
+                         replace(first, coverage=ie.QUARANTINED, null_reason="KNOWN_BASIS_CONFLICT", capture=capture("state-conflict"))):
+            doc = build([first, conflict], axis)
+            self.assertEqual(series(doc)[0]["coverage"], ie.QUARANTINED)
+            self.assertEqual(series(doc)[0]["null_reason"], "CONFLICTING_REVISIONS")
+            self.assertIsNone(series(doc)[0]["raw"])
+            self.assertEqual(doc["observed_brokers"], [])
+
+    def test_revision_numbers_cannot_skip_the_declared_parent(self):
+        for revision, parent in ((3, 1), (5, 2), (2, 3)):
+            with self.assertRaises(ValueError):
+                build([], observation_revision=revision, parent_revision=parent)
+        self.assertEqual(build([], observation_revision=2, parent_revision=1)["observation_revision"], 2)
+
+    def test_explicit_followup_requires_actual_broker_request(self):
+        axis = axis_n(1)
+        cap = replace(capture(), requested_selectors=(), requested_brokers=("CC",))
+        doc = build([row(axis.start, scope=replace(SCOPE, capture_scope="EXPLICIT_FOLLOWUP"), cap=cap)], axis)
+        self.assertEqual(series(doc)[0]["coverage"], ie.INVALID)
+        self.assertEqual(series(doc)[0]["null_reason"], "CAPTURE_SCOPE_MISMATCH")
+
+    def test_market_duplicate_provenance_is_complete_and_order_independent(self):
+        axis = axis_n(21)
+        markets = market_rows(axis)
+        # Equal capture IDs from distinct sources are distinct input references.
+        other = [replace(m, capture=replace(m.capture, source_id="ohlc:second", content_sha256="2" * 64)) for m in markets]
+        rows = [row(d) for d in axis.sessions]
+        first = build(rows, axis, market_observations=markets + other)
+        shuffled = build(rows, axis, market_observations=list(reversed(other + markets)))
+        self.assertEqual(ie.canonical_json(first), ie.canonical_json(shuffled))
+        refs = metric(first, "flow_vs_adv")["adv20"]["input_refs"]
+        market_refs = [r for r in refs if "measurement_contract" in r]
+        self.assertEqual(len(market_refs), 40)
+        self.assertEqual({r["source_id"] for r in market_refs}, {"neobdm:/api/inventory", "ohlc:second"})
+        conflicting = replace(other[-1], volume=1)
+        for order in (markets + [conflicting], [conflicting] + markets):
+            self.assertIsNone(metric(build(rows, axis, market_observations=order), "flow_vs_adv")["value"])
+
+    def test_observed_brokers_only_names_emitted_valid_requested_evidence(self):
+        axis = axis_n(1)
+        rows = [row(axis.start), row(axis.start, broker="CC"),
+                row(axis.start, broker="ZZ", cap=capture("quarantined-zz", returned=("ZZ",)), coverage=ie.QUARANTINED)]
+        doc = build(rows, axis, codes=("ES", "ZZ"))
+        self.assertEqual(doc["observed_brokers"], ["ES"])
+        self.assertNotIn("CC", doc["brokers"])
+
+    def test_request_identity_is_canonical_and_covers_meaning_parameters(self):
+        axis = axis_n(5)
+        rows = [row(d) for d in axis.sessions]
+        first = build(rows, axis, codes=("ES", "CC"), windows=(5, 2), compatibility_scopes=(SCOPE,))
+        reordered = build(rows[::-1], axis, codes=("CC", "ES"), windows=(2, 5), compatibility_scopes=(SCOPE, SCOPE))
+        self.assertEqual(first["request_contract_sha256"], reordered["request_contract_sha256"])
+        correction = build(rows, axis, codes=("CC", "ES"), windows=(2, 5), compatibility_scopes=(SCOPE,),
+                           observation_revision=2, parent_revision=1, availability_cutoff=EARLY)
+        self.assertEqual(first["request_contract_sha256"], correction["request_contract_sha256"])
+        for changes in ({"codes": ("CC",)}, {"windows": (2,)}, {"acceleration_half_window": 2},
+                        {"compatibility_scopes": (SCOPE, replace(SCOPE, basis_version="basis-v2"))}):
+            args = dict(codes=("CC", "ES"), windows=(2, 5), compatibility_scopes=(SCOPE,))
+            args.update(changes)
+            self.assertNotEqual(first["request_contract_sha256"], build(rows, axis, **args)["request_contract_sha256"])
+        self.assertEqual(first["request_contract_sha256"], ie.content_hash(first["request_identity"]))
 
     def test_bad_parameters_are_refused(self):
         for window in (0, -1, True, 1.5):
@@ -530,7 +654,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(retrospective["view"], "LATEST_RETROSPECTIVE")
         self.assertEqual(retrospective["evidence"], second)
         self.assertEqual(old["view"], "AS_OF")
-        self.assertEqual(latest["evidence"]["known_at"], ie.utc_text(EARLY))
+        self.assertEqual(latest["evidence"]["max_input_known_at"], ie.utc_text(EARLY))
         self.assertEqual(self.conn.execute("SELECT observation_json FROM inventory_evidence_revisions WHERE observation_revision=1").fetchone()[0], before)
         changed = copy.deepcopy(first)
         changed["availability_cutoff"] = ie.utc_text(LATE)
@@ -545,7 +669,7 @@ class StorageTests(unittest.TestCase):
     def test_unconfirmed_body_is_unavailable_and_retry_confirms_at_retry_time(self):
         axis = axis_n(5)
         doc = build([row(d) for d in axis.sessions], axis)
-        with patch.object(tdb, "utc_now", side_effect=RuntimeError("interrupted after body commit")):
+        with patch.object(tdb, "utc_now", side_effect=[LATE, RuntimeError("interrupted after body commit")]):
             with self.assertRaises(RuntimeError):
                 tdb.record_inventory_evidence(self.conn, doc)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 1)
@@ -599,7 +723,7 @@ class StorageTests(unittest.TestCase):
         basis = tao._basis_reference()
         scope = replace(SCOPE, basis_version=basis["canonical_json_sha256"])
         args = dict(anchor=dates[0], cutoff=dates[-1], availability_cutoff=LATE, broker_codes=("ES", "ZZ"),
-                    scope=scope, basis_reference_known_at=EARLY, windows=(5,))
+                    scope=scope, windows=(5,))
         with closing(tao.open_readonly(source)) as conn:
             original = tao.observation_json(tao.observe(conn, "SINI"))
             missing = tao.observe_inventory_evidence(conn, "SINI", **args)
@@ -608,6 +732,7 @@ class StorageTests(unittest.TestCase):
         try:
             with patch.object(tdb, "utc_now", return_value=LATE):
                 accepted = tdb.accept_inventory_snapshot(writer, "SINI", dates[-1])
+                tdb.accept_inventory_basis_reference(writer, tao.BASIS_SOURCE_ID, json.loads(Path(tao.BASIS_FILE).read_text()))
             with patch.object(tdb, "utc_now", return_value="2026-10-04T10:00:00Z"):
                 self.assertEqual(tdb.accept_inventory_snapshot(writer, "SINI", dates[-1]), accepted)
         finally:
@@ -622,8 +747,8 @@ class StorageTests(unittest.TestCase):
             earlier = tao.observe_inventory_evidence(conn, "SINI", **dict(args, availability_cutoff=EARLY))
             self.assertIsNone(metric(earlier, "net_flow_slope")["value"])
             self.assertEqual(earlier["provenance"], [])
-            future_basis = tao.observe_inventory_evidence(conn, "SINI", **dict(args, basis_reference_known_at="2026-10-04T10:00:00Z"))
-            self.assertEqual(future_basis["provenance"], [])
+            with self.assertRaises(ValueError):
+                tao.observe_inventory_evidence(conn, "SINI", **dict(args, basis_reference_known_at="2026-10-04T10:00:00Z"))
             with self.assertRaises(ValueError):
                 tao.observe_inventory_evidence(conn, "SINI", **dict(args, scope=replace(scope, capture_scope="EXPLICIT_FOLLOWUP")))
             conflict_path = os.path.join(self.tmp.name, "basis.json")
@@ -631,10 +756,9 @@ class StorageTests(unittest.TestCase):
                                                                    "regime_last_date": dates[2]}]}))
             with patch.object(tao, "BASIS_FILE", conflict_path):
                 conflict_scope = replace(scope, basis_version=tao._basis_reference()["canonical_json_sha256"])
-                quarantined = tao.observe_inventory_evidence(conn, "SINI", **dict(args, scope=conflict_scope))
-                self.assertEqual(series(quarantined)[2]["coverage"], ie.QUARANTINED)
-                self.assertEqual(series(quarantined)[2]["null_reason"], "KNOWN_BASIS_CONFLICT")
-                self.assertIsNone(series(quarantined)[-1]["cumulative_observable_lots"])
+                unavailable = tao.observe_inventory_evidence(conn, "SINI", **dict(args, scope=conflict_scope))
+                self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(unavailable)))
+                self.assertEqual(tao.observe_inventory_evidence(conn, "SINI", **args), doc)
         self.assertEqual(hashlib.sha256(Path(source).read_bytes()).hexdigest(), before)
         self.assertFalse(any(os.path.exists(source + s) for s in tdb.SIDECARS))
         writer = tdb.connect(source)
@@ -649,6 +773,533 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(stored["evidence"], doc)
             self.assertIsNone(tao.inventory_evidence_revision(conn, "SINI", dates[0], dates[-1], EARLY))
             self.assertEqual(tao.observation_json(tao.observe(conn, "SINI")), original)
+
+
+class StorageFindingsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = tdb.connect(os.path.join(self.tmp.name, "panel.db"))
+        self.axis = axis_n(5)
+        self.rows = [row(d) for d in self.axis.sessions]
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def evidence(self, **changes):
+        return build(self.rows, self.axis, availability_cutoff=changes.pop("availability_cutoff", EARLY),
+                     compatibility_scopes=changes.pop("compatibility_scopes", (SCOPE,)), **changes)
+
+    def store(self, doc, accepted=LATE):
+        with patch.object(tdb, "utc_now", return_value=accepted):
+            return tdb.record_inventory_evidence(self.conn, doc)
+
+    def read(self, cutoff, digest=None):
+        return tdb.inventory_evidence_as_of(self.conn, "SINI", self.axis.start, self.axis.cutoff,
+                                          cutoff, request_contract_sha256=digest)
+
+    def test_request_identity_refuses_changed_question_and_accepts_distinct_chain(self):
+        first = self.evidence()
+        self.store(first)
+        for changes in ({"codes": ("CC",)}, {"windows": (2,)}, {"acceleration_half_window": 2},
+                        {"compatibility_scopes": (SCOPE, replace(SCOPE, market_scope="OTHER"))}):
+            with self.subTest(changes=changes):
+                child = self.evidence(observation_revision=2, parent_revision=1, **changes)
+                self.assertNotEqual(child["request_contract_sha256"], first["request_contract_sha256"])
+                with self.assertRaisesRegex(ValueError, "immediately preceding revision"):
+                    self.store(child)
+        corrected = build([row(d, 11, revision=2) for d in self.axis.sessions], self.axis,
+                          observation_revision=2, parent_revision=1, availability_cutoff=EARLY,
+                          compatibility_scopes=(SCOPE,))
+        self.assertEqual(corrected["request_contract_sha256"], first["request_contract_sha256"])
+        self.store(corrected)
+        independent = self.evidence(codes=("CC",))
+        self.store(independent)
+        with self.assertRaisesRegex(ValueError, "multiple evidence requests"):
+            self.read(LATE)
+        with self.assertRaisesRegex(ValueError, "multiple evidence requests"):
+            tdb.latest_inventory_evidence(self.conn, "SINI", self.axis.start, self.axis.cutoff)
+        selected = self.read(LATE, first["request_contract_sha256"])
+        self.assertEqual(selected["evidence"], corrected)
+        self.assertEqual(self.read(LATE, independent["request_contract_sha256"])["evidence"], independent)
+
+    def test_durable_product_acceptance_is_distinct_from_early_inputs(self):
+        doc = self.evidence()
+        self.assertEqual(doc["max_input_known_at"], ie.utc_text(EARLY))
+        self.assertNotIn("known_at", doc)
+        self.store(doc, LATE)
+        self.assertIsNone(self.read("2026-10-03T09:59:59Z"))
+        envelope = self.read(LATE)
+        self.assertEqual(envelope["known_at"], ie.utc_text(LATE))
+        self.assertEqual(envelope["evidence"]["max_input_known_at"], ie.utc_text(EARLY))
+        import coverage_guard
+        for wrapped in (envelope, tdb.latest_inventory_evidence(self.conn, "SINI", self.axis.start, self.axis.cutoff)):
+            with self.assertRaises(coverage_guard.TargetedCoverageError):
+                coverage_guard.refuse_targeted(wrapped, "full-universe consumer")
+
+    def test_product_acceptance_cannot_precede_input_or_parent(self):
+        doc = self.evidence()
+        with patch.object(tdb, "utc_now", side_effect=[LATE, "2026-10-02T09:59:59Z"]):
+            with self.assertRaisesRegex(ValueError, "input's availability"):
+                tdb.record_inventory_evidence(self.conn, doc)
+        self.assertIsNone(self.read(LATE))
+        self.store(doc, LATE)
+        child = self.evidence(observation_revision=2, parent_revision=1)
+        with patch.object(tdb, "utc_now", side_effect=["2026-10-04T10:00:00Z", "2026-10-03T09:59:59Z"]):
+            with self.assertRaisesRegex(ValueError, "precedes parent revision"):
+                tdb.record_inventory_evidence(self.conn, child)
+        self.assertEqual(self.read(LATE)["evidence"], doc)
+
+    def test_availability_cannot_move_backward_and_future_cutoff_cannot_occupy_revision(self):
+        first = self.evidence(availability_cutoff=LATE)
+        self.store(first)
+        child = self.evidence(observation_revision=2, parent_revision=1)
+        with self.assertRaisesRegex(ValueError, "availability cannot move backwards"):
+            self.store(child)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 1)
+        future = self.evidence(codes=("CC",), availability_cutoff="2026-10-04T10:00:00Z")
+        with self.assertRaisesRegex(ValueError, "cutoff cannot be later"):
+            self.store(future, LATE)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 1)
+        self.store(self.evidence(codes=("CC",)))
+
+    def test_unconfirmed_body_retry_becomes_visible_only_at_retry_time(self):
+        doc = self.evidence()
+        with patch.object(tdb, "utc_now", side_effect=[LATE, RuntimeError("after body commit")]):
+            with self.assertRaises(RuntimeError):
+                tdb.record_inventory_evidence(self.conn, doc)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 1)
+        self.assertIsNone(self.read("2026-10-05T10:00:00Z"))
+        retry = "2026-10-04T10:00:00Z"
+        self.assertEqual(self.store(doc, retry), "identical")
+        self.assertIsNone(self.read(LATE))
+        self.assertIsNotNone(self.read(retry))
+        self.store(doc, "2026-10-05T10:00:00Z")
+        self.assertEqual(self.read(retry)["known_at"], ie.utc_text(retry))
+
+    def test_revision_numbering_is_exactly_parent_plus_one(self):
+        self.store(self.evidence())
+        with self.assertRaises(ValueError):
+            self.evidence(observation_revision=3, parent_revision=1)
+        skipped = self.evidence(observation_revision=3, parent_revision=2)
+        with self.assertRaisesRegex(ValueError, "immediately preceding revision"):
+            self.store(skipped)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 1)
+
+    def test_microsecond_durability_has_no_earlier_visibility(self):
+        from datetime import datetime, timezone
+        instant = datetime(2026, 10, 3, 10, 0, 0, 123456, tzinfo=timezone.utc)
+        with patch.object(tdb, "datetime") as clock:
+            clock.now.return_value = instant
+            self.assertEqual(tdb.utc_now(), "2026-10-03T10:00:00.123456Z")
+        self.store(self.evidence(), "2026-10-03T10:00:00.123456Z")
+        self.assertIsNone(self.read("2026-10-03T10:00:00.123455Z"))
+        self.assertIsNotNone(self.read("2026-10-03T10:00:00.123456Z"))
+
+    def test_selector_union_refusal_inspects_capture_provenance_without_valid_rows(self):
+        explicit = replace(capture("followup"), requested_selectors=(), requested_brokers=("CC",))
+        doc = build([], self.axis, reference_captures=(explicit,), compatibility_scopes=(SCOPE,),
+                    availability_cutoff=EARLY)
+        self.assertTrue(all(r["scope"] is None for r in series(doc)))
+        with self.assertRaisesRegex(ValueError, "selector-union evidence only"):
+            self.store(doc)
+
+    def test_raw_replace_update_delete_cannot_rewrite_immutable_keys(self):
+        doc = self.evidence()
+        self.store(doc)
+        tdb.start_run(self.conn, "r", "v1", EARLY)
+        columns = ("ticker,discovery_as_of,run_id,collection_mode,coverage_scope,selector_plan,"
+                   "requested_start_date,requested_end_date,investor_type,first_session,last_session,"
+                   "session_count,observed_broker_count,content_sha256,recorded_utc")
+        with self.conn:
+            self.conn.execute("INSERT INTO panel_snapshots (" + columns + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              ("SINI", self.axis.cutoff, "r", tdb.COLLECTION_MODE, tdb.COVERAGE_SCOPE, "v1",
+                               self.axis.start, self.axis.cutoff, "A", self.axis.start, self.axis.cutoff,
+                               5, 1, "f" * 64, EARLY))
+        with patch.object(tdb, "utc_now", return_value=LATE):
+            accepted = tdb.accept_inventory_snapshot(self.conn, "SINI", self.axis.cutoff)
+            basis = tdb.accept_inventory_basis_reference(self.conn, "basis", {"regimes": []})
+        for table in tdb._INVENTORY_KEYS:
+            original = self.conn.execute("SELECT * FROM " + table).fetchall()
+            info = self.conn.execute("PRAGMA table_info(" + table + ")").fetchall()
+            columns = [r[1] for r in info]
+            tampered = list(original[0])
+            target = "durable_accepted_at" if "durable_accepted_at" in columns else "content_sha256"
+            tampered[columns.index(target)] = "2000-01-01T00:00:00Z" if target == "durable_accepted_at" else "a" * 64
+            # A body hash is not part of a revision key. For basis bodies, keep
+            # the key and replace the content itself instead.
+            if table == "inventory_basis_references":
+                tampered = list(original[0])
+                tampered[columns.index("content_json")] = "{}"
+            for prefix in ("INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT INTO"):
+                with self.subTest(table=table, action=prefix), self.assertRaises(sqlite3.IntegrityError):
+                    self.conn.execute(prefix + " " + table + " VALUES (" + ",".join("?" for _ in columns) + ")", tampered)
+                self.conn.rollback()
+            for sql in ("UPDATE " + table + " SET " + columns[0] + "=" + columns[0], "DELETE FROM " + table):
+                with self.subTest(table=table, action=sql), self.assertRaises(sqlite3.IntegrityError):
+                    self.conn.execute(sql)
+                self.conn.rollback()
+            self.assertEqual(self.conn.execute("SELECT * FROM " + table).fetchall(), original)
+        with patch.object(tdb, "utc_now", return_value="2026-10-05T10:00:00Z"):
+            self.assertEqual(tdb.accept_inventory_snapshot(self.conn, "SINI", self.axis.cutoff), accepted)
+            self.assertEqual(tdb.accept_inventory_basis_reference(self.conn, "basis", {"regimes": []}), basis)
+        self.assertEqual(self.store(doc), "identical")
+
+    def test_basis_hash_and_postcommit_availability_are_coupled(self):
+        first_content = {"regimes": []}
+        with patch.object(tdb, "utc_now", return_value=EARLY):
+            first = tdb.accept_inventory_basis_reference(self.conn, "basis", first_content)
+        later_content = {"regimes": [{"ticker": "SINI"}]}
+        with patch.object(tdb, "utc_now", return_value=LATE):
+            later = tdb.accept_inventory_basis_reference(self.conn, "basis", later_content)
+        self.assertNotEqual(first["content_sha256"], later["content_sha256"])
+        self.assertEqual(first["content_sha256"], ie.content_hash(json.loads(first["content_json"])))
+        self.assertIsNone(tdb.inventory_basis_reference_as_of(self.conn, "basis", later["content_sha256"], EARLY))
+        self.assertEqual(tdb.inventory_basis_reference_as_of(self.conn, "basis", first["content_sha256"], EARLY), first)
+        self.assertEqual(tdb.inventory_basis_reference_as_of(self.conn, "basis", later["content_sha256"], LATE), later)
+        content = {"regimes": [{"ticker": "OTHER"}]}
+        with patch.object(tdb, "utc_now", side_effect=RuntimeError("after basis body commit")):
+            with self.assertRaises(RuntimeError):
+                tdb.accept_inventory_basis_reference(self.conn, "basis", content)
+        self.assertIsNone(tdb.inventory_basis_reference_as_of(self.conn, "basis", ie.content_hash(content), LATE))
+        with patch.object(tdb, "utc_now", return_value="2026-10-04T10:00:00Z"):
+            confirmed = tdb.accept_inventory_basis_reference(self.conn, "basis", content)
+        self.assertIsNone(tdb.inventory_basis_reference_as_of(self.conn, "basis", ie.content_hash(content), LATE))
+        self.assertEqual(confirmed["durable_accepted_at"], ie.utc_text("2026-10-04T10:00:00Z"))
+
+    def test_incompatible_unshipped_extension_fails_without_migrating_v1(self):
+        self.conn.execute("DROP TABLE inventory_evidence_acceptances")
+        self.conn.execute("DROP TABLE inventory_evidence_revisions")
+        self.conn.execute("CREATE TABLE inventory_evidence_revisions (ticker TEXT, anchor TEXT, cutoff TEXT, "
+                          "observation_revision INTEGER, PRIMARY KEY(ticker,anchor,cutoff,observation_revision))")
+        self.conn.commit()
+        before = tdb.panel_meta(self.conn)
+        with self.assertRaisesRegex(tdb.NotTargetedPanelError, "incompatible unshipped"):
+            tdb.ensure_schema(self.conn)
+        self.assertEqual(tdb.panel_meta(self.conn), before)
+
+
+class BasisAvailabilityTests(unittest.TestCase):
+    """An accepted content hash, rather than today's file, determines as-of basis."""
+
+    def setUp(self):
+        import test_targeted_actor_panel as tp
+        import targeted_actor_observations as tao
+        self.tao = tao
+        self.tmp = tempfile.TemporaryDirectory()
+        self.axis = axis_n(5)
+        dates = list(self.axis.sessions)
+        market = {"dates": dates, "ohlc": tp.ohlc_rows(dates, 1000),
+                  "brokers": {"ES": tp.broker_series([10] * 5, [1_000_000] * 5)}}
+        with patch.object(tdb, "utc_now", return_value=EARLY):
+            result = tp.run(tp.FakeVendor({"SINI": market}), ["SINI"], self.tmp.name, db="basis-source.db", clock=lambda: EARLY)
+        self.path = result["db_path"]
+        self.initial_content = {"regimes": []}
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", return_value=EARLY):
+                tdb.accept_inventory_snapshot(writer, "SINI", dates[-1])
+                self.initial_basis = tdb.accept_inventory_basis_reference(
+                    writer, tao.BASIS_SOURCE_ID, self.initial_content)
+        finally:
+            writer.close()
+        self.scope = replace(SCOPE, basis_version=ie.content_hash(self.initial_content))
+        self.args = dict(anchor=dates[0], cutoff=dates[-1], availability_cutoff=EARLY,
+                         broker_codes=("ES",), scope=self.scope, windows=(5,))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _observe(self, **changes):
+        with closing(self.tao.open_readonly(self.path)) as conn:
+            return self.tao.observe_inventory_evidence(conn, "SINI", **dict(self.args, **changes))
+
+    def _accept_later_basis(self):
+        content = {"regimes": [{"ticker": "SINI", "regime_first_date": self.axis.sessions[2],
+                                "regime_last_date": self.axis.sessions[2]}]}
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", return_value=LATE):
+                accepted = tdb.accept_inventory_basis_reference(writer, self.tao.BASIS_SOURCE_ID, content)
+        finally:
+            writer.close()
+        return content, accepted, replace(self.scope, basis_version=ie.content_hash(content))
+
+    def test_later_basis_content_is_not_available_to_an_earlier_cutoff(self):
+        before = self._observe()
+        self.assertEqual(metric(before, "net_flow_slope")["value"], 10)
+        content, accepted, later_scope = self._accept_later_basis()
+        self.assertEqual(ie.canonical_json(self._observe()), ie.canonical_json(before))
+        unavailable = self._observe(scope=later_scope, basis_reference_known_at=EARLY)
+        self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(unavailable)))
+        self.assertEqual(unavailable["provenance"], [])
+        after = self._observe(scope=later_scope, availability_cutoff=LATE)
+        self.assertEqual(series(after)[2]["coverage"], ie.QUARANTINED)
+        self.assertEqual(series(after)[2]["null_reason"], "KNOWN_BASIS_CONFLICT")
+        self.assertIsNone(series(after)[-1]["cumulative_observable_lots"])
+        self.assertEqual(after["max_input_known_at"], ie.utc_text(LATE))
+        self.assertEqual(accepted["content_sha256"], ie.content_hash(content))
+
+    def test_current_basis_file_cannot_change_historical_adapter_or_stored_result(self):
+        before = self._observe()
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", return_value=EARLY):
+                tdb.record_inventory_evidence(writer, before)
+        finally:
+            writer.close()
+        changed_file = os.path.join(self.tmp.name, "current-basis.json")
+        Path(changed_file).write_text(json.dumps({"regimes": [
+            {"ticker": "SINI", "regime_first_date": self.axis.sessions[0],
+             "regime_last_date": self.axis.sessions[-1]}]}))
+        source_before = Path(self.path).read_bytes()
+        with patch.object(self.tao, "BASIS_FILE", changed_file):
+            self.assertEqual(ie.canonical_json(self._observe()), ie.canonical_json(before))
+            with closing(self.tao.open_readonly(self.path)) as conn:
+                historical = self.tao.inventory_evidence_revision(
+                    conn, "SINI", self.axis.start, self.axis.cutoff, EARLY)
+                retrospective = self.tao.inventory_evidence_revision(
+                    conn, "SINI", self.axis.start, self.axis.cutoff)
+        self.assertEqual(historical["evidence"], before)
+        self.assertEqual(retrospective["evidence"], before)
+        self.assertEqual(retrospective["view"], "LATEST_RETROSPECTIVE")
+        self.assertEqual(Path(self.path).read_bytes(), source_before)
+        self.assertFalse(any(os.path.exists(self.path + s) for s in tdb.SIDECARS))
+
+    def test_durable_basis_hash_and_time_are_coupled_and_attestation_cannot_backdate(self):
+        content, accepted, later_scope = self._accept_later_basis()
+        with closing(self.tao.open_readonly(self.path)) as conn:
+            self.assertIsNone(tdb.inventory_basis_reference_as_of(
+                conn, self.tao.BASIS_SOURCE_ID, ie.content_hash(content), EARLY))
+            record = tdb.inventory_basis_reference_as_of(
+                conn, self.tao.BASIS_SOURCE_ID, ie.content_hash(content), LATE)
+        self.assertEqual(ie.content_hash(json.loads(record["content_json"])), record["content_sha256"])
+        self.assertEqual(record["durable_accepted_at"], ie.utc_text(LATE))
+        with self.assertRaisesRegex(ValueError, "stored durable basis acceptance"):
+            self._observe(scope=later_scope, availability_cutoff=LATE, basis_reference_known_at=EARLY)
+        after = self._observe(scope=later_scope, availability_cutoff=LATE, basis_reference_known_at=LATE)
+        self.assertEqual(after["max_input_known_at"], ie.utc_text(LATE))
+
+    def test_accepted_basis_is_read_without_the_current_basis_file(self):
+        with patch.object(self.tao, "_basis_reference", side_effect=AssertionError("current file must not be read")), \
+                patch.object(self.tao, "BASIS_FILE", os.path.join(self.tmp.name, "missing.json")):
+            doc = self._observe()
+        self.assertEqual(metric(doc, "net_flow_slope")["value"], 10)
+
+    def test_later_basis_can_be_read_as_explicit_latest_retrospective_request(self):
+        original = self._observe()
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", return_value=EARLY):
+                tdb.record_inventory_evidence(writer, original)
+        finally:
+            writer.close()
+        _, _, later_scope = self._accept_later_basis()
+        later = self._observe(scope=later_scope, availability_cutoff=LATE)
+        self.assertNotEqual(original["request_contract_sha256"], later["request_contract_sha256"])
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", return_value=LATE):
+                tdb.record_inventory_evidence(writer, later)
+        finally:
+            writer.close()
+        with closing(self.tao.open_readonly(self.path)) as conn:
+            earlier = self.tao.inventory_evidence_revision(
+                conn, "SINI", self.axis.start, self.axis.cutoff, EARLY,
+                request_contract_sha256=original["request_contract_sha256"])
+            unavailable = self.tao.inventory_evidence_revision(
+                conn, "SINI", self.axis.start, self.axis.cutoff, EARLY,
+                request_contract_sha256=later["request_contract_sha256"])
+            retrospective = self.tao.inventory_evidence_revision(
+                conn, "SINI", self.axis.start, self.axis.cutoff,
+                request_contract_sha256=later["request_contract_sha256"])
+        self.assertEqual(earlier["evidence"], original)
+        self.assertIsNone(unavailable)
+        self.assertEqual(retrospective["view"], "LATEST_RETROSPECTIVE")
+        self.assertEqual(retrospective["evidence"], later)
+        self.assertEqual(series(retrospective["evidence"])[2]["coverage"], ie.QUARANTINED)
+
+    def test_unconfirmed_basis_content_cannot_be_backdated_by_retry(self):
+        content = {"regimes": [{"ticker": "SINI", "regime_first_date": self.axis.sessions[0],
+                                "regime_last_date": self.axis.sessions[0]}]}
+        digest = ie.content_hash(content)
+        writer = tdb.connect(self.path)
+        try:
+            with patch.object(tdb, "utc_now", side_effect=RuntimeError("interrupted basis acceptance")):
+                with self.assertRaises(RuntimeError):
+                    tdb.accept_inventory_basis_reference(writer, self.tao.BASIS_SOURCE_ID, content)
+            self.assertIsNone(tdb.inventory_basis_reference_as_of(
+                writer, self.tao.BASIS_SOURCE_ID, digest, LATE))
+            with patch.object(tdb, "utc_now", return_value=LATE):
+                record = tdb.accept_inventory_basis_reference(writer, self.tao.BASIS_SOURCE_ID, content)
+            self.assertEqual(record["durable_accepted_at"], ie.utc_text(LATE))
+            self.assertIsNone(tdb.inventory_basis_reference_as_of(
+                writer, self.tao.BASIS_SOURCE_ID, digest, EARLY))
+            self.assertIsNotNone(tdb.inventory_basis_reference_as_of(
+                writer, self.tao.BASIS_SOURCE_ID, digest, LATE))
+        finally:
+            writer.close()
+
+
+class ValidatorFindingsTests(unittest.TestCase):
+    def setUp(self):
+        self.axis = axis_n(20)
+        self.doc = build([row(d) for d in self.axis.sessions], self.axis, windows=(5,20),
+                         market_observations=market_rows(self.axis))
+
+    def mutate(self, path, value):
+        modified = copy.deepcopy(self.doc)
+        target = modified
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        return modified
+
+    def test_current_builder_document_is_accepted(self):
+        ie.validate_document(self.doc)
+        ie.validate_document(build([], self.axis, codes=('ES','ZZ'), windows=(5,20)))
+
+    def test_semantic_claims_cannot_be_strengthened(self):
+        mutations = [
+            (('rotation_evidence','concurrent_buying_means'), 'CONFIRMED_SELLER_TO_BUYER_TRANSFER'),
+            (('rotation_evidence','context','coverage_scope'), 'FULL_UNIVERSE'),
+            (('rotation_evidence','context','ticker'), 'BBCA'),
+            (('rotation_evidence','context','declared_windows'), [1]),
+            (('rotation_evidence','broker_windows','ES','left_censored'), False),
+            (('brokers','ES','series',0,'left_censored'), False),
+            (('brokers','ES','series',0,'opening_position_lots'), 0),
+            (('contract','full_universe'), True),
+            (('contract','shares_per_lot'), 1),
+        ]
+        for path, value in mutations:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+
+    def test_state_and_reason_values_use_controlled_vocabulary(self):
+        mutations = [
+            (('brokers','ES','series',0,'coverage'), 'OWNER_CONFIRMED'),
+            (('brokers','ES','series',0,'continuity_status'), 'HOLDINGS_KNOWN'),
+            (('brokers','ES','series',0,'null_reason'), 'ES = Albert'),
+            (('brokers','ES','series',0,'break_reason'), 'controller'),
+            (('brokers','ES','measurements','5','net_flow','null_reason'), 'smart_money'),
+        ]
+        for path,value in mutations:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+
+    def test_measurement_constants_and_status_value_pairs_are_pinned(self):
+        mutations = [
+            (('brokers','ES','measurements','5','net_flow','unit'), 'billions'),
+            (('brokers','ES','measurements','5','net_flow','status'), 'OBSERVED'),
+            (('brokers','ES','measurements','5','net_flow','value'), None),
+            (('brokers','ES','measurements','5','reversal','zero_handling'), 'ZERO_IS_SELLING'),
+            (('brokers','ES','measurements','5','implied_buy_price','shares_per_lot'), 1),
+            (('brokers','ES','measurements','5','persistence','denominator'), 4),
+            (('brokers','ES','acceleration','recent_sessions'), 10),
+        ]
+        for path,value in mutations:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+        omitted = build([], self.axis)
+        omitted['brokers']['ES']['measurements']['5']['net_flow']['value'] = 0
+        with self.assertRaises(ValueError):
+            ie.validate_document(omitted)
+
+    def test_identity_hash_and_correspondence_are_enforced(self):
+        modified = self.mutate(('request_identity','declared_windows'), [2])
+        modified['request_contract_sha256'] = ie.content_hash(modified['request_identity'])
+        with self.assertRaises(ValueError):
+            ie.validate_document(modified)
+        for path,value in [
+            (('request_contract_sha256',), '0'*64),
+            (('request_identity','acceleration_half_window'), True),
+            (('request_identity','market_measurement_contract'), 'SELECTED_BROKER_TOTALS'),
+            (('request_identity','compatibility_scopes'), []),
+            (('observed_brokers',), ['CC','ES']),
+        ]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+
+    def test_provenance_and_actual_input_availability_are_enforced(self):
+        for path,value in [
+            (('max_input_known_at',), '2000-01-01T00:00:00.000000Z'),
+            (('provenance',0,'known_at'), '2000-01-01T00:00:00.000000Z'),
+            (('provenance',0,'durable_accepted_at'), '2000-01-01T00:00:00.000000Z'),
+            (('provenance',0,'content_hash_kind'), 'UNDECLARED_MEANING'),
+            (('provenance',0,'request_parameters','actor_identity'), 'Albert'),
+        ]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+
+    def test_concurrent_list_withheld_and_count_have_identical_semantics(self):
+        missing = build([row(d) for d in self.axis.sessions], self.axis, codes=('ES','ZZ'))
+        ie.validate_document(missing)
+        self.assertIsNone(missing['rotation_evidence']['concurrent_positive_brokers']['value'])
+        missing['rotation_evidence']['concurrent_positive_brokers']['value'] = []
+        with self.assertRaises(ValueError):
+            ie.validate_document(missing)
+
+    def test_semantic_constants_and_counts_preserve_json_types(self):
+        mutations = [
+            (('contract','full_universe'), 0),
+            (('contract','unobserved_is_zero'), 0),
+            (('contract','shares_per_lot'), 100.0),
+            (('brokers','ES','series',0,'evidence_revision'), True),
+            (('rotation_evidence','context','observation_revision'), True),
+            (('brokers','ES','measurements','5','net_flow','expected_sessions'), 5.0),
+            (('brokers','ES','measurements','5','net_flow','window','sessions'), 5.0),
+            (('brokers','ES','acceleration','recent_sessions'), 5.0),
+            (('rotation_evidence','observed_subset_positive_broker_count','value'), True),
+        ]
+        for path,value in mutations:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                ie.validate_document(self.mutate(path,value))
+
+    def test_storage_refuses_forged_observed_capture_session_and_request(self):
+        axis = axis_n(1)
+        valid = build([row(axis.start)], axis, windows=(1,))
+        with tempfile.TemporaryDirectory() as tmp, closing(tdb.connect(os.path.join(tmp, "panel.db"))) as conn:
+            for changed in (
+                {"response_at": axis.start + "T00:00:00.000000Z"},
+                {"request_parameters": {"symbol": "BBCA", "investor_type": "A"}},
+                {"request_parameters": {"symbol": "SINI", "investor_type": "A", "market": "NEGOTIATED"}},
+                {"request_parameters": {"symbol": "SINI", "investor_type": "A", "end_date": "2026-08-31"}},
+                {"returned_brokers": ["CC"]}):
+                forged = copy.deepcopy(valid)
+                forged["provenance"][0].update(changed)
+                with self.subTest(changed=changed), patch.object(tdb, "utc_now", return_value=LATE):
+                    with self.assertRaisesRegex(ValueError, "source request/session/flow contract"):
+                        tdb.record_inventory_evidence(conn, forged)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM inventory_evidence_revisions").fetchone()[0], 0)
+        malformed = copy.deepcopy(valid)
+        malformed["brokers"]["ES"]["series"][0]["raw"]["buy_lots"] = 10.0
+        with self.assertRaisesRegex(ValueError, "source request/session/flow contract"):
+            ie.validate_document(malformed)
+        with localcontext() as context:
+            context.prec = 2
+            ie.validate_document(valid)
+
+    def test_storage_refuses_forged_market_capture_session_and_request(self):
+        for changed in (
+            {"response_at": self.axis.cutoff + "T06:00:00.000000Z"},
+            {"request_parameters": {"symbol": "BBCA"}},
+            {"request_parameters": {"symbol": "SINI", "market": "NEGOTIATED"}},
+            {"request_parameters": {"symbol": "SINI", "end_date": "2026-08-31"}}):
+            forged = copy.deepcopy(self.doc)
+            market_capture = next(c for c in forged["provenance"] if c["capture_id"] == "market")
+            market_capture.update(changed)
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "market reference violates"):
+                ie.validate_document(forged)
+
+    def test_nan_and_unknown_fields_cannot_be_persisted(self):
+        with self.assertRaises(ValueError):
+            ie.validate_document(self.mutate(('brokers','ES','series',0,'raw','buy_value_rp'),float('nan')))
+        modified=copy.deepcopy(self.doc)
+        modified['rotation_evidence']['context']['beneficial_owner']='Albert'
+        with self.assertRaises(ValueError):
+            ie.validate_document(modified)
+
+
 
 
 if __name__ == "__main__":

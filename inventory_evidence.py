@@ -30,6 +30,16 @@ REQUEST_FIELDS = ("symbol", "start_date", "end_date", "investor_type", "market")
 MEASUREMENT_CONTRACT = "NEOBDM_INVENTORY_REPORTED_LOTS_RUPIAH_V1"
 MARKET_CONTRACT = "OHLC_MARKET_VOLUME_V1"
 SHARES_PER_LOT = 100
+CAPTURE_SCOPES = ("TARGETED_SELECTOR_UNION", "EXPLICIT_FOLLOWUP")
+NULL_REASONS = frozenset("""OBSERVED_ZERO OBSERVED_NONZERO UNOBSERVED INVALID QUARANTINED
+    KNOWN_BASIS_CONFLICT SUSPENSION_UNCERTAIN BROKER_NOT_RETURNED REQUEST_SCOPE_MISMATCH
+    REQUEST_SESSION_OUT_OF_RANGE CAPTURE_SCOPE_MISMATCH UNSUPPORTED_UNIT_CONTRACT UNSUPPORTED_SCOPE
+    NULL_OR_MALFORMED_LOTS LOTS_OUT_OF_RANGE NULL_OR_NONFINITE_VALUE NEGATIVE_GROSS_FLOW
+    LOT_CONSERVATION VALUE_CONSERVATION LOTS_WITHOUT_VALUE MISSING_BROKER_COVERAGE
+    MISSING_EXPECTED_SESSION CONFLICTING_REVISIONS CALENDAR_UNSUPPORTED INSUFFICIENT_HISTORY
+    INCOMPLETE_COVERAGE INCOMPATIBLE_SEGMENTS INCOMPLETE_VERIFIED_MARKET_DATA ZERO_ADV
+    ZERO_DENOMINATOR VALUE_WITHOUT_REPORTED_LOTS NUMERIC_OVERFLOW INCOMPLETE_OBSERVED_SUBSET
+    SESSION_NOT_FINAL_AT_CAPTURE""".split())
 
 
 def canonical_json(value):
@@ -83,6 +93,8 @@ class Scope:
     def __post_init__(self):
         if any(not isinstance(v, str) or not v.strip() for v in asdict(self).values()):
             raise ValueError("every compatibility scope field must be declared")
+        if self.capture_scope not in CAPTURE_SCOPES:
+            raise ValueError("unsupported capture scope")
 
 
 @dataclass(frozen=True)
@@ -116,6 +128,12 @@ class Capture:
                for p in params) or len({p[0] for p in params}) != len(params):
             raise ValueError("request parameters must be unique allowlisted text pairs")
         object.__setattr__(self, "request_parameters", params)
+        dates = dict(params)
+        for field in ("start_date", "end_date"):
+            if field in dates:
+                market_date(dates[field])
+        if dates.get("start_date", "") > dates.get("end_date", "9999-12-31"):
+            raise ValueError("request start_date follows end_date")
         for field in ("requested_brokers", "returned_brokers", "requested_selectors"):
             values = getattr(self, field)
             if any(not isinstance(v, str) for v in values):
@@ -164,6 +182,8 @@ class Observation:
             raise ValueError("typed scope and capture are required")
         if self.coverage not in COVERAGE_STATES:
             raise ValueError("unknown coverage state")
+        if self.null_reason is not None and self.null_reason not in NULL_REASONS:
+            raise ValueError("null reason must be a controlled evidence reason")
 
 
 @dataclass(frozen=True)
@@ -251,14 +271,30 @@ def _raw(o):
     return {field: getattr(o, field) for field in FLOW_FIELDS}
 
 
+def _request_issue(o):
+    params = dict(o.capture.request_parameters)
+    if not params.get("start_date", "0001-01-01") <= o.canonical_session_date <= params.get("end_date", "9999-12-31"):
+        return "REQUEST_SESSION_OUT_OF_RANGE"
+    # No authoritative exchange close-time contract exists here. Daily evidence
+    # is final only when the response's Jakarta date is after the source session.
+    local_date = timestamp(o.capture.response_at).astimezone(timezone(timedelta(hours=7))).date()
+    if local_date <= market_date(o.canonical_session_date):
+        return "SESSION_NOT_FINAL_AT_CAPTURE"
+    return None
+
+
 def _coverage(o):
+    issue = _request_issue(o)
+    if issue:
+        return INVALID, issue
     if o.coverage not in OBSERVED:
         return o.coverage, o.null_reason or o.coverage
     raw = _raw(o)
     if o.broker_code not in o.capture.returned_brokers:
         return INVALID, "BROKER_NOT_RETURNED"
     params = dict(o.capture.request_parameters)
-    if params.get("symbol") != o.ticker or params.get("investor_type") != o.scope.investor_type:
+    if (params.get("symbol") != o.ticker or params.get("investor_type") != o.scope.investor_type
+            or ("market" in params and params["market"] != o.scope.market_scope)):
         return INVALID, "REQUEST_SCOPE_MISMATCH"
     if o.scope.capture_scope == "TARGETED_SELECTOR_UNION" and (
             not o.capture.requested_selectors or o.capture.requested_brokers):
@@ -403,11 +439,21 @@ def _market_by_date(market):
     for row in market:
         groups.setdefault(row.canonical_session_date, []).append(row)
     # Conflicting market captures are withheld, never averaged or arbitrarily selected.
-    return {d: rows[0] for d, rows in groups.items() if len({canonical_json({
+    return {d: tuple(sorted(rows, key=lambda r: canonical_json(r.capture.document())))
+            for d, rows in groups.items() if len({canonical_json({
         "close": r.close if _finite(r.close) else None,
         "volume": r.volume if _finite(r.volume) else None,
         "unit": r.volume_unit, "basis": r.basis_version, "market": r.market_scope,
-        "contract": r.measurement_contract, "valid": r.valid}) for r in rows}) == 1}
+        "contract": r.measurement_contract, "valid": r.valid,
+        "request_issue": _market_request_issue(r)}) for r in rows}) == 1}
+
+
+def _market_request_issue(row):
+    params = dict(row.capture.request_parameters)
+    if (("symbol" in params and params["symbol"] != row.ticker)
+            or ("market" in params and params["market"] != row.market_scope)):
+        return "REQUEST_SCOPE_MISMATCH"
+    return _request_issue(row)
 
 
 def _market_measurement(rows, axis, n, market, kind, offset=0):
@@ -419,18 +465,18 @@ def _market_measurement(rows, axis, n, market, kind, offset=0):
     else:
         start = len(axis.sessions) - offset - n
         dates = ([axis.sessions[start - 1]] if start > 0 else []) + dates
-    selected = [market.get(d) for d in dates]
+    selected = [market[d][0] if d in market else None for d in dates]
     scope = next((r["scope"] for r in reversed(rows) if r["canonical_session_date"] in
                   doc["window"]["session_dates"] and r["scope"]), None)
     needed = 20 if kind == "adv20" else n + 1
-    valid = [r for r in selected if r is not None and r.valid and scope is not None and
+    valid = [r for r in selected if r is not None and r.valid and not _market_request_issue(r) and scope is not None and
              r.basis_version == scope["basis_version"] and r.market_scope == scope["market_scope"] and
              r.measurement_contract == MARKET_CONTRACT and
              (_finite(r.volume) and r.volume >= 0 and r.volume_unit in ("shares", "lots")
               if kind == "adv20" else _finite(r.close) and r.close > 0)]
     refs = [{"source_id": r.capture.source_id, "capture_id": r.capture.capture_id, "content_sha256": r.capture.content_sha256,
              "source_market_session": r.canonical_session_date, "measurement_contract": r.measurement_contract}
-            for r in valid]
+            for representative in valid for r in market[representative.canonical_session_date]]
     reason = doc["null_reason"]
     if len(valid) != needed:
         reason = reason or "INCOMPLETE_VERIFIED_MARKET_DATA"
@@ -447,7 +493,7 @@ def _market_measurement(rows, axis, n, market, kind, offset=0):
                null_reason=reason, unit="lots/session" if kind == "adv20" else "fraction",
                market_window={"session_dates": dates, "expected_sessions": needed,
                                                   "observed_sessions": len(valid)},
-               input_refs=sorted(doc["input_refs"] + refs, key=canonical_json))
+               input_refs=sorted({canonical_json(ref): ref for ref in doc["input_refs"] + refs}.values(), key=canonical_json))
     if kind == "return":
         doc["market_window"].update(
             baseline_close_rp_per_share=valid[0].close if not reason else None,
@@ -512,7 +558,8 @@ def _metrics(rows, axis, n, market, offset=0):
 
 def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, availability_cutoff,
                               observation_revision=1, parent_revision=None, windows=(5, 20),
-                              acceleration_half_window=5, market_observations=(), reference_captures=()):
+                              acceleration_half_window=5, market_observations=(), reference_captures=(),
+                              compatibility_scopes=None):
     """Build one as-of revision. Missing rows become unknown coverage, never flows.
 
     Inputs with revisions above observation_revision or acceptance after the
@@ -526,8 +573,8 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
     _positive_int(observation_revision, "observation_revision")
     if parent_revision is not None:
         _positive_int(parent_revision, "parent_revision")
-        if parent_revision >= observation_revision:
-            raise ValueError("parent must precede revision")
+        if parent_revision + 1 != observation_revision:
+            raise ValueError("child revision must equal parent + 1")
     _positive_int(acceleration_half_window, "acceleration_half_window")
     windows = tuple(sorted(set(windows)))
     if not windows:
@@ -544,6 +591,19 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
         raise ValueError("observations must be typed rows of this ticker")
     if any(not isinstance(o, MarketObservation) or o.ticker != ticker for o in market_observations):
         raise ValueError("market observations must be typed rows of this ticker")
+    declared_scopes = tuple(compatibility_scopes) if compatibility_scopes is not None else tuple(
+        o.scope for o in observations if o.broker_code in codes and axis.start <= o.canonical_session_date <= axis.cutoff)
+    if any(not isinstance(s, Scope) for s in declared_scopes):
+        raise ValueError("compatibility scopes must be typed scopes")
+    scopes = sorted({canonical_json(asdict(s)): asdict(s) for s in declared_scopes}.values(), key=canonical_json)
+    if any(asdict(o.scope) not in scopes for o in observations if o.broker_code in codes
+           and axis.start <= o.canonical_session_date <= axis.cutoff):
+        raise ValueError("row scope outside declared compatibility contract")
+    identity = {"evidence_schema_version": VERSION, "ticker": ticker, "anchor": axis.start,
+                "cutoff": axis.cutoff, "requested_evidence_brokers": codes,
+                "declared_windows": list(windows), "acceleration_half_window": acceleration_half_window,
+                "compatibility_scopes": scopes, "session_axis": asdict(axis),
+                "market_measurement_contract": MARKET_CONTRACT}
     visible = [o for o in observations if axis.start <= o.canonical_session_date <= axis.cutoff
                and o.observation_revision <= observation_revision and timestamp(o.capture.known_at) <= cutoff]
     market = [o for o in market_observations if o.canonical_session_date <= axis.cutoff and
@@ -567,7 +627,7 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
         if key in captures and captures[key] != doc:
             raise ValueError("reference capture ID has conflicting provenance")
         captures[key] = doc
-    market_by_date = _market_by_date(sorted(market, key=lambda o: (o.canonical_session_date, o.capture.capture_id)))
+    market_by_date = _market_by_date(market)
     brokers, rotation = {}, {}
     for b in codes:
         rows = _series(b, visible, axis, observation_revision)
@@ -593,21 +653,24 @@ def _build_inventory_evidence(observations, *, ticker, broker_codes, axis, avail
         for m in count_inputs for ref in m["input_refs"]}.values(), key=canonical_json))
     if any(m["status"] != "CALCULATED" for m in count_inputs):
         count.update(value=None, status="WITHHELD", null_reason="INCOMPLETE_OBSERVED_SUBSET")
+    positive_measurement = dict(count, value=positive if count["status"] == "CALCULATED" else None,
+                                unit="broker-code list")
     doc = {"schema": SCHEMA, "schema_version": VERSION, "ticker": ticker,
            "coverage_scope": "OBSERVED_BROKER_SUBSET",
            "observation_revision": observation_revision, "parent_revision": parent_revision,
            "availability_cutoff": utc_text(availability_cutoff),
-           "known_at": max((c["known_at"] for c in captures.values()), default=None),
+           "max_input_known_at": max((c["known_at"] for c in captures.values()), default=None),
+           "request_identity": identity, "request_contract_sha256": content_hash(identity),
            "contract": evidence_contract(),
            "axis": asdict(axis), "declared_windows": list(windows),
            "provenance": sorted(captures.values(), key=lambda c: (c["source_id"], c["capture_id"])),
            "requested_evidence_brokers": codes,
-           "observed_brokers": sorted({o.broker_code for o in visible if _coverage(o)[0] in OBSERVED}),
+           "observed_brokers": [b for b in codes if any(r["coverage"] in OBSERVED for r in brokers[b]["series"])],
            "brokers": brokers,
            "rotation_evidence": {"context": {"ticker": ticker, "cutoff": axis.cutoff,
                                   "observation_revision": observation_revision,
                                   "coverage_scope": "OBSERVED_BROKER_SUBSET", "declared_windows": list(windows)},
-                                 "broker_windows": rotation, "concurrent_positive_brokers": positive,
+                                 "broker_windows": rotation, "concurrent_positive_brokers": positive_measurement,
                                  "observed_subset_positive_broker_count": count,
                                  "concurrent_buying_means": "ABSORPTION_PROXY_ONLY_NO_COUNTERPARTY_LINK"}}
     # Round-trip detaches mutable input values and gives callers only JSON types.
@@ -623,74 +686,377 @@ def build_inventory_evidence(observations, **parameters):
 
 
 def validate_document(doc):
-    """Refuse changed semantics or extra fields at the persistence boundary.
+    """Validate the v1 vocabulary and semantic constants before persistence.
 
-    The storage API accepts only this version's evidence vocabulary. Dynamic
-    map keys are broker codes and integer window sizes, never actor labels.
-    Arithmetic is produced by build_inventory_evidence, not recalculated here.
+    This boundary checks the declared evidence contract, availability, and
+    envelope semantics. It does not recalculate flow or market measurements.
     """
-    top = {"schema", "schema_version", "ticker", "coverage_scope", "observation_revision", "parent_revision",
-           "availability_cutoff", "known_at", "contract", "axis", "declared_windows", "provenance",
-           "requested_evidence_brokers", "observed_brokers", "brokers", "rotation_evidence"}
-    if set(doc) != top or doc["schema"] != SCHEMA or doc["schema_version"] != VERSION:
-        raise ValueError("not an inventory evidence v1 document")
-    if doc["contract"] != evidence_contract() or doc["coverage_scope"] != "OBSERVED_BROKER_SUBSET":
-        raise ValueError("inventory evidence v1 is partial coverage with unknown omissions")
-    _positive_int(doc["observation_revision"], "observation_revision")
-    utc_text(doc["availability_cutoff"])
-    if doc["known_at"] is not None and timestamp(doc["known_at"]) > timestamp(doc["availability_cutoff"]):
-        raise ValueError("known_at exceeds the availability cutoff")
-    SessionAxis(**doc["axis"])
-    if not re.fullmatch(r"[A-Z]{4}", doc["ticker"]):
-        raise ValueError("invalid evidence ticker")
-    if set(doc["brokers"]) != set(doc["requested_evidence_brokers"]):
-        raise ValueError("broker map differs from declared evidence brokers")
-    metrics = set("net_flow net_flow_slope persistence reversal direction_efficiency gross_buy_lots gross_sell_lots two_sided_broker_activity_lots implied_buy_price implied_sell_price flow_vs_adv price_flow_divergence".split())
-    row_fields = set("canonical_session_date broker_code observation_revision evidence_revision coverage null_reason raw scope input_refs segment_id segment_start opening_position_lots left_censored break_reason continuity_status cumulative_observable_lots cumulative_observable_value segment_cumulative_net_lots segment_cumulative_net_value".split())
-
     def exact(value, fields):
-        if not isinstance(value, dict) or set(value) != fields:
+        if not isinstance(value, dict) or set(value) != set(fields):
             raise ValueError("evidence object fields differ from the v1 contract")
 
-    def metric_map(value):
-        exact(value, metrics)
+    def codes(value):
+        if (not isinstance(value, list) or any(not isinstance(b, str) or
+                not re.fullmatch(r"[A-Z]{2}", b) for b in value) or value != sorted(set(value))):
+            raise ValueError("evidence broker codes must be sorted and unique")
 
+    def number(value, nullable=False):
+        if not (nullable and value is None) and not _finite(value):
+            raise ValueError("evidence numeric value must be finite")
+
+    def reason(value, nullable=True, boundary=False):
+        if nullable and value is None:
+            return
+        if isinstance(value, str) and (value in NULL_REASONS or (boundary and value == "OBSERVATION_ANCHOR")):
+            return
+        if boundary and isinstance(value, str) and value.startswith("INCOMPATIBLE_"):
+            fields = value[len("INCOMPATIBLE_"):].split("_AND_")
+            allowed = {name.upper() for name in Scope.__dataclass_fields__}
+            if fields and fields == sorted(set(fields)) and set(fields) <= allowed:
+                return
+        raise ValueError("null or break reason is outside the controlled v1 vocabulary")
+
+    top = {"schema", "schema_version", "ticker", "coverage_scope", "observation_revision", "parent_revision",
+           "availability_cutoff", "max_input_known_at", "request_identity", "request_contract_sha256",
+           "contract", "axis", "declared_windows", "provenance", "requested_evidence_brokers",
+           "observed_brokers", "brokers", "rotation_evidence"}
+    exact(doc, top)
+    if doc["schema"] != SCHEMA or doc["schema_version"] != VERSION:
+        raise ValueError("not an inventory evidence v1 document")
+    if canonical_json(doc["contract"]) != canonical_json(evidence_contract()) or doc["coverage_scope"] != "OBSERVED_BROKER_SUBSET":
+        raise ValueError("inventory evidence v1 is partial coverage with unknown omissions")
+    _positive_int(doc["observation_revision"], "observation_revision")
+    if doc["parent_revision"] is not None:
+        _positive_int(doc["parent_revision"], "parent_revision")
+        if doc["parent_revision"] + 1 != doc["observation_revision"]:
+            raise ValueError("child revision must equal parent + 1")
+    cutoff = timestamp(doc["availability_cutoff"])
+    if doc["availability_cutoff"] != utc_text(doc["availability_cutoff"]):
+        raise ValueError("availability cutoff must be canonical UTC text")
+    exact(doc["axis"], SessionAxis.__dataclass_fields__)
+    axis = SessionAxis(**doc["axis"])
+    if not isinstance(doc["ticker"], str) or not re.fullmatch(r"[A-Z]{4}", doc["ticker"]):
+        raise ValueError("invalid evidence ticker")
+    windows = doc["declared_windows"]
+    if not isinstance(windows, list) or not windows:
+        raise ValueError("declared evidence windows are required")
+    for n in windows:
+        _positive_int(n, "window")
+    if windows != sorted(set(windows)):
+        raise ValueError("declared windows must be sorted and unique")
+    codes(doc["requested_evidence_brokers"])
+    if not doc["requested_evidence_brokers"]:
+        raise ValueError("explicit evidence broker codes required")
+    exact(doc["brokers"], doc["requested_evidence_brokers"])
+    codes(doc["observed_brokers"])
+    identity = doc["request_identity"]
+    exact(identity, {"evidence_schema_version", "ticker", "anchor", "cutoff", "requested_evidence_brokers",
+                     "declared_windows", "acceleration_half_window", "compatibility_scopes", "session_axis",
+                     "market_measurement_contract"})
+    _positive_int(identity["acceleration_half_window"], "acceleration_half_window")
+    scopes = identity["compatibility_scopes"]
+    if not isinstance(scopes, list):
+        raise ValueError("compatibility scopes must be a declared list")
+    for scope in scopes:
+        exact(scope, Scope.__dataclass_fields__)
+        Scope(**scope)
+    if scopes != sorted({canonical_json(s): s for s in scopes}.values(), key=canonical_json):
+        raise ValueError("compatibility scopes must be sorted and unique")
+    expected_identity = {"evidence_schema_version": VERSION, "ticker": doc["ticker"], "anchor": axis.start,
+                         "cutoff": axis.cutoff, "requested_evidence_brokers": doc["requested_evidence_brokers"],
+                         "declared_windows": windows, "acceleration_half_window": identity["acceleration_half_window"],
+                         "compatibility_scopes": scopes, "session_axis": doc["axis"],
+                         "market_measurement_contract": MARKET_CONTRACT}
+    if canonical_json(identity) != canonical_json(expected_identity) or doc["request_contract_sha256"] != content_hash(identity):
+        raise ValueError("request identity differs from the evidence contract")
+
+    captures = {}
+    capture_objects = {}
+    if not isinstance(doc["provenance"], list):
+        raise ValueError("capture provenance must be a list")
+    for capture in doc["provenance"]:
+        exact(capture, set(Capture.__dataclass_fields__) | {"known_at"})
+        if any(not isinstance(capture[k], str) for k in ("source_id", "capture_id")):
+            raise ValueError("capture identifiers must be text")
+        if not isinstance(capture["request_parameters"], dict):
+            raise ValueError("capture request parameters must be an object")
+        fields = {k: v for k, v in capture.items() if k != "known_at"}
+        fields["request_parameters"] = tuple(fields["request_parameters"].items())
+        typed_capture = Capture(**fields)
+        rebuilt = typed_capture.document()
+        if canonical_json(rebuilt) != canonical_json(capture) or timestamp(capture["known_at"]) > cutoff:
+            raise ValueError("capture provenance is not canonical or available at cutoff")
+        key = (capture["source_id"], capture["capture_id"])
+        if key in captures:
+            raise ValueError("capture provenance identifiers must be unique")
+        captures[key] = capture
+        capture_objects[key] = typed_capture
+    if doc["provenance"] != sorted(captures.values(), key=lambda c: (c["source_id"], c["capture_id"])):
+        raise ValueError("capture provenance must have stable ordering")
+    if doc["max_input_known_at"] != max((c["known_at"] for c in captures.values()), default=None):
+        raise ValueError("max_input_known_at must describe the actual input provenance")
+
+    def refs(value, broker_only=False):
+        if not isinstance(value, list):
+            raise ValueError("input references must be a list")
+        if value != sorted({canonical_json(r): r for r in value}.values(), key=canonical_json):
+            raise ValueError("input references must be sorted and unique")
+        for ref in value:
+            base = {"source_id", "capture_id", "content_sha256", "source_market_session"}
+            if not isinstance(ref, dict):
+                raise ValueError("input reference must be an object")
+            if "observation_revision" in ref:
+                exact(ref, base | {"observation_revision"})
+                _positive_int(ref["observation_revision"], "observation_revision")
+                if ref["observation_revision"] > doc["observation_revision"]:
+                    raise ValueError("input revision exceeds the evidence revision")
+            else:
+                exact(ref, base | {"measurement_contract"})
+                if broker_only or ref["measurement_contract"] != MARKET_CONTRACT:
+                    raise ValueError("input reference measurement contract differs from v1")
+            market_date(ref["source_market_session"])
+            capture = captures.get((ref["source_id"], ref["capture_id"]))
+            if capture is None or capture["content_sha256"] != ref["content_sha256"]:
+                raise ValueError("input reference lacks matching capture provenance")
+            if "measurement_contract" in ref:
+                params = capture["request_parameters"]
+                source_market = MarketObservation(doc["ticker"], ref["source_market_session"],
+                    capture_objects[(ref["source_id"], ref["capture_id"])], None, None, "shares", "",
+                    params.get("market", ""))
+                if (_market_request_issue(source_market) or ("market" in params and
+                        params["market"] not in {s["market_scope"] for s in scopes})):
+                    raise ValueError("market reference violates source request/session contract")
+
+    base_fields = {"value", "status", "null_reason", "window", "expected_sessions", "observed_sessions", "input_refs", "unit"}
+
+    def envelope(value, n, offset, unit, extras=()):
+        exact(value, base_fields | set(extras))
+        if value["status"] not in ("CALCULATED", "WITHHELD") or value["unit"] != unit:
+            raise ValueError("measurement status or unit differs from the v1 contract")
+        reason(value["null_reason"], nullable=value["status"] == "CALCULATED")
+        if ((value["status"] == "WITHHELD" and value["value"] is not None) or
+                (value["status"] == "CALCULATED" and (value["value"] is None or value["null_reason"] is not None))):
+            raise ValueError("measurement value does not match its availability status")
+        exact(value["window"], {"sessions", "offset_sessions", "start", "end", "session_dates"})
+        end = max(0, len(axis.sessions) - offset)
+        dates = list(axis.sessions[max(0, end - n):end])
+        expected_window = {"sessions": n, "offset_sessions": offset,
+                           "start": dates[0] if dates else None, "end": dates[-1] if dates else axis.cutoff,
+                           "session_dates": dates}
+        if (canonical_json(value["window"]) != canonical_json(expected_window) or
+                type(value["expected_sessions"]) is not int or value["expected_sessions"] != n):
+            raise ValueError("measurement window differs from the declared session axis")
+        observed = value["observed_sessions"]
+        if type(observed) is not int or not 0 <= observed <= len(dates):
+            raise ValueError("invalid measurement observed-session count")
+        if value["status"] == "CALCULATED" and (axis.status != "VERIFIED" or len(dates) != n or observed != n):
+            raise ValueError("calculated measurements require a complete verified window")
+        refs(value["input_refs"])
+
+    def market_envelope(value, n, offset, kind):
+        envelope(value, n, offset, "lots/session" if kind == "adv20" else "fraction", {"market_window"})
+        fields = {"session_dates", "expected_sessions", "observed_sessions"}
+        if kind == "return":
+            fields |= {"baseline_close_rp_per_share", "end_close_rp_per_share"}
+        exact(value["market_window"], fields)
+        market_window = value["market_window"]
+        end = max(0, len(axis.sessions) - offset)
+        dates = list(axis.sessions[max(0, end - 20):end]) if kind == "adv20" else list(value["window"]["session_dates"])
+        start = len(axis.sessions) - offset - n
+        if kind == "return" and start > 0:
+            dates.insert(0, axis.sessions[start - 1])
+        needed = 20 if kind == "adv20" else n + 1
+        if (market_window["session_dates"] != dates or type(market_window["expected_sessions"]) is not int or
+                market_window["expected_sessions"] != needed or
+                type(market_window["observed_sessions"]) is not int or
+                not 0 <= market_window["observed_sessions"] <= len(dates)):
+            raise ValueError("market window differs from verified market-session requirements")
+        if value["status"] == "CALCULATED" and market_window["observed_sessions"] != needed:
+            raise ValueError("calculated market measurement requires all market inputs")
+        number(value["value"], nullable=True)
+        if kind == "return":
+            for key in ("baseline_close_rp_per_share", "end_close_rp_per_share"):
+                number(market_window[key], nullable=value["status"] == "WITHHELD")
+                if value["status"] == "WITHHELD" and market_window[key] is not None:
+                    raise ValueError("withheld return must not expose calculated endpoint prices")
+
+    metric_units = {"net_flow": "lots", "net_flow_slope": "lots/session", "persistence": "fraction",
+                    "reversal": "count", "direction_efficiency": "fraction", "gross_buy_lots": "lots",
+                    "gross_sell_lots": "lots", "two_sided_broker_activity_lots": "lots",
+                    "implied_buy_price": "rupiah/share", "implied_sell_price": "rupiah/share",
+                    "flow_vs_adv": "ADV20 multiples", "price_flow_divergence": "underlying_facts"}
+
+    def metric_map(value, n, offset=0):
+        exact(value, metric_units)
+        for name, unit in metric_units.items():
+            extras = ({"numerator", "denominator"} if name == "persistence" else
+                      {"zero_handling"} if name == "reversal" else
+                      {"shares_per_lot"} if name.startswith("implied_") else
+                      {"adv20"} if name == "flow_vs_adv" else
+                      {"facts"} if name == "price_flow_divergence" else set())
+            measurement = value[name]
+            envelope(measurement, n, offset, unit, extras)
+            if name != "price_flow_divergence":
+                number(measurement["value"], nullable=True)
+            if name == "persistence":
+                if measurement["denominator"] != n or type(measurement["denominator"]) is not int:
+                    raise ValueError("persistence denominator must equal the declared window")
+                numerator = measurement["numerator"]
+                if not (measurement["status"] == "WITHHELD" and numerator is None) and (
+                        type(numerator) is not int or not 0 <= numerator <= n):
+                    raise ValueError("invalid persistence numerator")
+            elif name == "reversal" and measurement["zero_handling"] != "SKIP_ZEROS_WITHIN_COMPLETE_WINDOW":
+                raise ValueError("reversal zero handling differs from the v1 contract")
+            elif name.startswith("implied_") and (type(measurement["shares_per_lot"]) is not int or
+                                                   measurement["shares_per_lot"] != SHARES_PER_LOT):
+                raise ValueError("implied-price lot/share contract differs from v1")
+            elif name == "flow_vs_adv":
+                market_envelope(measurement["adv20"], n, offset, "adv20")
+            elif name == "price_flow_divergence":
+                facts = measurement["facts"]
+                exact(facts, {"price_return", "net_flow", "net_flow_slope", "coverage"})
+                market_envelope(facts["price_return"], n, offset, "return")
+                if (facts["net_flow"] != value["net_flow"] or facts["net_flow_slope"] != value["net_flow_slope"] or
+                        facts["coverage"] != value["net_flow"]["status"]):
+                    raise ValueError("price/flow facts differ from their declared measurements")
+                if measurement["value"] is not None:
+                    exact(measurement["value"], {"price_return", "net_flow_lots", "net_flow_slope_lots_per_session"})
+                    for fact in measurement["value"].values():
+                        number(fact)
+
+    row_fields = set("canonical_session_date broker_code observation_revision evidence_revision coverage null_reason raw scope input_refs segment_id segment_start opening_position_lots left_censored break_reason continuity_status cumulative_observable_lots cumulative_observable_value segment_cumulative_net_lots segment_cumulative_net_value".split())
+    observed_brokers = []
     for broker, value in doc["brokers"].items():
-        if not re.fullmatch(r"[A-Z]{2}", broker):
-            raise ValueError("invalid evidence broker")
         exact(value, {"series", "measurements", "acceleration"})
-        exact(value["measurements"], {str(n) for n in doc["declared_windows"]})
-        for measurements in value["measurements"].values():
-            metric_map(measurements)
+        if not isinstance(value["series"], list):
+            raise ValueError("broker series must be a list")
+        dates = []
         for row in value["series"]:
             exact(row, row_fields)
-            if row["broker_code"] != broker or row["evidence_revision"] != doc["observation_revision"]:
-                raise ValueError("row grain differs from document")
+            d = row["canonical_session_date"]
+            market_date(d)
+            dates.append(d)
+            if (not axis.start <= d <= axis.cutoff or row["broker_code"] != broker or
+                    type(row["evidence_revision"]) is not int or row["evidence_revision"] != doc["observation_revision"]):
+                raise ValueError("row grain differs from the evidence document")
+            if row["observation_revision"] is not None:
+                _positive_int(row["observation_revision"], "observation_revision")
+                if row["observation_revision"] > doc["observation_revision"]:
+                    raise ValueError("row revision exceeds evidence revision")
+            if row["coverage"] not in COVERAGE_STATES:
+                raise ValueError("unknown row coverage state")
+            reason(row["null_reason"], nullable=row["coverage"] in OBSERVED)
+            reason(row["break_reason"], boundary=True)
+            if row["opening_position_lots"] is not None or row["left_censored"] is not True:
+                raise ValueError("opening position is unknown and every observed segment is left censored")
+            if row["continuity_status"] not in ("CONTINUOUS_FROM_ANCHOR", "ANCHOR_BROKEN", "UNKNOWN_CALENDAR"):
+                raise ValueError("unknown continuity status")
+            if (row["continuity_status"] == "UNKNOWN_CALENDAR") != (axis.status == "UNSUPPORTED"):
+                raise ValueError("continuity status differs from the declared calendar support")
             if row["raw"] is not None:
-                exact(row["raw"], set(FLOW_FIELDS))
+                exact(row["raw"], FLOW_FIELDS)
+                for raw_value in row["raw"].values():
+                    number(raw_value, nullable=True)
             if row["scope"] is not None:
+                exact(row["scope"], Scope.__dataclass_fields__)
                 Scope(**row["scope"])
+                if row["scope"] not in scopes:
+                    raise ValueError("row scope is outside the request compatibility contract")
+            refs(row["input_refs"], broker_only=True)
+            if row["coverage"] in OBSERVED:
+                if row["null_reason"] is not None or row["raw"] is None or row["scope"] is None:
+                    raise ValueError("observed rows require valid flow and scope evidence")
+                for raw_value in row["raw"].values():
+                    number(raw_value)
+                if not row["input_refs"] or row["observation_revision"] is None:
+                    raise ValueError("observed rows require source observation references")
+                for ref in row["input_refs"]:
+                    if ref["source_market_session"] != d or ref["observation_revision"] != row["observation_revision"]:
+                        raise ValueError("observed row reference differs from its session/revision")
+                    source_row = Observation(doc["ticker"], broker, d, row["observation_revision"],
+                                             Scope(**row["scope"]),
+                                             capture_objects[(ref["source_id"], ref["capture_id"])],
+                                             **row["raw"], coverage=row["coverage"])
+                    with localcontext(Context(prec=1000, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
+                                              capitals=1, clamp=0, flags=[],
+                                              traps=[InvalidOperation, DivisionByZero, Overflow])):
+                        state, issue = _coverage(source_row)
+                    if state != row["coverage"] or issue is not None:
+                        raise ValueError("observed row violates source request/session/flow contract")
+                if (row["coverage"] == OBSERVED_ZERO) != all(v == 0 for v in row["raw"].values()):
+                    raise ValueError("explicit-zero coverage must match all raw flow fields")
+                if not isinstance(row["segment_id"], str) or not re.fullmatch(r"[0-9a-f]{24}", row["segment_id"]):
+                    raise ValueError("observed row must identify its segment")
+                market_date(row["segment_start"])
+                if not axis.start <= row["segment_start"] <= d:
+                    raise ValueError("segment start must precede its observed row")
+                for field in ("segment_cumulative_net_lots", "segment_cumulative_net_value"):
+                    number(row[field])
+            else:
+                if any(row[k] is not None for k in ("segment_id", "segment_start", "segment_cumulative_net_lots", "segment_cumulative_net_value")):
+                    raise ValueError("unobserved or invalid rows cannot extend a segment")
+                if row["coverage"] == UNOBSERVED and row["raw"] is not None:
+                    raise ValueError("unobserved rows cannot contain synthesized raw flow")
+            for field in ("cumulative_observable_lots", "cumulative_observable_value"):
+                number(row[field], nullable=row["continuity_status"] != "CONTINUOUS_FROM_ANCHOR")
+                if row["continuity_status"] != "CONTINUOUS_FROM_ANCHOR" and row[field] is not None:
+                    raise ValueError("broken anchor continuity must withhold cumulative flow")
+            if row["continuity_status"] == "CONTINUOUS_FROM_ANCHOR" and row["coverage"] not in OBSERVED:
+                raise ValueError("continuous anchor requires observed coverage")
+        if dates != sorted(set(dates)) or (axis.status == "VERIFIED" and dates != list(axis.sessions)):
+            raise ValueError("broker series differs from the declared session axis")
+        if any(row["coverage"] in OBSERVED for row in value["series"]):
+            observed_brokers.append(broker)
+        exact(value["measurements"], {str(n) for n in windows})
+        for n in windows:
+            metric_map(value["measurements"][str(n)], n)
+        h = identity["acceleration_half_window"]
+        acceleration = value["acceleration"]
+        envelope(acceleration, 2 * h, 0, "lots/session", {"recent_sessions", "preceding_sessions"})
+        if any(type(acceleration[k]) is not int or acceleration[k] != h
+               for k in ("recent_sessions", "preceding_sessions")):
+            raise ValueError("acceleration periods differ from the request contract")
+        number(acceleration["value"], nullable=True)
+    if doc["observed_brokers"] != sorted(observed_brokers):
+        raise ValueError("observed brokers must derive from emitted valid requested series")
+
     rotation = doc["rotation_evidence"]
     exact(rotation, {"context", "broker_windows", "concurrent_positive_brokers",
                      "observed_subset_positive_broker_count", "concurrent_buying_means"})
-    exact(rotation["broker_windows"], set(doc["brokers"]))
-    for value in rotation["broker_windows"].values():
+    expected_context = {"ticker": doc["ticker"], "cutoff": axis.cutoff,
+                        "observation_revision": doc["observation_revision"],
+                        "coverage_scope": "OBSERVED_BROKER_SUBSET", "declared_windows": windows}
+    if canonical_json(rotation["context"]) != canonical_json(expected_context):
+        raise ValueError("rotation context differs from the bounded evidence contract")
+    if rotation["concurrent_buying_means"] != "ABSORPTION_PROXY_ONLY_NO_COUNTERPARTY_LINK":
+        raise ValueError("concurrent buying cannot assert a confirmed counterparty transfer")
+    exact(rotation["broker_windows"], doc["requested_evidence_brokers"])
+    n = windows[0]
+    for broker, value in rotation["broker_windows"].items():
         exact(value, {"prior_window", "recent_window", "first_observed_activity", "left_censored"})
-        metric_map(value["prior_window"])
-        metric_map(value["recent_window"])
-    allowed = top | set(FLOW_FIELDS) | set(REQUEST_FIELDS) | set(Scope.__dataclass_fields__) | set(Capture.__dataclass_fields__)
-    allowed |= set("inventory_means negative_curve_means full_universe unobserved_is_zero lot_unit value_unit shares_per_lot start cutoff sessions status calendar_version response_at durable_accepted_at known_at series measurements acceleration canonical_session_date broker_code evidence_revision coverage null_reason raw scope input_refs segment_id segment_start opening_position_lots left_censored break_reason continuity_status cumulative_observable_lots cumulative_observable_value segment_cumulative_net_lots segment_cumulative_net_value source_market_session net_flow net_flow_slope persistence reversal direction_efficiency gross_buy_lots gross_sell_lots two_sided_broker_activity_lots implied_buy_price implied_sell_price flow_vs_adv price_flow_divergence value window expected_sessions observed_sessions offset_sessions end session_dates unit numerator denominator zero_handling adv20 market_window measurement_contract facts price_return net_flow_lots net_flow_slope_lots_per_session recent_sessions preceding_sessions context coverage_scope broker_windows prior_window recent_window first_observed_activity concurrent_positive_brokers observed_subset_positive_broker_count concurrent_buying_means baseline_close_rp_per_share end_close_rp_per_share".split())
-
-    def check(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key not in allowed and not re.fullmatch(r"[A-Z]{2}|[1-9][0-9]*", key):
-                    raise ValueError(f"field outside evidence v1 vocabulary: {key}")
-                if key == "opening_position_lots" and child is not None:
-                    raise ValueError("opening position must remain unknown")
-                check(child)
-        elif isinstance(value, (tuple, list)):
-            for child in value:
-                check(child)
-    check(doc)
+        if value["left_censored"] is not True:
+            raise ValueError("rotation activity history is left censored")
+        metric_map(value["prior_window"], n, offset=n)
+        if value["recent_window"] != doc["brokers"][broker]["measurements"][str(n)]:
+            raise ValueError("rotation recent window differs from declared broker measurements")
+        first = next((r["canonical_session_date"] for r in doc["brokers"][broker]["series"]
+                      if r["coverage"] == OBSERVED_NONZERO), None)
+        if value["first_observed_activity"] != first:
+            raise ValueError("first activity must derive from emitted observed nonzero rows")
+    count = rotation["observed_subset_positive_broker_count"]
+    positive = rotation["concurrent_positive_brokers"]
+    envelope(count, n, 0, "broker-code count")
+    envelope(positive, n, 0, "broker-code list")
+    if {k: v for k, v in count.items() if k not in ("value", "unit")} != {
+            k: v for k, v in positive.items() if k not in ("value", "unit")}:
+        raise ValueError("concurrent broker list and count must share availability semantics")
+    inputs = [doc["brokers"][b]["measurements"][str(n)]["net_flow"] for b in doc["requested_evidence_brokers"]]
+    if any(m["status"] != "CALCULATED" for m in inputs):
+        if count["status"] != "WITHHELD" or count["null_reason"] != "INCOMPLETE_OBSERVED_SUBSET":
+            raise ValueError("incomplete broker subsets must withhold concurrent buying evidence")
+    else:
+        expected_positive = [b for b, m in zip(doc["requested_evidence_brokers"], inputs) if m["value"] > 0]
+        if (count["status"] != "CALCULATED" or positive["value"] != expected_positive or
+                type(count["value"]) is not int or count["value"] != len(expected_positive)):
+            raise ValueError("concurrent buying evidence differs from the observed subset")
     canonical_json(doc)
