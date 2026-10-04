@@ -2714,6 +2714,12 @@ Cleanup removes only regular, non-symlink pending files proven to be hard-link
 aliases of the canonical object. Independent same-byte copies and unrelated
 pending files remain. Native Windows alias cleanup temporarily clears the
 shared read-only attribute and restores destination protection in `finally`.
+Two databases in one directory can share the default raw root. If reuse repairs
+a publisher's live pending alias, the publisher verifies the canonical bytes
+and treats the object as reused, relinquishing rollback deletion. A subsequent
+body insert failure cannot remove the other database's accepted raw object.
+Residue removal tolerates an alias disappearing after inspection; other
+filesystem failures propagate.
 A digest-path conflict with different bytes fails closed and preserves the
 existing object and its protection. Cleanup cannot mask the content-conflict
 error. Supported platforms fsync the parent directory.
@@ -2852,18 +2858,30 @@ mutation copy, raw fixture, or generated database is committed.
 The case-variant mutation removes only `icase` from the tracked-path query and
 must fail the intended tracked-output refusal assertion. Fixture and Git setup
 assertions remain outside the behavioral kill classification.
+All mutation-suite Git subprocesses also discard inherited `GIT_*` overrides.
+The regression runs the deleted-case behavior with absolute `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, and invalid `GIT_CONFIG_COUNT`
+overrides, individually and together, and checks that the unrelated repository
+is unchanged.
+
+The shared-root regression deterministically runs a second database's complete
+ingest and acceptance between the first publisher's hard link and temporary
+unlink. It verifies the accepted capture after the first ingest succeeds and
+after its body insertion rolls back. Unrelated pending files and independent
+same-byte copies remain. Further regressions cover conflicting canonical bytes
+after alias disappearance, genuine unlink denial, and competing residue removal.
 
 The completed delta passed these Linux gates:
 
 | Command | Result |
 |---|---|
-| `python test_bandarmolony_trade_capture.py` | 143 tests passed |
-| `python test_bandarmolony_trade_mutations.py --run` | Baseline 40 and classification controls 7 passed; 40 killed, 0 survived, 0 invalid |
+| `python test_bandarmolony_trade_capture.py` | 147 tests passed |
+| `python test_bandarmolony_trade_mutations.py --run` | Baseline 40 and classification controls 8 passed; 40 killed, 0 survived, 0 invalid |
 | `python test_inventory_evidence.py` | 106 tests passed |
 | `python test_targeted_actor_panel.py` | 33 tests passed |
 | `python test_targeted_actor_observations.py` | 25 tests passed |
 | `python test_pipeline.py` | 107 passed, 1 skipped for absent candidate artifacts; real-data provenance subassertions skipped for absent raw cache |
-| `python check_ml_health.py --quick` | ML health OK, 30 modules imported and 760 tests passed; model smoke test skipped |
+| `python check_ml_health.py --quick` | ML health OK, 30 modules imported and 764 tests passed; model smoke test skipped |
 | `git diff --check` | Passed |
 
 The health panel has 10,076 rows, 251 dates, 45 tickers, and zero impossible
@@ -2874,10 +2892,12 @@ No model was fitted. Tests used an isolated Linux Python environment with
 the existing repository dependencies.
 
 The prior native Windows delta review reported zero blockers, highs, or mediums
-and six LOW findings. This cleanup addresses those LOW findings and is
-`READY FOR FINAL MICRO-REVIEW`. Its validation ran on Linux. Native Windows
-rechecks remain necessary to confirm Windows filesystem behavior. No PR is
-opened by this task.
+and six LOW findings. The subsequent bounded micro-review closed LOW-1 through
+LOW-6 and reported two new LOWs with `FINAL READY FOR PR`. This cleanup addresses
+LOW-A's shared-root pending-alias race and LOW-B's inherited Git environment,
+and passes the capture, mutation, quick-health, and diff gates above. Status is
+`READY FOR PR`. Final cleanup validation used Linux Python 3.12; native Windows
+filesystem behavior was not rerun. No PR is opened by this task.
 
 Required commands are:
 

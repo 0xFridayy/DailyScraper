@@ -27,6 +27,7 @@ import sys
 import tempfile
 from typing import Callable
 import unittest
+from unittest.mock import patch
 
 
 class BehavioralAssertionFailure(AssertionError):
@@ -38,6 +39,14 @@ def make_tree_writable(root):
     for path in root.rglob("*"):
         if path.is_file():
             path.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def git(root, *arguments, check=True):
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith("GIT_")}
+    return subprocess.run(["git", "-C", str(root), *arguments], check=check,
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", env=environment, timeout=30)
 
 
 class MutationBehaviorTests(unittest.TestCase):
@@ -232,10 +241,8 @@ class MutationBehaviorTests(unittest.TestCase):
         tracked = repository / "private" / "tracked.parquet"
         tracked.parent.mkdir()
         tracked.write_bytes(b"synthetic tracked sentinel, not parquet")
-        subprocess.run(["git", "init", "-q", str(repository)], check=True,
-                       capture_output=True)
-        subprocess.run(["git", "-C", str(repository), "add", "-f", str(tracked)],
-                       check=True, capture_output=True)
+        git(repository, "init", "-q")
+        git(repository, "add", "-f", str(tracked))
         with self.behavior(), self.assertRaises(self.contract.TradeContractError):
             self.capture.check_private_output(tracked.parent)
 
@@ -251,14 +258,9 @@ class MutationBehaviorTests(unittest.TestCase):
         tracked.parent.mkdir()
         tracked.write_bytes(b"synthetic tracked sentinel, not a database")
 
-        def git(*arguments):
-            return subprocess.run(["git", "-C", str(repository), *arguments],
-                                  check=True, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace")
-
-        git("init", "-q")
-        git("config", "core.ignorecase", "false")
-        git("add", "-f", "private_data/capture.db")
+        git(repository, "init", "-q")
+        git(repository, "config", "core.ignorecase", "false")
+        git(repository, "add", "-f", "private_data/capture.db")
         tracked.unlink()
         tracked.parent.rmdir()
         requested = repository / "PRIVATE_DATA" / "CAPTURE.DB"
@@ -267,10 +269,10 @@ class MutationBehaviorTests(unittest.TestCase):
         self.assertFalse(requested.parent.exists())
         relative = requested.resolve().relative_to(repository.resolve()).as_posix()
         self.assertEqual(relative, "PRIVATE_DATA/CAPTURE.DB")
-        self.assertEqual(git("ls-files", "--", ":(literal)" + relative).stdout, "")
-        self.assertEqual(git("ls-files", "--", ":(icase,literal)" + relative).stdout,
+        self.assertEqual(git(repository, "ls-files", "--", ":(literal)" + relative).stdout, "")
+        self.assertEqual(git(repository, "ls-files", "--", ":(icase,literal)" + relative).stdout,
                          "private_data/capture.db\n")
-        git("check-ignore", "-q", "--", relative)
+        git(repository, "check-ignore", "-q", "--", relative)
         with self.behavior(), self.assertRaisesRegex(
                 self.contract.TradeContractError, "^tracked output destination refused$"):
             self.capture.check_private_output(requested)
@@ -792,9 +794,7 @@ def run_gate():
     counts = {"total": len(specs), "killed": 0, "survived": 0, "invalid": 0}
     with tempfile.TemporaryDirectory(prefix="bandarmolony-mutations-") as temporary:
         root = Path(temporary)
-        repository = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                                    capture_output=True, text=True, encoding="utf-8",
-                                    errors="replace", timeout=30)
+        repository = git(root, "rev-parse", "--show-toplevel", check=False)
         if repository.returncode == 0:
             raise AssertionError("mutation copies must be outside Git repositories")
         baseline = root / "baseline"
@@ -841,6 +841,36 @@ def run_gate():
 
 
 class MutationClassificationTests(unittest.TestCase):
+    def test_deleted_case_git_helper_ignores_inherited_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            other = Path(temporary) / "unrelated"
+            other.mkdir()
+            git(other, "init", "-q")
+            git(other, "config", "core.ignorecase", "true")
+            (other / "sentinel.txt").write_bytes(b"unrelated repository sentinel")
+            git(other, "add", "sentinel.txt")
+            config = (other / ".git" / "config").read_bytes()
+            index = (other / ".git" / "index").read_bytes()
+            spoof_index = other / "spoof-index"
+            overrides = {
+                "GIT_DIR": str(other / ".git"),
+                "GIT_WORK_TREE": str(other),
+                "GIT_INDEX_FILE": str(spoof_index),
+                "GIT_COMMON_DIR": str(other / ".git"),
+                "GIT_CONFIG_COUNT": "invalid-spoof-value",
+            }
+            environments = [{key: value} for key, value in overrides.items()]
+            environments.append(overrides)
+            for environment in environments:
+                with self.subTest(environment=environment), patch.dict(os.environ, environment):
+                    outcome = suite_outcome(unittest.TestSuite([
+                        MutationBehaviorTests("test_deleted_tracked_case_variant_refused")
+                    ]))
+                    self.assertTrue(outcome["successful"], json.dumps(outcome, sort_keys=True))
+                    self.assertEqual((other / ".git" / "config").read_bytes(), config)
+                    self.assertEqual((other / ".git" / "index").read_bytes(), index)
+                    self.assertFalse(spoof_index.exists())
+
     def outcome(self, action, *, setup=False, intended=False):
         class Probe(unittest.TestCase):
             def setUp(probe):

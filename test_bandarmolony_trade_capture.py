@@ -1272,6 +1272,122 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
+    def test_shared_raw_root_pending_alias_repair_during_publication(self):
+        for fail_insert in (False, True):
+            with self.subTest(fail_insert=fail_insert):
+                root = self.root / ("shared-rollback" if fail_insert else "shared-success")
+                path = write_parquet(root / "input.parquet")
+                data = path.read_bytes()
+                digest = contract.sha256_bytes(data)
+                first_env = envelope("shared-first")
+                second_env = envelope("shared-second")
+                with capture.TradeCaptureStore(root / "first.db") as first, \
+                        capture.TradeCaptureStore(root / "second.db") as second:
+                    self.assertEqual(first.raw_root, second.raw_root)
+                    self.assertNotEqual(first.db, second.db)
+                    destination = first.raw_path(digest)
+                    destination.parent.mkdir(parents=True)
+                    unrelated = destination.parent / ".pending-unrelated"
+                    unrelated.write_bytes(b"unrelated pending bytes")
+                    independent = destination.parent / ".pending-independent-same-bytes"
+                    independent.write_bytes(data)
+                    interleaved = []
+                    real_unlink, real_body_digest = os.unlink, capture._body_digest
+
+                    def unlink(name, *args, **kwargs):
+                        if not interleaved and Path(name).name.startswith(".pending-"):
+                            alias = Path(name)
+                            self.assertTrue(alias.samefile(destination))
+                            interleaved.append(alias)
+                            accepted = second.ingest(path, second_env)
+                            self.assertTrue(accepted["durable_accepted_at"])
+                            self.assertFalse(alias.exists())
+                            self.assertTrue(second.verify(second_env.capture_id))
+                        return real_unlink(name, *args, **kwargs)
+
+                    def body_digest(record):
+                        if fail_insert and record["capture_id"] == first_env.capture_id:
+                            return None
+                        return real_body_digest(record)
+
+                    with patch.object(capture.os, "unlink", side_effect=unlink), \
+                            patch.object(capture, "_body_digest", side_effect=body_digest):
+                        if fail_insert:
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                first.ingest(path, first_env)
+                            self.assertEqual(first.conn.execute(
+                                "SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+                        else:
+                            accepted = first.ingest(path, first_env)
+                            self.assertTrue(accepted["durable_accepted_at"])
+                            self.assertTrue(first.verify(first_env.capture_id))
+
+                    self.assertEqual(len(interleaved), 1)
+                    self.assertEqual(destination.read_bytes(), data)
+                    self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+                    self.assertEqual(unrelated.read_bytes(), b"unrelated pending bytes")
+                    self.assertEqual(independent.read_bytes(), data)
+                    self.assertEqual(set(destination.parent.glob(".pending-*")),
+                                     {unrelated, independent})
+                with capture.TradeCaptureStore(root / "second.db", read_only=True) as reader:
+                    self.assertTrue(reader.verify(second_env.capture_id))
+
+    def test_missing_published_alias_conflict_refused_without_deleting_destination(self):
+        data = b"invented raw publication conflict fixture"
+        digest = contract.sha256_bytes(data)
+        destination = self.store.raw_path(digest)
+        conflict = b"different bytes after publication"
+        real_unlink = os.unlink
+
+        def unlink(name, *args, **kwargs):
+            if Path(name).name.startswith(".pending-") and Path(name).exists():
+                real_unlink(name, *args, **kwargs)
+                destination.write_bytes(conflict)
+                destination.chmod(0o400)
+            return real_unlink(name, *args, **kwargs)
+
+        with patch.object(capture.os, "unlink", side_effect=unlink):
+            with self.assertRaisesRegex(contract.TradeContractError, "differs"):
+                self.store._preserve_raw(data, digest)
+        self.assertEqual(destination.read_bytes(), conflict)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_raw_pending_unlink_permission_failure_propagates(self):
+        data = b"invented raw unlink failure fixture"
+        real_unlink = os.unlink
+        failed = []
+
+        def unlink(name, *args, **kwargs):
+            if not failed and Path(name).name.startswith(".pending-"):
+                failed.append(name)
+                raise PermissionError("synthetic pending unlink denial")
+            return real_unlink(name, *args, **kwargs)
+
+        with patch.object(capture.os, "unlink", side_effect=unlink):
+            with self.assertRaisesRegex(PermissionError, "synthetic pending unlink denial"):
+                self.store._preserve_raw(data, contract.sha256_bytes(data))
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_raw_residue_alias_disappears_after_scan(self):
+        data = b"invented concurrent residue repair fixture"
+        destination = self.store._preserve_raw(data, contract.sha256_bytes(data))
+        pending = destination.parent / ".pending-other-repair"
+        os.link(destination, pending)
+        real_unlink = os.unlink
+
+        def unlink(name, *args, **kwargs):
+            if Path(name) == pending:
+                real_unlink(name, *args, **kwargs)
+            return real_unlink(name, *args, **kwargs)
+
+        with patch.object(capture.os, "unlink", side_effect=unlink):
+            self.assertEqual(self.store._preserve_raw(data, contract.sha256_bytes(data)), destination)
+        self.assertEqual(destination.read_bytes(), data)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
     def test_raw_hard_crash_residue_restores_protection_and_removes_only_aliases(self):
         data = b"invented hard-crash raw publication fixture"
         digest = contract.sha256_bytes(data)

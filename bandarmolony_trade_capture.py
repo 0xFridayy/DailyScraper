@@ -398,7 +398,11 @@ class TradeCaptureStore:
                 if not destination.stat().st_mode & 0o222:
                     os.chmod(destination, 0o600)
                 for pending in aliases:
-                    pending.unlink()
+                    try:
+                        pending.unlink()
+                    except FileNotFoundError:
+                        # Another publisher or repairer already removed this alias.
+                        continue
             finally:
                 os.chmod(destination, 0o400)
         elif destination.stat().st_mode & 0o222:
@@ -427,7 +431,18 @@ class TradeCaptureStore:
                 raise TradeContractError("existing raw object differs from supplied bytes")
             # Windows shares the read-only attribute across hard links. Remove
             # the writable temporary name before protecting the published name.
-            os.unlink(tmp_name)
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                if not created:
+                    raise
+                # A store sharing this raw root may have repaired our live alias
+                # and adopted the object. Relinquish rollback deletion before
+                # checking the canonical bytes, even if that check fails.
+                created = False
+                tmp_name = None
+                if destination.is_symlink() or destination.read_bytes() != data:
+                    raise TradeContractError("existing raw object differs from supplied bytes")
             tmp_name = None
             if created:
                 os.chmod(destination, 0o400)
