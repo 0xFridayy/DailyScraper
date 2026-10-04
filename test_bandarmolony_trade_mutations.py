@@ -239,6 +239,42 @@ class MutationBehaviorTests(unittest.TestCase):
         with self.behavior(), self.assertRaises(self.contract.TradeContractError):
             self.capture.check_private_output(tracked.parent)
 
+    def test_deleted_tracked_case_variant_refused(self):
+        repository = self.root / "synthetic-case-git"
+        repository.mkdir()
+        # Ignore both spellings so only the tracked-path guard can refuse the
+        # query. Remove the directory too: native Windows resolve() cannot
+        # recover an existing on-disk spelling and hide the need for icase.
+        (repository / ".gitignore").write_text(
+            "private_data/\nPRIVATE_DATA/\n", encoding="utf-8")
+        tracked = repository / "private_data" / "capture.db"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"synthetic tracked sentinel, not a database")
+
+        def git(*arguments):
+            return subprocess.run(["git", "-C", str(repository), *arguments],
+                                  check=True, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+
+        git("init", "-q")
+        git("config", "core.ignorecase", "false")
+        git("add", "-f", "private_data/capture.db")
+        tracked.unlink()
+        tracked.parent.rmdir()
+        requested = repository / "PRIVATE_DATA" / "CAPTURE.DB"
+        # Arrangement failures are INVALID, outside the behavioral assertion.
+        self.assertFalse(requested.exists())
+        self.assertFalse(requested.parent.exists())
+        relative = requested.resolve().relative_to(repository.resolve()).as_posix()
+        self.assertEqual(relative, "PRIVATE_DATA/CAPTURE.DB")
+        self.assertEqual(git("ls-files", "--", ":(literal)" + relative).stdout, "")
+        self.assertEqual(git("ls-files", "--", ":(icase,literal)" + relative).stdout,
+                         "private_data/capture.db\n")
+        git("check-ignore", "-q", "--", relative)
+        with self.behavior(), self.assertRaisesRegex(
+                self.contract.TradeContractError, "^tracked output destination refused$"):
+            self.capture.check_private_output(requested)
+
     def test_ticker_date_mismatch_refused(self):
         for changes in ({"STK_CODE": "ZZZZ"}, {"TRX_DATE": date(2026, 9, 30)}):
             with self.subTest(field=next(iter(changes))):
@@ -601,6 +637,10 @@ def mutations():
                              'if tracked.returncode == 0 and tracked.stdout.strip():\n'
                              '                return real\n'
                              '            if tracked.returncode or tracked.stdout.strip():')),
+        Mutation("remove_icase_tracked_path_protection", capture,
+                 "test_deleted_tracked_case_variant_refused",
+                 in_function("check_private_output", '":(icase,literal)" + relative',
+                             '":(literal)" + relative')),
         Mutation("accept_ticker_date_mismatch", contract, "test_ticker_date_mismatch_refused",
                  accept_mismatch),
         Mutation("accept_unsupported_schema", contract, "test_unsupported_schema_refused",
@@ -640,7 +680,7 @@ def mutations():
         Mutation("skip_content_length_verification", capture, "test_content_length_verified",
                  in_function("_verify_record", 'if len(data) != record["content_length"]:', 'if False:')),
         Mutation("skip_raw_destination_verification", capture, "test_raw_destination_verified",
-                 in_function("_preserve_raw", 'if destination.is_symlink() or destination.read_bytes() != data:',
+                 in_function("_preserve_raw", 'if not created and (destination.is_symlink() or destination.read_bytes() != data):',
                              'if False:')),
         Mutation("skip_parent_acceptance_order", capture, "test_parent_acceptance_order_verified",
                  in_function("_verify_chain", 'if prior_marker is None or record["body_recorded_at"] < prior_marker["durable_accepted_at"]:',

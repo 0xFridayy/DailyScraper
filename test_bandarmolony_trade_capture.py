@@ -49,7 +49,7 @@ def envelope(name="capture-a", **changes):
         capture_id=name, ticker="DEWA", trade_date="2026-10-01",
         requested_at="2026-10-01T10:00:00.123456Z",
         response_at="2026-10-01T10:00:01.654321Z",
-        last_modified="2026-10-01T01:59:59.111111Z",
+        last_modified="2026-10-01T09:00:01Z",
         x_ms_creation_time="2026-10-01T01:58:00.222222Z",
         x_ms_request_id="12345678-1234-4234-8234-123456789abc",
         source_path_without_query_or_token="https://example.invalid/trade/DEWA.parquet",
@@ -187,6 +187,11 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
         self.assertEqual(list(self.raw.rglob("*.parquet")), [])
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def assert_safe_exception(self, error, secret):
+        for rendered in (str(error), repr(error), str(error.__context__), repr(error.__context__)):
+            self.assertNotIn(secret, rendered)
+        self.assertIsNone(error.__context__)
 
     def test_recent_valid_ingest(self):
         result = self.ingest()
@@ -1267,6 +1272,77 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
+    def test_raw_hard_crash_residue_restores_protection_and_removes_only_aliases(self):
+        data = b"invented hard-crash raw publication fixture"
+        digest = contract.sha256_bytes(data)
+        destination = self.store.raw_path(digest)
+        destination.parent.mkdir(parents=True)
+        pending = destination.parent / ".pending-crashed-publication"
+        pending.write_bytes(data)
+        os.link(pending, destination)
+        unrelated = destination.parent / ".pending-unrelated-publication"
+        unrelated.write_bytes(b"different invented bytes")
+        same_bytes = destination.parent / ".pending-independent-same-bytes"
+        same_bytes.write_bytes(data)
+        pending_directory = destination.parent / ".pending-directory"
+        pending_directory.mkdir()
+        self.assertTrue(pending.samefile(destination))
+        self.assertTrue(destination.stat().st_mode & stat.S_IWRITE)
+
+        self.assertEqual(self.store._preserve_raw(data, digest), destination)
+
+        self.assertEqual(destination.read_bytes(), data)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertFalse(pending.exists())
+        self.assertEqual(unrelated.read_bytes(), b"different invented bytes")
+        self.assertEqual(same_bytes.read_bytes(), data)
+        self.assertTrue(pending_directory.is_dir())
+        self.assertEqual(set(destination.parent.glob(".pending-*")),
+                         {unrelated, same_bytes, pending_directory})
+
+    def test_interrupted_initialization_rolls_back_schema_and_reopens_cleanly(self):
+        real_connect = sqlite3.connect
+        for stage in ("meta", "trigger"):
+            with self.subTest(stage=stage):
+                db = self.root / ("interrupted-" + stage) / "capture.db"
+                raw = db.parent / "raw"
+                statements = []
+
+                class InterruptedConnection(sqlite3.Connection):
+                    def execute(self, sql, *args, **kwargs):
+                        statements.append(sql)
+                        if sql.startswith("CREATE TRIGGER") and sum(
+                                statement.startswith("CREATE TRIGGER") for statement in statements) == 2:
+                            raise RuntimeError("synthetic initialization interruption")
+                        return super().execute(sql, *args, **kwargs)
+
+                    def rollback(self):
+                        statements.append("ROLLBACK")
+                        return super().rollback()
+
+                def connect(*args, **kwargs):
+                    return real_connect(*args, factory=InterruptedConnection, **kwargs)
+
+                fault = (patch.object(capture.TradeCaptureStore, "_meta", side_effect=RuntimeError(
+                    "synthetic initialization interruption")) if stage == "meta" else
+                    patch.object(capture.sqlite3, "connect", side_effect=connect))
+                with fault, self.assertRaisesRegex(RuntimeError, "synthetic initialization interruption"):
+                    capture.TradeCaptureStore(db, raw_root=raw)
+                with closing(real_connect(db)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger')").fetchall(), [])
+                if stage == "trigger":
+                    self.assertLess(statements.index("BEGIN IMMEDIATE"),
+                                    next(index for index, sql in enumerate(statements)
+                                         if sql.startswith("CREATE TABLE")))
+                    self.assertIn("ROLLBACK", statements)
+                with capture.TradeCaptureStore(db, raw_root=raw) as reopened:
+                    self.assertEqual(dict(reopened.conn.execute("SELECT key, value FROM trade_store_meta")),
+                                     reopened._meta())
+                    path = write_parquet(db.parent / "input.parquet")
+                    result = reopened.ingest(path, envelope("after-interruption-" + stage))
+                    self.assertTrue(reopened.verify(result["capture_id"]))
+
     def test_raw_link_failure_leaves_no_orphan_or_pending_file(self):
         data = b"invented offline publication failure"
         with patch.object(capture.os, "link", side_effect=OSError("synthetic link failure")):
@@ -1337,9 +1413,68 @@ class TradeCaptureTests(unittest.TestCase):
                         {"last_modified": None, "x_ms_creation_time": None}):
             self.assertIsInstance(envelope(**headers), contract.CaptureEnvelope)
 
+    def test_last_modified_before_jakarta_trade_day_start_refused(self):
+        for status in (200, 404):
+            with self.subTest(status=status), self.assertRaises(contract.TradeContractError):
+                env = envelope(http_status=status, last_modified="2026-09-30T16:59:59.999999Z",
+                               x_ms_creation_time=None)
+                if status == 404:
+                    self.store.observe_absence(env)
+                else:
+                    self.ingest(env=env)
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+
+    def test_last_modified_before_latest_represented_second_refused(self):
+        # The final input row is earlier, so the bound must cover the whole tape.
+        rows = [source_row(TRX_CODE=1002, TRX_TIME=160001), source_row()]
+        self.assert_rejected(rows, env=envelope(last_modified="2026-10-01T09:00:00.999999Z"))
+
+    def test_last_modified_at_latest_represented_second_and_later_accepted(self):
+        for minute, stamp in enumerate(("2026-10-01T09:00:01Z", "2026-10-01T09:30:00Z"), start=1):
+            with self.subTest(last_modified=stamp):
+                result = self.ingest(env=observation("modified-bound-" + str(minute), minute,
+                                                     last_modified=stamp))
+                self.assertEqual(result["last_modified"], contract.utc_text(stamp))
+                self.assertTrue(self.store.verify(result["capture_id"]))
+
+    def test_absence_last_modified_uses_date_bound_without_represented_trades(self):
+        # Midnight Jakarta is 17:00 UTC on the preceding calendar date.
+        env = envelope("absence-at-date-start", http_status=404,
+                       last_modified="2026-09-30T17:00:00Z",
+                       x_ms_creation_time="2026-09-30T16:00:00Z")
+        result = self.store.observe_absence(env)
+        self.assertTrue(self.store.verify(result["capture_id"]))
+        self.assertEqual(result["last_modified"], "2026-09-30T17:00:00.000000Z")
+
+    def test_success_without_last_modified_remains_supported(self):
+        result = self.ingest(env=envelope(last_modified=None))
+        self.assertIsNone(result["last_modified"])
+        self.assertTrue(self.store.verify(result["capture_id"]))
+
+    def test_verify_rejects_resealed_header_temporal_violations(self):
+        result = self.ingest()
+        stored = json.loads(self.store.conn.execute(
+            "SELECT metadata_json FROM trade_captures WHERE capture_id=?",
+            (result["capture_id"],)).fetchone()[0])
+        for changes in (
+            {"last_modified": "2026-09-30T16:59:59.999999Z", "x_ms_creation_time": None},
+            {"last_modified": "2026-10-01T09:00:00.999999Z"},
+            {"x_ms_creation_time": "2026-10-01T09:00:02.000000Z"},
+            {"last_modified": "2026-10-01T10:01:02.000000Z"},
+        ):
+            forged = {**stored, **changes}
+            rewrite_immutable_row(self.store.conn,
+                                  "UPDATE trade_captures SET metadata_json=? WHERE capture_id=?",
+                                  (contract.canonical_json(forged), result["capture_id"]),
+                                  reseal_capture_id=result["capture_id"])
+            with self.subTest(changes=changes), self.assertRaises(contract.TradeContractError):
+                self.store.verify(result["capture_id"])
+
     def test_response_cannot_precede_represented_trade(self):
         self.assert_rejected([source_row(TRX_TIME=160001)], env=envelope(
-            requested_at="2026-10-01T09:00:00Z", response_at="2026-10-01T09:00:00.999999Z"))
+            requested_at="2026-10-01T09:00:00Z", response_at="2026-10-01T09:00:00.999999Z",
+            last_modified=None))
         # Source has seconds only: capture during the represented second is plausible.
         result = self.ingest([source_row(TRX_TIME=160001)], env=envelope(
             "same-trade-second", requested_at="2026-10-01T09:00:01Z",
@@ -1356,8 +1491,73 @@ class TradeCaptureTests(unittest.TestCase):
                        f"https://example.invalid:broken/{secret}/DEWA.parquet"):
             with self.subTest(source=source), self.assertRaises(contract.TradeContractError) as error:
                 contract.sanitize_source_path(source)
-            self.assertNotIn(secret, str(error.exception))
-            self.assertIsNone(error.exception.__context__)
+            self.assert_safe_exception(error.exception, secret)
+
+    def test_contract_parser_errors_do_not_retain_secret_context(self):
+        secret = "dummy-secret-never-persist"
+        for name, operation in (
+            ("canonical-json", lambda: contract.canonical_json({secret: object()})),
+            ("timestamp", lambda: contract.utc_text("token=" + secret)),
+            ("header", lambda: envelope(last_modified="session=" + secret)),
+            ("date", lambda: envelope(trade_date="sig=" + secret)),
+            ("request-id", lambda: envelope(x_ms_request_id="token=" + secret)),
+        ):
+            with self.subTest(parser=name), self.assertRaises(contract.TradeContractError) as error:
+                operation()
+            self.assert_safe_exception(error.exception, secret)
+
+        with patch.object(pq, "ParquetFile", side_effect=ValueError("token=" + secret)):
+            with self.assertRaises(contract.TradeContractError) as error:
+                contract.normalize_parquet(b"invented parser-error fixture", envelope())
+        self.assert_safe_exception(error.exception, secret)
+
+    def test_missing_secret_shaped_input_filenames_do_not_echo_or_retain_context(self):
+        secret = "dummy-secret-never-persist"
+        jwt = "eyJkdW1teSI6dHJ1ZX0.eyJ0ZXN0IjpmYWxzZX0.dummySignature000"
+        for component, marker in (("sig=" + secret, secret), ("token=" + secret, secret),
+                                  ("session=" + secret, secret), (jwt, jwt)):
+            path = self.root / ("missing-" + component + ".parquet")
+            self.assertFalse(path.exists())
+            for name, operation in (
+                ("writer", lambda: self.store.ingest(path, envelope())),
+                ("contract", lambda: contract.normalize_parquet(path, envelope())),
+            ):
+                with self.subTest(component=component, parser=name):
+                    with self.assertRaises(contract.TradeContractError) as error:
+                        operation()
+                    self.assert_safe_exception(error.exception, marker)
+
+    def test_capture_storage_errors_do_not_retain_secret_context(self):
+        secret = "dummy-secret-never-persist"
+        with patch.object(capture.subprocess, "run", side_effect=OSError("token=" + secret)):
+            with self.assertRaises(contract.TradeContractError) as error:
+                capture._git(["rev-parse", "--show-toplevel"], self.root)
+        self.assert_safe_exception(error.exception, secret)
+
+        with patch.object(Path, "open", side_effect=OSError("session=" + secret)):
+            with self.assertRaises(contract.TradeContractError) as error:
+                self.store._require_checkpointed_database()
+        self.assert_safe_exception(error.exception, secret)
+
+        result = self.ingest()
+        with patch.object(Path, "read_bytes", side_effect=OSError("sig=" + secret)):
+            with self.assertRaises(contract.TradeContractError) as error:
+                self.store.verify(result["capture_id"])
+        self.assert_safe_exception(error.exception, secret)
+
+    def test_invalid_persisted_envelope_does_not_retain_secret_context(self):
+        secret = "dummy-secret-never-persist"
+        result = self.ingest()
+        stored = json.loads(self.store.conn.execute(
+            "SELECT metadata_json FROM trade_captures WHERE capture_id=?",
+            (result["capture_id"],)).fetchone()[0])
+        for metadata in ("{token=" + secret, contract.canonical_json({**stored, "token=" + secret: "dummy"})):
+            rewrite_immutable_row(self.store.conn,
+                                  "UPDATE trade_captures SET metadata_json=? WHERE capture_id=?",
+                                  (metadata, result["capture_id"]), reseal_capture_id=result["capture_id"])
+            with self.subTest(metadata=metadata), self.assertRaises(contract.TradeContractError) as error:
+                self.store.verify(result["capture_id"])
+            self.assert_safe_exception(error.exception, secret)
 
     def test_source_fragment_stripping_and_literal_local_hash(self):
         self.assertEqual(contract.sanitize_source_path("https://example.invalid/DEWA.parquet#fragment"),
@@ -1622,6 +1822,26 @@ class TradeCaptureTests(unittest.TestCase):
                         capture.check_private_output(path)
         with self.assertRaises(contract.TradeContractError):
             capture.check_private_output(root / "PRIVATE_DATA")
+
+    def test_git_guard_case_variant_of_deleted_tracked_path_refused(self):
+        root = self.git_repository("git-deleted-case")
+        self.git(root, "config", "core.ignorecase", "false")
+        (root / ".gitignore").write_text("private_data/\nPRIVATE_DATA/\n", encoding="utf-8")
+        tracked = root / "private_data" / "capture.db"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"synthetic index-only private database marker")
+        self.git(root, "add", "-f", "private_data/capture.db")
+        tracked.unlink()
+        tracked.parent.rmdir()
+        candidate = root / "PRIVATE_DATA" / "CAPTURE.DB"
+        self.assertFalse(candidate.exists())
+        self.assertFalse(candidate.parent.exists())
+        self.assertEqual(self.git(root, "ls-files", "--", ":(literal)PRIVATE_DATA/CAPTURE.DB").stdout, "")
+        self.assertEqual(self.git(root, "ls-files", "--", ":(icase,literal)PRIVATE_DATA/CAPTURE.DB").stdout.strip(),
+                         "private_data/capture.db")
+        self.git(root, "check-ignore", "-q", "--", "PRIVATE_DATA/CAPTURE.DB")
+        with self.assertRaisesRegex(contract.TradeContractError, "tracked output destination refused"):
+            capture.check_private_output(candidate)
 
     def test_git_guard_main_and_linked_worktree(self):
         root = self.git_repository("git-main")

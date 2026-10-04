@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -65,7 +66,8 @@ def _git(args, cwd):
                               encoding="utf-8", errors="replace", timeout=30,
                               env=environment)
     except (OSError, subprocess.SubprocessError):
-        raise TradeContractError("private output guard cannot run git") from None
+        pass
+    raise TradeContractError("private output guard cannot run git")
 
 
 def check_private_output(path, sidecars=()):
@@ -86,6 +88,7 @@ def check_private_output(path, sidecars=()):
     contexts = []
     for directory in (anchor, *anchor.parents):
         marker = directory / ".git"
+        inspection_failed = False
         try:
             marker.lstat()
             # An independently inspected empty directory has no repository or
@@ -96,7 +99,9 @@ def check_private_output(path, sidecars=()):
         except FileNotFoundError:
             continue
         except OSError:
-            raise TradeContractError("cannot inspect private output repository ancestry") from None
+            inspection_failed = True
+        if inspection_failed:
+            raise TradeContractError("cannot inspect private output repository ancestry")
         contexts.append(directory)
     top = _git(["rev-parse", "--show-toplevel"], anchor)
     if top.returncode:
@@ -114,10 +119,13 @@ def check_private_output(path, sidecars=()):
         if repo != context:
             raise TradeContractError("private output repository ancestry is ambiguous")
         for candidate in (real, *(Path(str(real) + suffix) for suffix in sidecars)):
+            relative = None
             try:
                 relative = candidate.relative_to(repo).as_posix()
             except ValueError:
-                raise TradeContractError("private output repository ancestry is ambiguous") from None
+                pass
+            if relative is None:
+                raise TradeContractError("private output repository ancestry is ambiguous")
             # Git's icase literal pathspec includes tracked directory descendants
             # and also catches case variants on Windows with core.ignorecase off.
             tracked = _git(["ls-files", "--", ":(icase,literal)" + relative], repo)
@@ -244,8 +252,9 @@ def _private_mkdir(path):
         try:
             directory.mkdir(mode=0o700)
         except FileExistsError:
-            if not directory.is_dir():
-                raise TradeContractError("output parent is not a directory") from None
+            pass
+        if not directory.is_dir():
+            raise TradeContractError("output parent is not a directory")
         _fsync_dir(directory.parent)
 
 
@@ -279,12 +288,7 @@ class TradeCaptureStore:
                 self.conn.execute("PRAGMA synchronous = FULL")
             tables = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             if not tables and not read_only:
-                with self.conn:
-                    for sql in TABLE_SQL.values():
-                        self.conn.execute(sql)
-                    self.conn.executemany("INSERT INTO trade_store_meta VALUES (?, ?)", self._meta().items())
-                    for sql in TRIGGER_SQL.values():
-                        self.conn.execute(sql)
+                self._initialize_schema()
                 _fsync_dir(self.db.parent)
             self._verify_schema()
         except BaseException:
@@ -303,6 +307,19 @@ class TradeCaptureStore:
     def _meta(self):
         return {"product": PRODUCT, "schema_version": STORE_VERSION, "raw_root": str(self.raw_root)}
 
+    def _initialize_schema(self):
+        """Keep tables, identity and triggers in one durable transaction."""
+        with self._write_transaction():
+            # Another first-open writer may have initialized while we waited
+            # for the lock. The caller verifies the complete schema either way.
+            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'").fetchone():
+                return
+            for sql in TABLE_SQL.values():
+                self.conn.execute(sql)
+            self.conn.executemany("INSERT INTO trade_store_meta VALUES (?, ?)", self._meta().items())
+            for sql in TRIGGER_SQL.values():
+                self.conn.execute(sql)
+
     def _require_checkpointed_database(self):
         try:
             for suffix in ("-wal", "-journal"):
@@ -313,8 +330,10 @@ class TradeCaptureStore:
                 header = handle.read(20)
             if header[:16] == b"SQLite format 3\x00" and b"\x02" in header[18:20]:
                 raise TradeContractError("read-only inspection refuses WAL-mode database; open a writer to checkpoint and restore DELETE journaling")
+            return
         except OSError:
-            raise TradeContractError("cannot establish read-only database WAL state") from None
+            pass
+        raise TradeContractError("cannot establish read-only database WAL state")
 
     def _check_paths(self):
         # Filesystem locations are local paths, not source provenance. Ordinary
@@ -362,6 +381,29 @@ class TradeCaptureStore:
             return
         _fsync_dir(path.parent)
 
+    @staticmethod
+    def _repair_raw_residue(destination):
+        """Remove only pending hard links to a verified canonical raw object."""
+        aliases = []
+        for pending in destination.parent.glob(".pending-*"):
+            try:
+                if stat.S_ISREG(pending.lstat().st_mode) and pending.samefile(destination):
+                    aliases.append(pending)
+            except FileNotFoundError:
+                continue
+        if aliases:
+            # On Windows every hard link shares the read-only attribute.
+            # Restore protection even if removing an old alias fails.
+            try:
+                if not destination.stat().st_mode & 0o222:
+                    os.chmod(destination, 0o600)
+                for pending in aliases:
+                    pending.unlink()
+            finally:
+                os.chmod(destination, 0o400)
+        elif destination.stat().st_mode & 0o222:
+            os.chmod(destination, 0o400)
+
     def _preserve_raw(self, data, digest, *, report_created=False):
         if sha256_bytes(data) != digest:
             raise TradeContractError("raw identity does not match supplied bytes")
@@ -380,14 +422,17 @@ class TradeCaptureStore:
                 os.link(tmp_name, destination)
                 created = True
             except FileExistsError:
-                if destination.is_symlink() or destination.read_bytes() != data:
-                    raise TradeContractError("existing raw object differs from supplied bytes")
+                pass
+            if not created and (destination.is_symlink() or destination.read_bytes() != data):
+                raise TradeContractError("existing raw object differs from supplied bytes")
             # Windows shares the read-only attribute across hard links. Remove
             # the writable temporary name before protecting the published name.
             os.unlink(tmp_name)
             tmp_name = None
             if created:
                 os.chmod(destination, 0o400)
+            else:
+                self._repair_raw_residue(destination)
             _fsync_dir(destination.parent)
         except BaseException:
             if tmp_name is not None:
@@ -431,10 +476,13 @@ class TradeCaptureStore:
             raise TradeContractError("response timestamp cannot be in the future")
         self._check_paths()
         self._verify_schema()
+        data = None
         try:
             data = Path(file).read_bytes()
         except OSError:
-            raise TradeContractError("cannot read local input file") from None
+            pass
+        if data is None:
+            raise TradeContractError("cannot read local input file")
         digest = sha256_bytes(data)
         # Validate the exact bytes read once before publishing any raw object.
         # _record publishes inside its body transaction after chain validation.
@@ -570,11 +618,14 @@ class TradeCaptureStore:
             raise TradeContractError("unsupported capture dataset identity")
         if record["body_sha256"] != _body_digest(record):
             raise TradeContractError("immutable capture body digest mismatch")
+        envelope = None
         try:
             stored = json.loads(record["metadata_json"])
             envelope = CaptureEnvelope(**stored)
         except (TypeError, ValueError):
-            raise TradeContractError("invalid persisted capture envelope") from None
+            pass
+        if envelope is None:
+            raise TradeContractError("invalid persisted capture envelope")
         if canonical_json(asdict(envelope)) != record["metadata_json"]:
             raise TradeContractError("persisted envelope is not canonical or sanitized")
         if any(record[key] != getattr(envelope, key) for key in ("capture_id", "ticker", "trade_date")):
@@ -602,10 +653,13 @@ class TradeCaptureStore:
         check_private_output(raw)
         if raw.is_symlink():
             raise TradeContractError("raw object cannot be a symbolic link")
+        data = None
         try:
             data = raw.read_bytes()
         except OSError:
-            raise TradeContractError("raw object is missing or unreadable") from None
+            pass
+        if data is None:
+            raise TradeContractError("raw object is missing or unreadable")
         if sha256_bytes(data) != record["raw_response_sha256"]:
             raise TradeContractError("raw sha256 mismatch")
         if len(data) != record["content_length"]:

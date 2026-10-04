@@ -78,7 +78,8 @@ def canonical_json(value: Any) -> str:
             ensure_ascii=False, allow_nan=False,
         )
     except (TypeError, ValueError):
-        raise TradeContractError("value cannot be represented canonically") from None
+        pass
+    raise TradeContractError("value cannot be represented canonically")
 
 
 def utc_text(value: str | datetime) -> str:
@@ -94,7 +95,8 @@ def utc_text(value: str | datetime) -> str:
             raise ValueError
         return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     except (ValueError, TypeError, OverflowError):
-        raise TradeContractError("timestamp must be a timezone-aware ISO instant") from None
+        pass
+    raise TradeContractError("timestamp must be a timezone-aware ISO instant")
 
 
 def _header_time(value: str | None) -> str | None:
@@ -103,10 +105,12 @@ def _header_time(value: str | None) -> str | None:
     try:
         return utc_text(value)
     except TradeContractError:
-        try:
-            return utc_text(parsedate_to_datetime(value))
-        except (TradeContractError, ValueError, TypeError, OverflowError):
-            raise TradeContractError("header timestamp is invalid") from None
+        pass
+    try:
+        return utc_text(parsedate_to_datetime(value))
+    except (TradeContractError, ValueError, TypeError, OverflowError):
+        pass
+    raise TradeContractError("header timestamp is invalid")
 
 
 _CREDENTIAL_WORD = re.compile(
@@ -227,7 +231,8 @@ def _trade_date(value: str) -> str:
             raise ValueError
         return value
     except ValueError:
-        raise TradeContractError("trade_date must be an ISO calendar date") from None
+        pass
+    raise TradeContractError("trade_date must be an ISO calendar date")
 
 
 @dataclass(frozen=True)
@@ -263,6 +268,8 @@ class CaptureEnvelope:
             raise TradeContractError("response timestamp precedes the Jakarta trade date")
         last_modified = _header_time(self.last_modified)
         creation_time = _header_time(self.x_ms_creation_time)
+        if last_modified is not None and last_modified < trade_day_start:
+            raise TradeContractError("source last modification precedes the Jakarta trade date")
         if any(stamp > response_at for stamp in (last_modified, creation_time) if stamp is not None):
             raise TradeContractError("source header timestamp follows the response")
         if creation_time is not None and last_modified is not None and creation_time > last_modified:
@@ -272,10 +279,13 @@ class CaptureEnvelope:
         object.__setattr__(self, "last_modified", last_modified)
         object.__setattr__(self, "x_ms_creation_time", creation_time)
         if self.x_ms_request_id is not None:
+            parsed_id = None
             try:
                 parsed_id = str(UUID(self.x_ms_request_id))
             except (ValueError, TypeError, AttributeError):
-                raise TradeContractError("request ID must be a UUID") from None
+                pass
+            if parsed_id is None:
+                raise TradeContractError("request ID must be a UUID")
             object.__setattr__(self, "x_ms_request_id", parsed_id)
         object.__setattr__(
             self, "source_path_without_query_or_token",
@@ -529,6 +539,8 @@ def normalize_parquet(
     if isinstance(path, str) and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", path):
         raise TradeContractError("Parquet input must be a local file")
     source = None
+    tape = None
+    error_message = None
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
@@ -587,6 +599,8 @@ def normalize_parquet(
                 ))
                 if envelope.response_at < represented_trade_at:
                     raise TradeContractError("response timestamp precedes a represented trade")
+                if envelope.last_modified is not None and envelope.last_modified < represented_trade_at:
+                    raise TradeContractError("source last modification precedes a represented trade")
                 trx_code = canonical["trx_code"]
                 if trx_code in rows_by_key and rows_by_key[trx_code] != canonical:
                     raise TradeContractError("conflicting duplicate natural trade key")
@@ -598,7 +612,7 @@ def normalize_parquet(
         # Deterministic accounting invariants are not independent source proof.
         broker_totals(rows)
         content_json = canonical_json(normalized_document(rows))
-        return NormalizedTape(
+        tape = NormalizedTape(
             schema_version=schema_version,
             schema_fingerprint=schema_fingerprint,
             rows=rows,
@@ -607,14 +621,20 @@ def normalize_parquet(
             normalized_content_sha256=sha256_bytes(content_json.encode("utf-8")),
             content_json=content_json,
         )
-    except TradeContractError:
-        raise
+    except TradeContractError as exc:
+        error_message = str(exc)
     except Exception:
         # Parser exceptions can echo filenames, embedded metadata or payloads.
-        raise TradeContractError("local Parquet cannot satisfy the trade contract") from None
+        error_message = "local Parquet cannot satisfy the trade contract"
     finally:
         if source is not None:
-            source.close()
+            try:
+                source.close()
+            except Exception:
+                error_message = error_message or "local Parquet cannot satisfy the trade contract"
+    if error_message is not None:
+        raise TradeContractError(error_message)
+    return tape
 
 
 def broker_totals(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:

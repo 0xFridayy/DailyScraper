@@ -2649,10 +2649,14 @@ future body or acceptance timestamp. The response must fall on or after
 occur on or after its latest represented trade second in Asia/Jakarta. The
 contract infers no trade milliseconds. When supplied, Azure creation time and
 last-modified time must satisfy
-`creation_time <= last_modified <= response_at`. With one header missing,
-only the comparisons supported by the remaining timestamps apply. Future
-header times are refused. These checks establish lower bounds and do not prove
-that capture occurred after market close.
+`creation_time <= last_modified <= response_at`. Last-modified must also be
+on or after the start of `trade_date` in Asia/Jakarta. For a successful 200
+tape, it must be on or after the latest represented trade second, including
+exact equality at that whole second. A 404 has no represented-trade bound.
+Last-modified remains optional. With one header missing, only the comparisons
+supported by the remaining timestamps apply. Writer and verification enforce
+the same bounds. These checks do not prove that capture occurred after market
+close.
 
 `durable_accepted_at` is this product's availability time. Request, response,
 header, trade, and body-recorded timestamps cannot establish an earlier product
@@ -2680,6 +2684,9 @@ worktree deletion.
 The private-output guard checks SQLite, its journal, WAL and SHM sidecars, and
 the raw root. Inside a Git worktree, destinations must be ignored and contain
 no tracked output or tracked descendants. Git path checks include case variants.
+The case-variant regression keeps the lowercase path in the Git index, deletes
+its working-tree file and directory, and requests a nonexistent uppercase path.
+It therefore exercises `:(icase,literal)` without filesystem case normalization.
 Git subprocesses discard inherited `GIT_*` overrides and decode output as
 UTF-8 with safe error handling. Independent ancestor discovery prevents a
 spoofed or broken Git environment from being treated as outside a repository.
@@ -2701,9 +2708,15 @@ it to the destination. It unlinks the temporary name while writable and only
 then marks the destination read-only where supported. This order avoids the
 Windows shared read-only attribute across hard links. The existing-object
 branch also cleans its writable temporary file. Identical bytes reuse the
-object. A digest-path conflict with different bytes fails closed and preserves
-the existing object. Cleanup cannot clear the existing object's protection or
-mask the content-conflict error. Supported platforms fsync the parent directory.
+object. Reuse restores the destination's read-only protection and removes
+matching `.pending-*` residue left by a hard crash between link and unlink.
+Cleanup removes only regular, non-symlink pending files proven to be hard-link
+aliases of the canonical object. Independent same-byte copies and unrelated
+pending files remain. Native Windows alias cleanup temporarily clears the
+shared read-only attribute and restores destination protection in `finally`.
+A digest-path conflict with different bytes fails closed and preserves the
+existing object and its protection. Cleanup cannot mask the content-conflict
+error. Supported platforms fsync the parent directory.
 Python does not provide directory fsync on Windows.
 Publication runs inside the body write transaction. If insertion fails before
 commit, the writer removes only its newly published object. A committed pending
@@ -2720,6 +2733,11 @@ content, raw and normalized hashes, schema facts, and both lineages.
 `trade_acceptances` holds a separate durable acceptance. Every non-nullable
 identity and primary key has an explicit `NOT NULL` constraint. Nullable parent
 IDs express the absence of a parent, rather than an invalid identity.
+
+First-open schema creation, metadata insertion, and trigger creation run in one
+explicit `BEGIN IMMEDIATE` transaction. An initialization failure rolls back
+all schema changes, so a later open can initialize a clean store. Existing
+stores still require exact schema and trigger verification.
 
 The store commits the validated body before a separate acceptance transaction.
 Immutable triggers refuse updates, deletes, duplicate-key inserts, and SQLite
@@ -2784,6 +2802,9 @@ query-stripping provenance convention. Extended Windows paths and ambiguous
 malformed source values are refused rather than partially normalized.
 Failures suppress unsafe exception context and do not echo source input or
 payloads. These provenance rules do not restrict ordinary output directory names.
+Translated capture and parser errors clear `exc.__context__`. Missing filenames
+containing secret-shaped assignments or JWT-like text stay absent from both
+`str(exc)` and `repr(exc)`.
 
 The body seal is unkeyed SHA-256. The raw hashes, body seals, schema checks, and
 chains establish local integrity under this store model. They do not attest
@@ -2801,7 +2822,7 @@ uses a synthetic file whose trades occur on the prior Asia/Jakarta date:
 	  --file /private/synthetic.parquet \
 	  --requested-at 2026-10-02T00:00:00.000001Z \
 	  --response-at 2026-10-02T00:00:01.000002Z \
-	  --source-path /done_detail/DEWA/2026-10-01.parquet
+	  --source-path /done_detail/20261001/STOCK/DEWA.parquet
 	python bandarmolony_trade_capture.py resume --capture-id CAPTURE_ID
 	python bandarmolony_trade_capture.py verify --capture-id CAPTURE_ID
 	python bandarmolony_trade_capture.py inspect --capture-id CAPTURE_ID
@@ -2828,29 +2849,35 @@ A kill requires the intended behavioral assertion. Syntax, import, runtime,
 and setup failures are `INVALID`, never kills. The baseline must pass before
 mutation results count, and the required gate has zero invalid mutants. No
 mutation copy, raw fixture, or generated database is committed.
+The case-variant mutation removes only `icase` from the tracked-path query and
+must fail the intended tracked-output refusal assertion. Fixture and Git setup
+assertions remain outside the behavioral kill classification.
 
 The completed delta passed these Linux gates:
 
 | Command | Result |
 |---|---|
-| `python test_bandarmolony_trade_capture.py` | 130 tests passed |
-| `python test_bandarmolony_trade_mutations.py --run` | Baseline 39 and classification controls 7 passed; 39 killed, 0 survived, 0 invalid |
+| `python test_bandarmolony_trade_capture.py` | 143 tests passed |
+| `python test_bandarmolony_trade_mutations.py --run` | Baseline 40 and classification controls 7 passed; 40 killed, 0 survived, 0 invalid |
 | `python test_inventory_evidence.py` | 106 tests passed |
 | `python test_targeted_actor_panel.py` | 33 tests passed |
 | `python test_targeted_actor_observations.py` | 25 tests passed |
-| `python test_pipeline.py` | Passed; existing candidate-artifact case skipped because artifacts are absent |
-| `python check_ml_health.py --quick` | ML health OK, 31 modules imported and 747 tests passed; model smoke test skipped |
+| `python test_pipeline.py` | 107 passed, 1 skipped for absent candidate artifacts; real-data provenance subassertions skipped for absent raw cache |
+| `python check_ml_health.py --quick` | ML health OK, 30 modules imported and 760 tests passed; model smoke test skipped |
 | `git diff --check` | Passed |
 
-The health report retains its existing broker-flow availability caveat and
-compile-only check for optional `smart_money_divergence` setup. No model was
-fitted. Tests used an isolated Linux Python environment with the existing
-repository dependencies, including CPU builds of XGBoost and PyTorch.
+The health panel has 10,076 rows, 251 dates, 45 tickers, and zero impossible
+targets. Its existing broker-flow point-in-time availability caveat remains.
+Health used compile-only checks for `smart_money_divergence` because optional
+setup was absent and for `ddqn_entry_exit` because PyTorch was unavailable.
+No model was fitted. Tests used an isolated Linux Python environment with
+the existing repository dependencies.
 
-Native Windows execution remains a separate required gate. Cloud/Linux cannot
-prove native Windows filesystem semantics. This delta is
-`READY FOR NATIVE WINDOWS RE-REVIEW`. Final approval requires Claude's native
-Windows delta review. No PR is opened by this task.
+The prior native Windows delta review reported zero blockers, highs, or mediums
+and six LOW findings. This cleanup addresses those LOW findings and is
+`READY FOR FINAL MICRO-REVIEW`. Its validation ran on Linux. Native Windows
+rechecks remain necessary to confirm Windows filesystem behavior. No PR is
+opened by this task.
 
 Required commands are:
 
