@@ -2159,10 +2159,14 @@ class TradeCaptureTests(unittest.TestCase):
                 capture._git(["rev-parse", "--show-toplevel"], self.root)
         self.assert_safe_exception(error.exception, secret)
 
-        with patch.object(Path, "open", side_effect=OSError("session=" + secret)):
-            with self.assertRaises(contract.TradeContractError) as error:
-                self.store._require_checkpointed_database()
-        self.assert_safe_exception(error.exception, secret)
+        for failure in (OSError("session=" + secret),
+                        subprocess.CalledProcessError(1, ["token=" + secret]),
+                        subprocess.TimeoutExpired(["session=" + secret], 30)):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(capture.subprocess, "run", side_effect=failure):
+                    with self.assertRaises(contract.TradeContractError) as error:
+                        self.store._require_checkpointed_database()
+                self.assert_safe_exception(error.exception, secret)
 
         result = self.ingest()
         with patch.object(Path, "read_bytes", side_effect=OSError("sig=" + secret)):
@@ -2356,6 +2360,61 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
         self.assertEqual(list(self.raw.rglob("*.parquet")), [])
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX closes can release another connection's locks")
+    def test_read_only_preflight_retains_same_process_writer_lock(self):
+        probe_script = """
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as error:
+        if error.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+            raise
+        print("blocked")
+    else:
+        connection.rollback()
+        print("available")
+finally:
+    connection.close()
+"""
+
+        def assert_lock(expected):
+            probe = subprocess.run([sys.executable, "-c", probe_script, str(self.db)],
+                                   capture_output=True, text=True, check=True, timeout=15)
+            self.assertEqual(probe.stdout.strip(), expected)
+
+        # BEGIN IMMEDIATE holds the writer lock without creating a journal.
+        self.store.conn.execute("BEGIN IMMEDIATE")
+        try:
+            assert_lock("blocked")
+            self.store._require_checkpointed_database()
+            assert_lock("blocked")
+            with capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True) as reader:
+                assert_lock("blocked")
+                reader._require_checkpointed_database()
+                assert_lock("blocked")
+            assert_lock("blocked")
+        finally:
+            self.store.conn.rollback()
+        assert_lock("available")
+
+    def test_read_only_refuses_either_wal_header_version_without_sidecars(self):
+        self.store.close()
+        original = self.db.read_bytes()
+        for versions in (b"\x02\x01", b"\x01\x02"):
+            with self.subTest(versions=versions):
+                contents = original[:18] + versions + original[20:]
+                self.db.write_bytes(contents)
+                with self.assertRaisesRegex(contract.TradeContractError, "WAL-mode"):
+                    with capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True):
+                        pass
+                self.assertEqual(self.db.read_bytes(), contents)
+                for suffix in capture.SIDECARS:
+                    self.assertFalse(Path(str(self.db) + suffix).exists())
 
     def test_read_only_reader_cannot_observe_uncommitted_body_or_acceptance(self):
         first = self.ingest()

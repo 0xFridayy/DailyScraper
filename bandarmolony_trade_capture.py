@@ -381,12 +381,19 @@ class TradeCaptureStore:
                 sidecar = Path(str(self.db) + suffix)
                 if sidecar.exists() and sidecar.stat().st_size:
                     raise TradeContractError("read-only inspection requires a quiescent checkpointed database; outstanding WAL or journal refused")
-            with self.db.open("rb") as handle:
-                header = handle.read(20)
+            # On POSIX, closing any file handle can release this process's
+            # SQLite locks on the same inode. Inspect the header in a fresh
+            # interpreter so that its file close cannot unlock our writers.
+            header = subprocess.run(
+                [sys.executable, "-I", "-S", "-c",
+                 "import sys\nwith open(sys.argv[1], 'rb') as handle:\n"
+                 "    sys.stdout.buffer.write(handle.read(20))\n", str(self.db)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=True, timeout=30).stdout
             if header[:16] == b"SQLite format 3\x00" and b"\x02" in header[18:20]:
                 raise TradeContractError("read-only inspection refuses WAL-mode database; open a writer to checkpoint and restore DELETE journaling")
             return
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             pass
         raise TradeContractError("cannot establish read-only database WAL state")
 
