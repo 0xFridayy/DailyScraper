@@ -155,6 +155,18 @@ def rewrite_immutable_row(conn, sql, parameters=(), *, reseal_capture_id=None):
     conn.commit()
 
 
+class CommitFailureConnection(sqlite3.Connection):
+    """Inject one failure before SQLite makes a body transaction durable."""
+    commit_error = None
+
+    def commit(self):
+        if self.commit_error is not None:
+            message = self.commit_error
+            self.commit_error = None
+            raise sqlite3.OperationalError(message)
+        return super().commit()
+
+
 class TradeCaptureTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="trade-capture-test-")
@@ -1272,17 +1284,24 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
-    def test_shared_raw_root_pending_alias_repair_during_publication(self):
-        for fail_insert in (False, True):
-            with self.subTest(fail_insert=fail_insert):
-                root = self.root / ("shared-rollback" if fail_insert else "shared-success")
+    def test_shared_raw_root_pending_alias_repair_after_body_commit(self):
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, factory=CommitFailureConnection, **kwargs)
+
+        for first_failure in ("none", "insert", "commit"):
+            with self.subTest(first_failure=first_failure):
+                root = self.root / ("shared-success-" + first_failure)
                 path = write_parquet(root / "input.parquet")
                 data = path.read_bytes()
                 digest = contract.sha256_bytes(data)
                 first_env = envelope("shared-first")
                 second_env = envelope("shared-second")
-                with capture.TradeCaptureStore(root / "first.db") as first, \
-                        capture.TradeCaptureStore(root / "second.db") as second:
+                with patch.object(capture.sqlite3, "connect", side_effect=connect):
+                    first = capture.TradeCaptureStore(root / "first.db")
+                    second = capture.TradeCaptureStore(root / "second.db")
+                with first, second:
                     self.assertEqual(first.raw_root, second.raw_root)
                     self.assertNotEqual(first.db, second.db)
                     destination = first.raw_path(digest)
@@ -1292,37 +1311,72 @@ class TradeCaptureTests(unittest.TestCase):
                     independent = destination.parent / ".pending-independent-same-bytes"
                     independent.write_bytes(data)
                     interleaved = []
+                    repaired = []
+                    second_ingesting = False
                     real_unlink, real_body_digest = os.unlink, capture._body_digest
+                    real_repair = capture.TradeCaptureStore._repair_raw_residue
 
                     def unlink(name, *args, **kwargs):
+                        nonlocal second_ingesting
                         if not interleaved and Path(name).name.startswith(".pending-"):
                             alias = Path(name)
                             self.assertTrue(alias.samefile(destination))
                             interleaved.append(alias)
-                            accepted = second.ingest(path, second_env)
+                            second_ingesting = True
+                            try:
+                                accepted = second.ingest(path, second_env)
+                            finally:
+                                second_ingesting = False
                             self.assertTrue(accepted["durable_accepted_at"])
                             self.assertFalse(alias.exists())
                             self.assertTrue(second.verify(second_env.capture_id))
                         return real_unlink(name, *args, **kwargs)
 
+                    def repair(raw_path):
+                        if second_ingesting:
+                            alias = interleaved[0]
+                            self.assertTrue(alias.exists())
+                            self.assertTrue(alias.samefile(destination))
+                            # A separate connection cannot see B's body until its
+                            # COMMIT. Acceptance must follow alias cleanup.
+                            with closing(sqlite3.connect(second.db)) as reader:
+                                self.assertEqual(reader.execute(
+                                    "SELECT count(*) FROM trade_captures WHERE capture_id=?",
+                                    (second_env.capture_id,)).fetchone()[0], 1)
+                                self.assertEqual(reader.execute(
+                                    "SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+                            repaired.append(alias)
+                        return real_repair(raw_path)
+
                     def body_digest(record):
-                        if fail_insert and record["capture_id"] == first_env.capture_id:
+                        if first_failure == "insert" and record["capture_id"] == first_env.capture_id:
                             return None
                         return real_body_digest(record)
 
                     with patch.object(capture.os, "unlink", side_effect=unlink), \
+                            patch.object(capture.TradeCaptureStore, "_repair_raw_residue", side_effect=repair), \
                             patch.object(capture, "_body_digest", side_effect=body_digest):
-                        if fail_insert:
+                        if first_failure == "insert":
                             with self.assertRaises(sqlite3.IntegrityError):
                                 first.ingest(path, first_env)
-                            self.assertEqual(first.conn.execute(
-                                "SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+                        elif first_failure == "commit":
+                            first.conn.commit_error = "synthetic first body COMMIT failure"
+                            with self.assertRaisesRegex(
+                                    sqlite3.OperationalError, "synthetic first body COMMIT failure"):
+                                first.ingest(path, first_env)
                         else:
                             accepted = first.ingest(path, first_env)
                             self.assertTrue(accepted["durable_accepted_at"])
                             self.assertTrue(first.verify(first_env.capture_id))
 
                     self.assertEqual(len(interleaved), 1)
+                    self.assertEqual(repaired, interleaved)
+                    for store, count in ((first, 1 if first_failure == "none" else 0), (second, 1)):
+                        self.assertFalse(store.conn.in_transaction)
+                        self.assertEqual(store.conn.execute(
+                            "SELECT count(*) FROM trade_captures").fetchone()[0], count)
+                        self.assertEqual(store.conn.execute(
+                            "SELECT count(*) FROM trade_acceptances").fetchone()[0], count)
                     self.assertEqual(destination.read_bytes(), data)
                     self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
                     self.assertEqual(unrelated.read_bytes(), b"unrelated pending bytes")
@@ -1331,6 +1385,85 @@ class TradeCaptureTests(unittest.TestCase):
                                      {unrelated, independent})
                 with capture.TradeCaptureStore(root / "second.db", read_only=True) as reader:
                     self.assertTrue(reader.verify(second_env.capture_id))
+                if first_failure == "none":
+                    with capture.TradeCaptureStore(root / "first.db", read_only=True) as reader:
+                        self.assertTrue(reader.verify(first_env.capture_id))
+
+    def test_shared_raw_root_dual_body_failures_remove_orphan(self):
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, factory=CommitFailureConnection, **kwargs)
+
+        for first_failure, second_failure in (("insert", "insert"), ("insert", "commit"),
+                                               ("commit", "insert"), ("commit", "commit")):
+            with self.subTest(first_failure=first_failure, second_failure=second_failure):
+                root = self.root / ("shared-dual-" + first_failure + "-" + second_failure)
+                path = write_parquet(root / "input.parquet")
+                digest = contract.sha256_bytes(path.read_bytes())
+                first_env = envelope("shared-first-failure")
+                second_env = envelope("shared-second-failure")
+                with patch.object(capture.sqlite3, "connect", side_effect=connect):
+                    first = capture.TradeCaptureStore(root / "first.db")
+                    second = capture.TradeCaptureStore(root / "second.db")
+                with first, second:
+                    self.assertEqual(first.raw_root, second.raw_root)
+                    self.assertNotEqual(first.db, second.db)
+                    destination = first.raw_path(digest)
+                    interleaved = []
+                    real_unlink, real_body_digest = os.unlink, capture._body_digest
+
+                    def unlink(name, *args, **kwargs):
+                        if not interleaved and Path(name).name.startswith(".pending-"):
+                            alias = Path(name)
+                            self.assertTrue(alias.samefile(destination))
+                            interleaved.append(alias)
+                            if second_failure == "commit":
+                                second.conn.commit_error = "synthetic second body COMMIT failure"
+                                with self.assertRaisesRegex(
+                                        sqlite3.OperationalError, "synthetic second body COMMIT failure"):
+                                    second.ingest(path, second_env)
+                            else:
+                                with self.assertRaises(sqlite3.IntegrityError):
+                                    second.ingest(path, second_env)
+                            # A retains its rollback ownership until B commits
+                            # a body, including when B's body COMMIT fails.
+                            self.assertTrue(alias.exists())
+                            self.assertTrue(alias.samefile(destination))
+                            self.assertFalse(second.conn.in_transaction)
+                            self.assertEqual(second.conn.execute(
+                                "SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+                            self.assertEqual(second.conn.execute(
+                                "SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+                        return real_unlink(name, *args, **kwargs)
+
+                    def body_digest(record):
+                        if (first_failure == "insert" and record["capture_id"] == first_env.capture_id or
+                                second_failure == "insert" and record["capture_id"] == second_env.capture_id):
+                            return None
+                        return real_body_digest(record)
+
+                    with patch.object(capture.os, "unlink", side_effect=unlink), \
+                            patch.object(capture, "_body_digest", side_effect=body_digest):
+                        if first_failure == "commit":
+                            first.conn.commit_error = "synthetic first body COMMIT failure"
+                            with self.assertRaisesRegex(
+                                    sqlite3.OperationalError, "synthetic first body COMMIT failure"):
+                                first.ingest(path, first_env)
+                        else:
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                first.ingest(path, first_env)
+
+                    self.assertEqual(len(interleaved), 1)
+                    for store in (first, second):
+                        self.assertFalse(store.conn.in_transaction)
+                        self.assertEqual(store.conn.execute(
+                            "SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+                        self.assertEqual(store.conn.execute(
+                            "SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(list(first.raw_root.rglob("*.parquet")), [])
+                    self.assertEqual(list(first.raw_root.rglob(".pending-*")), [])
 
     def test_missing_published_alias_conflict_refused_without_deleting_destination(self):
         data = b"invented raw publication conflict fixture"
@@ -1371,10 +1504,13 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
     def test_raw_residue_alias_disappears_after_scan(self):
-        data = b"invented concurrent residue repair fixture"
+        path = write_parquet(self.root / "concurrent-residue.parquet")
+        data = path.read_bytes()
         destination = self.store._preserve_raw(data, contract.sha256_bytes(data))
         pending = destination.parent / ".pending-other-repair"
         os.link(destination, pending)
+        self.assertEqual(self.store._preserve_raw(data, contract.sha256_bytes(data)), destination)
+        self.assertTrue(pending.samefile(destination))
         real_unlink = os.unlink
 
         def unlink(name, *args, **kwargs):
@@ -1383,13 +1519,15 @@ class TradeCaptureTests(unittest.TestCase):
             return real_unlink(name, *args, **kwargs)
 
         with patch.object(capture.os, "unlink", side_effect=unlink):
-            self.assertEqual(self.store._preserve_raw(data, contract.sha256_bytes(data)), destination)
+            result = self.store.ingest(path, envelope("concurrent-residue-repair"))
+        self.assertTrue(self.store.verify(result["capture_id"]))
         self.assertEqual(destination.read_bytes(), data)
         self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
         self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
     def test_raw_hard_crash_residue_restores_protection_and_removes_only_aliases(self):
-        data = b"invented hard-crash raw publication fixture"
+        path = write_parquet(self.root / "hard-crash-residue.parquet")
+        data = path.read_bytes()
         digest = contract.sha256_bytes(data)
         destination = self.store.raw_path(digest)
         destination.parent.mkdir(parents=True)
@@ -1406,7 +1544,12 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertTrue(destination.stat().st_mode & stat.S_IWRITE)
 
         self.assertEqual(self.store._preserve_raw(data, digest), destination)
+        self.assertTrue(pending.samefile(destination))
+        self.assertTrue(destination.stat().st_mode & stat.S_IWRITE)
 
+        result = self.store.ingest(path, envelope("hard-crash-residue-repair"))
+
+        self.assertTrue(self.store.verify(result["capture_id"]))
         self.assertEqual(destination.read_bytes(), data)
         self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
         self.assertFalse(pending.exists())
@@ -1415,6 +1558,62 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertTrue(pending_directory.is_dir())
         self.assertEqual(set(destination.parent.glob(".pending-*")),
                          {unrelated, same_bytes, pending_directory})
+
+    def test_raw_postcommit_cleanup_permission_failure_can_resume_without_source(self):
+        path = write_parquet(self.root / "postcommit-residue.parquet")
+        data = path.read_bytes()
+        digest = contract.sha256_bytes(data)
+        destination = self.store._preserve_raw(data, digest)
+        pending = destination.parent / ".pending-cleanup-denied"
+        os.link(destination, pending)
+        env = envelope("postcommit-residue-recovery")
+        real_unlink = os.unlink
+        failures = []
+
+        def unlink(name, *args, **kwargs):
+            if Path(name) == pending:
+                # The committed body owns the canonical object before repair.
+                with closing(sqlite3.connect(self.db)) as reader:
+                    self.assertEqual(reader.execute(
+                        "SELECT count(*) FROM trade_captures WHERE capture_id=?",
+                        (env.capture_id,)).fetchone()[0], 1)
+                    self.assertEqual(reader.execute(
+                        "SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+                failures.append(Path(name))
+                raise PermissionError("synthetic postcommit residue unlink denial")
+            return real_unlink(name, *args, **kwargs)
+
+        with patch.object(capture.os, "unlink", side_effect=unlink):
+            with self.assertRaisesRegex(PermissionError, "synthetic postcommit residue unlink denial"):
+                self.store.ingest(path, env)
+
+        self.assertEqual(failures, [pending])
+        self.assertFalse(self.store.conn.in_transaction)
+        body = dict(self.store.conn.execute(
+            "SELECT * FROM trade_captures WHERE capture_id=?", (env.capture_id,)).fetchone())
+        self.assertEqual(self.store.conn.execute(
+            "SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+        self.assertEqual(destination.read_bytes(), data)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertTrue(pending.samefile(destination))
+        path.unlink()
+        self.store.close()
+
+        with capture.TradeCaptureStore(self.db, raw_root=self.raw) as recovered:
+            accepted = recovered.resume(env.capture_id)
+            self.assertTrue(accepted["durable_accepted_at"])
+            self.assertEqual(dict(recovered.conn.execute(
+                "SELECT * FROM trade_captures WHERE capture_id=?", (env.capture_id,)).fetchone()), body)
+            self.assertEqual(recovered.conn.execute(
+                "SELECT count(*) FROM trade_acceptances").fetchone()[0], 1)
+            self.assertEqual(recovered.resume(env.capture_id), accepted)
+            self.assertTrue(recovered.verify(env.capture_id))
+        self.assertFalse(pending.exists())
+        self.assertEqual(destination.read_bytes(), data)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
     def test_interrupted_initialization_rolls_back_schema_and_reopens_cleanly(self):
         real_connect = sqlite3.connect

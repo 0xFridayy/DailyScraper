@@ -383,7 +383,7 @@ class TradeCaptureStore:
 
     @staticmethod
     def _repair_raw_residue(destination):
-        """Remove only pending hard links to a verified canonical raw object."""
+        """Remove pending hard links only after a verified body has committed."""
         aliases = []
         for pending in destination.parent.glob(".pending-*"):
             try:
@@ -446,8 +446,7 @@ class TradeCaptureStore:
             tmp_name = None
             if created:
                 os.chmod(destination, 0o400)
-            else:
-                self._repair_raw_residue(destination)
+            # Reuse leaves other publishers' aliases intact until our body commits.
             _fsync_dir(destination.parent)
         except BaseException:
             if tmp_name is not None:
@@ -588,7 +587,7 @@ class TradeCaptureStore:
                     if referenced is None:
                         self._discard_raw(published)
             raise
-        # The raw object and body are durable before the independent acceptance.
+        # Raw and body are durable before residue repair and independent acceptance.
         return self.resume(envelope.capture_id)
 
     @staticmethod
@@ -610,11 +609,17 @@ class TradeCaptureStore:
         return "CONTENT_CHANGED", last_content["content_version"] + 1
 
     def resume(self, capture_id):
-        """Recompute sealed pending truth and add only its missing acceptance."""
+        """Verify a committed body, repair raw residue, and add missing acceptance."""
         self._check_paths()
         self._verify_schema()
         with self._write_transaction():
             existing = self._verify_chain(capture_id, allow_pending=True)
+            if existing["raw_response_sha256"] is not None:
+                raw = self.raw_path(existing["raw_response_sha256"])
+                # A durable body now owns this object. Cleanup failures can roll
+                # back acceptance, but must never trigger publication rollback.
+                self._repair_raw_residue(raw)
+                _fsync_dir(raw.parent)
             marker = self._acceptance(capture_id)
             if marker is None:
                 if self.conn.execute(

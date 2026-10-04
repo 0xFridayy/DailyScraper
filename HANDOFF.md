@@ -2708,18 +2708,25 @@ it to the destination. It unlinks the temporary name while writable and only
 then marks the destination read-only where supported. This order avoids the
 Windows shared read-only attribute across hard links. The existing-object
 branch also cleans its writable temporary file. Identical bytes reuse the
-object. Reuse restores the destination's read-only protection and removes
-matching `.pending-*` residue left by a hard crash between link and unlink.
+verified object without removing other publishers' `.pending-*` aliases.
+After the body commits, `resume` verifies the canonical bytes again, restores
+read-only protection, repairs matching pending residue, and fsyncs the raw
+directory before adding the independent acceptance. A failed body insertion
+or COMMIT leaves other publishers' aliases untouched.
 Cleanup removes only regular, non-symlink pending files proven to be hard-link
 aliases of the canonical object. Independent same-byte copies and unrelated
 pending files remain. Native Windows alias cleanup temporarily clears the
 shared read-only attribute and restores destination protection in `finally`.
-Two databases in one directory can share the default raw root. If reuse repairs
-a publisher's live pending alias, the publisher verifies the canonical bytes
-and treats the object as reused, relinquishing rollback deletion. A subsequent
-body insert failure cannot remove the other database's accepted raw object.
+Two databases in one directory can share the default raw root. Only a store
+with a committed body can repair a publisher's live pending alias. The publisher
+then verifies the canonical bytes and relinquishes rollback deletion. If both
+body writes fail during this interleaving, the original publisher retains
+ownership and removes its unreferenced object. If the competing body commits,
+the object remains even if the original publisher's insertion fails.
 Residue removal tolerates an alias disappearing after inspection; other
-filesystem failures propagate.
+filesystem failures propagate. A postcommit repair failure leaves a sealed
+body and its canonical object intact, without a new acceptance. `resume` can
+retry cleanup and acceptance without the original input file.
 A digest-path conflict with different bytes fails closed and preserves the
 existing object and its protection. Cleanup cannot mask the content-conflict
 error. Supported platforms fsync the parent directory.
@@ -2866,22 +2873,26 @@ is unchanged.
 
 The shared-root regression deterministically runs a second database's complete
 ingest and acceptance between the first publisher's hard link and temporary
-unlink. It verifies the accepted capture after the first ingest succeeds and
-after its body insertion rolls back. Unrelated pending files and independent
-same-byte copies remain. Further regressions cover conflicting canonical bytes
-after alias disappearance, genuine unlink denial, and competing residue removal.
+unlink. It proves cleanup follows a committed body and precedes acceptance,
+then verifies the competing capture when the first ingest succeeds or its
+INSERT or COMMIT fails. All four combinations of two writers' INSERT/COMMIT
+failures leave both databases empty, with no canonical object or pending file.
+Unrelated pending files and independent same-byte copies remain. Further
+regressions cover conflicting canonical bytes after alias disappearance,
+genuine unlink denial, competing residue removal, and source-free resume after
+a postcommit cleanup permission failure.
 
 The completed delta passed these Linux gates:
 
 | Command | Result |
 |---|---|
-| `python test_bandarmolony_trade_capture.py` | 147 tests passed |
+| `python test_bandarmolony_trade_capture.py` | 149 tests passed |
 | `python test_bandarmolony_trade_mutations.py --run` | Baseline 40 and classification controls 8 passed; 40 killed, 0 survived, 0 invalid |
 | `python test_inventory_evidence.py` | 106 tests passed |
 | `python test_targeted_actor_panel.py` | 33 tests passed |
 | `python test_targeted_actor_observations.py` | 25 tests passed |
 | `python test_pipeline.py` | 107 passed, 1 skipped for absent candidate artifacts; real-data provenance subassertions skipped for absent raw cache |
-| `python check_ml_health.py --quick` | ML health OK, 30 modules imported and 764 tests passed; model smoke test skipped |
+| `python check_ml_health.py --quick` | ML health OK, 30 modules imported and 766 tests passed; model smoke test skipped |
 | `git diff --check` | Passed |
 
 The health panel has 10,076 rows, 251 dates, 45 tickers, and zero impossible
