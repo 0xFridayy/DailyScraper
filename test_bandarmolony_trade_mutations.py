@@ -564,6 +564,16 @@ def mutations():
             'if sha256_bytes(record["content_json"].encode("utf-8")) != record["normalized_content_sha256"]:',
             'if False:')
 
+    def skip_raw_destination_verification(source):
+        source = replace_in_function(source, "_preserve_raw",
+            'if not created and (destination.is_symlink() or destination.read_bytes() != data):',
+            'if False:')
+        return replace_in_function(source, "_preserve_raw",
+            '# Crash residue is repaired only after a body has committed.\n'
+            '                if destination.is_symlink() or destination.read_bytes() != data:',
+            '# Crash residue is repaired only after a body has committed.\n'
+            '                if False:')
+
     def accept_mismatch(source):
         source = replace_in_function(source, "normalize_parquet",
             'if row["STK_CODE"] != envelope.ticker:', 'if False:')
@@ -682,8 +692,7 @@ def mutations():
         Mutation("skip_content_length_verification", capture, "test_content_length_verified",
                  in_function("_verify_record", 'if len(data) != record["content_length"]:', 'if False:')),
         Mutation("skip_raw_destination_verification", capture, "test_raw_destination_verified",
-                 in_function("_preserve_raw", 'if not created and (destination.is_symlink() or destination.read_bytes() != data):',
-                             'if False:')),
+                 skip_raw_destination_verification),
         Mutation("skip_parent_acceptance_order", capture, "test_parent_acceptance_order_verified",
                  in_function("_verify_chain", 'if prior_marker is None or record["body_recorded_at"] < prior_marker["durable_accepted_at"]:',
                              'if False:')),

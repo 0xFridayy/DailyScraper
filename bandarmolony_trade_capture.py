@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 
 from bandarmolony_trade_contract import (
     OBSERVATION_STATES, DATASET, CaptureEnvelope, TradeContractError,
@@ -44,6 +45,7 @@ DEFAULT_DB = _user_data_directory() / "trade_capture.db"
 SIDECARS = ("-journal", "-wal", "-shm")
 PRODUCT = "BANDARMOLONY_TRADE_CAPTURE_V1"
 STORE_VERSION = "2"
+RAW_ROOT_LOCK = ".raw-root-lock.sqlite3"
 
 
 class PendingCaptureError(TradeContractError):
@@ -265,6 +267,7 @@ class TradeCaptureStore:
         self.db = Path(db).resolve()
         self.raw_root = Path(raw_root).resolve() if raw_root is not None else self.db.parent / "trade_raw"
         self.read_only = read_only
+        self._raw_coordination = threading.local()
         self._check_paths()
         if read_only:
             # Normal DELETE-mode reads retain SQLite's shared locks. WAL files
@@ -370,9 +373,65 @@ class TradeCaptureStore:
             raise TradeContractError("invalid raw content identity")
         return self.raw_root / "sha256" / digest[:2] / (digest + ".parquet")
 
+    @contextmanager
+    def _raw_root_lock(self):
+        """Serialize raw ownership across stores, threads and processes.
+
+        This private, persistent SQLite file holds no evidence or capture data.
+        BEGIN IMMEDIATE uses SQLite's native Windows/Linux process locks, which
+        close/process death releases. Never unlink or replace the lock file.
+        Acquire it before the store's SQLite transaction, including for repair.
+        A bounded busy wait or any setup failure refuses the operation.
+        """
+        if self.read_only:
+            raise TradeContractError("read-only trade store")
+        if getattr(self._raw_coordination, "held", False):
+            yield
+            return
+        lock_path = self.raw_root / RAW_ROOT_LOCK
+        coordination = None
+        try:
+            try:
+                check_private_output(lock_path, SIDECARS)
+                _private_mkdir(self.raw_root)
+                try:
+                    previous = lock_path.lstat()
+                except FileNotFoundError:
+                    previous = None
+                if previous is not None and not stat.S_ISREG(previous.st_mode):
+                    raise TradeContractError("invalid shared raw-root coordination file")
+                # Let SQLite own every handle to this inode. On POSIX, closing
+                # an unrelated os.open handle could release another thread's
+                # SQLite locks. Stat/chmod do not open independent handles.
+                coordination = sqlite3.connect(lock_path, timeout=30, isolation_level=None)
+                identity = lock_path.lstat()
+                if (not stat.S_ISREG(identity.st_mode) or previous is not None and
+                        not os.path.samestat(previous, identity)):
+                    raise TradeContractError("shared raw-root coordination file changed")
+                os.chmod(lock_path, 0o600)
+                # No tables or writes are needed. A zero-byte SQLite database
+                # still has native file locks, and cannot leave a hot journal.
+                if coordination.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+                    raise TradeContractError("invalid shared raw-root coordination journal mode")
+                coordination.execute("BEGIN IMMEDIATE")
+                if not os.path.samestat(identity, lock_path.lstat()):
+                    raise TradeContractError("shared raw-root coordination file changed")
+            except (OSError, sqlite3.Error):
+                raise TradeContractError("cannot establish shared raw-root coordination") from None
+            self._raw_coordination.held = True
+            try:
+                yield
+            finally:
+                self._raw_coordination.held = False
+        finally:
+            # Closing rolls back the coordination transaction and releases all
+            # native locks even when publication, rollback or repair raised.
+            if coordination is not None:
+                coordination.close()
+
     @staticmethod
     def _discard_raw(path):
-        """Remove a newly published, unreferenced object under the writer lock."""
+        """Remove a newly published object while its raw-root lock is held."""
         path = Path(path)
         try:
             os.chmod(path, 0o600)
@@ -383,7 +442,7 @@ class TradeCaptureStore:
 
     @staticmethod
     def _repair_raw_residue(destination):
-        """Remove pending hard links only after a verified body has committed."""
+        """Repair a committed body's aliases under the shared raw-root lock."""
         aliases = []
         for pending in destination.parent.glob(".pending-*"):
             try:
@@ -409,57 +468,61 @@ class TradeCaptureStore:
             os.chmod(destination, 0o400)
 
     def _preserve_raw(self, data, digest, *, report_created=False):
-        if sha256_bytes(data) != digest:
-            raise TradeContractError("raw identity does not match supplied bytes")
-        destination = self.raw_path(digest)
-        check_private_output(destination)
-        _private_mkdir(destination.parent)
-        # Never use rename/replace: an existing content identity cannot be overwritten.
-        fd, tmp_name = tempfile.mkstemp(prefix=".pending-", dir=destination.parent)
-        created = False
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+        with self._raw_root_lock():
+            if sha256_bytes(data) != digest:
+                raise TradeContractError("raw identity does not match supplied bytes")
+            destination = self.raw_path(digest)
+            check_private_output(destination)
+            _private_mkdir(destination.parent)
+            # Never use rename/replace: an existing content identity cannot be overwritten.
+            fd, tmp_name = tempfile.mkstemp(prefix=".pending-", dir=destination.parent)
+            created = False
             try:
-                os.link(tmp_name, destination)
-                created = True
-            except FileExistsError:
-                pass
-            if not created and (destination.is_symlink() or destination.read_bytes() != data):
-                raise TradeContractError("existing raw object differs from supplied bytes")
-            # Windows shares the read-only attribute across hard links. Remove
-            # the writable temporary name before protecting the published name.
-            try:
-                os.unlink(tmp_name)
-            except FileNotFoundError:
-                if not created:
-                    raise
-                # A store sharing this raw root may have repaired our live alias
-                # and adopted the object. Relinquish rollback deletion before
-                # checking the canonical bytes, even if that check fails.
-                created = False
-                tmp_name = None
-                if destination.is_symlink() or destination.read_bytes() != data:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(tmp_name, destination)
+                    created = True
+                except FileExistsError:
+                    pass
+                if not created and (destination.is_symlink() or destination.read_bytes() != data):
                     raise TradeContractError("existing raw object differs from supplied bytes")
-            tmp_name = None
-            if created:
-                os.chmod(destination, 0o400)
-            # Reuse leaves other publishers' aliases intact until our body commits.
-            _fsync_dir(destination.parent)
-        except BaseException:
-            if tmp_name is not None:
+                # Windows shares the read-only attribute across hard links. Remove
+                # the writable temporary name before protecting the published name.
                 try:
                     os.unlink(tmp_name)
-                except OSError:
-                    # Preserve a content-conflict error; never chmod a temporary
-                    # hard link that could change the published inode's protection.
-                    pass
-            if created:
-                self._discard_raw(destination)
-            raise
-        return (destination, created) if report_created else destination
+                except FileNotFoundError:
+                    if not created:
+                        raise
+                    # An unexpected missing alias cannot establish ownership.
+                    # Keep conflict handling fail closed without deleting a changed
+                    # destination. Cooperating writers cannot enter this window.
+                    created = False
+                    tmp_name = None
+                    if destination.is_symlink() or destination.read_bytes() != data:
+                        raise TradeContractError("existing raw object differs from supplied bytes")
+                tmp_name = None
+                if created:
+                    os.chmod(destination, 0o400)
+                # Verify the exact canonical bytes for both creation and reuse.
+                # Crash residue is repaired only after a body has committed.
+                if destination.is_symlink() or destination.read_bytes() != data:
+                    raise TradeContractError("existing raw object differs from supplied bytes")
+                _fsync_dir(destination.parent)
+            except BaseException:
+                if tmp_name is not None:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        # Preserve a content-conflict error; never chmod a temporary
+                        # hard link that could change the published inode's protection.
+                        pass
+                if created:
+                    self._discard_raw(destination)
+                raise
+            return (destination, created) if report_created else destination
 
     @contextmanager
     def _write_transaction(self):
@@ -525,68 +588,65 @@ class TradeCaptureStore:
             "duplicate_counts_json": None if tape is None else canonical_json(tape.duplicate_counts),
             "content_json": None if tape is None else tape.content_json,
         }
-        published = None
-        try:
-            with self._write_transaction():
-                existing = self.conn.execute("SELECT * FROM trade_captures WHERE capture_id = ?",
-                                             (envelope.capture_id,)).fetchone()
-                if existing is not None:
-                    existing = dict(existing)
-                    if any(existing[key] != value for key, value in desired.items()):
-                        raise TradeContractError("capture identity conflicts with immutable body")
-                    self._verify_chain(envelope.capture_id, allow_pending=True)
-                else:
-                    chain = self.conn.execute(
-                        "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? ORDER BY observation_seq",
-                        (envelope.ticker, envelope.trade_date)).fetchall()
-                    previous = dict(chain[-1]) if chain else None
-                    if previous:
-                        if self._acceptance(previous["capture_id"]) is None:
-                            self._verify_chain(previous["capture_id"], allow_pending=True)
-                            raise PendingCaptureError(previous["capture_id"])
-                        self._verify_chain(previous["capture_id"])
-                    last_content = next((dict(row) for row in reversed(chain)
-                                         if row["observation_state"] != "ABSENT_OBSERVED"), None)
-                    self._check_chronology(envelope, previous)
-                    state, version = self._content_relation(
-                        envelope, desired["normalized_content_sha256"], last_content)
-                    recorded = utc_now()
-                    if envelope.response_at > recorded:
-                        raise TradeContractError("body recording cannot precede response")
-                    existing = dict(
-                        capture_id=envelope.capture_id, dataset=DATASET,
-                        ticker=envelope.ticker, trade_date=envelope.trade_date,
-                        observation_seq=1 if previous is None else previous["observation_seq"] + 1,
-                        previous_observation_id=None if previous is None else previous["capture_id"],
-                        previous_content_capture_id=None if last_content is None else last_content["capture_id"],
-                        observation_state=state, content_version=version,
-                        **desired, body_recorded_at=recorded,
-                    )
-                    existing["body_sha256"] = _body_digest(existing)
-                    if raw_data is not None:
-                        path, created = self._preserve_raw(raw_data, digest, report_created=True)
-                        if created:
-                            published = path
-                    columns = tuple(existing)
-                    try:
+        with self._raw_root_lock():
+            published = None
+            try:
+                with self._write_transaction():
+                    existing = self.conn.execute("SELECT * FROM trade_captures WHERE capture_id = ?",
+                                                 (envelope.capture_id,)).fetchone()
+                    if existing is not None:
+                        existing = dict(existing)
+                        if any(existing[key] != value for key, value in desired.items()):
+                            raise TradeContractError("capture identity conflicts with immutable body")
+                        self._verify_chain(envelope.capture_id, allow_pending=True)
+                    else:
+                        chain = self.conn.execute(
+                            "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? ORDER BY observation_seq",
+                            (envelope.ticker, envelope.trade_date)).fetchall()
+                        previous = dict(chain[-1]) if chain else None
+                        if previous:
+                            if self._acceptance(previous["capture_id"]) is None:
+                                self._verify_chain(previous["capture_id"], allow_pending=True)
+                                raise PendingCaptureError(previous["capture_id"])
+                            self._verify_chain(previous["capture_id"])
+                        last_content = next((dict(row) for row in reversed(chain)
+                                             if row["observation_state"] != "ABSENT_OBSERVED"), None)
+                        self._check_chronology(envelope, previous)
+                        state, version = self._content_relation(
+                            envelope, desired["normalized_content_sha256"], last_content)
+                        recorded = utc_now()
+                        if envelope.response_at > recorded:
+                            raise TradeContractError("body recording cannot precede response")
+                        existing = dict(
+                            capture_id=envelope.capture_id, dataset=DATASET,
+                            ticker=envelope.ticker, trade_date=envelope.trade_date,
+                            observation_seq=1 if previous is None else previous["observation_seq"] + 1,
+                            previous_observation_id=None if previous is None else previous["capture_id"],
+                            previous_content_capture_id=None if last_content is None else last_content["capture_id"],
+                            observation_state=state, content_version=version,
+                            **desired, body_recorded_at=recorded,
+                        )
+                        existing["body_sha256"] = _body_digest(existing)
+                        if raw_data is not None:
+                            path, created = self._preserve_raw(raw_data, digest, report_created=True)
+                            if created:
+                                published = path
+                        columns = tuple(existing)
                         self.conn.execute(
                             f"INSERT INTO trade_captures ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
                             tuple(existing[column] for column in columns))
-                    except BaseException:
-                        if published is not None:
-                            self._discard_raw(published)
-                            published = None
-                        raise
-        except BaseException:
-            # If COMMIT failed, reacquire the writer lock before inspecting references.
-            # Another writer may already have adopted the same content identity.
-            if published is not None:
-                with self._write_transaction():
+                # Body COMMIT permanently relinquishes rollback deletion ownership.
+                published = None
+            except BaseException:
+                # The shared lock has never been released. No other database can
+                # adopt our publication before rollback cleanup finishes. The local
+                # check also protects a COMMIT that succeeded before reporting an error.
+                if published is not None:
                     referenced = self.conn.execute(
                         "SELECT 1 FROM trade_captures WHERE raw_response_sha256=?", (digest,)).fetchone()
                     if referenced is None:
                         self._discard_raw(published)
-            raise
+                raise
         # Raw and body are durable before residue repair and independent acceptance.
         return self.resume(envelope.capture_id)
 
@@ -612,25 +672,26 @@ class TradeCaptureStore:
         """Verify a committed body, repair raw residue, and add missing acceptance."""
         self._check_paths()
         self._verify_schema()
-        with self._write_transaction():
-            existing = self._verify_chain(capture_id, allow_pending=True)
-            if existing["raw_response_sha256"] is not None:
-                raw = self.raw_path(existing["raw_response_sha256"])
-                # A durable body now owns this object. Cleanup failures can roll
-                # back acceptance, but must never trigger publication rollback.
-                self._repair_raw_residue(raw)
-                _fsync_dir(raw.parent)
-            marker = self._acceptance(capture_id)
-            if marker is None:
-                if self.conn.execute(
-                    "SELECT 1 FROM trade_captures WHERE ticker=? AND trade_date=? AND observation_seq>?",
-                    (existing["ticker"], existing["trade_date"], existing["observation_seq"])).fetchone():
-                    raise TradeContractError("pending capture has a conflicting successor")
-                accepted = utc_now()
-                if accepted < existing["body_recorded_at"]:
-                    raise TradeContractError("acceptance cannot precede validated body")
-                self.conn.execute("INSERT INTO trade_acceptances VALUES (?, ?, ?)",
-                                  (capture_id, existing["body_sha256"], accepted))
+        with self._raw_root_lock():
+            with self._write_transaction():
+                existing = self._verify_chain(capture_id, allow_pending=True)
+                if existing["raw_response_sha256"] is not None:
+                    raw = self.raw_path(existing["raw_response_sha256"])
+                    # A durable body now owns this object. Cleanup failures can roll
+                    # back acceptance, but must never trigger publication rollback.
+                    self._repair_raw_residue(raw)
+                    _fsync_dir(raw.parent)
+                marker = self._acceptance(capture_id)
+                if marker is None:
+                    if self.conn.execute(
+                        "SELECT 1 FROM trade_captures WHERE ticker=? AND trade_date=? AND observation_seq>?",
+                        (existing["ticker"], existing["trade_date"], existing["observation_seq"])).fetchone():
+                        raise TradeContractError("pending capture has a conflicting successor")
+                    accepted = utc_now()
+                    if accepted < existing["body_recorded_at"]:
+                        raise TradeContractError("acceptance cannot precede validated body")
+                    self.conn.execute("INSERT INTO trade_acceptances VALUES (?, ?, ?)",
+                                      (capture_id, existing["body_sha256"], accepted))
         return self.verify(capture_id)
 
     def _verify_record(self, record, *, allow_pending=False):
