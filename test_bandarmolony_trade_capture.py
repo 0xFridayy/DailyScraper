@@ -4,11 +4,14 @@ Fixtures contain invented executions only. No source account, credentials,
 network collection, paid Parquet, OHLC, or actor data is used.
 """
 
-from dataclasses import FrozenInstanceError, fields, replace
+from contextlib import closing
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -44,8 +47,8 @@ def envelope(name="capture-a", **changes):
     """Give each numbered observation independent synthetic request timestamps."""
     values = dict(
         capture_id=name, ticker="DEWA", trade_date="2026-10-01",
-        requested_at="2026-10-01T02:00:00.123456Z",
-        response_at="2026-10-01T02:00:01.654321Z",
+        requested_at="2026-10-01T10:00:00.123456Z",
+        response_at="2026-10-01T10:00:01.654321Z",
         last_modified="2026-10-01T01:59:59.111111Z",
         x_ms_creation_time="2026-10-01T01:58:00.222222Z",
         x_ms_request_id="12345678-1234-4234-8234-123456789abc",
@@ -53,6 +56,12 @@ def envelope(name="capture-a", **changes):
     )
     values.update(changes)
     return contract.CaptureEnvelope(**values)
+
+
+def observation(name, minute, **changes):
+    stamp = datetime(2026, 10, 1, 10, tzinfo=timezone.utc) + timedelta(minutes=minute)
+    return envelope(name, requested_at=stamp.isoformat(),
+                    response_at=(stamp + timedelta(seconds=1)).isoformat(), **changes)
 
 
 def source_row(**changes):
@@ -109,6 +118,22 @@ def write_parquet(path, rows=None, *, legacy=False, field_types=None, drop=(),
     return path
 
 
+def remove_readonly(path):
+    """Windows applies a read-only attribute to chmod(0400) raw fixtures."""
+    path = Path(path)
+    path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    path.unlink()
+
+
+def make_tree_writable(root):
+    """Run after connections close and before TemporaryDirectory removes raw files."""
+    root = Path(root)
+    if root.exists():
+        for path in root.rglob("*"):
+            if path.is_file():
+                path.chmod(stat.S_IWRITE | stat.S_IREAD)
+
+
 def rewrite_immutable_row(conn, sql, parameters=(), *, reseal_capture_id=None):
     """Simulate an adversary, restoring trigger definitions before verification."""
     triggers = list(conn.execute(
@@ -135,6 +160,7 @@ class TradeCaptureTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="trade-capture-test-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.addCleanup(make_tree_writable, self.root)
         self.db = self.root / "private" / "trade_capture.db"
         self.raw = self.root / "private" / "trade_raw"
         self.store = capture.TradeCaptureStore(self.db, raw_root=self.raw)
@@ -144,7 +170,7 @@ class TradeCaptureTests(unittest.TestCase):
     def ingest(self, rows=None, *, env=None, **fixture_options):
         self.sequence += 1
         if env is None:
-            stamp = datetime(2026, 10, 1, 2, tzinfo=timezone.utc) + timedelta(minutes=self.sequence)
+            stamp = datetime(2026, 10, 1, 10, tzinfo=timezone.utc) + timedelta(minutes=self.sequence)
             env = envelope(f"capture-{self.sequence}", requested_at=stamp.isoformat(),
                            response_at=(stamp + timedelta(seconds=1)).isoformat())
         path = write_parquet(self.root / f"input-{self.sequence}.parquet", rows,
@@ -159,6 +185,8 @@ class TradeCaptureTests(unittest.TestCase):
             self.ingest(rows, **options)
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
     def test_recent_valid_ingest(self):
         result = self.ingest()
@@ -270,14 +298,15 @@ class TradeCaptureTests(unittest.TestCase):
         second = self.ingest(list(reversed(sample_rows())))
         self.assertNotEqual(first["raw_response_sha256"], second["raw_response_sha256"])
         self.assertEqual(first["normalized_content_sha256"], second["normalized_content_sha256"])
-        self.assertEqual(second["capture_state"], "REVISED")
+        self.assertEqual(second["observation_state"], "CONTENT_REPEAT")
+        self.assertEqual(second["content_version"], first["content_version"])
 
     def test_capture_timestamps_do_not_change_hash(self):
         path = write_parquet(self.root / "times.parquet")
         first = contract.normalize_parquet(path, envelope("capture-a"))
         second = contract.normalize_parquet(path, envelope(
-            "capture-b", requested_at="2026-10-02T02:00:00.000001Z",
-            response_at="2026-10-02T02:00:01.000002Z"))
+            "capture-b", requested_at="2026-10-02T10:00:00.000001Z",
+            response_at="2026-10-02T10:00:01.000002Z"))
         self.assertEqual(first.normalized_content_sha256, second.normalized_content_sha256)
         self.assertEqual(first.content_json, second.content_json)
         self.assertNotIn("source_capture_id", first.content_json)
@@ -285,30 +314,36 @@ class TradeCaptureTests(unittest.TestCase):
 
     def test_first_seen(self):
         result = self.ingest()
-        self.assertEqual(result["capture_state"], "FIRST_SEEN")
-        self.assertEqual(result["capture_revision"], 1)
-        self.assertIsNone(result["previous_capture_id"])
+        self.assertEqual(result["observation_state"], "CONTENT_FIRST_SEEN")
+        self.assertEqual(result["observation_seq"], 1)
+        self.assertIsNone(result["previous_observation_id"])
+        self.assertIsNone(result["previous_content_capture_id"])
+        self.assertEqual(result["content_version"], 1)
 
     def test_revised_immutable_history(self):
         first = self.ingest([source_row()])
         second = self.ingest([source_row(STK_VOLM=126)])
-        self.assertEqual(second["capture_state"], "REVISED")
-        self.assertEqual(second["capture_revision"], 2)
-        self.assertEqual(second["previous_capture_id"], first["capture_id"])
+        self.assertEqual(second["observation_state"], "CONTENT_CHANGED")
+        self.assertEqual(second["observation_seq"], 2)
+        self.assertEqual(second["previous_observation_id"], first["capture_id"])
+        self.assertEqual(second["previous_content_capture_id"], first["capture_id"])
+        self.assertEqual(second["content_version"], 2)
         self.assertNotEqual(first["raw_response_sha256"], second["raw_response_sha256"])
         self.assertEqual(self.rows(first)[0]["shares"], 125)
         self.assertEqual(self.rows(second)[0]["shares"], 126)
-        self.assertEqual(self.store.inspect(first["capture_id"])["capture_state"], "FIRST_SEEN")
+        self.assertEqual(self.store.inspect(first["capture_id"])["observation_state"], "CONTENT_FIRST_SEEN")
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 2)
 
     def test_repeat_confirmation(self):
         first = self.ingest()
         repeat = self.ingest()
-        self.assertEqual(repeat["capture_state"], "REPEAT_CONFIRMED")
+        self.assertEqual(repeat["observation_state"], "CONTENT_REPEAT")
         self.assertNotEqual(first["capture_id"], repeat["capture_id"])
         self.assertEqual(first["raw_response_sha256"], repeat["raw_response_sha256"])
         self.assertEqual(first["normalized_content_sha256"], repeat["normalized_content_sha256"])
-        self.assertEqual(repeat["capture_revision"], 2)
+        self.assertEqual(repeat["observation_seq"], 2)
+        self.assertEqual(repeat["content_version"], 1)
+        self.assertEqual(repeat["previous_content_capture_id"], first["capture_id"])
 
     def test_old_version_remains_queryable_after_repeat(self):
         first = self.ingest([source_row()])
@@ -322,15 +357,16 @@ class TradeCaptureTests(unittest.TestCase):
 
     def test_no_finality_state(self):
         results = [self.ingest(), self.ingest(), self.ingest([source_row(STK_VOLM=126)])]
-        self.assertEqual(set(contract.CAPTURE_STATES),
-                         {"FIRST_SEEN", "REVISED", "REPEAT_CONFIRMED", "ABSENT_OBSERVED"})
+        self.assertEqual(set(contract.OBSERVATION_STATES),
+                         {"CONTENT_FIRST_SEEN", "CONTENT_CHANGED", "CONTENT_REPEAT", "ABSENT_OBSERVED"})
         for result in results:
-            self.assertNotIn("FINAL", result["capture_state"])
+            self.assertNotIn("FINAL", result["observation_state"])
 
     def test_absence_is_not_zero_trades(self):
         result = self.store.observe_absence(envelope(http_status=404))
-        self.assertEqual(result["capture_state"], "ABSENT_OBSERVED")
-        for key in ("row_count", "raw_response_sha256", "normalized_content_sha256", "content_length"):
+        self.assertEqual(result["observation_state"], "ABSENT_OBSERVED")
+        for key in ("row_count", "raw_response_sha256", "normalized_content_sha256", "content_length",
+                    "content_version"):
             self.assertIsNone(result[key])
         self.assertTrue(result["durable_accepted_at"])
         self.assertEqual(list(self.raw.rglob("*.parquet")), [])
@@ -437,7 +473,7 @@ class TradeCaptureTests(unittest.TestCase):
             self.store.conn.rollback()
         self.assertEqual(self.rows(result)[0]["shares"], 125)
 
-    def test_broker_day_share_balance(self):
+    def test_broker_day_share_accounting_invariant(self):
         rows = self.rows(self.ingest())
         totals = contract.broker_totals(rows)
         self.assertEqual(list(totals), sorted(totals))
@@ -447,7 +483,7 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertEqual(totals["AB"]["buy_shares"], 425)
         self.assertEqual(totals["AB"]["sell_shares"], 75)
 
-    def test_broker_day_value_balance(self):
+    def test_broker_day_value_accounting_invariant(self):
         rows = self.rows(self.ingest())
         totals = contract.broker_totals(rows)
         value = sum(row["value_rp"] for row in rows)
@@ -513,15 +549,20 @@ class TradeCaptureTests(unittest.TestCase):
         with patch.object(self.store, "_write_transaction", side_effect=fail_before_acceptance):
             with self.assertRaisesRegex(RuntimeError, "synthetic interruption"):
                 self.store.ingest(path, env)
-        with sqlite3.connect(self.db) as independent:
+        with closing(sqlite3.connect(self.db)) as independent:
             self.assertEqual(independent.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
             self.assertEqual(independent.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
         with self.assertRaises(contract.TradeContractError):
             self.store.verify(env.capture_id)
-        accepted = self.store.ingest(path, env)
-        self.assertEqual(accepted["capture_revision"], 1)
-        self.assertEqual(accepted["capture_state"], "FIRST_SEEN")
+        recorded = self.store.conn.execute("SELECT body_recorded_at FROM trade_captures").fetchone()[0]
+        path.unlink()  # Resume needs the sealed body and immutable object, not the original input.
+        accepted = self.store.resume(env.capture_id)
+        self.assertEqual(accepted["observation_seq"], 1)
+        self.assertEqual(accepted["observation_state"], "CONTENT_FIRST_SEEN")
         self.assertTrue(accepted["durable_accepted_at"])
+        self.assertEqual(accepted["body_recorded_at"], recorded)
+        self.assertGreaterEqual(accepted["durable_accepted_at"], recorded)
+        self.assertEqual(self.store.resume(env.capture_id), accepted)
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
         self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 1)
 
@@ -544,8 +585,8 @@ class TradeCaptureTests(unittest.TestCase):
         second = self.ingest([source_row(STK_CODE="BBCA")],
                              env=envelope("capture-bbca", ticker="BBCA"))
         self.assertEqual(self.rows(first)[0]["trx_code"], self.rows(second)[0]["trx_code"])
-        self.assertEqual(second["capture_revision"], 1)
-        self.assertEqual(second["capture_state"], "FIRST_SEEN")
+        self.assertEqual(second["observation_seq"], 1)
+        self.assertEqual(second["observation_state"], "CONTENT_FIRST_SEEN")
 
     def test_parser_batch_size_determinism(self):
         path = write_parquet(self.root / "batch-sizes.parquet", sample_rows() + [source_row()])
@@ -562,11 +603,14 @@ class TradeCaptureTests(unittest.TestCase):
                         contract.normalize_parquet(f"{scheme}://example.invalid/DEWA.parquet", envelope())
                     parser.assert_not_called()
 
-    def test_parser_passes_local_handles_for_string_and_uri_shaped_path(self):
+    def test_parser_passes_local_handles(self):
         local = write_parquet(self.root / "local.parquet")
-        uri_shaped = write_parquet(self.root / "s3:" / "synthetic-bucket" / "local.parquet")
+        paths = [str(local), local]
+        # A colon is legal in a POSIX directory, but an invalid Windows name.
+        if os.name != "nt":
+            paths.append(write_parquet(self.root / "s3:" / "synthetic-bucket" / "local.parquet"))
         expected = contract.normalize_parquet(local, envelope())
-        for path in (str(local), uri_shaped):
+        for path in paths:
             with self.subTest(path=path), patch.object(pq, "ParquetFile", wraps=pq.ParquetFile) as parser:
                 actual = contract.normalize_parquet(path, envelope())
                 parser.assert_called_once()
@@ -590,25 +634,21 @@ class TradeCaptureTests(unittest.TestCase):
         original = write_parquet(self.root / "race-a.parquet", [source_row()])
         replacement = write_parquet(self.root / "race-b.parquet", [source_row(STK_VOLM=130)])
         original_bytes = original.read_bytes()
-        raw_file = self.store.raw_path(contract.sha256_bytes(original_bytes))
         parsed = []
         parser = capture.normalize_parquet
 
-        def swap_parse_restore(source, env):
-            prior = raw_file.read_bytes()
-            raw_file.chmod(0o600)
-            raw_file.write_bytes(replacement.read_bytes())
-            try:
-                tape = parser(source, env)
-                parsed.append((source, tape.rows[0]["shares"]))
-                return tape
-            finally:
-                raw_file.write_bytes(prior)
-                raw_file.chmod(0o400)
+        def replace_input_after_snapshot(source, env):
+            if not parsed:
+                self.assertFalse(self.store.raw_path(contract.sha256_bytes(original_bytes)).exists())
+            original.write_bytes(replacement.read_bytes())
+            tape = parser(source, env)
+            parsed.append((source, tape.rows[0]["shares"]))
+            return tape
 
-        with patch.object(capture, "normalize_parquet", side_effect=swap_parse_restore):
+        with patch.object(capture, "normalize_parquet", side_effect=replace_input_after_snapshot):
             result = self.store.ingest(original, envelope())
         self.assertEqual(result["raw_response_sha256"], contract.sha256_bytes(original_bytes))
+        self.assertEqual(self.store.raw_path(result["raw_response_sha256"]).read_bytes(), original_bytes)
         persisted = json.loads(self.store.conn.execute("SELECT content_json FROM trade_captures").fetchone()[0])
         self.assertEqual(persisted["rows"][0]["shares"], 125)
         self.assertTrue(parsed)
@@ -692,21 +732,21 @@ class TradeCaptureTests(unittest.TestCase):
     def test_first_success_after_absence(self):
         absent = self.store.observe_absence(envelope("capture-absent", http_status=404))
         first = self.ingest()
-        self.assertEqual(first["capture_state"], "FIRST_SEEN")
-        self.assertEqual(first["capture_revision"], 2)
-        self.assertEqual(first["previous_capture_id"], absent["capture_id"])
+        self.assertEqual(first["observation_state"], "CONTENT_FIRST_SEEN")
+        self.assertEqual(first["observation_seq"], 2)
+        self.assertEqual(first["previous_observation_id"], absent["capture_id"])
 
     def test_absence_has_own_immutable_provenance(self):
         first = self.ingest()
         absent = self.store.observe_absence(envelope(
-            "capture-absent", http_status=404, requested_at="2026-10-01T02:01:30.333333Z",
-            response_at="2026-10-01T02:01:31.444444Z"))
+            "capture-absent", http_status=404, requested_at="2026-10-01T10:01:30.333333Z",
+            response_at="2026-10-01T10:01:31.444444Z"))
         repeat = self.ingest()
-        self.assertEqual(absent["previous_capture_id"], first["capture_id"])
-        self.assertEqual(repeat["previous_capture_id"], absent["capture_id"])
-        self.assertEqual(repeat["capture_state"], "REPEAT_CONFIRMED")
-        self.assertEqual(repeat["capture_revision"], 3)
-        self.assertEqual(absent["response_at"], "2026-10-01T02:01:31.444444Z")
+        self.assertEqual(absent["previous_observation_id"], first["capture_id"])
+        self.assertEqual(repeat["previous_observation_id"], absent["capture_id"])
+        self.assertEqual(repeat["observation_state"], "CONTENT_REPEAT")
+        self.assertEqual(repeat["observation_seq"], 3)
+        self.assertEqual(absent["response_at"], "2026-10-01T10:01:31.444444Z")
 
     def test_http_status_contract(self):
         with self.assertRaises(contract.TradeContractError):
@@ -719,7 +759,7 @@ class TradeCaptureTests(unittest.TestCase):
     def test_update_delete_and_duplicate_insert_refused(self):
         result = self.ingest()
         statements = [
-            "UPDATE trade_captures SET capture_state='REVISED' WHERE capture_id=?",
+            "UPDATE trade_captures SET observation_state='CONTENT_CHANGED' WHERE capture_id=?",
             "DELETE FROM trade_captures WHERE capture_id=?",
             "INSERT INTO trade_captures SELECT * FROM trade_captures WHERE capture_id=?",
             "UPDATE trade_acceptances SET durable_accepted_at='2026-10-03T00:00:00Z' WHERE capture_id=?",
@@ -750,9 +790,11 @@ class TradeCaptureTests(unittest.TestCase):
     def test_version_chain_tampering_detected(self):
         self.ingest()
         revised = self.ingest([source_row(STK_VOLM=126)])
+        self.store.conn.execute("PRAGMA ignore_check_constraints=ON")
         rewrite_immutable_row(self.store.conn,
-                              "UPDATE trade_captures SET previous_capture_id=NULL WHERE capture_id=?",
+                              "UPDATE trade_captures SET previous_observation_id=NULL WHERE capture_id=?",
                               (revised["capture_id"],))
+        self.store.conn.execute("PRAGMA ignore_check_constraints=OFF")
         with self.assertRaises(contract.TradeContractError):
             self.store.verify(revised["capture_id"])
 
@@ -766,7 +808,7 @@ class TradeCaptureTests(unittest.TestCase):
 
     def test_missing_raw_file_detected(self):
         result = self.ingest()
-        next(self.raw.rglob("*.parquet")).unlink()
+        remove_readonly(next(self.raw.rglob("*.parquet")))
         with self.assertRaises(contract.TradeContractError):
             self.store.verify(result["capture_id"])
 
@@ -834,19 +876,19 @@ class TradeCaptureTests(unittest.TestCase):
         self.assert_rejected([source_row(STK_VOLM=-1, VALUE=Decimal("-12.70"))])
 
     def test_microseconds_and_timezone_canonicalization(self):
-        env = envelope(requested_at="2026-10-01T09:00:00.123456+07:00",
-                       response_at="2026-10-01T09:00:01.654321+07:00")
-        self.assertEqual(env.requested_at, "2026-10-01T02:00:00.123456Z")
-        self.assertEqual(env.response_at, "2026-10-01T02:00:01.654321Z")
+        env = envelope(requested_at="2026-10-01T17:00:00.123456+07:00",
+                       response_at="2026-10-01T17:00:01.654321+07:00")
+        self.assertEqual(env.requested_at, "2026-10-01T10:00:00.123456Z")
+        self.assertEqual(env.response_at, "2026-10-01T10:00:01.654321Z")
         result = self.ingest(env=env)
         self.assertEqual(result["requested_at"], env.requested_at)
         self.assertEqual(result["response_at"], env.response_at)
-        self.assertRegex(result["durable_accepted_at"], r"\.\d{6}Z$")
+        self.assertRegex(result["durable_accepted_at"], r"\.[0-9]{6}Z$")
 
     def test_envelope_validation_and_immutability(self):
         for changes in (
             {"ticker": "dewa"}, {"ticker": "DEWA?sig=dummy"}, {"trade_date": "2026-02-30"},
-            {"requested_at": "2026-10-01T02:00:00"},
+            {"requested_at": "2026-10-01T10:00:00"},
             {"response_at": "2026-10-01T01:00:00Z"},
             {"created_by": "Bearer dummy-never-persist"},
             {"x_ms_request_id": "session=dummy-never-persist"},
@@ -884,7 +926,7 @@ class TradeCaptureTests(unittest.TestCase):
         self.assertEqual(output["board_counts"], {"NG": 1, "RG": 2})
         self.assertEqual(output["time_range"], ["09:01:01", "16:00:01"])
         self.assertEqual(self.db.read_bytes(), before)
-        next(self.raw.rglob("*.parquet")).unlink()
+        remove_readonly(next(self.raw.rglob("*.parquet")))
         with self.assertRaises(contract.TradeContractError):
             self.store.inspect(result["capture_id"])
 
@@ -893,10 +935,10 @@ class TradeCaptureTests(unittest.TestCase):
         cli_db = self.root / "cli-private" / "capture.db"
         command = [sys.executable, str(Path(capture.__file__)), "ingest", "--db", str(cli_db),
                    "--ticker", "DEWA", "--trade-date", "2026-10-01", "--file", str(path),
-                   "--requested-at", "2026-10-01T02:00:00.123456Z",
-                   "--response-at", "2026-10-01T02:00:01.654321Z", "--capture-id", "cli-capture"]
+                   "--requested-at", "2026-10-01T10:00:00.123456Z",
+                   "--response-at", "2026-10-01T10:00:01.654321Z", "--capture-id", "cli-capture"]
         ingested = subprocess.run(command, capture_output=True, text=True, check=True)
-        self.assertEqual(json.loads(ingested.stdout)["capture_state"], "FIRST_SEEN")
+        self.assertEqual(json.loads(ingested.stdout)["observation_state"], "CONTENT_FIRST_SEEN")
         for action in ("verify", "inspect"):
             result = subprocess.run([sys.executable, str(Path(capture.__file__)), action,
                                      "--db", str(cli_db), "--capture-id", "cli-capture"],
@@ -908,11 +950,796 @@ class TradeCaptureTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(Path(capture.__file__)), "ingest", "--db", str(self.root / "bad.db"),
              "--ticker", "DEWA", "--trade-date", "2026-10-01", "--file", str(self.root / dummy),
-             "--requested-at", "2026-10-01T02:00:00Z", "--response-at", "2026-10-01T02:00:01Z",
+             "--requested-at", "2026-10-01T10:00:00Z", "--response-at", "2026-10-01T10:00:01Z",
              "--source-path", f"https://example.invalid/file?sig={dummy}"],
             capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(dummy, result.stdout + result.stderr)
+
+    def test_required_observation_content_matrix(self):
+        scenarios = [
+            ("same-raw", [(200, 125, False), (200, 125, False)],
+             ["CONTENT_FIRST_SEEN", "CONTENT_REPEAT"], [1, 1]),
+            ("new-raw-same-content", [(200, 125, False), (200, 125, True)],
+             ["CONTENT_FIRST_SEEN", "CONTENT_REPEAT"], [1, 1]),
+            ("changed", [(200, 125, False), (200, 126, False)],
+             ["CONTENT_FIRST_SEEN", "CONTENT_CHANGED"], [1, 2]),
+            ("absent-twice", [(404, None, False), (404, None, False)],
+             ["ABSENT_OBSERVED", "ABSENT_OBSERVED"], [None, None]),
+            ("absent-then-content", [(404, None, False), (200, 125, False)],
+             ["ABSENT_OBSERVED", "CONTENT_FIRST_SEEN"], [None, 1]),
+            ("content-then-absent", [(200, 125, False), (404, None, False)],
+             ["CONTENT_FIRST_SEEN", "ABSENT_OBSERVED"], [1, None]),
+            ("changed-then-repeat", [(200, 125, False), (200, 126, False), (200, 126, False)],
+             ["CONTENT_FIRST_SEEN", "CONTENT_CHANGED", "CONTENT_REPEAT"], [1, 2, 2]),
+            ("absence-does-not-erase", [(200, 125, False), (404, None, False), (200, 125, True)],
+             ["CONTENT_FIRST_SEEN", "ABSENT_OBSERVED", "CONTENT_REPEAT"], [1, None, 1]),
+        ]
+        for label, events, states, versions in scenarios:
+            with self.subTest(scenario=label), capture.TradeCaptureStore(
+                    self.root / label / "capture.db") as store:
+                results = []
+                last_content = None
+                for index, (status, shares, reencoded) in enumerate(events, start=1):
+                    env = observation(label + str(index), index, http_status=status)
+                    if status == 404:
+                        result = store.observe_absence(env)
+                    else:
+                        path = write_parquet(self.root / (label + str(index) + ".parquet"),
+                                             [source_row(STK_VOLM=shares)],
+                                             use_dictionary=not reencoded,
+                                             compression="none" if reencoded else "zstd")
+                        result = store.ingest(path, env)
+                    self.assertEqual(result["observation_seq"], index)
+                    self.assertEqual(result["observation_state"], states[index - 1])
+                    self.assertEqual(result["content_version"], versions[index - 1])
+                    self.assertEqual(result["previous_observation_id"],
+                                     None if not results else results[-1]["capture_id"])
+                    self.assertEqual(result["previous_content_capture_id"], last_content)
+                    self.assertEqual(store.verify(env.capture_id), result)
+                    if status == 200:
+                        last_content = result["capture_id"]
+                    results.append(result)
+                if label == "same-raw":
+                    self.assertEqual(results[0]["raw_response_sha256"], results[1]["raw_response_sha256"])
+                if label == "new-raw-same-content":
+                    self.assertNotEqual(results[0]["raw_response_sha256"], results[1]["raw_response_sha256"])
+                    self.assertEqual(results[0]["normalized_content_sha256"], results[1]["normalized_content_sha256"])
+                if label == "content-then-absent":
+                    self.assertEqual(store.read_rows(results[0]["capture_id"])[0]["shares"], 125)
+
+    def test_backdated_matrix_refused_for_content_and_absence(self):
+        for first_status, second_status, shares, reencoded in (
+                (200, 200, 125, False), (200, 200, 125, True), (200, 200, 126, False),
+                (404, 404, None, False), (404, 200, 125, False), (200, 404, None, False)):
+            label = f"late-{first_status}-{second_status}-{shares}-{reencoded}"
+            with self.subTest(scenario=label), capture.TradeCaptureStore(
+                    self.root / label / "capture.db") as store:
+                first = observation(label + "a", 30, http_status=first_status)
+                if first_status == 404:
+                    store.observe_absence(first)
+                else:
+                    store.ingest(write_parquet(self.root / (label + "a.parquet"), [source_row()]), first)
+                before_raw = set(store.raw_root.rglob("*.parquet"))
+                second = observation(label + "b", 10, http_status=second_status)
+                with self.assertRaises(contract.TradeContractError):
+                    if second_status == 404:
+                        store.observe_absence(second)
+                    else:
+                        store.ingest(write_parquet(self.root / (label + "b.parquet"),
+                                     [source_row(STK_VOLM=shares)], use_dictionary=not reencoded), second)
+                self.assertEqual(store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+                self.assertEqual(store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 1)
+                self.assertEqual(set(store.raw_root.rglob("*.parquet")), before_raw)
+                self.assertEqual(list(store.raw_root.rglob(".pending-*")), [])
+
+    def test_equal_response_or_overlapping_request_refused(self):
+        for status in (200, 404):
+            for kind in ("equal-response", "overlapping-request"):
+                label = f"chronology-{status}-{kind}"
+                with self.subTest(status=status, kind=kind), capture.TradeCaptureStore(
+                        self.root / label / "capture.db") as store:
+                    first = observation(label + "a", 10, http_status=status)
+                    path = write_parquet(self.root / (label + ".parquet"))
+                    if status == 404:
+                        store.observe_absence(first)
+                    else:
+                        store.ingest(path, first)
+                    second = replace(first, capture_id=label + "b",
+                                     requested_at=(first.response_at if kind == "equal-response"
+                                                   else "2026-10-01T10:10:00.500000Z"),
+                                     response_at=(first.response_at if kind == "equal-response"
+                                                  else "2026-10-01T10:10:03.000000Z"))
+                    with self.assertRaises(contract.TradeContractError):
+                        if status == 404:
+                            store.observe_absence(second)
+                        else:
+                            store.ingest(path, second)
+
+    def test_verify_rechecks_source_chronology(self):
+        first = self.ingest([source_row()], env=observation("chronology-a", 30))
+        second = self.ingest([source_row(STK_VOLM=126)], env=observation("chronology-b", 31))
+        record = self.store.conn.execute("SELECT metadata_json FROM trade_captures WHERE capture_id=?",
+                                         (second["capture_id"],)).fetchone()[0]
+        changed = json.loads(record)
+        changed.update(requested_at="2026-10-01T10:20:00.000000Z",
+                       response_at="2026-10-01T10:20:01.000000Z")
+        rewrite_immutable_row(self.store.conn,
+                              "UPDATE trade_captures SET metadata_json=? WHERE capture_id=?",
+                              (contract.canonical_json(changed), second["capture_id"]),
+                              reseal_capture_id=second["capture_id"])
+        self.assertTrue(self.store.verify(first["capture_id"]))
+        with self.assertRaises(contract.TradeContractError):
+            self.store.verify(second["capture_id"])
+
+    def test_resealed_state_and_version_tampering_detected(self):
+        first = self.ingest([source_row()])
+        repeated = self.ingest([source_row()])
+        for field, bad_value, good_value in (
+                ("observation_state", "CONTENT_CHANGED", "CONTENT_REPEAT"),
+                ("content_version", 2, 1),
+                ("previous_content_capture_id", repeated["capture_id"], first["capture_id"])):
+            with self.subTest(field=field):
+                rewrite_immutable_row(self.store.conn,
+                                      f"UPDATE trade_captures SET {field}=? WHERE capture_id=?",
+                                      (bad_value, repeated["capture_id"]),
+                                      reseal_capture_id=repeated["capture_id"])
+                with self.assertRaises(contract.TradeContractError):
+                    self.store.verify(repeated["capture_id"])
+                rewrite_immutable_row(self.store.conn,
+                                      f"UPDATE trade_captures SET {field}=? WHERE capture_id=?",
+                                      (good_value, repeated["capture_id"]),
+                                      reseal_capture_id=repeated["capture_id"])
+
+    def test_resealed_duplicate_schema_and_length_tampering_detected(self):
+        result = self.ingest([source_row(), source_row()])
+        record = dict(self.store.conn.execute("SELECT * FROM trade_captures").fetchone())
+        for field, bad_value in (("duplicate_counts_json", "[]"),
+                                 ("schema_fingerprint", "0" * 64),
+                                 ("source_row_count", 3),
+                                 ("row_count", 2),
+                                 ("content_length", result["content_length"] + 1)):
+            with self.subTest(field=field):
+                rewrite_immutable_row(self.store.conn,
+                                      f"UPDATE trade_captures SET {field}=? WHERE capture_id=?",
+                                      (bad_value, result["capture_id"]), reseal_capture_id=result["capture_id"])
+                with self.assertRaises(contract.TradeContractError):
+                    self.store.verify(result["capture_id"])
+                rewrite_immutable_row(self.store.conn,
+                                      f"UPDATE trade_captures SET {field}=? WHERE capture_id=?",
+                                      (record[field], result["capture_id"]), reseal_capture_id=result["capture_id"])
+
+    def test_raw_destination_metadata_tampering_detected(self):
+        result = self.ingest()
+        rewrite_immutable_row(self.store.conn,
+                              "UPDATE trade_store_meta SET value=? WHERE key='raw_root'",
+                              (str(self.root / "different-raw-root"),))
+        with self.assertRaises(contract.TradeContractError):
+            self.store.verify(result["capture_id"])
+
+    def test_parent_acceptance_ordering_rechecked(self):
+        first = self.ingest([source_row()])
+        second = self.ingest([source_row(STK_VOLM=126)])
+        self.assertGreater(second["durable_accepted_at"], second["body_recorded_at"])
+        rewrite_immutable_row(self.store.conn,
+                              "UPDATE trade_acceptances SET durable_accepted_at=? WHERE capture_id=?",
+                              (second["durable_accepted_at"], first["capture_id"]))
+        with self.assertRaises(contract.TradeContractError):
+            self.store.verify(second["capture_id"])
+
+    def test_same_trigger_name_with_corrupt_body_refused(self):
+        result = self.ingest()
+        name = "immutable_trade_captures_update"
+        self.store.conn.execute(f"DROP TRIGGER {name}")
+        self.store.conn.execute(f"CREATE TRIGGER {name} BEFORE UPDATE ON trade_captures BEGIN SELECT 1; END")
+        self.store.conn.commit()
+        with self.assertRaises(contract.TradeContractError):
+            self.store.verify(result["capture_id"])
+
+    def test_requires_parent_trigger_blocks_orphan_observation(self):
+        result = self.ingest()
+        record = dict(self.store.conn.execute("SELECT * FROM trade_captures").fetchone())
+        record.update(capture_id="orphan-observation", observation_seq=2, previous_observation_id=None)
+        columns = tuple(record)
+        self.store.conn.execute("PRAGMA foreign_keys=OFF")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.conn.execute(f"INSERT INTO trade_captures ({','.join(columns)}) VALUES "
+                                    f"({','.join('?' for _ in columns)})", tuple(record.values()))
+        self.store.conn.rollback()
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+        self.assertTrue(self.store.verify(result["capture_id"]))
+
+    def test_meta_update_delete_and_replace_refused(self):
+        for sql in ("UPDATE trade_store_meta SET value='forged' WHERE key='product'",
+                    "DELETE FROM trade_store_meta WHERE key='product'",
+                    "INSERT OR REPLACE INTO trade_store_meta VALUES ('product','forged')"):
+            with self.subTest(sql=sql), self.assertRaises(sqlite3.DatabaseError):
+                self.store.conn.execute(sql)
+            self.store.conn.rollback()
+
+    def test_null_identity_keys_fail_sqlite_constraints(self):
+        self.ingest()
+        record = dict(self.store.conn.execute("SELECT * FROM trade_captures").fetchone())
+        with closing(sqlite3.connect(":memory:")) as conn:
+            for ddl in capture.TABLE_SQL.values():
+                conn.execute(ddl)
+            for field in ("capture_id", "ticker", "trade_date", "observation_seq"):
+                candidate = dict(record, **{field: None})
+                columns = tuple(candidate)
+                with self.subTest(field=field), self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(f"INSERT INTO trade_captures ({','.join(columns)}) VALUES "
+                                 f"({','.join('?' for _ in columns)})", tuple(candidate.values()))
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO trade_store_meta VALUES (NULL, 'forged')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO trade_acceptances VALUES (NULL, ?, ?)",
+                             ("0" * 64, "2026-10-02T00:00:00.000000Z"))
+
+    def test_absence_null_fields_enforced_in_sql_and_verify(self):
+        absent = self.store.observe_absence(envelope(http_status=404))
+        record = dict(self.store.conn.execute("SELECT * FROM trade_captures").fetchone())
+        null_fields = ("content_version", "raw_response_sha256", "normalized_content_sha256",
+                       "schema_fingerprint", "schema_version", "row_count", "source_row_count",
+                       "duplicate_counts_json", "content_json", "content_length")
+        with closing(sqlite3.connect(":memory:")) as conn:
+            for ddl in capture.TABLE_SQL.values():
+                conn.execute(ddl)
+            for field in null_fields:
+                self.assertIsNone(record[field])
+                candidate = dict(record, **{field: 0 if field.endswith("count") or field in
+                                            ("content_version", "content_length") else "forged"})
+                columns = tuple(candidate)
+                with self.subTest(field=field), self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(f"INSERT INTO trade_captures ({','.join(columns)}) VALUES "
+                                 f"({','.join('?' for _ in columns)})", tuple(candidate.values()))
+        # Bypass CHECK constraints to ensure verifier independently enforces truth.
+        self.store.conn.execute("PRAGMA ignore_check_constraints=ON")
+        rewrite_immutable_row(self.store.conn,
+                              "UPDATE trade_captures SET content_length=0 WHERE capture_id=?",
+                              (absent["capture_id"],), reseal_capture_id=absent["capture_id"])
+        self.store.conn.execute("PRAGMA ignore_check_constraints=OFF")
+        with self.assertRaises(contract.TradeContractError):
+            self.store.verify(absent["capture_id"])
+
+    def test_zero_row_recent_and_legacy_refused(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.assert_rejected([], legacy=legacy)
+
+    def test_rejected_nonparquet_bytes_leave_no_published_object(self):
+        for name, data in (("html", b"<html><title>Sign in</title></html>"),
+                           ("malformed", b"PAR1not-a-parquet-bodyPAR1")):
+            path = self.root / (name + ".parquet")
+            path.write_bytes(data)
+            with self.subTest(body=name), self.assertRaises(contract.TradeContractError):
+                self.store.ingest(path, envelope(name))
+            self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+            self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+            self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+            self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+
+    def test_raw_publish_windows_safe_order(self):
+        data = b"invented offline lifecycle fixture"
+        digest = contract.sha256_bytes(data)
+        destination = self.store.raw_path(digest)
+        events = []
+        real_link, real_unlink, real_chmod = os.link, os.unlink, os.chmod
+
+        def link(source, target, *args, **kwargs):
+            self.assertTrue(Path(source).stat().st_mode & stat.S_IWRITE)
+            events.append("link")
+            return real_link(source, target, *args, **kwargs)
+
+        def unlink(path, *args, **kwargs):
+            if Path(path).name.startswith(".pending-"):
+                self.assertTrue(Path(path).stat().st_mode & stat.S_IWRITE)
+                self.assertTrue(destination.stat().st_mode & stat.S_IWRITE)
+                events.append("unlink-temp")
+            return real_unlink(path, *args, **kwargs)
+
+        def chmod(path, mode, *args, **kwargs):
+            if Path(path) == destination and not mode & stat.S_IWRITE:
+                self.assertEqual(list(destination.parent.glob(".pending-*")), [])
+                events.append("protect-destination")
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with patch.object(capture.os, "link", side_effect=link), \
+                patch.object(capture.os, "unlink", side_effect=unlink), \
+                patch.object(capture.os, "chmod", side_effect=chmod):
+            self.assertEqual(self.store._preserve_raw(data, digest), destination)
+        self.assertEqual(events, ["link", "unlink-temp", "protect-destination"])
+        self.assertEqual(destination.read_bytes(), data)
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_raw_existing_conflict_cleanup_keeps_protection(self):
+        data = b"invented immutable raw body"
+        digest = contract.sha256_bytes(data)
+        destination = self.store._preserve_raw(data, digest)
+        self.assertEqual(self.store._preserve_raw(data, digest), destination)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+        destination.chmod(stat.S_IWRITE | stat.S_IREAD)
+        destination.write_bytes(b"different bytes at the same digest path")
+        destination.chmod(stat.S_IREAD)
+        with self.assertRaisesRegex(contract.TradeContractError, "differs"):
+            self.store._preserve_raw(data, digest)
+        self.assertEqual(destination.read_bytes(), b"different bytes at the same digest path")
+        self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_raw_link_failure_leaves_no_orphan_or_pending_file(self):
+        data = b"invented offline publication failure"
+        with patch.object(capture.os, "link", side_effect=OSError("synthetic link failure")):
+            with self.assertRaises(OSError):
+                self.store._preserve_raw(data, contract.sha256_bytes(data))
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_zero_shares_and_zero_price_refused(self):
+        for values in ({"STK_VOLM": 0}, {"STK_PRIC": 0}):
+            with self.subTest(values=values):
+                self.assert_rejected([source_row(**values)])
+
+    def test_value_float32_refused(self):
+        self.assert_rejected([source_row(VALUE=1587.5)], field_types={"VALUE": pa.float32()})
+
+    def test_legacy_trx_type_requires_exact_audited_zero(self):
+        path = write_parquet(self.root / "legacy-nonzero.parquet", legacy=True)
+        table = pq.read_table(path)
+        index = table.schema.get_field_index("TRX_TYPE")
+        table = table.set_column(index, table.schema.field(index), pa.array([1] * len(table), pa.int32()))
+        pq.write_table(table, path)
+        with self.assertRaises(contract.TradeContractError):
+            self.store.ingest(path, envelope())
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+
+    def test_double_binary_imprecision_reconciles_exact_integer_money(self):
+        for shares, price, value in ((29, 1, 0.29), (137, 103, 141.11)):
+            with self.subTest(shares=shares, price=price):
+                self.assertNotEqual(value * 100, shares * price)
+                row = self.rows(self.ingest([source_row(STK_VOLM=shares, STK_PRIC=price, VALUE=value)],
+                                            field_types={"VALUE": pa.float64()}))[0]
+                self.assertEqual(row["value_rp"], shares * price)
+                self.assertIs(type(row["value_rp"]), int)
+
+    def test_double_nonfinite_and_ambiguous_large_money_refused(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=str(value)):
+                self.assert_rejected([source_row(VALUE=value)], field_types={"VALUE": pa.float64()})
+        self.assert_rejected([source_row(STK_VOLM=2 ** 60, STK_PRIC=100, VALUE=float(2 ** 60))],
+                             field_types={"VALUE": pa.float64()})
+
+    def test_unicode_numeric_and_time_strings_refused(self):
+        for changes, types in (({"TRX_TIME": "０９:０１:０１"}, {"TRX_TIME": pa.string()}),
+                               ({"TRX_TIME": "٠٩٠١٠١"}, {"TRX_TIME": pa.string()}),
+                               ({"STK_VOLM": "１２５"}, {"STK_VOLM": pa.string()})):
+            with self.subTest(changes=changes):
+                self.assert_rejected([source_row(**changes, VALUE=Decimal("1587.50"))], field_types=types)
+
+    def test_time_lower_bounds_and_headers_apply_to_200_and_404(self):
+        for status in (200, 404):
+            for changes in (
+                {"requested_at": "2026-09-30T16:58:00Z", "response_at": "2026-09-30T16:59:00Z",
+                 "last_modified": None, "x_ms_creation_time": None},
+                {"last_modified": "2026-10-01T10:00:02Z"},
+                {"x_ms_creation_time": "2026-10-01T10:00:02Z", "last_modified": None},
+                {"x_ms_creation_time": "2026-10-01T01:59:59.222222Z",
+                 "last_modified": "2026-10-01T01:58:00.111111Z"},
+                {"requested_at": "2026-10-01T10:01:00Z"},
+            ):
+                with self.subTest(status=status, changes=changes), self.assertRaises(contract.TradeContractError):
+                    env = envelope(http_status=status, **changes)
+                    if status == 404:
+                        self.store.observe_absence(env)
+                    else:
+                        self.ingest(env=env)
+        for headers in ({"last_modified": None}, {"x_ms_creation_time": None},
+                        {"last_modified": None, "x_ms_creation_time": None}):
+            self.assertIsInstance(envelope(**headers), contract.CaptureEnvelope)
+
+    def test_response_cannot_precede_represented_trade(self):
+        self.assert_rejected([source_row(TRX_TIME=160001)], env=envelope(
+            requested_at="2026-10-01T09:00:00Z", response_at="2026-10-01T09:00:00.999999Z"))
+        # Source has seconds only: capture during the represented second is plausible.
+        result = self.ingest([source_row(TRX_TIME=160001)], env=envelope(
+            "same-trade-second", requested_at="2026-10-01T09:00:01Z",
+            response_at="2026-10-01T09:00:01.000001Z"))
+        self.assertEqual(self.rows(result)[0]["trade_time"], "16:00:01")
+
+    def test_source_sanitizer_matrix_device_paths_and_exception_context(self):
+        secret = "dummy-secret-never-persist"
+        for source in (f"https://example.invalid/trade;token={secret}/DEWA.parquet",
+                       f"https://example.invalid/trade%3Btoken={secret}/DEWA.parquet",
+                       rf"\\?\C:\private\DEWA.parquet?sig={secret}",
+                       rf"\\.\C:\private\DEWA.parquet?sig={secret}",
+                       f"https://[broken-host/{secret}/DEWA.parquet",
+                       f"https://example.invalid:broken/{secret}/DEWA.parquet"):
+            with self.subTest(source=source), self.assertRaises(contract.TradeContractError) as error:
+                contract.sanitize_source_path(source)
+            self.assertNotIn(secret, str(error.exception))
+            self.assertIsNone(error.exception.__context__)
+
+    def test_source_fragment_stripping_and_literal_local_hash(self):
+        self.assertEqual(contract.sanitize_source_path("https://example.invalid/DEWA.parquet#fragment"),
+                         "https://example.invalid/DEWA.parquet")
+        self.assertEqual(contract.sanitize_source_path("/ordinary/capture/DEWA#draft.parquet"),
+                         "/ordinary/capture/DEWA#draft.parquet")
+        self.assertEqual(contract.sanitize_source_path(r"C:\ordinary\DEWA#draft.parquet"),
+                         "C:/ordinary/DEWA#draft.parquet")
+
+    def test_ordinary_storage_directory_names_allowed(self):
+        for index, name in enumerate(("session", "token", "a" * 40), start=1):
+            with self.subTest(name=name), capture.TradeCaptureStore(
+                    self.root / name / "capture.db", raw_root=self.root / name / "raw") as store:
+                self.assertTrue(store.db.is_file())
+                path = write_parquet(self.root / name / "input.parquet")
+                self.assertEqual(store.ingest(path, envelope("ordinary-" + str(index)))["row_count"], 3)
+
+    def test_legacy_identical_raw_is_envelope_scoped(self):
+        path = write_parquet(self.root / "legacy-scoped.parquet", legacy=True)
+        first = self.store.ingest(path, envelope("legacy-dewa"))
+        second = self.store.ingest(path, envelope("legacy-bbca", ticker="BBCA", trade_date="2026-09-30"))
+        self.assertEqual(first["raw_response_sha256"], second["raw_response_sha256"])
+        self.assertNotEqual(first["normalized_content_sha256"], second["normalized_content_sha256"])
+        self.assertEqual(self.rows(first)[0]["ticker"], "DEWA")
+        self.assertEqual(self.rows(second)[0]["ticker"], "BBCA")
+        self.assertEqual(second["content_version"], 1)
+
+    def test_duplicate_collapse_count_exposed_in_safe_metadata(self):
+        result = self.ingest([source_row(), source_row(), source_row(TRX_CODE=1002)])
+        for metadata in (result, self.store.verify(result["capture_id"]), self.store.inspect(result["capture_id"])):
+            self.assertEqual(metadata["duplicate_collapse_count"], 1)
+            self.assertEqual(metadata["row_count"], 2)
+            self.assertEqual(metadata["source_row_count"], 3)
+
+    def test_pending_body_blocks_successor_with_recovery_instruction(self):
+        path = write_parquet(self.root / "pending.parquet")
+        env = observation("pending-body", 1)
+        transaction = self.store._write_transaction
+        calls = 0
+
+        def fail_acceptance():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("synthetic crash before acceptance")
+            return transaction()
+
+        with patch.object(self.store, "_write_transaction", side_effect=fail_acceptance):
+            with self.assertRaises(RuntimeError):
+                self.store.ingest(path, env)
+        with self.assertRaises(contract.TradeContractError) as error:
+            self.store.ingest(path, observation("pending-successor", 2))
+        self.assertIn(env.capture_id, str(error.exception))
+        self.assertIn("resume", str(error.exception).lower())
+        self.store.resume(env.capture_id)
+        self.assertEqual(self.store.ingest(path, observation("pending-successor", 2))["observation_seq"], 2)
+
+    def test_pending_absence_resumes_without_envelope_or_input(self):
+        env = observation("pending-absence", 1, http_status=404)
+        transaction = self.store._write_transaction
+        calls = 0
+
+        def fail_acceptance():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("synthetic crash before absence acceptance")
+            return transaction()
+
+        with patch.object(self.store, "_write_transaction", side_effect=fail_acceptance):
+            with self.assertRaises(RuntimeError):
+                self.store.observe_absence(env)
+        recorded = self.store.conn.execute("SELECT body_recorded_at FROM trade_captures").fetchone()[0]
+        result = self.store.resume(env.capture_id)
+        self.assertEqual(result["observation_state"], "ABSENT_OBSERVED")
+        self.assertIsNone(result["content_version"])
+        self.assertEqual(result["body_recorded_at"], recorded)
+        self.assertTrue(result["durable_accepted_at"])
+        self.assertEqual(self.store.resume(env.capture_id), result)
+
+    def test_resume_revalidates_raw_and_refuses_unknown_capture(self):
+        with self.assertRaises(contract.TradeContractError):
+            self.store.resume("unknown-pending-body")
+        result = self.ingest()
+        rewrite_immutable_row(self.store.conn, "DELETE FROM trade_acceptances WHERE capture_id=?",
+                              (result["capture_id"],))
+        raw = self.store.raw_path(result["raw_response_sha256"])
+        raw.chmod(stat.S_IWRITE | stat.S_IREAD)
+        raw.write_bytes(b"corrupt pending raw object")
+        with self.assertRaises(contract.TradeContractError):
+            self.store.resume(result["capture_id"])
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+
+    def test_cli_rejects_abbreviated_and_repeated_single_value_flags(self):
+        for arguments in (("--capt", "capture-a"),
+                          ("--capture-id", "capture-a", "--capture-id", "capture-a"),
+                          ("--capture-id", "capture-a", "--db", str(self.db))):
+            result = subprocess.run([sys.executable, str(Path(capture.__file__)), "verify", "--db",
+                                     str(self.db), *arguments], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace")
+            self.assertEqual(result.returncode, 2)
+
+    def test_cli_read_only_purity_and_checkpointed_wal_mode(self):
+        result = self.ingest()
+        self.store.close()
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        for action in ("verify", "inspect"):
+            before = {str(path.relative_to(self.root)): path.read_bytes()
+                      for path in self.root.rglob("*") if path.is_file()}
+            run = subprocess.run([sys.executable, str(Path(capture.__file__)), action,
+                                  "--db", str(self.db), "--raw-root", str(self.raw),
+                                  "--capture-id", result["capture_id"]], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
+            self.assertNotEqual(run.returncode, 0)
+            after = {str(path.relative_to(self.root)): path.read_bytes()
+                     for path in self.root.rglob("*") if path.is_file()}
+            self.assertEqual(after, before)
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(Path(str(self.db) + suffix).exists())
+        # A writer checkpoints and restores this store's DELETE journal model.
+        with capture.TradeCaptureStore(self.db, raw_root=self.raw) as writer:
+            self.assertEqual(writer.conn.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        for action in ("verify", "inspect"):
+            before = {str(path.relative_to(self.root)): path.read_bytes()
+                      for path in self.root.rglob("*") if path.is_file()}
+            run = subprocess.run([sys.executable, str(Path(capture.__file__)), action,
+                                  "--db", str(self.db), "--raw-root", str(self.raw),
+                                  "--capture-id", result["capture_id"]], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout)["capture_id"], result["capture_id"])
+            self.assertEqual({str(path.relative_to(self.root)): path.read_bytes()
+                              for path in self.root.rglob("*") if path.is_file()}, before)
+
+    def test_cli_resume_accepts_pending_body(self):
+        result = self.ingest()
+        rewrite_immutable_row(self.store.conn, "DELETE FROM trade_acceptances WHERE capture_id=?",
+                              (result["capture_id"],))
+        original_body = result["body_recorded_at"]
+        self.store.close()
+        command = [sys.executable, str(Path(capture.__file__)), "resume", "--db", str(self.db),
+                   "--raw-root", str(self.raw), "--capture-id", result["capture_id"]]
+        resumed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        metadata = json.loads(resumed.stdout)
+        self.assertEqual(metadata["body_recorded_at"], original_body)
+        self.assertTrue(metadata["durable_accepted_at"])
+        retry = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout), metadata)
+
+    def test_durable_default_location_outside_repository(self):
+        self.assertNotEqual(capture.DEFAULT_DB.parent, Path(capture.__file__).resolve().parent / "private_data")
+        self.assertFalse(capture.DEFAULT_DB.is_relative_to(Path(capture.__file__).resolve().parent))
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(self.root / "xdg"),
+                                     "LOCALAPPDATA": str(self.root / "local-app-data")}):
+            location = capture._user_data_directory()
+            self.assertTrue(location.is_absolute())
+            if sys.platform == "win32":
+                self.assertEqual(location, self.root / "local-app-data" / "DailyScraper" / "bandarmolony")
+            elif sys.platform != "darwin":
+                self.assertEqual(location, self.root / "xdg" / "dailyscraper" / "bandarmolony")
+
+    def test_publication_then_body_insert_failure_removes_orphan(self):
+        path = write_parquet(self.root / "insert-failure.parquet")
+        with patch.object(capture, "_body_digest", return_value=None):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.ingest(path, envelope())
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 0)
+        self.assertEqual(list(self.raw.rglob("*.parquet")), [])
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+
+    def test_read_only_reader_cannot_observe_uncommitted_body_or_acceptance(self):
+        first = self.ingest()
+        record = dict(self.store.conn.execute("SELECT * FROM trade_captures").fetchone())
+        env = observation("uncommitted-writer", 2)
+        record.update(capture_id=env.capture_id, observation_seq=2,
+                      previous_observation_id=first["capture_id"],
+                      previous_content_capture_id=first["capture_id"],
+                      observation_state="CONTENT_REPEAT", metadata_json=contract.canonical_json(asdict(env)),
+                      body_recorded_at=capture.utc_now())
+        record["body_sha256"] = capture._body_digest(record)
+        columns = tuple(record)
+        with capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True) as reader:
+            self.store.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.store.conn.execute(f"INSERT INTO trade_captures ({','.join(columns)}) VALUES "
+                                        f"({','.join('?' for _ in columns)})", tuple(record.values()))
+                self.store.conn.execute("INSERT INTO trade_acceptances VALUES (?, ?, ?)",
+                                        (env.capture_id, record["body_sha256"], capture.utc_now()))
+                before = {path.name: path.read_bytes() for path in self.db.parent.iterdir() if path.is_file()}
+                self.assertEqual(reader.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+                self.assertEqual(reader.conn.execute("SELECT count(*) FROM trade_acceptances").fetchone()[0], 1)
+                with self.assertRaises(contract.TradeContractError):
+                    reader.verify(env.capture_id)
+                # A new operator reader also refuses the active recovery journal.
+                with self.assertRaises(contract.TradeContractError):
+                    with capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True):
+                        pass
+                after = {path.name: path.read_bytes() for path in self.db.parent.iterdir() if path.is_file()}
+                self.assertEqual(after, before)
+            finally:
+                self.store.conn.rollback()
+            self.assertEqual(reader.verify(first["capture_id"])["observation_seq"], 1)
+            with self.assertRaises(contract.TradeContractError):
+                reader.verify(env.capture_id)
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+
+    def test_read_only_outstanding_wal_and_journal_refused(self):
+        self.ingest()
+        self.store.close()
+        with closing(sqlite3.connect(self.db)) as writer:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE synthetic_wal_probe (value TEXT)")
+            writer.commit()
+            self.assertGreater(Path(str(self.db) + "-wal").stat().st_size, 0)
+            with self.assertRaises(contract.TradeContractError):
+                with capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True):
+                    pass
+        # Use a separate valid store for an unrecovered journal, without WAL probe schema.
+        with capture.TradeCaptureStore(self.root / "journal" / "capture.db") as valid:
+            journal_db, journal_raw = valid.db, valid.raw_root
+        journal = Path(str(journal_db) + "-journal")
+        journal.write_bytes(b"synthetic nonempty recovery journal")
+        with self.assertRaises(contract.TradeContractError):
+            with capture.TradeCaptureStore(journal_db, raw_root=journal_raw, read_only=True):
+                pass
+        self.assertEqual(journal.read_bytes(), b"synthetic nonempty recovery journal")
+
+    def git(self, root, *arguments):
+        environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        return subprocess.run(["git", "-C", str(root), *arguments], capture_output=True,
+                              encoding="utf-8", errors="replace", env=environment, check=True)
+
+    def git_repository(self, name, *, anchored=False):
+        root = self.root / name
+        root.mkdir()
+        self.git(root, "init", "-q")
+        (root / ".gitignore").write_text(("/" if anchored else "") + "private_data/\n",
+                                          encoding="utf-8")
+        return root
+
+    def test_git_guard_case_variants_and_inherited_environment(self):
+        root = self.git_repository("git-case")
+        tracked = root / "private_data" / "capture.db"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"synthetic tracked marker")
+        self.git(root, "add", "-f", "private_data/capture.db")
+        other = self.git_repository("git-spoof")
+        for variable, value in (("GIT_DIR", str(other / ".git")),
+                                ("GIT_WORK_TREE", str(other)),
+                                ("GIT_INDEX_FILE", str(other / "spoof-index")),
+                                ("GIT_DIR", str(self.root / "nonexistent-git-dir")),
+                                ("GIT_COMMON_DIR", str(other / ".git")),
+                                ("GIT_CONFIG_COUNT", "invalid-spoof-value")):
+            for path in (tracked, root / "PRIVATE_DATA" / "CAPTURE.DB"):
+                with self.subTest(variable=variable, path=path), patch.dict(os.environ, {variable: value}):
+                    with self.assertRaises(contract.TradeContractError):
+                        capture.check_private_output(path)
+        with self.assertRaises(contract.TradeContractError):
+            capture.check_private_output(root / "PRIVATE_DATA")
+
+    def test_git_guard_main_and_linked_worktree(self):
+        root = self.git_repository("git-main")
+        self.git(root, "add", ".gitignore")
+        self.git(root, "-c", "user.name=Synthetic Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "synthetic ignored-output fixture")
+        linked = self.root / "git-linked"
+        self.git(root, "worktree", "add", "--detach", str(linked), "HEAD")
+        try:
+            for checkout in (root, linked):
+                with self.subTest(checkout=checkout):
+                    candidate = checkout / "private_data" / "capture.db"
+                    self.assertEqual(capture.check_private_output(candidate, capture.SIDECARS), candidate.resolve())
+                    with self.assertRaises(contract.TradeContractError):
+                        capture.check_private_output(checkout / "public" / "capture.db", capture.SIDECARS)
+        finally:
+            self.git(root, "worktree", "remove", "--force", str(linked))
+
+    def test_git_guard_nested_and_outside_repository(self):
+        outer = self.git_repository("git-outer", anchored=True)
+        inner = outer / "nested"
+        inner.mkdir()
+        tracked = inner / "private_data" / "capture.db"
+        tracked.parent.mkdir()
+        tracked.write_bytes(b"synthetic marker tracked by outer checkout")
+        self.git(outer, "add", "-f", str(tracked))
+        self.git(inner, "init", "-q")
+        (inner / ".gitignore").write_text("private_data/\n", encoding="utf-8")
+        with self.assertRaises(contract.TradeContractError):
+            capture.check_private_output(inner / "private_data" / "capture.db")
+        outside = self.root / "outside" / "capture.db"
+        self.assertEqual(capture.check_private_output(outside, capture.SIDECARS), outside.resolve())
+        with patch.dict(os.environ, {"GIT_DIR": str(outer / ".git"), "GIT_WORK_TREE": str(outer)}):
+            self.assertEqual(capture.check_private_output(outside), outside.resolve())
+
+    def test_git_guard_tracked_sidecars_and_ignored_descendants(self):
+        for suffix in capture.SIDECARS:
+            root = self.git_repository("git-sidecar-" + suffix[1:])
+            candidate = root / "private_data" / "capture.db"
+            sidecar = Path(str(candidate) + suffix)
+            sidecar.parent.mkdir()
+            sidecar.write_bytes(b"synthetic tracked sidecar")
+            self.git(root, "add", "-f", str(sidecar))
+            with self.subTest(suffix=suffix), self.assertRaises(contract.TradeContractError):
+                capture.check_private_output(candidate, capture.SIDECARS)
+        root = self.git_repository("git-descendant")
+        descendant = root / "private_data" / "raw" / "nested" / "synthetic.parquet"
+        descendant.parent.mkdir(parents=True)
+        descendant.write_bytes(b"synthetic tracked descendant")
+        self.git(root, "add", "-f", str(descendant))
+        with self.assertRaises(contract.TradeContractError):
+            capture.check_private_output(root / "PRIVATE_DATA" / "RAW")
+
+    def test_git_not_repository_error_cannot_hide_ancestor_context(self):
+        root = self.git_repository("git-failed-discovery")
+        failed = subprocess.CompletedProcess(["git"], 128, stdout="", stderr="fatal: not a git repository")
+        with patch.object(capture, "_git", return_value=failed):
+            with self.assertRaises(contract.TradeContractError):
+                capture.check_private_output(root / "private_data" / "capture.db")
+
+    def test_git_subprocess_environment_and_decoding_are_explicit(self):
+        completed = subprocess.CompletedProcess(["git"], 0, stdout="", stderr="")
+        with patch.dict(os.environ, {"GIT_DIR": "spoof", "git_index_file": "spoof"}), \
+                patch.object(capture.subprocess, "run", return_value=completed) as run:
+            self.assertIs(capture._git(["status", "--porcelain"], self.root), completed)
+        self.assertEqual(run.call_args.kwargs["encoding"].lower(), "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+        git_environment = {key: value for key, value in run.call_args.kwargs["env"].items()
+                           if key.upper().startswith("GIT_")}
+        self.assertEqual(git_environment, {})
+
+    def test_resume_pending_conflicting_successor_refused(self):
+        first = self.ingest()
+        second = self.ingest([source_row(STK_VOLM=126)])
+        # Already accepted bodies remain idempotent even when history continues.
+        self.assertEqual(self.store.resume(first["capture_id"]), first)
+        rewrite_immutable_row(self.store.conn, "DELETE FROM trade_acceptances WHERE capture_id=?",
+                              (first["capture_id"],))
+        before_bodies = list(self.store.conn.execute("SELECT * FROM trade_captures"))
+        before_acceptances = list(self.store.conn.execute("SELECT * FROM trade_acceptances"))
+        with self.assertRaisesRegex(contract.TradeContractError, "conflicting successor"):
+            self.store.resume(first["capture_id"])
+        self.assertEqual(list(self.store.conn.execute("SELECT * FROM trade_captures")), before_bodies)
+        self.assertEqual(list(self.store.conn.execute("SELECT * FROM trade_acceptances")), before_acceptances)
+        self.assertEqual(before_acceptances[0]["capture_id"], second["capture_id"])
+
+    def test_source_schema_profile_change_is_semantic_repeat_in_both_directions(self):
+        for first_legacy in (True, False):
+            label = "legacy-first" if first_legacy else "recent-first"
+            with self.subTest(direction=label), capture.TradeCaptureStore(
+                    self.root / label / "capture.db") as store:
+                results, tapes = [], []
+                for index, legacy in enumerate((first_legacy, not first_legacy), start=1):
+                    env = observation(label + str(index), index)
+                    path = write_parquet(self.root / (label + str(index) + ".parquet"),
+                                         [source_row(TRX_TYPE="UNKNOWN")], legacy=legacy)
+                    expected_profile = (contract.LEGACY_SCHEMA_VERSION if legacy
+                                        else contract.RECENT_SCHEMA_VERSION)
+                    tape = contract.normalize_parquet(path, env)
+                    self.assertEqual(tape.rows[0]["source_schema_version"], expected_profile)
+                    self.assertNotIn("source_schema_version", json.loads(tape.content_json)["rows"][0])
+                    result = store.ingest(path, env)
+                    self.assertEqual(result["schema_version"], expected_profile)
+                    self.assertEqual(result["content_version"], 1)
+                    self.assertEqual(result["observation_seq"], index)
+                    self.assertEqual(result["observation_state"],
+                                     "CONTENT_FIRST_SEEN" if index == 1 else "CONTENT_REPEAT")
+                    self.assertEqual(store.read_rows(result["capture_id"])[0]["source_schema_version"],
+                                     expected_profile)
+                    self.assertEqual(store.verify(result["capture_id"]), result)
+                    results.append(result)
+                    tapes.append(tape)
+                self.assertNotEqual(results[0]["raw_response_sha256"], results[1]["raw_response_sha256"])
+                self.assertNotEqual(results[0]["schema_version"], results[1]["schema_version"])
+                self.assertNotEqual(results[0]["schema_fingerprint"], results[1]["schema_fingerprint"])
+                self.assertEqual(tapes[0].content_json, tapes[1].content_json)
+                self.assertEqual(results[0]["normalized_content_sha256"], results[1]["normalized_content_sha256"])
+                self.assertEqual(results[1]["previous_content_capture_id"], results[0]["capture_id"])
 
 
 if __name__ == "__main__":

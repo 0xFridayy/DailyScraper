@@ -19,16 +19,38 @@ import sys
 import tempfile
 
 from bandarmolony_trade_contract import (
-    CAPTURE_STATES, DATASET, CaptureEnvelope, TradeContractError,
+    OBSERVATION_STATES, DATASET, CaptureEnvelope, TradeContractError,
     broker_totals, canonical_json, normalize_parquet,
-    sanitize_source_path, sha256_bytes, tape_summary, utc_text,
+    sha256_bytes, tape_summary, utc_text,
 )
 
-HERE = Path(__file__).resolve().parent
-DEFAULT_DB = HERE / "private_data" / "bandarmolony" / "trade_capture.db"
+
+def _user_data_directory():
+    """Resolve stable local user storage without depending on a checkout."""
+    home = Path.home()
+    if os.name == "nt":
+        configured = os.environ.get("LOCALAPPDATA")
+        base = Path(configured) if configured and Path(configured).is_absolute() else home / "AppData" / "Local"
+        return base / "DailyScraper" / "bandarmolony"
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "DailyScraper" / "bandarmolony"
+    configured = os.environ.get("XDG_DATA_HOME")
+    base = Path(configured) if configured and Path(configured).is_absolute() else home / ".local" / "share"
+    return base / "dailyscraper" / "bandarmolony"
+
+
+DEFAULT_DB = _user_data_directory() / "trade_capture.db"
 SIDECARS = ("-journal", "-wal", "-shm")
 PRODUCT = "BANDARMOLONY_TRADE_CAPTURE_V1"
-STORE_VERSION = "1"
+STORE_VERSION = "2"
+
+
+class PendingCaptureError(TradeContractError):
+    """An intact committed body needs its acceptance, recoverable by identity."""
+
+    def __init__(self, capture_id):
+        self.capture_id = capture_id
+        super().__init__(f"pending capture {capture_id}; use resume --capture-id {capture_id}")
 
 
 def utc_now():
@@ -37,8 +59,11 @@ def utc_now():
 
 def _git(args, cwd):
     try:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                              text=True, timeout=30)
+                              encoding="utf-8", errors="replace", timeout=30,
+                              env=environment)
     except (OSError, subprocess.SubprocessError):
         raise TradeContractError("private output guard cannot run git") from None
 
@@ -55,33 +80,68 @@ def check_private_output(path, sidecars=()):
     anchor = real.parent
     while not anchor.is_dir() and anchor != anchor.parent:
         anchor = anchor.parent
+    # Check every enclosing checkout, including an outer repository around a
+    # nested checkout. A failing rev-parse alone cannot prove a path is outside
+    # Git: a broken .git worktree file must fail closed as well.
+    contexts = []
+    for directory in (anchor, *anchor.parents):
+        marker = directory / ".git"
+        try:
+            marker.lstat()
+            # An independently inspected empty directory has no repository or
+            # worktree metadata (some managed hosts install these sentinels).
+            # Files, symlinks and any nonempty directory still fail closed.
+            if not marker.is_symlink() and marker.is_dir() and next(marker.iterdir(), None) is None:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise TradeContractError("cannot inspect private output repository ancestry") from None
+        contexts.append(directory)
     top = _git(["rev-parse", "--show-toplevel"], anchor)
     if top.returncode:
-        if "not a git repository" in top.stderr.lower():
-            return real
-        raise TradeContractError("cannot establish private output destination")
-    repo = Path(top.stdout.strip())
-    for candidate in (real, *(Path(str(real) + suffix) for suffix in sidecars)):
-        tracked = _git(["ls-files", "--", str(candidate)], repo)
-        if tracked.returncode or tracked.stdout.strip():
-            raise TradeContractError("tracked output destination refused")
-        ignored = _git(["check-ignore", "-q", str(candidate)], repo)
-        if ignored.returncode != 0:
-            raise TradeContractError("public or unignored output destination refused")
+        if contexts or "not a git repository" not in top.stderr.lower():
+            raise TradeContractError("cannot establish private output destination")
+        return real
+    discovered = Path(top.stdout.strip()).resolve()
+    if discovered not in contexts:
+        contexts.append(discovered)
+    for context in contexts:
+        top = _git(["rev-parse", "--show-toplevel"], context)
+        if top.returncode:
+            raise TradeContractError("cannot establish private output destination")
+        repo = Path(top.stdout.strip()).resolve()
+        if repo != context:
+            raise TradeContractError("private output repository ancestry is ambiguous")
+        for candidate in (real, *(Path(str(real) + suffix) for suffix in sidecars)):
+            try:
+                relative = candidate.relative_to(repo).as_posix()
+            except ValueError:
+                raise TradeContractError("private output repository ancestry is ambiguous") from None
+            # Git's icase literal pathspec includes tracked directory descendants
+            # and also catches case variants on Windows with core.ignorecase off.
+            tracked = _git(["ls-files", "--", ":(icase,literal)" + relative], repo)
+            if tracked.returncode or tracked.stdout.strip():
+                raise TradeContractError("tracked output destination refused")
+            ignored = _git(["check-ignore", "-q", "--", relative], repo)
+            if ignored.returncode != 0:
+                raise TradeContractError("public or unignored output destination refused")
     return real
 
 
 TABLE_SQL = {
     "trade_store_meta": """CREATE TABLE trade_store_meta (
-        key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
+        key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)""",
     "trade_captures": """CREATE TABLE trade_captures (
-        capture_id TEXT PRIMARY KEY,
+        capture_id TEXT PRIMARY KEY NOT NULL,
         dataset TEXT NOT NULL CHECK (dataset = 'BANDARMOLONY_DONE_DETAIL'),
         ticker TEXT NOT NULL, trade_date TEXT NOT NULL,
-        capture_revision INTEGER NOT NULL CHECK (capture_revision > 0),
-        previous_capture_id TEXT REFERENCES trade_captures(capture_id),
-        capture_state TEXT NOT NULL CHECK (capture_state IN
-            ('FIRST_SEEN','REVISED','REPEAT_CONFIRMED','ABSENT_OBSERVED')),
+        observation_seq INTEGER NOT NULL CHECK (observation_seq > 0),
+        previous_observation_id TEXT REFERENCES trade_captures(capture_id),
+        previous_content_capture_id TEXT REFERENCES trade_captures(capture_id),
+        content_version INTEGER CHECK (content_version > 0),
+        observation_state TEXT NOT NULL CHECK (observation_state IN
+            ('CONTENT_FIRST_SEEN','CONTENT_CHANGED','CONTENT_REPEAT','ABSENT_OBSERVED')),
         metadata_json TEXT NOT NULL,
         content_length INTEGER,
         raw_response_sha256 TEXT,
@@ -92,19 +152,29 @@ TABLE_SQL = {
         content_json TEXT,
         body_recorded_at TEXT NOT NULL,
         body_sha256 TEXT NOT NULL,
-        UNIQUE(ticker, trade_date, capture_revision),
-        CHECK ((capture_state = 'ABSENT_OBSERVED' AND content_length IS NULL
+        UNIQUE(ticker, trade_date, observation_seq),
+        CHECK ((observation_seq = 1 AND previous_observation_id IS NULL)
+          OR (observation_seq > 1 AND previous_observation_id IS NOT NULL)),
+        CHECK (observation_state = 'ABSENT_OBSERVED'
+          OR (observation_state = 'CONTENT_FIRST_SEEN' AND content_version = 1
+            AND previous_content_capture_id IS NULL)
+          OR (observation_state IN ('CONTENT_CHANGED','CONTENT_REPEAT')
+            AND previous_content_capture_id IS NOT NULL)),
+        CHECK ((observation_state = 'ABSENT_OBSERVED' AND content_version IS NULL
+            AND content_length IS NULL
             AND raw_response_sha256 IS NULL AND normalized_content_sha256 IS NULL
             AND schema_fingerprint IS NULL AND schema_version IS NULL
             AND row_count IS NULL AND source_row_count IS NULL
             AND duplicate_counts_json IS NULL AND content_json IS NULL)
-          OR (capture_state != 'ABSENT_OBSERVED' AND content_length >= 0
+          OR (observation_state != 'ABSENT_OBSERVED' AND content_version IS NOT NULL
+            AND content_length IS NOT NULL AND content_length > 0
             AND raw_response_sha256 IS NOT NULL AND normalized_content_sha256 IS NOT NULL
             AND schema_fingerprint IS NOT NULL AND schema_version IS NOT NULL
-            AND row_count >= 0 AND source_row_count >= row_count
+            AND row_count IS NOT NULL AND row_count > 0
+            AND source_row_count IS NOT NULL AND source_row_count >= row_count
             AND duplicate_counts_json IS NOT NULL AND content_json IS NOT NULL)))""",
     "trade_acceptances": """CREATE TABLE trade_acceptances (
-        capture_id TEXT PRIMARY KEY REFERENCES trade_captures(capture_id),
+        capture_id TEXT PRIMARY KEY NOT NULL REFERENCES trade_captures(capture_id),
         body_sha256 TEXT NOT NULL,
         durable_accepted_at TEXT NOT NULL)""",
 }
@@ -122,7 +192,7 @@ for _table, _keys in {
     _name = f"immutable_{_table}_insert"
     _same = " AND ".join(f"{key} = NEW.{key}" for key in _keys)
     if _table == "trade_captures":
-        _same += " OR (ticker = NEW.ticker AND trade_date = NEW.trade_date AND capture_revision = NEW.capture_revision)"
+        _same += " OR (ticker = NEW.ticker AND trade_date = NEW.trade_date AND observation_seq = NEW.observation_seq)"
     TRIGGER_SQL[_name] = (
         f"CREATE TRIGGER {_name} BEFORE INSERT ON {_table} "
         f"WHEN EXISTS (SELECT 1 FROM {_table} WHERE {_same}) "
@@ -134,12 +204,12 @@ TRIGGER_SQL["trade_acceptance_requires_body"] = """CREATE TRIGGER trade_acceptan
     BEGIN SELECT RAISE(ABORT, 'trade acceptance requires committed validated body'); END"""
 TRIGGER_SQL["trade_capture_requires_parent"] = """CREATE TRIGGER trade_capture_requires_parent
     BEFORE INSERT ON trade_captures
-    WHEN (NEW.capture_revision = 1 AND (NEW.previous_capture_id IS NOT NULL OR EXISTS
+    WHEN (NEW.observation_seq = 1 AND (NEW.previous_observation_id IS NOT NULL OR EXISTS
         (SELECT 1 FROM trade_captures WHERE ticker = NEW.ticker AND trade_date = NEW.trade_date)))
-      OR (NEW.capture_revision > 1 AND NOT EXISTS
+      OR (NEW.observation_seq > 1 AND NOT EXISTS
         (SELECT 1 FROM trade_captures c JOIN trade_acceptances a USING(capture_id)
-         WHERE c.capture_id = NEW.previous_capture_id AND c.ticker = NEW.ticker
-           AND c.trade_date = NEW.trade_date AND c.capture_revision = NEW.capture_revision - 1))
+         WHERE c.capture_id = NEW.previous_observation_id AND c.ticker = NEW.ticker
+           AND c.trade_date = NEW.trade_date AND c.observation_seq = NEW.observation_seq - 1))
     BEGIN SELECT RAISE(ABORT, 'trade capture requires accepted parent'); END"""
 
 
@@ -188,22 +258,27 @@ class TradeCaptureStore:
         self.read_only = read_only
         self._check_paths()
         if read_only:
+            # Normal DELETE-mode reads retain SQLite's shared locks. WAL files
+            # are refused before opening: mode=ro can create SHM, and immutable
+            # would ignore locks and potentially expose an uncommitted write.
             self.conn = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True)
         else:
             _private_mkdir(self.db.parent)
             new_file = not self.db.exists()
             self.conn = sqlite3.connect(self.db)
-            if new_file:
-                os.chmod(self.db, 0o600)
-            self.conn.execute("PRAGMA synchronous = FULL")
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self.conn.execute("PRAGMA busy_timeout = 30000")
         try:
-            tables = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            if not tables and not read_only:
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("PRAGMA busy_timeout = 30000")
+            if read_only:
+                self._require_checkpointed_database()
+            else:
+                if new_file:
+                    os.chmod(self.db, 0o600)
                 self.conn.execute("PRAGMA journal_mode = DELETE")
                 self.conn.execute("PRAGMA synchronous = FULL")
+            tables = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            if not tables and not read_only:
                 with self.conn:
                     for sql in TABLE_SQL.values():
                         self.conn.execute(sql)
@@ -228,17 +303,35 @@ class TradeCaptureStore:
     def _meta(self):
         return {"product": PRODUCT, "schema_version": STORE_VERSION, "raw_root": str(self.raw_root)}
 
+    def _require_checkpointed_database(self):
+        try:
+            for suffix in ("-wal", "-journal"):
+                sidecar = Path(str(self.db) + suffix)
+                if sidecar.exists() and sidecar.stat().st_size:
+                    raise TradeContractError("read-only inspection requires a quiescent checkpointed database; outstanding WAL or journal refused")
+            with self.db.open("rb") as handle:
+                header = handle.read(20)
+            if header[:16] == b"SQLite format 3\x00" and b"\x02" in header[18:20]:
+                raise TradeContractError("read-only inspection refuses WAL-mode database; open a writer to checkpoint and restore DELETE journaling")
+        except OSError:
+            raise TradeContractError("cannot establish read-only database WAL state") from None
+
     def _check_paths(self):
-        # Raw location is persisted in store identity. Refuse credential-shaped
-        # output components before creating directories or database metadata.
-        for path in (self.db, self.raw_root):
-            if sanitize_source_path(str(path)) != str(path).replace("\\", "/"):
-                raise TradeContractError("output paths cannot contain query or fragment credentials")
+        # Filesystem locations are local paths, not source provenance. Ordinary
+        # names containing session/token or long identifiers remain valid.
+        assignment = re.compile(
+            r"(?:^|[^a-z0-9])(?:bearer|token|sas|sig|session|cookie|password|"
+            r"authorization|supabase|secret|credential|username|api_key|apikey)\s*=",
+            re.IGNORECASE)
+        if any(assignment.search(str(path)) for path in (self.db, self.raw_root)):
+            raise TradeContractError("output paths cannot contain credential assignments")
         check_private_output(self.db, SIDECARS)
         check_private_output(self.raw_root)
         check_private_output(self.raw_root / ".private-output-probe")
         if self.db == self.raw_root or self.raw_root in self.db.parents:
             raise TradeContractError("database cannot be inside the raw object store")
+        if self.read_only:
+            self._require_checkpointed_database()
 
     def _verify_schema(self):
         actual = {(row["type"], row["name"]): _sql_text(row["sql"])
@@ -258,27 +351,56 @@ class TradeCaptureStore:
             raise TradeContractError("invalid raw content identity")
         return self.raw_root / "sha256" / digest[:2] / (digest + ".parquet")
 
-    def _preserve_raw(self, data, digest):
+    @staticmethod
+    def _discard_raw(path):
+        """Remove a newly published, unreferenced object under the writer lock."""
+        path = Path(path)
+        try:
+            os.chmod(path, 0o600)
+            path.unlink()
+        except FileNotFoundError:
+            return
+        _fsync_dir(path.parent)
+
+    def _preserve_raw(self, data, digest, *, report_created=False):
+        if sha256_bytes(data) != digest:
+            raise TradeContractError("raw identity does not match supplied bytes")
         destination = self.raw_path(digest)
         check_private_output(destination)
         _private_mkdir(destination.parent)
         # Never use rename/replace: an existing content identity cannot be overwritten.
         fd, tmp_name = tempfile.mkstemp(prefix=".pending-", dir=destination.parent)
+        created = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(tmp_name, 0o400)
             try:
                 os.link(tmp_name, destination)
+                created = True
             except FileExistsError:
                 if destination.is_symlink() or destination.read_bytes() != data:
                     raise TradeContractError("existing raw object differs from supplied bytes")
-            _fsync_dir(destination.parent)
-        finally:
+            # Windows shares the read-only attribute across hard links. Remove
+            # the writable temporary name before protecting the published name.
             os.unlink(tmp_name)
-        return destination
+            tmp_name = None
+            if created:
+                os.chmod(destination, 0o400)
+            _fsync_dir(destination.parent)
+        except BaseException:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    # Preserve a content-conflict error; never chmod a temporary
+                    # hard link that could change the published inode's protection.
+                    pass
+            if created:
+                self._discard_raw(destination)
+            raise
+        return (destination, created) if report_created else destination
 
     @contextmanager
     def _write_transaction(self):
@@ -314,17 +436,11 @@ class TradeCaptureStore:
         except OSError:
             raise TradeContractError("cannot read local input file") from None
         digest = sha256_bytes(data)
-        preserved = self._preserve_raw(data, digest)
-        # Parse the exact preserved snapshot whose hash we checked. Reopening
-        # the path in the parser could race a concurrent rewrite of that object.
-        try:
-            snapshot = preserved.read_bytes()
-        except OSError:
-            raise TradeContractError("preserved raw object is unreadable") from None
-        if sha256_bytes(snapshot) != digest:
-            raise TradeContractError("preserved raw snapshot sha256 mismatch")
-        tape = normalize_parquet(snapshot, envelope)
-        return self._record(envelope, digest=digest, content_length=len(data), tape=tape)
+        # Validate the exact bytes read once before publishing any raw object.
+        # _record publishes inside its body transaction after chain validation.
+        tape = normalize_parquet(data, envelope)
+        return self._record(envelope, digest=digest, content_length=len(data),
+                            tape=tape, raw_data=data)
 
     def observe_absence(self, envelope):
         """Record a supplied 404 observation. This API makes no HTTP request."""
@@ -332,7 +448,7 @@ class TradeCaptureStore:
             raise TradeContractError("absence observation requires HTTP 404 provenance")
         return self._record(envelope)
 
-    def _record(self, envelope, *, digest=None, content_length=None, tape=None):
+    def _record(self, envelope, *, digest=None, content_length=None, tape=None, raw_data=None):
         self._check_paths()
         self._verify_schema()
         metadata_json = canonical_json(asdict(envelope))
@@ -347,64 +463,107 @@ class TradeCaptureStore:
             "duplicate_counts_json": None if tape is None else canonical_json(tape.duplicate_counts),
             "content_json": None if tape is None else tape.content_json,
         }
-        with self._write_transaction():
-            existing = self.conn.execute("SELECT * FROM trade_captures WHERE capture_id = ?",
-                                         (envelope.capture_id,)).fetchone()
-            if existing is not None:
-                existing = dict(existing)
-                if any(existing[key] != value for key, value in desired.items()):
-                    raise TradeContractError("capture identity conflicts with immutable body")
-                self._verify_chain(envelope.capture_id, allow_pending=True)
-            else:
-                chain = self.conn.execute(
-                    "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? ORDER BY capture_revision",
-                    (envelope.ticker, envelope.trade_date)).fetchall()
-                previous = dict(chain[-1]) if chain else None
-                if previous:
-                    self._verify_chain(previous["capture_id"])
-                last_content = next((dict(row) for row in reversed(chain)
-                                     if row["capture_state"] != "ABSENT_OBSERVED"), None)
-                # The state depends on the new raw digest, not normalized content equality.
-                state = self._capture_state(envelope, digest, previous, last_content)
-                recorded = utc_now()
-                if envelope.response_at > recorded:
-                    raise TradeContractError("body recording cannot precede response")
-                existing = dict(
-                    capture_id=envelope.capture_id, dataset=DATASET,
-                    ticker=envelope.ticker, trade_date=envelope.trade_date,
-                    capture_revision=1 if previous is None else previous["capture_revision"] + 1,
-                    previous_capture_id=None if previous is None else previous["capture_id"],
-                    capture_state=state, **desired, body_recorded_at=recorded,
-                )
-                existing["body_sha256"] = _body_digest(existing)
-                columns = tuple(existing)
-                self.conn.execute(
-                    f"INSERT INTO trade_captures ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
-                    tuple(existing[column] for column in columns))
-        # The body is now committed. A retry may accept ONLY this revalidated body.
-        with self._write_transaction():
-            self._verify_chain(envelope.capture_id, allow_pending=True)
-            marker = self._acceptance(envelope.capture_id)
-            if marker is None:
-                accepted = utc_now()
-                if accepted < existing["body_recorded_at"] or accepted < envelope.response_at:
-                    raise TradeContractError("acceptance cannot precede validated body")
-                self.conn.execute("INSERT INTO trade_acceptances VALUES (?, ?, ?)",
-                                  (envelope.capture_id, existing["body_sha256"], accepted))
-        return self.verify(envelope.capture_id)
+        published = None
+        try:
+            with self._write_transaction():
+                existing = self.conn.execute("SELECT * FROM trade_captures WHERE capture_id = ?",
+                                             (envelope.capture_id,)).fetchone()
+                if existing is not None:
+                    existing = dict(existing)
+                    if any(existing[key] != value for key, value in desired.items()):
+                        raise TradeContractError("capture identity conflicts with immutable body")
+                    self._verify_chain(envelope.capture_id, allow_pending=True)
+                else:
+                    chain = self.conn.execute(
+                        "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? ORDER BY observation_seq",
+                        (envelope.ticker, envelope.trade_date)).fetchall()
+                    previous = dict(chain[-1]) if chain else None
+                    if previous:
+                        if self._acceptance(previous["capture_id"]) is None:
+                            self._verify_chain(previous["capture_id"], allow_pending=True)
+                            raise PendingCaptureError(previous["capture_id"])
+                        self._verify_chain(previous["capture_id"])
+                    last_content = next((dict(row) for row in reversed(chain)
+                                         if row["observation_state"] != "ABSENT_OBSERVED"), None)
+                    self._check_chronology(envelope, previous)
+                    state, version = self._content_relation(
+                        envelope, desired["normalized_content_sha256"], last_content)
+                    recorded = utc_now()
+                    if envelope.response_at > recorded:
+                        raise TradeContractError("body recording cannot precede response")
+                    existing = dict(
+                        capture_id=envelope.capture_id, dataset=DATASET,
+                        ticker=envelope.ticker, trade_date=envelope.trade_date,
+                        observation_seq=1 if previous is None else previous["observation_seq"] + 1,
+                        previous_observation_id=None if previous is None else previous["capture_id"],
+                        previous_content_capture_id=None if last_content is None else last_content["capture_id"],
+                        observation_state=state, content_version=version,
+                        **desired, body_recorded_at=recorded,
+                    )
+                    existing["body_sha256"] = _body_digest(existing)
+                    if raw_data is not None:
+                        path, created = self._preserve_raw(raw_data, digest, report_created=True)
+                        if created:
+                            published = path
+                    columns = tuple(existing)
+                    try:
+                        self.conn.execute(
+                            f"INSERT INTO trade_captures ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                            tuple(existing[column] for column in columns))
+                    except BaseException:
+                        if published is not None:
+                            self._discard_raw(published)
+                            published = None
+                        raise
+        except BaseException:
+            # If COMMIT failed, reacquire the writer lock before inspecting references.
+            # Another writer may already have adopted the same content identity.
+            if published is not None:
+                with self._write_transaction():
+                    referenced = self.conn.execute(
+                        "SELECT 1 FROM trade_captures WHERE raw_response_sha256=?", (digest,)).fetchone()
+                    if referenced is None:
+                        self._discard_raw(published)
+            raise
+        # The raw object and body are durable before the independent acceptance.
+        return self.resume(envelope.capture_id)
 
     @staticmethod
-    def _capture_state(envelope, digest, previous, last_content):
-        if envelope.http_status == 404:
-            return "ABSENT_OBSERVED"
-        if last_content is None:
-            return "FIRST_SEEN"
-        if digest != last_content["raw_response_sha256"]:
-            return "REVISED"
+    def _check_chronology(envelope, previous):
+        if previous is None:
+            return
         prior = json.loads(previous["metadata_json"])
         if envelope.requested_at < prior["response_at"] or envelope.response_at <= prior["response_at"]:
-            raise TradeContractError("repeat observation must independently follow the prior response")
-        return "REPEAT_CONFIRMED"
+            raise TradeContractError("observation must independently follow the prior response")
+
+    @staticmethod
+    def _content_relation(envelope, normalized_digest, last_content):
+        if envelope.http_status == 404:
+            return "ABSENT_OBSERVED", None
+        if last_content is None:
+            return "CONTENT_FIRST_SEEN", 1
+        if normalized_digest == last_content["normalized_content_sha256"]:
+            return "CONTENT_REPEAT", last_content["content_version"]
+        return "CONTENT_CHANGED", last_content["content_version"] + 1
+
+    def resume(self, capture_id):
+        """Recompute sealed pending truth and add only its missing acceptance."""
+        self._check_paths()
+        self._verify_schema()
+        with self._write_transaction():
+            existing = self._verify_chain(capture_id, allow_pending=True)
+            marker = self._acceptance(capture_id)
+            if marker is None:
+                if self.conn.execute(
+                    "SELECT 1 FROM trade_captures WHERE ticker=? AND trade_date=? AND observation_seq>?",
+                    (existing["ticker"], existing["trade_date"], existing["observation_seq"])).fetchone():
+                    raise TradeContractError("pending capture has a conflicting successor")
+                accepted = utc_now()
+                if accepted < existing["body_recorded_at"]:
+                    raise TradeContractError("acceptance cannot precede validated body")
+                self.conn.execute("INSERT INTO trade_acceptances VALUES (?, ?, ?)",
+                                  (capture_id, existing["body_sha256"], accepted))
+        return self.verify(capture_id)
 
     def _verify_record(self, record, *, allow_pending=False):
         if record["dataset"] != DATASET:
@@ -434,9 +593,9 @@ class TradeCaptureStore:
               or not record["body_recorded_at"] <= marker["durable_accepted_at"] <= now):
             raise TradeContractError("immutable acceptance disagrees with committed body")
         if envelope.http_status == 404:
-            if record["capture_state"] != "ABSENT_OBSERVED" or any(record[key] is not None for key in (
+            if record["observation_state"] != "ABSENT_OBSERVED" or any(record[key] is not None for key in (
                 "raw_response_sha256", "normalized_content_sha256", "content_json", "row_count",
-                "schema_version", "schema_fingerprint", "source_row_count", "duplicate_counts_json", "content_length")):
+                "schema_version", "schema_fingerprint", "source_row_count", "duplicate_counts_json", "content_length", "content_version")):
                 raise TradeContractError("absence must not claim a zero-trade tape")
             return envelope, None
         raw = self.raw_path(record["raw_response_sha256"])
@@ -470,26 +629,31 @@ class TradeCaptureStore:
         if (sum(row["buy_shares"] for row in totals.values()) != sum(row["sell_shares"] for row in totals.values())
             or sum(row["buy_value_rp"] for row in totals.values()) != sum(row["sell_value_rp"] for row in totals.values())
             or sum(row["buy_value_rp"] for row in totals.values()) != sum(row["value_rp"] for row in tape.rows)):
-            raise TradeContractError("broker-day self-reconciliation failed")
+            raise TradeContractError("broker-day accounting invariant failed")
         return envelope, tape
 
     def _verify_chain(self, capture_id, *, allow_pending=False):
         target = self._get_record(capture_id)
         rows = self.conn.execute(
-            "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? AND capture_revision<=? ORDER BY capture_revision",
-            (target["ticker"], target["trade_date"], target["capture_revision"])).fetchall()
+            "SELECT * FROM trade_captures WHERE ticker=? AND trade_date=? AND observation_seq<=? ORDER BY observation_seq",
+            (target["ticker"], target["trade_date"], target["observation_seq"])).fetchall()
         if not rows or rows[-1]["capture_id"] != capture_id:
-            raise TradeContractError("invalid immutable capture revision")
+            raise TradeContractError("invalid immutable observation sequence")
         previous, last_content = None, None
         for index, row in enumerate(rows, start=1):
             record = dict(row)
-            if record["capture_revision"] != index or record["previous_capture_id"] != (None if previous is None else previous["capture_id"]):
-                raise TradeContractError("broken immutable capture version chain")
+            if record["observation_seq"] != index or record["previous_observation_id"] != (None if previous is None else previous["capture_id"]):
+                raise TradeContractError("broken immutable observation chain")
             envelope, tape = self._verify_record(
                 record, allow_pending=allow_pending and record["capture_id"] == capture_id)
-            expected_state = self._capture_state(envelope, record["raw_response_sha256"], previous, last_content)
-            if record["capture_state"] != expected_state or expected_state not in CAPTURE_STATES:
-                raise TradeContractError("capture state disagrees with version history")
+            self._check_chronology(envelope, previous)
+            expected_state, expected_version = self._content_relation(
+                envelope, record["normalized_content_sha256"], last_content)
+            if (record["observation_state"] != expected_state
+                or expected_state not in OBSERVATION_STATES
+                or record["content_version"] != expected_version
+                or record["previous_content_capture_id"] != (None if last_content is None else last_content["capture_id"])):
+                raise TradeContractError("observation state or content version disagrees with history")
             if previous:
                 prior_marker = self._acceptance(previous["capture_id"])
                 if prior_marker is None or record["body_recorded_at"] < prior_marker["durable_accepted_at"]:
@@ -503,6 +667,8 @@ class TradeCaptureStore:
         envelope = json.loads(record["metadata_json"])
         result = {key: value for key, value in record.items()
                   if key not in ("metadata_json", "content_json", "duplicate_counts_json", "body_sha256")}
+        result["duplicate_collapse_count"] = (None if record["row_count"] is None
+                                              else record["source_row_count"] - record["row_count"])
         result.update(envelope)
         marker = self._acceptance(record["capture_id"])
         result["durable_accepted_at"] = None if marker is None else marker["durable_accepted_at"]
@@ -519,16 +685,19 @@ class TradeCaptureStore:
         record = self._get_record(capture_id)
         if record["content_json"] is None:
             raise TradeContractError("absence observation has no trade tape")
-        return [dict(row, source_capture_id=capture_id) for row in json.loads(record["content_json"])["rows"]]
+        return [dict(row, source_capture_id=capture_id, source_schema_version=record["schema_version"])
+                for row in json.loads(record["content_json"])["rows"]]
 
     def inspect(self, capture_id):
         metadata = self.verify(capture_id)
         keys = ("capture_id", "ticker", "trade_date", "schema_version", "row_count", "source_row_count",
-                "capture_state", "capture_revision", "previous_capture_id", "requested_at", "response_at", "durable_accepted_at")
+                "observation_state", "observation_seq", "content_version", "previous_observation_id",
+                "previous_content_capture_id", "duplicate_collapse_count",
+                "requested_at", "response_at", "durable_accepted_at")
         result = {key: metadata[key] for key in keys}
         for key in ("raw_response_sha256", "normalized_content_sha256"):
             result[key + "_prefix"] = None if metadata[key] is None else metadata[key][:12]
-        if metadata["capture_state"] == "ABSENT_OBSERVED":
+        if metadata["observation_state"] == "ABSENT_OBSERVED":
             result["tape"] = None
         else:
             record = self._get_record(capture_id)
@@ -538,7 +707,26 @@ class TradeCaptureStore:
         return result
 
 
+class _SingleValue(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        seen = getattr(namespace, "_single_value_options", set())
+        if self.dest in seen:
+            parser.error("repeated single-value option")
+        seen.add(self.dest)
+        setattr(namespace, "_single_value_options", seen)
+        setattr(namespace, self.dest, values)
+
+
 class _SafeArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+    def add_argument(self, *args, **kwargs):
+        if args and args[0].startswith("--") and "action" not in kwargs:
+            kwargs["action"] = _SingleValue
+        return super().add_argument(*args, **kwargs)
+
     def error(self, message):
         # argparse otherwise echoes arbitrary unknown arguments, possibly tokens.
         self.print_usage()
@@ -554,8 +742,8 @@ def main(argv=None):
     for name in ("last-modified", "creation-time", "request-id", "source-path", "capture-id"):
         ingest.add_argument("--" + name)
     ingest.add_argument("--created-by", default="local-ingest-v1")
-    for command in ("verify", "inspect"):
-        child = sub.add_parser(command, help=command + " an accepted capture offline")
+    for command in ("verify", "inspect", "resume"):
+        child = sub.add_parser(command, help=command + " a capture offline")
         child.add_argument("--capture-id", required=True)
     for child in sub.choices.values():
         child.add_argument("--db", default=str(DEFAULT_DB))
@@ -575,10 +763,13 @@ def main(argv=None):
             with TradeCaptureStore(args.db, args.raw_root) as store:
                 result = store.ingest(args.file, envelope)
         else:
-            with TradeCaptureStore(args.db, args.raw_root, read_only=True) as store:
+            with TradeCaptureStore(args.db, args.raw_root, read_only=args.command != "resume") as store:
                 result = getattr(store, args.command)(args.capture_id)
         print(canonical_json(result))
         return 0
+    except PendingCaptureError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except (ValueError, OSError, sqlite3.Error, RuntimeError):
         print("trade capture failed validation or storage integrity checks", file=sys.stderr)
         return 1

@@ -2485,12 +2485,15 @@ The NeoBDM `0 22 * * *` cron change remains a separate operational task.
 
 ## BANDARMOLONY TRADE CAPTURE V1
 
-This offline foundation captures local `done_detail` Parquet files. It does not
-consume `order_detail`. Each source row is an executed trade. A ticker-day file
-contains the whole observed day without pagination, and the vendor can later
-rewrite the same source path. `REPEAT_CONFIRMED` records another matching
-observation. The vendor exposes no proven finality timestamp, so repeat
-confirmation cannot establish vendor finality.
+This offline foundation captures supplied local `done_detail` Parquet files.
+Each source row is an executed trade. The source audit observed ticker-day files
+without pagination, and the vendor can rewrite the same source path. The audit
+established no vendor finality timestamp. A later matching observation records
+repeat content and cannot establish finality.
+
+The unshipped SQLite schema has been replaced with store schema version 2.
+The product remains Trade Capture v1. No compatibility migration from the
+earlier schema is provided, and no real BandarmoloNY store exists yet.
 
 ### Trade contract and units
 
@@ -2498,48 +2501,52 @@ confirmation cannot establish vendor finality.
 recognition, canonical rows, exact arithmetic, schema fingerprints, broker
 totals, and compact tape diagnostics. The envelope fixes the requested ticker
 and trade date. Its timezone-aware request and response timestamps preserve
-microseconds in canonical UTC with the `Z` suffix. The response cannot
-precede the request.
+microseconds in canonical UTC with the `Z` suffix.
 
 The buyer is `BRK_COD1`, and the seller is `BRK_COD2`. `STK_VOLM` is shares,
 and `STK_PRIC` is IDR per share. Shares are the primary quantity, including odd
-shares on `NG`. `value_rp` is the exact integer product `shares * price_idr`.
-The parser requires source `VALUE * 100` to equal that product and refuses a
-mismatch. It does not use floating-point money arithmetic. A fractional lot
-would be `shares / 100`, but v1 exposes shares rather than a lots field.
+shares on `NG`. Shares and price must be positive. `value_rp` is the exact
+integer product `shares * price_idr`. The parser requires source `VALUE * 100`
+to equal that product and refuses a mismatch. It never multiplies a float.
+A fractional lot would be `shares / 100`, but v1 exposes shares.
 
-The normalized fields are `ticker`, `trade_date`, `trx_code`, `session`,
+The row API exposes `ticker`, `trade_date`, `trx_code`, `session`,
 `board`, `buyer_broker`, `buyer_investor_type`, `seller_broker`,
 `seller_investor_type`, `shares`, `price_idr`, `value_rp`, `buy_order_no`,
 `sell_order_no`, `trade_time`, `vendor_haka_haki`, and `source_schema_version`.
-`read_rows(capture_id)` attaches `source_capture_id` after verification. Capture
-identity, timestamps, and paths do not enter the normalized content hash.
+`read_rows(capture_id)` attaches `source_capture_id` and `source_schema_version`
+after verification. Capture identity, source schema provenance, timestamps, and
+paths do not enter the semantic content hash. Source schema version and
+fingerprint remain independently sealed and verified capture metadata.
 
 `TRX_CODE` supplies the candidate key `(ticker, trade_date, trx_code)` within
 one ticker-day. No global cross-ticker uniqueness is claimed. Identical
-canonical duplicates collapse to one row, while capture provenance retains
-their source multiplicities. Conflicting duplicates refuse the whole capture.
-Canonical rows sort by `trx_code` before deterministic JSON serialization and
-SHA-256 hashing under normalized schema version `TRADE_TAPE_V1`.
+canonical duplicates collapse to one row, and provenance retains their source
+multiplicities. Conflicting duplicates refuse the whole capture. Canonical
+rows sort by `trx_code` before deterministic JSON serialization and SHA-256
+hashing under normalized schema version `TRADE_TAPE_V1`.
 
 `TRX_ORD1` and `TRX_ORD2` become `buy_order_no` and `sell_order_no`. One order
 can have several fills. Tape diagnostics count unique orders and fills per
 order without queue or amendment inference. `HAKA_HAKI` remains only
-`vendor_haka_haki`. The audit observed an order-number comparison, which is
-not accepted as a reliable exchange aggressor signal, especially in auctions.
+`vendor_haka_haki`. The audit observed an order-number comparison, which does
+not establish an exchange aggressor signal, especially in auctions.
 
 `broker_totals(rows)` computes `buy_shares`, `sell_shares`, `net_shares`,
 `buy_value_rp`, `sell_value_rp`, `net_value_rp`, `trade_count_buy`, and
-`trade_count_sell` by broker. Buy and sell shares and values reconcile within
-the tape, including a broker on both sides of a trade. This self-reconciliation
-has no dependency on OHLC, `price_history`, or NeoBDM `broker_flow`.
+`trade_count_sell` by broker. Total buy and sell shares and values balance
+because each normalized trade contributes both sides. These are deterministic
+accounting invariants. They provide no independent evidence of source accuracy.
+The capture contract has no dependency on OHLC, `price_history`, or NeoBDM
+`broker_flow`.
 
 ### Accepted source schemas
 
 The parser uses the repository's existing `pyarrow` dependency. It supports
 ZSTD and dictionary-encoded Parquet through that parser. Synthetic fixtures
-exercise the supported recent layout and older pyarrow layout. Real paid
-vendor files are not committed as test fixtures.
+exercise recent and legacy layouts. Real paid vendor files are not committed
+as test fixtures. A zero-row 200 Parquet is refused in either layout because
+the source audit did not establish its meaning.
 
 `RECENT_16COL` requires these source columns:
 
@@ -2552,171 +2559,316 @@ vendor files are not committed as test fixtures.
 Recent `STK_CODE` and `TRX_DATE` must match the immutable envelope. Recent
 `TRX_TYPE` supplies the observed board. `LEGACY_2025_14COL` has the same
 column set without `STK_CODE` and `TRX_DATE`. Legacy ticker and date come only
-from the envelope, and its integer `TRX_TYPE` cannot establish board identity.
-Every legacy row has `board=UNKNOWN`. Missing columns, extra columns,
-unsupported types, required null values, and unknown layouts fail closed.
-The fingerprint hashes source column names, physical types and widths, logical
-type JSON, converted types, required or optional classification, and definition
-and repetition levels from the Parquet footer.
+from the envelope. Legacy `TRX_TYPE` must be the audited integer zero, and every
+legacy row has `board=UNKNOWN`. The same legacy bytes can be captured under two
+valid envelopes. That creates two envelope-scoped records, but the bytes cannot
+prove that the vendor supplied two actual ticker-days.
+
+Missing columns, extra columns, unsupported types, required null values, and
+unknown layouts fail closed. The schema fingerprint hashes source column
+names, physical types and widths, logical type JSON, converted types, required
+or optional classification, and definition and repetition levels from the
+Parquet footer.
 
 `SUPPORTED_PARQUET_REPRESENTATIONS` defines the type whitelist. Integer fields
 use physical `INT32` or `INT64`, with no logical annotation or the matching
 signed integer annotation. Text uses `BYTE_ARRAY` with String or UTF8. Session,
 investor type, and vendor HAKA_HAKI accept those supported integer or text
 representations. Recent boards require text. Legacy `TRX_TYPE` requires
-`INT32` value `0`. Columns must be flat and non-repeated. Required and optional
-field declarations are supported, but null source values are refused.
+`INT32`. Columns must be flat and non-repeated. Required and optional field
+declarations are supported, but null source values are refused.
 
 `TRX_DATE` accepts an `INT32` Date, integer `YYYYMMDD`, or ISO date text.
 `TRX_TIME` accepts integer `HHMMSS`, text `HHMMSS`, or text `HH:MM:SS`.
+Canonical numeric and time text uses ASCII `[0-9]`. Canonical trade time has
+whole-second precision.
+
 Source `VALUE` accepts an integer or Decimal with precision 1 through 76 and
 scale 0 through precision. Decimal physical storage can be `INT32`, `INT64`,
 `BYTE_ARRAY`, or `FIXED_LEN_BYTE_ARRAY`. `INT32` precision cannot exceed 9,
 and `INT64` precision cannot exceed 18. Fixed byte arrays must have 1 through
-32 bytes and enough signed capacity for the declared precision. Unannotated
-`DOUBLE` is supported only through `Decimal(str(value))`, the shortest decimal
-round-trip representation.
-The parser scales the decimal coefficient and exponent exactly, then requires
-equality with the integer share-price product. It never multiplies a float.
-Physical `FLOAT` is refused. A value whose decimal round trip disagrees with
-the product is refused, rather than rounded or tolerated.
+32 bytes and enough signed capacity for the declared precision.
 
-### Capture store and verification
+Unannotated `DOUBLE` is supported through `Decimal(str(value))`, Python's
+shortest decimal round-trip representation. The parser scales that decimal
+coefficient and exponent exactly, then requires equality with the integer
+share-price product. It also requires that product to be the only integer
+rupiah amount in the DOUBLE's exact IEEE-754 nearest-even rounding interval.
+Ordinary binary representation imprecision is accepted when these checks
+reconcile exactly. For example, synthetic DOUBLE `0.29` represents 29 Rp even
+though binary multiplication by 100 produces `28.999999999999996`.
+
+NaN, infinity, physical `FLOAT`, ambiguous large DOUBLE values, and decimal
+round trips that disagree with the product are refused. There is no broad
+tolerance or rounding allowance. The audit established no source-grounded
+monetary magnitude bound. Integer and Decimal values remain exact, and the
+DOUBLE precision check refuses ambiguity without inventing such a bound.
+
+### Observation sequence and semantic content version
+
+Each ticker-day has an append-only observation chain. `observation_seq`
+increases for every recorded observation, including repeats and 404 responses.
+`previous_observation_id` links the immediately preceding observation.
+`previous_content_capture_id` identifies the latest prior successful content
+observation, so absence cannot erase the content lineage.
+
+A successful observation has a positive `content_version`. Its version changes
+only when normalized semantic trade content changes against the most recent
+successful observation. Raw bytes have their own SHA-256 identity. A different
+encoding with the same normalized rows changes the raw hash and preserves the
+content version. Equivalent semantic trades in different supported source
+layouts also preserve the content version. Parser provenance alone is not a
+trade-content change.
+
+| Observation | `observation_state` | `content_version` |
+|---|---|---|
+| First successful X, including after 404 | `CONTENT_FIRST_SEEN` | 1 |
+| Another X with the same or different raw encoding | `CONTENT_REPEAT` | Same as prior content |
+| Y after X | `CONTENT_CHANGED` | Prior content version + 1 |
+| 404, including consecutive 404 responses | `ABSENT_OBSERVED` | Null |
+
+For X, Y, then Y, the content versions are 1, 2, and 2. Each record has a new
+observation sequence. An absence between two X observations preserves X, and
+the later X is a content repeat. There is no mutable latest version or `FINAL`
+state. Reusing a capture ID with the exact sanitized envelope and content is an
+idempotent retry. A different envelope or content for that ID is refused.
+
+### Chronology and availability
+
+Every observation, including 404, uses the same strict source chronology:
+`new.requested_at >= previous.response_at` and
+`new.response_at > previous.response_at`. Equal response instants cannot prove
+strict order and are refused. This prevents a backdated change, repeat, or
+absence from confirming or superseding a later observation. Verification
+rechecks these relations across the complete chain.
+
+An envelope requires `requested_at <= response_at`. Store recording also
+requires `response_at <= body_recorded_at <= durable_accepted_at`, with no
+future body or acceptance timestamp. The response must fall on or after
+`trade_date` in Asia/Jakarta. A successful tape's response must also
+occur on or after its latest represented trade second in Asia/Jakarta. The
+contract infers no trade milliseconds. When supplied, Azure creation time and
+last-modified time must satisfy
+`creation_time <= last_modified <= response_at`. With one header missing,
+only the comparisons supported by the remaining timestamps apply. Future
+header times are refused. These checks establish lower bounds and do not prove
+that capture occurred after market close.
+
+`durable_accepted_at` is this product's availability time. Request, response,
+header, trade, and body-recorded timestamps cannot establish an earlier product
+availability. An accepted body retains its original `body_recorded_at` even
+when recovery creates its acceptance later.
+
+### Durable private storage and raw publication
 
 `bandarmolony_trade_capture.py` owns `TradeCaptureStore` and the offline CLI.
-The default database is `private_data/bandarmolony/trade_capture.db`. Its
-default raw root is `private_data/bandarmolony/trade_raw`. `.gitignore` covers
-the entire `private_data/` tree, including database journals and WAL files.
-The private-output guard refuses public or tracked repository destinations,
-including tracked descendants, and checks raw output as well as SQLite output.
-Output paths containing credential-shaped names, query strings, or fragments
-are refused before persistence.
+The default store is under a stable user data directory outside Git worktrees:
 
-The store preserves the exact compressed input bytes at
-`trade_raw/sha256/<first-two-digest-characters>/<full-sha256>.parquet`. It
-reads one preserved byte snapshot, verifies its raw hash, and parses that same
-snapshot. It validates the tape and commits the capture body
-before it commits a separate durable acceptance marker. Identical source
-bytes share one raw object. A different digest never overwrites an earlier
-object or body. A different raw encoding can produce the same normalized
-hash, because raw-byte identity and normalized trade identity answer different
-questions.
-The writer flushes and fsyncs raw bytes before publication. On Linux it also
-fsyncs each new directory's parent and the directory that receives the raw
-object. Python does not provide the same directory fsync on Windows.
+| Platform | Default directory |
+|---|---|
+| Windows | Absolute `%LOCALAPPDATA%\DailyScraper\bandarmolony\`, or `~\AppData\Local\DailyScraper\bandarmolony\` when unavailable |
+| macOS | `~/Library/Application Support/DailyScraper/bandarmolony/` |
+| Linux and other Unix | Absolute `$XDG_DATA_HOME/dailyscraper/bandarmolony/`, or `~/.local/share/dailyscraper/bandarmolony/` when unavailable |
+
+The database is `trade_capture.db`, and the raw root is `trade_raw` beneath that
+directory. The resolver uses the standard library. `--db` and `--raw-root`
+remain available for explicit private destinations. The defaults survive Git
+worktree removal. The repository's `private_data/` ignore rule protects an
+explicitly selected repository-local destination, which is still subject to
+worktree deletion.
+
+The private-output guard checks SQLite, its journal, WAL and SHM sidecars, and
+the raw root. Inside a Git worktree, destinations must be ignored and contain
+no tracked output or tracked descendants. Git path checks include case variants.
+Git subprocesses discard inherited `GIT_*` overrides and decode output as
+UTF-8 with safe error handling. Independent ancestor discovery prevents a
+spoofed or broken Git environment from being treated as outside a repository.
+Ordinary local filesystem paths may contain words such as `session` or `token`.
+Ordinary 40-character directory names and neutral literal `#` paths are also
+allowed. Explicit credential-key assignments such as `token=...` in output
+paths are refused. Broader credential detection applies to persisted source
+provenance.
+
+The writer reads the input once, hashes it, and parses and validates those exact
+in-memory bytes before permanent publication. HTML, wrong ticker or date,
+unsupported schema, malformed Parquet, and zero-row bodies leave no permanent
+raw object, capture body, acceptance, or pending file.
+
+Valid compressed input bytes are preserved at
+`trade_raw/sha256/<first-two-digest-characters>/<full-sha256>.parquet`. The writer
+creates a writable temporary file, flushes and fsyncs it, and atomically links
+it to the destination. It unlinks the temporary name while writable and only
+then marks the destination read-only where supported. This order avoids the
+Windows shared read-only attribute across hard links. The existing-object
+branch also cleans its writable temporary file. Identical bytes reuse the
+object. A digest-path conflict with different bytes fails closed and preserves
+the existing object. Cleanup cannot clear the existing object's protection or
+mask the content-conflict error. Supported platforms fsync the parent directory.
+Python does not provide directory fsync on Windows.
+Publication runs inside the body write transaction. If insertion fails before
+commit, the writer removes only its newly published object. A committed pending
+body retains its object for recovery.
+
+POSIX modes limit normal Unix access. `chmod` and `mkdir` mode bits do not
+provide Windows ACL isolation. Read-only raw objects and Git guards do not
+prevent an administrator from replacing files.
+
+### Body, acceptance, recovery, and verification
 
 `trade_captures` holds immutable sanitized provenance, canonical normalized
-content, raw and normalized hashes, schema facts, and observation lineage.
-`trade_acceptances` holds the separately committed `durable_accepted_at`.
-Immutable triggers refuse updates, deletes, same-key inserts, and SQLite
-replacement syntax. Acceptance requires a body even when a caller disables
-SQLite foreign keys. Existing records must match their exact body and hashes
-before idempotent adoption. Hash text alone cannot authorize a different body.
+content, raw and normalized hashes, schema facts, and both lineages.
+`trade_acceptances` holds a separate durable acceptance. Every non-nullable
+identity and primary key has an explicit `NOT NULL` constraint. Nullable parent
+IDs express the absence of a parent, rather than an invalid identity.
 
-`capture_revision` increases for every observation, including repeats and
-absence. `previous_capture_id` links that ticker-day observation chain.
-`FIRST_SEEN`, `REVISED`, `REPEAT_CONFIRMED`, and `ABSENT_OBSERVED` describe
-observations. There is no mutable latest version and no `FINAL` state.
-The first successful body is `FIRST_SEEN`, even after an earlier absence.
-Changed bytes against the most recent successful body produce `REVISED`.
-An independent later observation of the same bytes produces
-`REPEAT_CONFIRMED`. Absence does not discard the earlier successful body.
-Reusing one capture ID with the same sanitized envelope and exact content is
-an idempotent retry. Changing its envelope or content is refused. A new capture
-ID records another independent observation, even when the raw bytes match.
+The store commits the validated body before a separate acceptance transaction.
+Immutable triggers refuse updates, deletes, duplicate-key inserts, and SQLite
+replacement syntax. Acceptance requires the matching committed body even when
+SQLite foreign keys are disabled. A successor requires an accepted observation
+parent, and its body cannot predate the parent's durable acceptance. Schema
+verification checks trigger bodies as well as their names.
 
-`observe_absence(envelope)` requires `http_status=404`. It records an
-`ABSENT_OBSERVED` capture with its own provenance and acceptance. Hashes and
-row counts are null, and no tape is invented. Absence does not mean zero
-trades, an empty session, or a non-trading day.
+A crash after body commit can leave a sealed, unaccepted body. `resume(capture_id)`
+and CLI `resume --capture-id CAPTURE_ID` recover it without asking the operator
+to reconstruct envelope fields. Recovery rebuilds and validates the sealed
+metadata, reparses the raw object, recomputes normalized truth and the body
+seal, checks the complete chain, and refuses a conflicting successor. It
+creates only the missing acceptance, with a fresh `durable_accepted_at` and the
+original `body_recorded_at`. Resume is idempotent for an already accepted valid
+capture and returns verified metadata without replacing its acceptance. It also
+supports absence observations. Retrying the exact explicit capture ID can
+recover its pending body. A new observation blocked by a pending predecessor
+reports that capture ID and the resume command.
 
-`verify(capture_id)` checks the raw object, reparsed normalized content,
-schema, envelope, natural key, value arithmetic, broker balances, immutable
-body, acceptance, observation chain, and private-output guards. It refuses
-corruption without repair. `inspect(capture_id)` verifies first and returns
-compact metadata and tape diagnostics. Both commands open SQLite read-only.
-`read_rows(capture_id)` also requires verification before returning rows.
-Inspection includes capture lineage and request, response, and acceptance
-timestamps. Hash prefixes have 12 characters. Successful captures add board
-counts, broker count, time range, total shares, total value, and unique orders.
-The pure Python API `tape_summary(rows)` also exposes per-order fill maps.
-An absence has `tape=null`.
+`observe_absence(envelope)` requires `http_status=404`. It records its own
+provenance and acceptance. Content version, hashes, schema facts, normalized
+rows, and row counts are null. Absence cannot establish zero trades, an empty
+session, or a non-trading day.
 
-The envelope has no credential or arbitrary metadata field. Source paths lose
-query strings, fragments, and URL user information before persistence. Token
-shaped path components and invalid identifier fields are refused. CLI failures
-use safe messages without echoing arbitrary input or source payloads.
+`verify(capture_id)` reparses the immutable raw object. It recomputes the raw
+hash, parser recognition, schema fingerprint, canonical normalized rows,
+normalized hash, row and source-row counts, duplicate counts, content-version
+relation, observation state, source chronology, body seal, acceptance relation,
+and complete chain. It rechecks envelope constraints, exact value arithmetic,
+accounting invariants, raw destinations, and private-output guards. Stored
+metadata alone cannot establish normalized truth. Verification refuses
+corruption without repair.
 
-These protections check local consistency. They do not attest vendor origin or
-prevent an administrator from replacing database files and all related evidence.
-Ignore rules and private-output guards protect the normal Git workflow.
+`inspect(capture_id)` verifies first and returns safe metadata and tape
+diagnostics. `read_rows(capture_id)` verifies before returning rows. Read-only
+commands use SQLite `mode=ro` and normal locking for DELETE-mode stores. A
+database left in WAL mode is refused, including after checkpointing. Nonempty
+WAL or rollback journals are also refused. Immutable mode cannot prove
+quiescence or respect a mutable store's writer locks, so readers do not use it.
+DELETE-mode read-only commands create no WAL or SHM sidecars, stores, or raw
+objects.
+
+Opening a normal writer restores DELETE journaling through SQLite. CLI
+`resume --capture-id CAPTURE_ID` can do this using an already accepted valid
+capture ID. It verifies that capture and leaves its durable acceptance
+unchanged. No manual SQL or envelope reconstruction is required.
+
+Inspection and verification metadata include observation and content lineage,
+request, response and acceptance times, and source duplicate collapse counts.
+Verification also exposes `body_recorded_at`. Hash prefixes have 12 characters.
+Successful inspection adds board counts, broker count, time range, total shares,
+total value, and unique orders.
+The pure Python API `tape_summary(rows)` also exposes per-order fill maps. An
+absence has `tape=null`.
+
+The envelope has no credential or arbitrary metadata field. Source sanitization
+removes URL query strings, fragments, and user information before persistence.
+Matrix parameters and credential-shaped source components are refused. Local
+paths preserve a literal `#`. Their `?` delimiter retains the established
+query-stripping provenance convention. Extended Windows paths and ambiguous
+malformed source values are refused rather than partially normalized.
+Failures suppress unsafe exception context and do not echo source input or
+payloads. These provenance rules do not restrict ordinary output directory names.
+
+The body seal is unkeyed SHA-256. The raw hashes, body seals, schema checks, and
+chains establish local integrity under this store model. They do not attest
+vendor origin or resist replacement of the database and all related evidence
+by an administrator.
 
 ### Offline commands
 
-The CLI accepts a local file and supplied observation timestamps. This example
-uses a synthetic file and a sanitized source path:
+The CLI accepts supplied local files and observation timestamps. This example
+uses a synthetic file whose trades occur on the prior Asia/Jakarta date:
 
 ```bash
 	python bandarmolony_trade_capture.py ingest \
 	  --ticker DEWA --trade-date 2026-10-01 \
 	  --file /private/synthetic.parquet \
-	  --requested-at 2026-10-01T09:00:00.000001Z \
-	  --response-at 2026-10-01T09:00:01.000002Z \
+	  --requested-at 2026-10-02T00:00:00.000001Z \
+	  --response-at 2026-10-02T00:00:01.000002Z \
 	  --source-path /done_detail/DEWA/2026-10-01.parquet
+	python bandarmolony_trade_capture.py resume --capture-id CAPTURE_ID
 	python bandarmolony_trade_capture.py verify --capture-id CAPTURE_ID
 	python bandarmolony_trade_capture.py inspect --capture-id CAPTURE_ID
 ```
 
 `ingest` also accepts `--capture-id`, `--created-by`, `--last-modified`,
 `--creation-time`, and `--request-id`. Every command accepts `--db` and
-`--raw-root` for an explicitly private destination. Output is safe JSON, and a
-verification or contract failure returns a nonzero exit status. The absence
-contract is available through the Python API rather than an HTTP collector.
+`--raw-root`. Option abbreviations and repeated single-value flags are refused.
+Output is safe JSON, and a contract or verification failure returns a nonzero
+exit status. Absence is available through the Python API. There is no HTTP
+collector.
 
-### Offline tests and scope
+### Offline gates and scope
 
-The normal behavioral suite runs with
-`python test_bandarmolony_trade_capture.py`. `check_ml_health.py` registers
-that suite in a separate process, including `--quick`, and counts its unittest
-summary. The pipeline regression checks one launch in quick and full health
-paths, passing-test counts, and failure propagation.
+The behavioral suite runs with `python test_bandarmolony_trade_capture.py`.
+`check_ml_health.py` registers it in a separate process, including `--quick`,
+and counts its unittest summary. Pipeline guards check one launch in quick and
+full health paths, count propagation, and failure propagation.
 
 The explicit mutation command is
-`python test_bandarmolony_trade_mutations.py --run`. The runner creates
-isolated copies outside Git repositories and starts a fresh Python process for
-each mutation. A kill requires a behavioral assertion failure, not a syntax or
-import failure. No mutation copy, raw fixture, or generated database is
-committed.
+`python test_bandarmolony_trade_mutations.py --run`. The runner creates isolated
+copies outside Git repositories and uses a fresh Python process for each case.
+A kill requires the intended behavioral assertion. Syntax, import, runtime,
+and setup failures are `INVALID`, never kills. The baseline must pass before
+mutation results count, and the required gate has zero invalid mutants. No
+mutation copy, raw fixture, or generated database is committed.
 
-The explicit mutation gate passes its 18-case baseline and kills all 18
-requested non-equivalent mutations. Its final output is:
-
-```text
-	BASELINE PASS tests=18
-	MUTATION RESULTS total=18 killed=18 survived=0 invalid=0
-```
-
-The verified native regression commands and results are:
+The completed delta passed these Linux gates:
 
 | Command | Result |
 |---|---|
-| `python test_bandarmolony_trade_capture.py` | 81 tests pass |
-| `python test_inventory_evidence.py` | 106 tests pass |
-| `python test_targeted_actor_panel.py` | 33 tests pass |
-| `python test_targeted_actor_observations.py` | 25 tests pass |
-| `python test_pipeline.py` | Passes with the existing absent candidate-artifact skip |
-| `python check_ml_health.py --quick` | 698 tests pass, 30 modules import, exit 0 |
+| `python test_bandarmolony_trade_capture.py` | 130 tests passed |
+| `python test_bandarmolony_trade_mutations.py --run` | Baseline 39 and classification controls 7 passed; 39 killed, 0 survived, 0 invalid |
+| `python test_inventory_evidence.py` | 106 tests passed |
+| `python test_targeted_actor_panel.py` | 33 tests passed |
+| `python test_targeted_actor_observations.py` | 25 tests passed |
+| `python test_pipeline.py` | Passed; existing candidate-artifact case skipped because artifacts are absent |
+| `python check_ml_health.py --quick` | ML health OK, 31 modules imported and 747 tests passed; model smoke test skipped |
+| `git diff --check` | Passed |
 
-The focused pipeline guards for trade and inventory health registration also
-pass. Default private database, WAL, and raw-object paths pass `git check-ignore`.
-Quick health checks the existing panel with 10,076 rows, 251 sessions, and
-45 tickers. The two existing modules, `smart_money_divergence` and
-`ddqn_entry_exit`, receive compile-only checks because their optional
-dependencies or scraper credentials are unavailable. `--quick` skips the
-model smoke test.
+The health report retains its existing broker-flow availability caveat and
+compile-only check for optional `smart_money_divergence` setup. No model was
+fitted. Tests used an isolated Linux Python environment with the existing
+repository dependencies, including CPU builds of XGBoost and PyTorch.
 
+Native Windows execution remains a separate required gate. Cloud/Linux cannot
+prove native Windows filesystem semantics. This delta is
+`READY FOR NATIVE WINDOWS RE-REVIEW`. Final approval requires Claude's native
+Windows delta review. No PR is opened by this task.
+
+Required commands are:
+
+```text
+	python test_bandarmolony_trade_capture.py
+	python test_bandarmolony_trade_mutations.py --run
+	python test_inventory_evidence.py
+	python test_targeted_actor_panel.py
+	python test_targeted_actor_observations.py
+	python test_pipeline.py
+	python check_ml_health.py --quick
+	git diff --check
+```
+
+`--quick` skips the model smoke test. This task performs no model fitting.
 V1 has no actor identity, Order Evidence product, Inventory Pilot, screening,
 dashboard, OHLC dependency, or external reconciliation. It reads no credentials
 and performs no login, Supabase authentication, SAS-token retrieval, Azure
 download, browser automation, network collection, or scheduled acquisition.
-Workflow schedules and unrelated production modules are unchanged.
+No real Parquet, store, raw paid data, or credential is added. Workflow
+schedules and unrelated production modules are unchanged.

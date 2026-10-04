@@ -9,14 +9,16 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from fractions import Fraction
 import hashlib
 import json
 import math
 from pathlib import Path
 import re
+import struct
 from typing import Any, Iterable, Mapping
 from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import UUID, uuid4
@@ -26,9 +28,10 @@ DATASET = "BANDARMOLONY_DONE_DETAIL"
 NORMALIZED_SCHEMA_VERSION = "TRADE_TAPE_V1"
 RECENT_SCHEMA_VERSION = "RECENT_16COL"
 LEGACY_SCHEMA_VERSION = "LEGACY_2025_14COL"
-CAPTURE_STATES = frozenset(
-    {"FIRST_SEEN", "REVISED", "REPEAT_CONFIRMED", "ABSENT_OBSERVED"}
+OBSERVATION_STATES = frozenset(
+    {"CONTENT_FIRST_SEEN", "CONTENT_CHANGED", "CONTENT_REPEAT", "ABSENT_OBSERVED"}
 )
+JAKARTA_TIMEZONE = timezone(timedelta(hours=7), "Asia/Jakarta")
 
 RECENT_COLUMNS = frozenset(
     {
@@ -52,7 +55,8 @@ SUPPORTED_PARQUET_REPRESENTATIONS = {
     "source_value": (
         "supported integer; Decimal on INT32/INT64/BYTE_ARRAY/"
         "FIXED_LEN_BYTE_ARRAY, precision 1..76, scale 0..precision; "
-        "unannotated DOUBLE via its shortest decimal roundtrip"
+        "unannotated DOUBLE via its shortest decimal roundtrip, with exactly "
+        "one integer rupiah compatible with its IEEE-754 rounding interval"
     ),
     "legacy_board": "unannotated or signed Int32 INT32, value exactly zero",
 }
@@ -128,14 +132,17 @@ def _safe_component(value: str) -> None:
         or _LONG_OPAQUE.search(decoded)
         or "@" in decoded
         or "%" in decoded
+        or ";" in decoded
     ):
         raise TradeContractError("source provenance contains an unsafe component")
 
 
 def sanitize_source_path(value: str) -> str:
-    """Remove query, fragment and URL userinfo before a path can be persisted.
+    """Remove queries and URL fragment/userinfo before provenance persistence.
 
     Windows separators normalize to '/', independently of the running OS.
+    A local '#' is a literal filename character. Extended/device Windows paths
+    and decoded matrix parameters are refused rather than partially parsed.
     Credential names, JWTs and long opaque path components are rejected, even
     when percent encoded. Rejection messages never include the input.
     """
@@ -143,29 +150,60 @@ def sanitize_source_path(value: str) -> str:
         raise TradeContractError("source provenance path is invalid")
     if not value:
         return ""
-    # Remove query and fragment first, including their credential-shaped text.
-    stripped = value.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
+    # Raise after leaving the parser's exception handler. ``from None`` alone
+    # hides a traceback but retains __context__, which may contain a secret.
+    result = None
     try:
-        is_windows = bool(re.match(r"^[A-Za-z]:/", stripped))
-        if not is_windows and "://" in stripped:
-            parsed = urlsplit(stripped)
+        normalized = value.replace("\\", "/")
+        if normalized.startswith(("//?/", "//./")):
+            raise ValueError
+        if any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+            raise ValueError
+        is_windows = bool(re.match(r"^[A-Za-z]:/", normalized))
+        scheme = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", normalized)
+        if not is_windows and scheme:
+            # Backslashes or missing '//' in a URI are ambiguous, not repairs.
+            if "\\" in value or "://" not in value:
+                raise ValueError
+            parsed = urlsplit(value)
             if parsed.scheme.lower() not in {"http", "https", "file"}:
-                raise TradeContractError("source provenance scheme is unsupported")
+                raise ValueError
             host = parsed.hostname or ""
+            if parsed.scheme.lower() in {"http", "https"} and not host:
+                raise ValueError
+            if parsed.scheme.lower() == "file" and (not parsed.path.startswith("/") or parsed.username):
+                raise ValueError
+            if any(char.isspace() for char in host) or parsed.netloc.endswith(":"):
+                raise ValueError
             _safe_component(host)
             if ":" in host:
                 host = f"[{host}]"
             port = parsed.port
+            if parsed.scheme.lower() == "file" and port is not None:
+                raise ValueError
             netloc = host + (f":{port}" if port is not None else "")
             path = parsed.path
             for component in path.split("/"):
                 _safe_component(component)
-            return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
-        for component in stripped.split("/"):
-            _safe_component(component)
-        return stripped
+            result = urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+        else:
+            if "://" in normalized or (":" in normalized and not is_windows):
+                raise ValueError
+            if is_windows and ":" in normalized[2:]:
+                raise ValueError
+            # Local '?' keeps the established provenance-query convention.
+            # Unlike URL fragments, a literal local '#' must survive intact.
+            stripped = normalized.split("?", 1)[0]
+            if not stripped:
+                raise ValueError
+            for component in stripped.split("/"):
+                _safe_component(component)
+            result = stripped
     except (ValueError, UnicodeError):
-        raise TradeContractError("source provenance path is invalid") from None
+        pass
+    if result is None:
+        raise TradeContractError("source provenance path is invalid")
+    return result
 
 
 def _safe_identifier(value: str, name: str, max_length: int = 128) -> str:
@@ -183,7 +221,7 @@ def _safe_identifier(value: str, name: str, max_length: int = 128) -> str:
 
 def _trade_date(value: str) -> str:
     try:
-        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
             raise ValueError
         if date.fromisoformat(value).isoformat() != value:
             raise ValueError
@@ -218,10 +256,21 @@ class CaptureEnvelope:
         response_at = utc_text(self.response_at)
         if response_at < requested_at:
             raise TradeContractError("response timestamp precedes request timestamp")
+        trade_day_start = utc_text(datetime.combine(
+            date.fromisoformat(self.trade_date), time.min, JAKARTA_TIMEZONE,
+        ))
+        if response_at < trade_day_start:
+            raise TradeContractError("response timestamp precedes the Jakarta trade date")
+        last_modified = _header_time(self.last_modified)
+        creation_time = _header_time(self.x_ms_creation_time)
+        if any(stamp > response_at for stamp in (last_modified, creation_time) if stamp is not None):
+            raise TradeContractError("source header timestamp follows the response")
+        if creation_time is not None and last_modified is not None and creation_time > last_modified:
+            raise TradeContractError("source creation timestamp follows last modification")
         object.__setattr__(self, "requested_at", requested_at)
         object.__setattr__(self, "response_at", response_at)
-        object.__setattr__(self, "last_modified", _header_time(self.last_modified))
-        object.__setattr__(self, "x_ms_creation_time", _header_time(self.x_ms_creation_time))
+        object.__setattr__(self, "last_modified", last_modified)
+        object.__setattr__(self, "x_ms_creation_time", creation_time)
         if self.x_ms_request_id is not None:
             try:
                 parsed_id = str(UUID(self.x_ms_request_id))
@@ -246,9 +295,10 @@ class NormalizedTape:
 
 
 def normalized_document(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """Hash rows in ticker/date/trx_code order, without capture provenance."""
+    """Hash semantic rows in ticker/date/trx_code order, without provenance."""
     ordered = sorted(
-        ({key: value for key, value in row.items() if key != "source_capture_id"} for row in rows),
+        ({key: value for key, value in row.items()
+          if key not in {"source_capture_id", "source_schema_version"}} for row in rows),
         key=lambda row: (row["ticker"], row["trade_date"], row["trx_code"]),
     )
     return {"schema_version": NORMALIZED_SCHEMA_VERSION, "rows": ordered}
@@ -291,9 +341,9 @@ def _source_date(value: Any) -> str:
 def _trade_time(value: Any) -> str:
     if type(value) is int and 0 <= value <= 235959:
         digits = f"{value:06d}"
-    elif isinstance(value, str) and re.fullmatch(r"\d{6}", value):
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]{6}", value):
         digits = value
-    elif isinstance(value, str) and re.fullmatch(r"\d{2}:\d{2}:\d{2}", value):
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", value):
         digits = value.replace(":", "")
     else:
         raise TradeContractError("trade time must be HHMMSS to seconds")
@@ -307,14 +357,21 @@ def _source_value_rp(value: Any) -> int:
     """Convert source VALUE ×100 without Decimal-context or float arithmetic.
 
     A DOUBLE is supported only through Python's shortest decimal roundtrip.
-    Its decimal result must resolve to integer rupiah and equal shares×price.
-    FLOAT and binary-float multiplication are unsupported.
+    Its decimal result must resolve to integer rupiah and be the only integer
+    rupiah in that DOUBLE's exact nearest-even rounding interval. This admits
+    ordinary binary representation imprecision, without accepting tolerances
+    or a representation that cannot distinguish adjacent integer rupiah.
+    Shares×price must independently equal the converted integer. No audited
+    source magnitude bound exists; Decimal and integer money remain exact.
+    FLOAT and binary-float money multiplication are unsupported.
     """
     if type(value) is int:
         return value * 100
+    double_value = None
     if type(value) is float:
         if not math.isfinite(value):
             raise TradeContractError("source VALUE must be finite")
+        double_value = value
         value = Decimal(str(value))
     if not isinstance(value, Decimal) or not value.is_finite():
         raise TradeContractError("source VALUE has an unsupported representation")
@@ -329,7 +386,31 @@ def _source_value_rp(value: Any) -> int:
         rupiah, remainder = divmod(coefficient, 10 ** -exponent)
         if remainder:
             raise TradeContractError("source VALUE does not resolve to integer rupiah")
-    return -rupiah if parts.sign else rupiah
+    rupiah = -rupiah if parts.sign else rupiah
+    if double_value is not None:
+        _require_unique_double_rupiah(double_value, rupiah)
+    return rupiah
+
+
+def _require_unique_double_rupiah(value: float, rupiah: int) -> None:
+    """Prove unique Rp using exact rational IEEE-754 rounding boundaries."""
+    previous = math.nextafter(value, -math.inf)
+    following = math.nextafter(value, math.inf)
+    if not math.isfinite(previous) or not math.isfinite(following):
+        raise TradeContractError("source VALUE DOUBLE cannot uniquely represent integer rupiah")
+    exact = Fraction.from_float(value)
+    # Midpoints in VALUE units, scaled by 100 to integer-rupiah units.
+    lower = (Fraction.from_float(previous) + exact) * 50
+    upper = (exact + Fraction.from_float(following)) * 50
+    minimum = -(-lower.numerator // lower.denominator)
+    maximum = upper.numerator // upper.denominator
+    # The least significant significand bit governs nearest-even ties.
+    ties_included = int.from_bytes(struct.pack(">d", value), "big") & 1 == 0
+    if not ties_included:
+        minimum += int(lower.denominator == 1)
+        maximum -= int(upper.denominator == 1)
+    if minimum != maximum or rupiah != minimum:
+        raise TradeContractError("source VALUE DOUBLE cannot uniquely represent integer rupiah")
 
 
 def _integer_type(column: Any) -> bool:
@@ -498,13 +579,23 @@ def normalize_parquet(
                     "vendor_haka_haki": _code(row["HAKA_HAKI"], "vendor HAKA_HAKI", True),
                     "source_schema_version": schema_version,
                 }
+                # TRX_TIME proves a lower bound to whole seconds only. It does
+                # not prove exchange milliseconds or a market-close cutoff.
+                represented_trade_at = utc_text(datetime.combine(
+                    date.fromisoformat(envelope.trade_date),
+                    time.fromisoformat(canonical["trade_time"]), JAKARTA_TIMEZONE,
+                ))
+                if envelope.response_at < represented_trade_at:
+                    raise TradeContractError("response timestamp precedes a represented trade")
                 trx_code = canonical["trx_code"]
                 if trx_code in rows_by_key and rows_by_key[trx_code] != canonical:
                     raise TradeContractError("conflicting duplicate natural trade key")
                 rows_by_key[trx_code] = canonical
                 multiplicities[trx_code] += 1
+        if source_row_count == 0:
+            raise TradeContractError("zero-row successful tapes have unaudited source semantics")
         rows = tuple(rows_by_key[key] for key in sorted(rows_by_key))
-        # Execute self-reconciliation at the parse boundary, before acceptance.
+        # Deterministic accounting invariants are not independent source proof.
         broker_totals(rows)
         content_json = canonical_json(normalized_document(rows))
         return NormalizedTape(
@@ -527,7 +618,7 @@ def normalize_parquet(
 
 
 def broker_totals(rows: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
-    """Deterministic broker-day self-reconciliation, independent of OHLC."""
+    """Deterministic broker-day accounting invariants, without OHLC inputs."""
     totals: dict[str, dict[str, int]] = {}
     fields = (
         "buy_shares", "sell_shares", "net_shares", "buy_value_rp",
