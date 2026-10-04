@@ -502,6 +502,108 @@ class MutationBehaviorTests(unittest.TestCase):
             self.assertEqual(list((self.root / "private" / "raw").rglob("*.parquet")), [])
             self.assertEqual(list((self.root / "private" / "raw").rglob(".pending-*")), [])
 
+    def foreign_pid(self):
+        """The process identity a forked child observes; real forks run on POSIX."""
+        return patch.object(self.capture.os, "getpid", return_value=os.getpid() + 1)
+
+    def inherited(self, action, identity=None):
+        with identity or self.foreign_pid(), self.behavior():
+            with self.assertRaises(self.contract.TradeContractError) as refused:
+                action()
+            self.assertEqual(str(refused.exception), self.capture.INHERITED_STORE_REFUSAL)
+
+    def test_inherited_store_refused(self):
+        accepted = self.ingest()
+        self.inherited(lambda: self.store.verify(accepted["capture_id"]))
+        self.inherited(lambda: self.store.resume(accepted["capture_id"]))
+
+    def test_inherited_store_refused_before_io(self):
+        accepted = self.ingest()
+        checked = []
+        guard = self.capture.check_private_output
+        with patch.object(self.capture, "check_private_output",
+                          side_effect=lambda *args, **kwargs: checked.append(args) or guard(*args, **kwargs)):
+            self.inherited(lambda: self.store.verify(accepted["capture_id"]))
+        self.equal(checked, [])
+
+    def test_reused_creator_pid_refused(self):
+        # A later descendant can reuse the creator PID after another fork.
+        later = patch.object(self.capture, "_fork_generation", self.capture._fork_generation + 1)
+        self.inherited(lambda: self.store.conn, identity=later)
+
+    def test_inherited_lock_exit_keeps_parent_coordination(self):
+        closed = []
+        connect = sqlite3.connect
+
+        class Recording(sqlite3.Connection):
+            def close(connection):
+                closed.append(connection)
+                return super().close()
+
+        def recording(database, *args, **kwargs):
+            if Path(database).name == self.capture.RAW_ROOT_LOCK:
+                kwargs["factory"] = Recording
+            return connect(database, *args, **kwargs)
+
+        with patch.object(self.capture.sqlite3, "connect", side_effect=recording):
+            context = self.store._raw_root_lock()
+            context.__enter__()
+        self.addCleanup(self.release_inherited_handles)
+        self.inherited(lambda: context.__exit__(None, None, None))
+        self.equal(closed, [])
+
+    def release_inherited_handles(self):
+        while self.capture._inherited_handles:
+            self.capture._inherited_handles.pop().close()
+
+    def test_inherited_publication_unwind_keeps_raw(self):
+        path = self.file()
+        data = path.read_bytes()
+        destination = self.store.raw_path(self.contract.sha256_bytes(data))
+        identity = self.foreign_pid()
+        link = os.link
+
+        def child_exits_after_link(source, target, *args, **kwargs):
+            # A signal handler forks right after publication; the child calls sys.exit().
+            link(source, target, *args, **kwargs)
+            if Path(target) == destination:
+                identity.start()
+                raise SystemExit(0)
+
+        self.addCleanup(self.release_inherited_handles)
+        outcome = None
+        try:
+            with patch.object(self.capture.os, "link", side_effect=child_exits_after_link):
+                try:
+                    self.store.ingest(path, self.envelope())
+                except BaseException as error:
+                    outcome = type(error).__name__
+        finally:
+            identity.stop()
+        # The simulated child left the owner's transaction to its owner.
+        self.store.conn.rollback()
+        aliases = ([alias for alias in destination.parent.glob(".pending-*") if alias.samefile(destination)]
+                   if destination.exists() else [])
+        # The child's exit stays SystemExit; the parent's alias and object remain.
+        self.equal((outcome, destination.read_bytes() if destination.exists() else None, len(aliases)),
+                   ("SystemExit", data, 1))
+
+    def test_inherited_raw_root_lock_refused(self):
+        def nested():
+            with self.store._raw_root_lock():
+                pass
+
+        with self.store._raw_root_lock():
+            self.inherited(nested)
+        self.inherited(nested)
+
+    def test_inherited_connection_refused(self):
+        self.inherited(lambda: self.store.conn)
+
+    def test_inherited_close_refused(self):
+        self.inherited(self.store.close)
+        self.equal(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+
 
 @dataclass(frozen=True)
 class Mutation:
@@ -720,6 +822,40 @@ def mutations():
         Mutation("publish_rejected_body", capture, "test_rejected_body_never_published",
                  in_function("ingest", 'digest = sha256_bytes(data)',
                              'digest = sha256_bytes(data)\n        self._preserve_raw(data, digest)')),
+        Mutation("ignore_store_process_identity", capture, "test_inherited_store_refused",
+                 in_function("_require_owner", 'if not self._owned():', 'if False:')),
+        Mutation("inherited_store_io_before_refusal", capture, "test_inherited_store_refused_before_io",
+                 in_function("_check_paths", 'self._require_owner()\n        # Filesystem locations',
+                             '# Filesystem locations')),
+        Mutation("identity_without_fork_generation", capture, "test_reused_creator_pid_refused",
+                 in_function("_process_identity", 'return os.getpid(), _fork_generation',
+                             'return os.getpid(), 0')),
+        Mutation("close_inherited_coordination_on_exit", capture,
+                 "test_inherited_lock_exit_keeps_parent_coordination",
+                 in_function("_raw_root_lock", 'if self._owned():\n                    coordination.close()',
+                             'if True:\n                    coordination.close()')),
+        Mutation("discard_inherited_publication", capture, "test_inherited_publication_unwind_keeps_raw",
+                 in_function("_preserve_raw", 'if not self._owned():\n', 'if False:\n')),
+        Mutation("alias_unlink_before_ownership_check", capture, "test_inherited_publication_unwind_keeps_raw",
+                 in_function("_preserve_raw", 'if not self._owned():\n',
+                             'if tmp_name is not None:\n                    os.unlink(tmp_name)\n'
+                             '                    tmp_name = None\n                if not self._owned():\n')),
+        Mutation("mask_child_exit_in_write_transaction", capture, "test_inherited_publication_unwind_keeps_raw",
+                 in_function("_write_transaction", 'if self._owned():\n                self.conn.rollback()',
+                             'self.conn.rollback()')),
+        Mutation("mask_child_exit_in_raw_root_lock", capture, "test_inherited_publication_unwind_keeps_raw",
+                 in_function("_raw_root_lock", '_inherited_handles.append(coordination)\n',
+                             '_inherited_handles.append(coordination)\n'
+                             '                    raise TradeContractError(INHERITED_STORE_REFUSAL)\n')),
+        Mutation("inherited_held_flag_skips_native_lock", capture, "test_inherited_raw_root_lock_refused",
+                 in_function("_raw_root_lock", 'self._require_owner()\n        if self.read_only:',
+                             'if self.read_only:')),
+        Mutation("use_inherited_sqlite_connection", capture, "test_inherited_connection_refused",
+                 in_function("conn", 'self._require_owner()\n        return self._conn',
+                             'return self._conn')),
+        Mutation("close_inherited_sqlite_connection", capture, "test_inherited_close_refused",
+                 in_function("close", 'self._require_owner()\n        self._conn.close()',
+                             'self._conn.close()')),
     )
 
 

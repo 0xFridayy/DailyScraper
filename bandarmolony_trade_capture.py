@@ -46,6 +46,28 @@ SIDECARS = ("-journal", "-wal", "-shm")
 PRODUCT = "BANDARMOLONY_TRADE_CAPTURE_V1"
 STORE_VERSION = "2"
 RAW_ROOT_LOCK = ".raw-root-lock.sqlite3"
+INHERITED_STORE_REFUSAL = "trade store belongs to another process; open a new store after fork"
+
+# Python runs this in every os.fork() child that continues in the interpreter.
+# Stores bind to their creator PID and fork generation, so an inherited store
+# stays refused even if a later descendant reuses the creator's PID.
+def _advance_fork_generation():
+    global _fork_generation
+    _fork_generation += 1
+
+
+# A module reload keeps the generation, the held handles and the single hook.
+if "_fork_generation" not in globals():
+    _fork_generation = 0
+    # Coordination connections that a fork child inherited inside a lock
+    # context. SQLite forbids closing them there, so they stay referenced.
+    _inherited_handles = []
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_advance_fork_generation)
+
+
+def _process_identity():
+    return os.getpid(), _fork_generation
 
 
 class PendingCaptureError(TradeContractError):
@@ -261,9 +283,14 @@ def _private_mkdir(path):
 
 
 class TradeCaptureStore:
-    """Private, append-only local store. Readers never create or repair stores."""
+    """Private, append-only local store. Readers never create or repair stores.
+
+    A store belongs to the process that created it. A forked child must open
+    its own store, which owns its own SQLite connection and raw-root lock.
+    """
 
     def __init__(self, db=DEFAULT_DB, raw_root=None, *, read_only=False):
+        self._owner = _process_identity()
         self.db = Path(db).resolve()
         self.raw_root = Path(raw_root).resolve() if raw_root is not None else self.db.parent / "trade_raw"
         self.read_only = read_only
@@ -273,11 +300,11 @@ class TradeCaptureStore:
             # Normal DELETE-mode reads retain SQLite's shared locks. WAL files
             # are refused before opening: mode=ro can create SHM, and immutable
             # would ignore locks and potentially expose an uncommitted write.
-            self.conn = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True)
+            self._conn = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True)
         else:
             _private_mkdir(self.db.parent)
             new_file = not self.db.exists()
-            self.conn = sqlite3.connect(self.db)
+            self._conn = sqlite3.connect(self.db)
         try:
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys = ON")
@@ -295,17 +322,42 @@ class TradeCaptureStore:
                 _fsync_dir(self.db.parent)
             self._verify_schema()
         except BaseException:
-            self.conn.close()
+            self._conn.close()
             raise
 
+    def _owned(self):
+        return _process_identity() == self._owner
+
+    def _require_owner(self):
+        """Refuse an inherited store before it touches SQLite or the raw root.
+
+        fork() copies this object, its SQLite connection and any thread-local
+        coordination flag, but none of the parent's native locks. SQLite
+        forbids using, or even closing, a connection inherited across fork:
+        close cleanup can delete a journal that the parent still needs.
+        """
+        if not self._owned():
+            raise TradeContractError(INHERITED_STORE_REFUSAL)
+
+    @property
+    def conn(self):
+        self._require_owner()
+        return self._conn
+
     def __enter__(self):
+        self._require_owner()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if exc is not None and not self._owned():
+            # A fork child's in-flight exception, such as SystemExit, keeps
+            # propagating, and the inherited connection stays open.
+            return False
         self.close()
 
     def close(self):
-        self.conn.close()
+        self._require_owner()
+        self._conn.close()
 
     def _meta(self):
         return {"product": PRODUCT, "schema_version": STORE_VERSION, "raw_root": str(self.raw_root)}
@@ -339,6 +391,8 @@ class TradeCaptureStore:
         raise TradeContractError("cannot establish read-only database WAL state")
 
     def _check_paths(self):
+        # Every operation starts here; refuse inherited stores before any I/O.
+        self._require_owner()
         # Filesystem locations are local paths, not source provenance. Ordinary
         # names containing session/token or long identifiers remain valid.
         assignment = re.compile(
@@ -382,7 +436,10 @@ class TradeCaptureStore:
         close/process death releases. Never unlink or replace the lock file.
         Acquire it before the store's SQLite transaction, including for repair.
         A bounded busy wait or any setup failure refuses the operation.
+        Nesting is shared only within one store, thread and creating process:
+        a forked child inherits the held flag but not the native lock.
         """
+        self._require_owner()
         if self.read_only:
             raise TradeContractError("read-only trade store")
         if getattr(self._raw_coordination, "held", False):
@@ -427,7 +484,15 @@ class TradeCaptureStore:
             # Closing rolls back the coordination transaction and releases all
             # native locks even when publication, rollback or repair raised.
             if coordination is not None:
-                coordination.close()
+                if self._owned():
+                    coordination.close()
+                else:
+                    # A fork child is unwinding its parent's lock context.
+                    # Keep the parent's connection open; never close it here.
+                    _inherited_handles.append(coordination)
+        # Only a normal exit gets here. An in-flight exception, such as a fork
+        # child's SystemExit, keeps propagating unchanged.
+        self._require_owner()
 
     @staticmethod
     def _discard_raw(path):
@@ -478,9 +543,12 @@ class TradeCaptureStore:
             fd, tmp_name = tempfile.mkstemp(prefix=".pending-", dir=destination.parent)
             created = False
             try:
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(data)
-                    handle.flush()
+                # Unbuffered, so a fork child unwinding this frame holds no
+                # copy of pending bytes that closing its file could append.
+                with os.fdopen(fd, "wb", buffering=0) as handle:
+                    view = memoryview(data)
+                    while view:
+                        view = view[handle.write(view):]
                     os.fsync(handle.fileno())
                 try:
                     os.link(tmp_name, destination)
@@ -512,6 +580,10 @@ class TradeCaptureStore:
                     raise TradeContractError("existing raw object differs from supplied bytes")
                 _fsync_dir(destination.parent)
             except BaseException:
+                if not self._owned():
+                    # A fork child unwinding its parent's publication owns
+                    # neither the pending alias nor the published object.
+                    raise
                 if tmp_name is not None:
                     try:
                         os.unlink(tmp_name)
@@ -533,7 +605,10 @@ class TradeCaptureStore:
             yield
             self.conn.commit()
         except BaseException:
-            self.conn.rollback()
+            # A fork child neither rolls back the parent's transaction nor
+            # replaces its own in-flight exception.
+            if self._owned():
+                self.conn.rollback()
             raise
 
     def _get_record(self, capture_id):
@@ -641,7 +716,8 @@ class TradeCaptureStore:
                 # The shared lock has never been released. No other database can
                 # adopt our publication before rollback cleanup finishes. The local
                 # check also protects a COMMIT that succeeded before reporting an error.
-                if published is not None:
+                # A fork child unwinding this frame never owns deletion.
+                if published is not None and self._owned():
                     referenced = self.conn.execute(
                         "SELECT 1 FROM trade_captures WHERE raw_response_sha256=?", (digest,)).fetchone()
                     if referenced is None:

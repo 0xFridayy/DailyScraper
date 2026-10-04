@@ -4,9 +4,11 @@ from contextlib import closing, contextmanager
 import multiprocessing
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import stat
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +17,9 @@ import bandarmolony_trade_contract as contract
 
 
 LOCK_NAME = ".raw-root-lock.sqlite3"
+INHERITED_OPERATIONS = ("raw-root lock", "connection", "ingest", "absence", "resume",
+                        "verify", "read rows", "inspect", "enter", "close")
+real_fork = unittest.skipUnless(hasattr(os, "fork"), "real os.fork() ownership checks need POSIX")
 
 
 class _NoWaitConnection(sqlite3.Connection):
@@ -128,7 +133,93 @@ def _process_crash_after_publication(db, raw_root, source, channel):
         channel.close()
 
 
+def _inherited_attempts(store, capture_id, source):
+    """Try every operation on a store owned by another process."""
+    from test_bandarmolony_trade_capture import observation
+
+    def lock():
+        with store._raw_root_lock():
+            pass
+
+    attempts = {
+        "raw-root lock": lock,
+        "connection": lambda: store.conn,
+        "ingest": lambda: store.ingest(source, observation("inherited-ingest", 50)),
+        "absence": lambda: store.observe_absence(observation("inherited-absence", 51, http_status=404)),
+        "resume": lambda: store.resume(capture_id),
+        "verify": lambda: store.verify(capture_id),
+        "read rows": lambda: store.read_rows(capture_id),
+        "inspect": lambda: store.inspect(capture_id),
+        "enter": store.__enter__,
+        "close": store.close,
+    }
+    outcomes = {}
+    for name, attempt in attempts.items():
+        try:
+            attempt()
+        except contract.TradeContractError as error:
+            outcomes[name] = str(error)
+        except Exception as error:
+            outcomes[name] = "UNEXPECTED " + type(error).__name__
+        else:
+            outcomes[name] = "ALLOWED"
+    return outcomes
+
+
+def _await(channel, message):
+    """Synchronize a forked child without unittest assertions.
+
+    The parent may spawn a probe interpreter before answering, so wait longer
+    than any single parent-side step.
+    """
+    if not channel.poll(60) or channel.recv() != message:
+        raise RuntimeError("forked child did not receive " + message)
+
+
+def _fork_inherited_child(stores, capture_id, source, fresh_db, raw_root, creator_pid, channel):
+    """Runs in a real fork child: inherited stores refuse, a fresh store does not."""
+    # The forking thread's nested-lock flag is copied into the child.
+    held_flag = getattr(stores["writer"]._raw_coordination, "held", False)
+    inherited = {role: _inherited_attempts(store, capture_id, source)
+                 for role, store in stores.items()}
+    # A later descendant can reuse the creator's PID; ownership still refuses.
+    with patch.object(capture.os, "getpid", return_value=creator_pid):
+        reused_pid = {role: _inherited_attempts(store, capture_id, source)
+                      for role, store in stores.items()}
+    with capture.TradeCaptureStore(fresh_db, raw_root=raw_root) as fresh:
+        try:
+            with _no_wait_coordination(raw_root), fresh._raw_root_lock():
+                fresh_lock = "acquired"
+        except contract.TradeContractError:
+            fresh_lock = "blocked"
+    channel.send({"held flag": held_flag, "inherited": inherited, "reused pid": reused_pid,
+                  "fresh lock": fresh_lock})
+
+
+def _fork_fresh_store_child(db, raw_root, source, channel):
+    """Runs in a real fork child: a newly constructed store owns real coordination."""
+    from test_bandarmolony_trade_capture import observation
+
+    with capture.TradeCaptureStore(db, raw_root=raw_root) as fresh:
+        channel.send("ready")
+        _await(channel, "try")
+        try:
+            with _no_wait_coordination(raw_root), fresh._raw_root_lock():
+                channel.send("unexpected acquisition")
+        except contract.TradeContractError:
+            channel.send("blocked")
+        _await(channel, "acquire")
+        with fresh._raw_root_lock():
+            with fresh._raw_root_lock():
+                channel.send("held")
+                _await(channel, "release")
+        accepted = fresh.ingest(source, observation("fresh-child", 1))
+        channel.send(("accepted", accepted["capture_id"], fresh.verify(accepted["capture_id"]) == accepted))
+
+
 class RawRootLockTests(unittest.TestCase):
+    maxDiff = None
+
     def setUp(self):
         from test_bandarmolony_trade_capture import make_tree_writable
 
@@ -341,6 +432,261 @@ class RawRootLockTests(unittest.TestCase):
             with other._raw_root_lock():
                 self.assert_native_lock("blocked")
         self.assert_native_lock("available")
+
+    def evidence_snapshot(self):
+        """Exact bytes of the parent's database, sidecars and raw evidence.
+
+        Never open the coordination file or its sidecars: on POSIX, closing any
+        descriptor to that inode releases this process's native SQLite lock.
+        """
+        paths = [Path(str(self.db) + suffix) for suffix in ("", *capture.SIDECARS)]
+        paths += [path for path in self.raw.rglob("*")
+                  if path.is_file() and not path.name.startswith(LOCK_NAME)]
+        return {str(path): path.read_bytes() for path in sorted(paths) if path.exists()}
+
+    def fork(self, target, *args):
+        """Run target(*args, channel) in a real os.fork() child, never returning there."""
+        parent_channel, child_channel = multiprocessing.Pipe()
+        pid = os.fork()
+        if pid == 0:
+            status = 70
+            try:
+                parent_channel.close()
+                target(*args, child_channel)
+                status = 0
+            except BaseException as error:
+                try:
+                    child_channel.send(("error", repr(error)))
+                except BaseException:
+                    pass
+            finally:
+                # Skip inherited unittest cleanups, atexit handlers and finalizers.
+                os._exit(status)
+        child_channel.close()
+        self.addCleanup(self.reap_fork, pid, parent_channel)
+        return pid, parent_channel
+
+    def join_fork(self, pid):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                return os.waitstatus_to_exitcode(status)
+            time.sleep(0.01)
+        self.fail("forked child did not finish")
+
+    @staticmethod
+    def reap_fork(pid, channel):
+        channel.close()
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def test_store_refuses_another_process_identity(self):
+        """Portable guard check; the real os.fork() tests below run on POSIX."""
+        from test_bandarmolony_trade_capture import observation
+
+        source = self.source()
+        accepted = self.store.ingest(source, observation("owner-capture", 0))
+        reader = capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True)
+        self.addCleanup(reader.close)
+        expected = dict.fromkeys(INHERITED_OPERATIONS, capture.INHERITED_STORE_REFUSAL)
+        before = self.evidence_snapshot()
+        other_pid = os.getpid() + 1
+        guard = capture.check_private_output
+        checked = []
+        with patch.object(capture, "check_private_output",
+                          side_effect=lambda *args, **kwargs: checked.append(args) or guard(*args, **kwargs)):
+            # Another process, or a later descendant that reuses the creator PID.
+            for identity in (patch.object(capture.os, "getpid", return_value=other_pid),
+                             patch.object(capture, "_fork_generation", capture._fork_generation + 1)):
+                with identity:
+                    idle = {role: _inherited_attempts(store, accepted["capture_id"], source)
+                            for role, store in (("writer", self.store), ("reader", reader))}
+                self.assertEqual(idle, {"writer": expected, "reader": expected})
+        # Refusal precedes every private-output Git inspection and file read.
+        self.assertEqual(checked, [])
+        with self.store._raw_root_lock():
+            with patch.object(capture.os, "getpid", return_value=other_pid):
+                held = _inherited_attempts(self.store, accepted["capture_id"], source)
+            self.assertEqual(held, expected)
+            self.assert_native_lock("blocked")
+        self.assert_native_lock("available")
+        self.assertEqual(self.evidence_snapshot(), before)
+        self.assertEqual(self.store.verify(accepted["capture_id"]), accepted)
+        self.assertEqual(reader.verify(accepted["capture_id"]), accepted)
+        later = self.store.observe_absence(observation("owner-after", 1, http_status=404))
+        self.assertEqual(later["previous_observation_id"], accepted["capture_id"])
+
+    def release_inherited_handles(self):
+        while capture._inherited_handles:
+            capture._inherited_handles.pop().close()
+
+    def test_inherited_cleanup_keeps_parent_coordination_and_publication(self):
+        """Frames active at fork never close parent handles or delete raw objects."""
+        from test_bandarmolony_trade_capture import observation
+
+        self.addCleanup(self.release_inherited_handles)
+        other_pid = os.getpid() + 1
+        # A normal exit from an inherited lock context is refused; an exit by
+        # exception, such as the child's sys.exit(), keeps that exception.
+        for error in (None, SystemExit(0)):
+            with self.subTest(error=error):
+                context = self.store._raw_root_lock()
+                context.__enter__()
+                with patch.object(capture.os, "getpid", return_value=other_pid):
+                    if error is None:
+                        with self.assertRaises(contract.TradeContractError) as refused:
+                            context.__exit__(None, None, None)
+                        self.assertEqual(str(refused.exception), capture.INHERITED_STORE_REFUSAL)
+                    else:
+                        self.assertFalse(context.__exit__(SystemExit, error, None))
+                        self.assertFalse(self.store.__exit__(SystemExit, error, None))
+                # The parent's coordination connection stayed open and still locks.
+                self.assertEqual(len(capture._inherited_handles), 1)
+                self.assert_native_lock("blocked")
+                self.release_inherited_handles()
+                self.assert_native_lock("available")
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+
+        source = self.source()
+        data = source.read_bytes()
+        destination = self.store.raw_path(contract.sha256_bytes(data))
+        identity = patch.object(capture.os, "getpid", return_value=other_pid)
+        link = os.link
+
+        def child_exits_after_link(source_path, target, *args, **kwargs):
+            # A signal handler forks right after publication; the child calls sys.exit().
+            link(source_path, target, *args, **kwargs)
+            if Path(target) == destination:
+                identity.start()
+                raise SystemExit(0)
+
+        try:
+            with patch.object(capture.os, "link", side_effect=child_exits_after_link):
+                with self.assertRaises(SystemExit):
+                    self.store.ingest(source, observation("unwound-child", 0))
+        finally:
+            identity.stop()
+        # The parent's pending alias and published object both survive.
+        self.assertEqual(destination.read_bytes(), data)
+        aliases = list(destination.parent.glob(".pending-*"))
+        self.assertEqual(len(aliases), 1)
+        self.assertTrue(aliases[0].samefile(destination))
+        # Only the simulation shares the owner's frames: release them as the owner.
+        self.assertTrue(self.store.conn.in_transaction)
+        self.store.conn.rollback()
+        self.release_inherited_handles()
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 0)
+        accepted = self.store.ingest(source, observation("owner-after-unwind", 1))
+        self.assertEqual(self.store.raw_path(accepted["raw_response_sha256"]), destination)
+        self.assertEqual(self.store.verify(accepted["capture_id"]), accepted)
+        self.assertEqual(destination.stat().st_mode & 0o222, 0)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
+        self.assert_native_lock("available")
+
+    @real_fork
+    def test_fork_while_lock_held_refuses_inherited_store(self):
+        from test_bandarmolony_trade_capture import observation
+
+        source = self.source()
+        accepted = self.store.ingest(source, observation("parent-before-fork", 0))
+        reader = capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True)
+        self.addCleanup(reader.close)
+        expected = dict.fromkeys(INHERITED_OPERATIONS, capture.INHERITED_STORE_REFUSAL)
+        with self.store._raw_root_lock():
+            held = self.evidence_snapshot()
+            pid, channel = self.fork(
+                _fork_inherited_child, {"writer": self.store, "reader": reader},
+                accepted["capture_id"], source, self.root / "private" / "fresh-child.db",
+                self.raw, os.getpid())
+            self.assertEqual(self.receive(channel), {
+                # Pre-fix, this inherited flag let nested acquisition skip the lock.
+                "held flag": True,
+                "inherited": {"writer": expected, "reader": expected},
+                "reused pid": {"writer": expected, "reader": expected},
+                # A fresh child store has its own flag, so it never inherits
+                # ownership. The parent's lock and SQLite's inherited in-process
+                # bookkeeping both refuse it here.
+                "fresh lock": "blocked",
+            })
+            self.assertEqual(self.join_fork(pid), 0)
+            # The child changed nothing and the parent still owns the native lock.
+            self.assertEqual(self.evidence_snapshot(), held)
+            self.assert_native_lock("blocked")
+            with self.store._raw_root_lock():
+                self.assertEqual(self.store.verify(accepted["capture_id"]), accepted)
+            self.assert_native_lock("blocked")
+        self.assert_native_lock("available")
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM trade_captures").fetchone()[0], 1)
+        self.assertEqual(reader.verify(accepted["capture_id"]), accepted)
+        later = self.store.observe_absence(observation("parent-after-fork", 1, http_status=404))
+        self.assertEqual(later["previous_observation_id"], accepted["capture_id"])
+
+    @real_fork
+    def test_fork_while_idle_refuses_inherited_store(self):
+        from test_bandarmolony_trade_capture import observation
+
+        source = self.source()
+        accepted = self.store.ingest(source, observation("parent-before-fork", 0))
+        reader = capture.TradeCaptureStore(self.db, raw_root=self.raw, read_only=True)
+        self.addCleanup(reader.close)
+        expected = dict.fromkeys(INHERITED_OPERATIONS, capture.INHERITED_STORE_REFUSAL)
+        before = self.evidence_snapshot()
+        pid, channel = self.fork(
+            _fork_inherited_child, {"writer": self.store, "reader": reader},
+            accepted["capture_id"], source, self.root / "private" / "fresh-child.db",
+            self.raw, os.getpid())
+        self.assertEqual(self.receive(channel), {
+            "held flag": False,
+            "inherited": {"writer": expected, "reader": expected},
+            "reused pid": {"writer": expected, "reader": expected},
+            "fresh lock": "acquired",
+        })
+        self.assertEqual(self.join_fork(pid), 0)
+        self.assertEqual(self.evidence_snapshot(), before)
+        self.assert_native_lock("available")
+        self.assertEqual(self.store.verify(accepted["capture_id"]), accepted)
+        self.assertEqual(reader.verify(accepted["capture_id"]), accepted)
+        with self.store._raw_root_lock():
+            with self.store._raw_root_lock():
+                later = self.store.observe_absence(observation("parent-after-fork", 1, http_status=404))
+            self.assert_native_lock("blocked")
+        self.assertEqual(later["previous_observation_id"], accepted["capture_id"])
+        self.assert_native_lock("available")
+
+    @real_fork
+    def test_fresh_store_in_forked_child_acquires_real_coordination(self):
+        from test_bandarmolony_trade_capture import observation
+
+        absent = self.store.observe_absence(observation("parent-before-fork", 0, http_status=404))
+        source = self.source()
+        pid, channel = self.fork(_fork_fresh_store_child, self.db, self.raw, source)
+        self.assertEqual(self.receive(channel), "ready")
+        with self.store._raw_root_lock():
+            channel.send("try")
+            self.assertEqual(self.receive(channel), "blocked")
+        channel.send("acquire")
+        self.assertEqual(self.receive(channel), "held")
+        self.assert_native_lock("blocked")
+        with _no_wait_coordination(self.raw):
+            with self.assertRaises(contract.TradeContractError):
+                with self.store._raw_root_lock():
+                    self.fail("parent acquired coordination held by the forked child")
+        channel.send("release")
+        self.assertEqual(self.receive(channel), ("accepted", "fresh-child", True))
+        self.assertEqual(self.join_fork(pid), 0)
+        self.assert_native_lock("available")
+        accepted = self.store.verify("fresh-child")
+        self.assertEqual(accepted["previous_observation_id"], absent["capture_id"])
+        self.assertEqual(accepted["observation_state"], "CONTENT_FIRST_SEEN")
+        destination = self.store.raw_path(accepted["raw_response_sha256"])
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+        self.assertEqual(destination.stat().st_mode & 0o222, 0)
+        self.assertEqual(list(self.raw.rglob(".pending-*")), [])
 
 
 if __name__ == "__main__":
