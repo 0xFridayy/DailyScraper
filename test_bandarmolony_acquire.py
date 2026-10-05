@@ -115,7 +115,11 @@ class FakeTransport:
 def sas_response(value=None, *, status=200, body=None, headers=None):
     if body is None:
         body = json.dumps({
-            "sasToken": sas_query() if value is None else value,
+            "data": {
+                "sasToken": sas_query() if value is None else value,
+                "containerUrl": f"https://{acquire.BLOB_HOST}/{acquire.BLOB_CONTAINER}",
+                "expiresAt": "2026-10-01T13:00:00Z",
+            },
             "note": "apikey=APIKEYCANARY api_key=APIKEYCANARY",
             "refresh_token": "eyJREFRESHCANARY",
         }).encode()
@@ -301,8 +305,17 @@ class SecretAndSasTests(AcquisitionTestCase):
     def test_non_https_sas_refused(self):
         for value in (f"http://{acquire.BLOB_HOST}/trading-data-v2?{sas_query()}",
                       f"ftp://{acquire.BLOB_HOST}/trading-data-v2?{sas_query()}",
-                      sas_query(spr="http"), sas_query(spr="https,http"), sas_query(spr=None)):
+                      sas_query(spr="http"), sas_query(spr="https,http"),
+                      sas_query(spr="http,https"), sas_query(spr=""), sas_query(spr="HTTPS")):
             self.assert_sas_refused(value, "HTTPS")
+
+    def test_sas_accepts_absent_protocol_or_exact_https_without_rewriting(self):
+        for spr in (None, "https"):
+            with self.subTest(protocol=spr):
+                query = sas_query(spr=spr)
+                sas = acquire.validate_sas(query, START)
+                self.assertEqual(sas.query.reveal(), query)
+                self.assertEqual(sas.expires_at, datetime(2026, 10, 1, 13, tzinfo=timezone.utc))
 
     def test_expired_or_unparseable_expiry_refused(self):
         for se in ("2026-10-01T11:59:59Z", "2026-10-01T12:00:30Z", "2026-09-30"):
@@ -458,6 +471,44 @@ class TransportBoundaryTests(AcquisitionTestCase):
             with self.assertRaises(acquire.AcquisitionError):
                 acquire.SasEndpoint(host=host, path=path, json_field=field)
 
+    def test_nested_sas_query_is_used_verbatim_for_https_blob_get(self):
+        # Mixed percent-escape casing and original parameter order are signed
+        # material. Absent spr must not cause the adapter to append anything.
+        query = sas_query(spr=None).replace("%3A", "%3a") + "%2f%2F%2b%2B%3d%3D"
+        query = "&".join(reversed(query.split("&")))
+        response = sas_response(query)
+        data = self.parquet()
+        result = self.run_acquire(response, blob_response(data))
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertTrue(response.closed)
+        (sas_url, sas_headers), (blob_url, blob_headers) = self.transport.requests
+        self.assertEqual(sas_url, ENDPOINT.url)
+        self.assertEqual(sas_headers["Authorization"], "Bearer " + TOKEN)
+        self.assertEqual(blob_url, f"https://{acquire.BLOB_HOST}{CLEAN_PATH}?{query}")
+        self.assertEqual(blob_headers, {"Accept-Encoding": "identity"})
+        self.assert_no_persisted_secrets()
+
+    def test_sas_response_requires_nested_data_string(self):
+        malformed_documents = (
+            {"sasToken": sas_query()},
+            {"data": None, "sasToken": sas_query()},
+            {"data": sas_query()},
+            {"data": [sas_query()]},
+            {"data": {}},
+            {"data": {"sasToken": None}},
+            {"data": {"sasToken": 5}},
+            {"data": {"sasToken": [sas_query()]}},
+            {"data": {"sasToken": {"value": sas_query()}}},
+        )
+        for document in malformed_documents:
+            response = sas_response(body=json.dumps(document).encode())
+            with self.subTest(shape=type(document.get("data")).__name__):
+                error = self.refused(response)
+                self.assertIn("pinned shape", str(error))
+                self.assertEqual(len(self.transport.requests), 1)
+                self.assertTrue(response.closed)
+                self.assert_nothing_recorded()
+
     def test_sas_endpoint_responses_are_refused_without_blob_request(self):
         location = {"Location": "https://elsewhere.test/?sig=LOCATIONCANARY"}
         cases = [
@@ -470,7 +521,7 @@ class TransportBoundaryTests(AcquisitionTestCase):
             (sas_response(body=b"<html>apikey=APIKEYCANARY</html>"), "pinned shape"),
             (sas_response(body=b'{"other": "eyJREFRESHCANARY"}'), "pinned shape"),
             (sas_response(body=b'["sv=1"]'), "pinned shape"),
-            (sas_response(body=b'{"sasToken": 5}'), "pinned shape"),
+            (sas_response(body=b'{"data": {"sasToken": 5}}'), "pinned shape"),
             (sas_response(f"https://evil.example.test/trading-data-v2?{sas_query()}"), "host"),
             (sas_response(body=b"x" * (acquire.MAX_SMALL_BODY + 1)), "size cap"),
         ]
@@ -1347,8 +1398,10 @@ class CommandLineTests(AcquisitionTestCase):
         return ["acquire", "--ticker", "DEWA", "--trade-date", "2026-10-01", "--db", str(self.db),
                 "--raw-root", str(self.raw), "--staging-dir", str(self.staging), *extra]
 
-    def test_shipped_live_endpoint_is_unconfigured(self):
-        self.assertIsNone(acquire.LIVE_SAS_ENDPOINT)
+    def test_shipped_live_endpoint_matches_phase0_contract(self):
+        self.assertEqual(acquire.LIVE_SAS_ENDPOINT, acquire.SasEndpoint(
+            host="bandarmolony.com", path="/api/api/orderbook-replay/sas-token",
+            json_field="sasToken", phase0_confirmed=True))
 
     def test_token_arguments_are_refused_without_echo(self):
         with patch.object(getpass, "getpass", side_effect=AssertionError("prompted")):

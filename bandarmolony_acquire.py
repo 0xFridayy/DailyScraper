@@ -11,9 +11,9 @@ the SAS stay in process memory and travel only to their allowlisted hosts. They
 are never logged, printed, persisted or placed in exception text. Python cannot
 wipe string memory, so the process is kept short-lived instead.
 
-Phase 0: LIVE_SAS_ENDPOINT stays None until browser discovery confirms the SPA
-API host, the sas-token path and the JSON field that holds the SAS. Until then
-the live command refuses before it prompts for a token.
+Phase 0 confirmed the SPA orderbook-replay SAS endpoint and its nested
+data.sasToken response. Live acquisition remains operator-attended, with
+the browser access token entered through the hidden interactive prompt.
 
 Legacy 14-column files carry no ticker or date. For them the requested blob
 path, routed here from the validated ticker and date, is the only ticker-day
@@ -162,9 +162,13 @@ class SasEndpoint:
         return f"https://{self.host}{self.path}"
 
 
-# Phase 0 replaces this with SasEndpoint(host=..., path=..., json_field=...,
-# phase0_confirmed=True). Do not guess these facts.
-LIVE_SAS_ENDPOINT = None
+# Confirmed by production SPA discovery on 2026-10-06; see issue #82.
+LIVE_SAS_ENDPOINT = SasEndpoint(
+    host="bandarmolony.com",
+    path="/api/api/orderbook-replay/sas-token",
+    json_field="sasToken",
+    phase0_confirmed=True,
+)
 
 
 class Secret:
@@ -255,7 +259,7 @@ def _sas_facts(value, now):
     facts = dict(pairs)
     if not facts.get("sv") or not facts.get("sig"):
         return "SAS is incomplete", None, None
-    if facts.get("spr") != "https":
+    if "spr" in facts and facts["spr"] != "https":
         return "SAS must be restricted to HTTPS", None, None
     if not re.fullmatch(r"[a-z]+", facts.get("sp", "")) or "r" not in facts["sp"]:
         return "SAS lacks read permission", None, None
@@ -272,7 +276,7 @@ def validate_sas(value, now):
 
     The original query text is kept verbatim: re-encoding could alter the
     signed fields. Validation reads a parsed copy only. Phase-0 discovery
-    must still establish the supported SAS resource shape.
+    observed container-scoped SAS query text from the production SPA.
     """
     problem, query, expires = "SAS is malformed", None, None
     try:
@@ -427,7 +431,8 @@ def fetch_sas(transport, endpoint, token, clock):
         document = json.loads(body.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError):
         pass
-    value = document.get(endpoint.json_field) if isinstance(document, dict) else None
+    data = document.get("data") if isinstance(document, dict) else None
+    value = data.get(endpoint.json_field) if isinstance(data, dict) else None
     if not isinstance(value, str):
         raise AcquisitionError("SAS response does not match the pinned shape")
     return validate_sas(value, clock())

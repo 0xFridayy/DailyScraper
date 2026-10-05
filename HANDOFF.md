@@ -2953,16 +2953,54 @@ precondition, and capture cannot independently prove their identity. Results
 report `ticker_date_evidence` as `SOURCE_COLUMNS_AND_REQUESTED_PATH` or
 `REQUESTED_PATH_ONLY`.
 
-### Phase-0 gate
+### Phase-0 production contract (2026-10-06)
 
-The SPA API host, the sas-token path, and the JSON field holding the SAS are
-not confirmed. `LIVE_SAS_ENDPOINT` is therefore `None`, and
-`acquire` exits with status 2 before prompting for a token. Phase-0 browser
-discovery fills `SasEndpoint(host, path, json_field, phase0_confirmed=True)`.
-The current validator accepts a query string or container URL and pins the
-actual blob request to the allowlisted HTTPS account, container, and requested
-blob path. The SAS resource shape itself is not yet proven container-only.
-Phase-0 discovery must establish the supported production shape.
+The [Phase-0 report on issue #82](https://github.com/0xFridayy/DailyScraper/issues/82#issuecomment-5999579031)
+records browser observations and the deployed frontend bundle. The
+[owner's implementation handoff](https://github.com/0xFridayy/DailyScraper/issues/82#issuecomment-5999556399)
+authorizes the minimal contract patch. This is not evidence of a completed
+live acquisition.
+
+The SPA origin is `https://bandarmolony.com`; its API base is
+`https://bandarmolony.com/api`. Trade Detail obtains the `done_detail` SAS with
+`GET /api/api/orderbook-replay/sas-token` on `bandarmolony.com`, with no query
+parameters or body. The frontend calls Supabase `auth.getSession()` and sends
+`Authorization: Bearer <session.access_token>` plus
+`Content-Type: application/json`. No separate API key, nonce, CSRF value, or
+token exchange appears in this call. Server requirements for that header or
+same-origin cookies, and bearer-only operation outside the browser, remain
+unverified.
+
+The response contract consumed by the frontend is a top-level `data` object
+with `sasToken` (SAS query string) and `containerUrl` (container URL string).
+The expected container is
+`https://storagebandarmolony.blob.core.windows.net/trading-data-v2`. The
+frontend appends `?${sasToken}` unchanged to the blob path and uses a bare GET
+without `Authorization`. It reads `response.ok`, status, and `arrayBuffer()`,
+but consumes no response headers. It also parses `data.expiresAt` with
+`new Date()`; that field's exact wire type remains unobserved.
+
+`LIVE_SAS_ENDPOINT` is configured as
+`SasEndpoint(host="bandarmolony.com", path="/api/api/orderbook-replay/sas-token", json_field="sasToken", phase0_confirmed=True)`.
+`fetch_sas()` requires nested `data.sasToken`; a top-level fallback is not
+accepted. The validator still accepts a query string or container URL and
+pins the actual blob request to the allowlisted HTTPS account, container, and
+requested blob path.
+
+The observed SAS has `sv=2025-07-05`, `sr=c`, and `sp=rl`, with no `spr`, `ss`,
+`srt`, or user-delegation fields. It appears to be a container-scoped service
+SAS. This observation does not prove a universal backend `spr` policy. The
+adapter accepts absent `spr` or exactly `spr=https`, rejects every other
+present value, and never rewrites signed SAS fields. An absent `spr` permits
+HTTP as well as HTTPS at the service; the adapter's own request stays HTTPS.
+Read permission remains required; no container listing is performed.
+
+Normal UI behavior loaded only BBRI / 2026-10-05 at the expected `done_detail`
+path. DEWA / 2026-10-01 has not been requested or acquired. The actual SAS/blob
+HTTP statuses and the values or presence of `Last-Modified`,
+`x-ms-creation-time`, `x-ms-request-id`, `Content-Length`, and `Content-Encoding`
+remain unobserved. A separately attended one-ticker-day live pilot must verify
+these response facts and bearer-only compatibility before broader use.
 
 ### Secrets
 
@@ -2985,8 +3023,9 @@ the process stays short-lived.
 
 A valid SAS must:
 
-- route any supplied URL through the allowlisted HTTPS host and container and
-  restrict its protocol to HTTPS (`spr=https`);
+- route any supplied URL through the allowlisted HTTPS host and container;
+- omit `spr` or use exactly `spr=https`; the blob request itself is always
+  HTTPS, and signed SAS fields are never rewritten;
 - include read permission;
 - be valid for at least 60 more seconds;
 - contain only standard SAS fields, so listing parameters and response-header
