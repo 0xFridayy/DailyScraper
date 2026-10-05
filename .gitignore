@@ -49,6 +49,10 @@ scratch_ownership_panes*.json
 inventory_raw/
 *.parquet
 
+# Private local capture stores, exact source bytes, and SQLite sidecars.
+# Optional BandarmoloNY outputs explicitly placed in this checkout; never commit paid trade data.
+private_data/
+
 # Broker learning dashboard (BROKER_LEARNING.md): the /api/inventory cache is
 # re-fetchable like inventory_raw/, and the rendered HTML goes to a private
 # Telegram chat only -- this repo is public. broker_learning.db IS committed.

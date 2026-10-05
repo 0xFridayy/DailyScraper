@@ -1479,6 +1479,58 @@ def test_ml_health_runs_and_counts_inventory_evidence_tests():
     print("test_ml_health_runs_and_counts_inventory_evidence_tests passed")
 
 
+def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
+    import subprocess
+    from unittest.mock import patch
+    import check_ml_health as health
+
+    suite = "test_bandarmolony_trade_capture.py"
+    launched = []
+
+    def successful_suite(args, **kwargs):
+        name = os.path.basename(args[1])
+        launched.append(name)
+        assert args == [health.sys.executable, os.path.join(health.HERE, name)]
+        assert kwargs["cwd"] == health.HERE
+        if name == suite:
+            return subprocess.CompletedProcess(args, 0, "", "Ran 23 tests in 0.1s\n\nOK\n")
+        return subprocess.CompletedProcess(args, 0, "fixture passed\n", "")
+
+    for quick in (True, False):
+        launched.clear()
+        with patch.object(health.subprocess, "run", side_effect=successful_suite), \
+                patch.object(health, "check_imports"), \
+                patch.object(health, "check_known_defects"), \
+                patch.object(health, "check_panel", return_value=None), \
+                patch.object(health, "check_model_runs") as model_fit:
+            problems, _, stats = health.check(quick=quick)
+        assert launched.count(suite) == 1, \
+            "ml-health must run the trade capture behavioral suite exactly once"
+        assert not problems
+        assert stats["tests_passed"] == len(launched) - 1 + 23, \
+            "ml-health must count the trade suite's unittest summary"
+        if quick:
+            model_fit.assert_not_called()
+
+    def failed_trade_suite(args, **kwargs):
+        if os.path.basename(args[1]) == suite:
+            launched.append(suite)
+            return subprocess.CompletedProcess(
+                args, 1, "", "Ran 23 tests in 0.1s\n\nFAILED (failures=1)\n")
+        return successful_suite(args, **kwargs)
+
+    launched.clear()
+    problems, stats = [], {}
+    with patch.object(health.subprocess, "run", side_effect=failed_trade_suite):
+        health.check_unit_tests(problems, stats)
+    assert launched.count(suite) == 1
+    assert any(f"{suite} FAILED" in problem for problem in problems), \
+        "trade capture failures must fail the health check"
+    assert stats["tests_passed"] == len(launched) - 1, \
+        "a failed unittest suite must not contribute passing tests"
+    print("test_ml_health_runs_and_counts_bandarmolony_trade_tests passed")
+
+
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
     # d2->d4's gap_1 is NaN for the same reason its fwd_1 is: d3 is missing,
     # so decision-at-d2 -> (positionally-next-but-calendar-discontiguous) d4
@@ -2901,6 +2953,7 @@ if __name__ == "__main__":
     test_build_panel_never_reads_raw_broker_flow()
     test_ml_health_workflow_runs_the_canonical_migration_suite()
     test_ml_health_runs_and_counts_inventory_evidence_tests()
+    test_ml_health_runs_and_counts_bandarmolony_trade_tests()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
     test_hold_days_one_uses_entry_session_high_low_and_close()
     test_tp_and_sl_hit_on_entry_session_are_detected()
