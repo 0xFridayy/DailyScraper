@@ -21,6 +21,8 @@ from pathlib import Path
 import pickle
 import re
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -367,6 +369,29 @@ class OutputPathSafetyTests(AcquisitionTestCase):
                 self.assert_safe_error(caught.exception)
                 self.assert_clean_text(out.getvalue(), err.getvalue(), self.logs.getvalue())
                 self.assertEqual(list(self.root.rglob("*")), [])
+
+
+    def test_database_equal_to_raw_root_is_refused_before_side_effects(self):
+        message = self.assert_path_refused(db=self.raw)
+        self.assertEqual(message, "database must be separate from the raw object store")
+        self.assertNotIn(str(self.raw), message)
+
+    def test_database_beneath_raw_root_is_refused_before_side_effects(self):
+        for db in (self.raw / "capture.db", self.raw / "nested" / "capture.db"):
+            with self.subTest(db=db):
+                message = self.assert_path_refused(db=db)
+                self.assertEqual(message, "database must be separate from the raw object store")
+                self.assertNotIn(str(db), message)
+
+    def test_retry_refuses_database_in_raw_root_before_lock_or_staging(self):
+        capture_id = "04a7fdd2-aef6-4c6d-b2a5-a115ae0c1dc8"
+        for db in (self.raw, self.raw / "nested" / "capture.db"):
+            with self.subTest(db=db), self.assertRaises(acquire.AcquisitionError) as caught:
+                acquire.retry(capture_id, db=db, raw_root=self.raw, staging_root=self.staging)
+            self.assert_safe_error(caught.exception)
+            self.assertEqual(str(caught.exception), "database must be separate from the raw object store")
+            self.assertNotIn(str(db), str(caught.exception))
+            self.assertEqual(list(self.root.rglob("*")), [])
 
 
 class PublicCaptureApiTests(unittest.TestCase):
@@ -1084,6 +1109,217 @@ class TerminalCleanupTests(AcquisitionTestCase):
         self.assertEqual(sentinel.read_bytes(), b"unrecognized contents")
         self.assertEqual(acquire._staged_attempts(self.staging), [])
         self.assertEqual(self.staged(), [tombstone.name])
+
+
+@unittest.skipUnless(os.name == "nt", "native Windows directory junction tests")
+class WindowsJunctionCleanupTests(AcquisitionTestCase):
+    def assert_junction(self, directory):
+        metadata = directory.lstat()
+        self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+        self.assertTrue(metadata.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    def junction(self, directory, target):
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(directory), str(target)],
+            capture_output=True, text=True, timeout=15, check=False)
+        # A Windows setup failure is a test failure; it must not hide the regression.
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        def remove_junction():
+            if os.path.lexists(directory):
+                directory.rmdir()
+
+        self.addCleanup(remove_junction)
+        self.assert_junction(directory)
+
+    def test_cleanup_junction_preserves_unresolved_attempt_and_allows_unrelated_acquisition(self):
+        data = self.parquet()
+        with patch.object(capture.TradeCaptureStore, "ingest",
+                          side_effect=sqlite3.OperationalError("disk I/O error")):
+            first = self.acquire_bytes(data)
+        self.assertEqual(first["outcome"], "UNRESOLVED")
+        self.assertTrue(first["staging_preserved"])
+        attempt_dir = self.staging / first["capture_id"]
+        record = (attempt_dir / "attempt.json").read_bytes()
+        tombstone = self.staging / "8bdb101a-6284-4862-b98b-d6d6cac71c0a.cleanup"
+        self.junction(tombstone, attempt_dir)
+
+        unrelated = self.parquet([source_row(STK_CODE="BBCA")])
+        second = self.acquire_bytes(unrelated, ticker="BBCA")
+        self.assertEqual(second["outcome"], "ACCEPTED")
+        self.assertEqual(len(self.transport.requests), 2)
+        self.assertEqual((attempt_dir / "body.parquet").read_bytes(), data)
+        self.assertEqual((attempt_dir / "attempt.json").read_bytes(), record)
+        self.assert_junction(tombstone)
+        self.assertEqual([attempt.envelope.capture_id
+                          for attempt in acquire._staged_attempts(self.staging)],
+                         [first["capture_id"]])
+
+        retried = self.run_retry(first["capture_id"])
+        self.assertEqual((retried["outcome"], retried["capture_id"]),
+                         ("ACCEPTED", first["capture_id"]))
+        self.assertEqual(self.reader_verify(first["capture_id"])["raw_response_sha256"],
+                         hashlib.sha256(data).hexdigest())
+        self.assertEqual(self.reader_verify(second["capture_id"])["raw_response_sha256"],
+                         hashlib.sha256(unrelated).hexdigest())
+        self.assertEqual(self.staged(), [tombstone.name])
+        self.assert_junction(tombstone)
+
+    def test_cleanup_junction_preserves_external_reserved_files(self):
+        target = self.root / "external"
+        target.mkdir()
+        sentinels = {"attempt.json": b"external attempt record",
+                     "body.parquet": b"external evidence bytes"}
+        for name, data in sentinels.items():
+            (target / name).write_bytes(data)
+        tombstone = self.staging / "e40fc5b4-3c94-49c2-bf9d-9ad36effcf6d.cleanup"
+        self.junction(tombstone, target)
+
+        with self.assertRaises(acquire.AcquisitionError) as caught:
+            acquire._cleanup_tombstone(tombstone)
+        self.assert_safe_error(caught.exception)
+        acquire._remove_cleanup_tombstones(self.staging)
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertTrue(target.is_dir())
+        self.assertEqual(sorted(path.name for path in target.iterdir()), sorted(sentinels))
+        for name, data in sentinels.items():
+            self.assertEqual((target / name).read_bytes(), data)
+        self.assert_junction(tombstone)
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [tombstone.name])
+
+    def test_terminal_discard_refuses_junction_after_acceptance_and_preserves_evidence(self):
+        target = self.root / "external"
+        target.mkdir()
+        sentinels = {"attempt.json": b"external attempt record",
+                     "body.parquet": b"external evidence bytes"}
+        for name, value in sentinels.items():
+            (target / name).write_bytes(value)
+        attempts, verified = [], []
+        original_discard = acquire._discard
+
+        def replace_before_discard(attempt):
+            attempts.append(attempt)
+            verified.append(self.reader_verify(attempt.envelope.capture_id))
+            os.replace(attempt.directory, self.root / "original-staged-attempt")
+            self.junction(attempt.directory, target)
+            with patch.object(os, "replace", wraps=os.replace) as rename:
+                try:
+                    return original_discard(attempt)
+                finally:
+                    self.assertEqual(rename.call_count, 0,
+                                     "a rejected junction must never be renamed")
+
+        data = self.parquet()
+        with patch.object(acquire, "_discard", replace_before_discard):
+            with self.assertRaises(acquire.AcquisitionError) as caught:
+                self.acquire_bytes(data)
+        self.assert_safe_error(caught.exception)
+        self.assertEqual(len(attempts), 1)
+        attempt = attempts[0]
+        self.assert_junction(attempt.directory)
+        self.assertFalse(attempt.directory.with_name(attempt.directory.name + ".cleanup").exists())
+        self.assertTrue(target.is_dir())
+        self.assertEqual(sorted(path.name for path in target.iterdir()), sorted(sentinels))
+        for name, value in sentinels.items():
+            self.assertEqual((target / name).read_bytes(), value)
+        self.assertEqual(self.reader_verify(attempt.envelope.capture_id), verified[0])
+        self.assertEqual(verified[0]["raw_response_sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(verified[0]["content_length"], len(data))
+        self.assertIsNotNone(verified[0]["durable_accepted_at"])
+        self.assertEqual(self.counts(), (1, 1))
+
+    def test_ordinary_real_cleanup_directory_is_removed(self):
+        tombstone = self.staging / "8ca2a109-4cfc-4ab2-8170-acd9a5c53083.cleanup"
+        tombstone.mkdir(parents=True)
+        (tombstone / "body.parquet").write_bytes(b"discarded body")
+        (tombstone / "attempt.json").write_bytes(b"discarded record")
+        metadata = tombstone.lstat()
+        self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+        self.assertFalse(metadata.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertFalse(tombstone.exists())
+        self.assertEqual(self.staged(), [])
+
+    def test_reserved_child_directory_junction_is_unexpected_and_preserves_target(self):
+        target = self.root / "external"
+        target.mkdir()
+        sentinel = target / "keep"
+        sentinel.write_bytes(b"external nested evidence")
+        tombstone = self.staging / "9ad63e2e-5fe1-4aae-bb0e-1f79d6a0e70c.cleanup"
+        tombstone.mkdir(parents=True)
+        child = tombstone / "body.parquet"
+        self.junction(child, target)
+        record = tombstone / "attempt.json"
+        record.write_bytes(b"discarded record")
+
+        with self.assertRaises(acquire.AcquisitionError) as caught:
+            acquire._cleanup_tombstone(tombstone)
+        self.assert_safe_error(caught.exception)
+        self.assertEqual(str(caught.exception), "terminal cleanup contains unexpected entries")
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual(sentinel.read_bytes(), b"external nested evidence")
+        self.assertEqual(record.read_bytes(), b"discarded record")
+        self.assert_junction(child)
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [tombstone.name])
+
+    def test_active_attempt_junction_is_ignored_and_refused_by_offline_retry(self):
+        capture_id = "4627cf6f-5d65-455b-b1d0-d4907d533722"
+        envelope = contract.CaptureEnvelope(
+            ticker="DEWA", trade_date="2026-10-01", capture_id=capture_id,
+            requested_at="2026-10-01T12:00:00Z", response_at="2026-10-01T12:00:01Z",
+            created_by=acquire.CREATED_BY)
+        data = self.parquet()
+        external_attempt = acquire._stage(self.root / "external-staging", envelope, data)
+        record = (external_attempt.directory / "attempt.json").read_bytes()
+        directory = self.staging / capture_id
+        self.junction(directory, external_attempt.directory)
+
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        with self.assertRaises(acquire.AcquisitionError) as caught:
+            acquire._load_attempt(directory)
+        self.assert_safe_error(caught.exception)
+        with self.assertRaises(acquire.AcquisitionError) as caught:
+            self.run_retry(capture_id)
+        self.assert_safe_error(caught.exception)
+        self.assertEqual(self.counts(), (0, 0))
+        self.assertEqual(self.raw_objects(), [])
+
+        unrelated = self.parquet([source_row(STK_CODE="BBCA")])
+        result = self.acquire_bytes(unrelated, ticker="BBCA")
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual((external_attempt.directory / "body.parquet").read_bytes(), data)
+        self.assertEqual((external_attempt.directory / "attempt.json").read_bytes(), record)
+        self.assert_junction(directory)
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [capture_id])
+
+    def test_partial_junction_startup_preserves_external_files_and_allows_acquisition(self):
+        target = self.root / "external"
+        target.mkdir()
+        sentinels = {"attempt.json": b"external attempt record",
+                     "body.parquet": b"external evidence bytes"}
+        for name, value in sentinels.items():
+            (target / name).write_bytes(value)
+        partial = self.staging / "b1a31db0-1f38-4b81-ae0f-c884c552473d.partial"
+        self.junction(partial, target)
+
+        acquire._remove_partials(self.staging)
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertTrue(target.is_dir())
+        self.assertEqual(sorted(path.name for path in target.iterdir()), sorted(sentinels))
+        for name, value in sentinels.items():
+            self.assertEqual((target / name).read_bytes(), value)
+        self.assert_junction(partial)
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [partial.name])
 
 
 class CommandLineTests(AcquisitionTestCase):
