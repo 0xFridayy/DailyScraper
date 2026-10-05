@@ -2959,8 +2959,10 @@ The SPA API host, the sas-token path, and the JSON field holding the SAS are
 not confirmed. `LIVE_SAS_ENDPOINT` is therefore `None`, and
 `acquire` exits with status 2 before prompting for a token. Phase-0 browser
 discovery fills `SasEndpoint(host, path, json_field, phase0_confirmed=True)`.
-The SAS validator also expects the audited shape: a container SAS for that
-account and container, given as a query string or container URL.
+The current validator accepts a query string or container URL and pins the
+actual blob request to the allowlisted HTTPS account, container, and requested
+blob path. The SAS resource shape itself is not yet proven container-only.
+Phase-0 discovery must establish the supported production shape.
 
 ### Secrets
 
@@ -2982,23 +2984,35 @@ are never persisted. Only `Last-Modified`, `x-ms-creation-time`, and
 the process stays short-lived.
 
 A valid SAS must:
-- be for the allowlisted host and container, over HTTPS only (`spr=https`);
+
+- route any supplied URL through the allowlisted HTTPS host and container and
+  restrict its protocol to HTTPS (`spr=https`);
 - include read permission;
 - be valid for at least 60 more seconds;
 - contain only standard SAS fields, so listing parameters and response-header
   overrides are refused.
+
+The adapter validates `--db`, `--raw-root`, `--staging-dir`, their defaults,
+and the derived acquisition lock path before directory creation, SQLite open,
+staging, or network dispatch. Case-insensitive credential assignments such as
+`sig=`, `sv=`, `api_key=`, `token=`, `authorization=`, `password=`, and `sas=`
+are refused with a fixed error that does not include the supplied path. The
+existing private-output guard also remains in force.
 
 ### Exact bytes and status routing
 
 For a 200 response, any `Content-Encoding` is refused. A present
 `Content-Length` must equal the received length, a 256 MiB cap applies, and the
 complete body is read before hashing. An incomplete body never reaches Trade
-Capture.
+Capture. A zero-byte 200 is refused before staging publication and never
+reaches `ingest()`. It is neither an absence observation nor evidence of zero
+trades.
 
 A 404 counts as an absence observation only when its `x-ms-error-code` is
 `BlobNotFound`. It is recorded through `observe_absence()` only with
 `--record-absence`, and otherwise reports `ABSENCE_NOT_RECORDED`. A 404 never
-means zero trades. Every other status, including redirects, records nothing.
+means zero trades or vendor finality. Every other status, including redirects,
+records nothing.
 
 `requested_at` is read immediately before the blob request is sent.
 `response_at` is read after the complete 200 body, or the complete 404
@@ -3012,23 +3026,47 @@ with `body.parquet` and `attempt.json`, then renamed into place. `attempt.json`
 holds only envelope fields, the received SHA-256, and the content length.
 The path of the staged body is what goes to `ingest()`.
 
+The adapter owns its CLI parser, private-directory creation, and best-effort
+directory-fsync helpers. It uses only public Trade Capture methods and does
+not query the capture schema. New POSIX attempt directories and files request
+`0700` and `0600`; Windows permissions follow platform semantics. Files are
+flushed and fsynced before publication. Python does not provide directory
+fsync on Windows, so file flushing and same-directory atomic rename do not
+provide the POSIX directory-durability guarantee there.
+
 A non-waiting SQLite lock, `<db>.acquisition-lock`, serializes attempts per
 store. A new attempt for a ticker-day is refused while an earlier staged
 attempt for that ticker-day is unresolved.
 
 `PendingCaptureError` is handled before any other capture error: the pending
 predecessor is resumed and the ingest is retried once. Any other writer failure
-is reconciled. If the body exists, `resume()` accepts it. If no body exists and
-Trade Capture's own `normalize_parquet` refuses the staged bytes, the outcome
-is `REJECTED` and staging is deleted. Everything else is `UNRESOLVED`, and the
-attempt is kept.
+is reconciled through public `resume(capture_id)`. A successful resume reports
+`COMMITTED` internally and still requires independent verification. A failed
+resume leaves the outcome `UNRESOLVED` and preserves the exact staged bytes,
+capture ID, and envelope. Parser exceptions, including `TradeContractError`,
+do not prove terminal rejection. Missing dependencies, resource failures,
+and malformed staged content therefore remain available for offline retry.
+The adapter does not call `normalize_parquet` to classify a failed handoff.
 
 After the writer closes, a fresh `TradeCaptureStore(..., read_only=True)` must
 reproduce every envelope fact, the raw SHA-256, and the length. A match
-deletes staging. A failed verification keeps staging as `UNRESOLVED`, and a
-disagreement keeps it as `INTEGRITY_MISMATCH`. `retry --capture-id` is offline.
-It re-runs the same handoff with the same capture ID, bytes, and envelope. A
-new HTTP response always gets a new capture ID and new timestamps.
+starts terminal cleanup by atomically renaming the entire active directory to
+`<capture_id>.cleanup` in the same staging root. The adapter fsyncs the staging
+directory where supported, removes the cleanup directory's contents and the
+directory, then fsyncs the staging directory again. Active-attempt discovery
+never parses these cleanup tombstones. Startup retries stale tombstone cleanup
+on both acquisition and offline retry without traversing symlinks or unknown
+child directories. Cleanup residue does not block unrelated ticker-days.
+Unpublished `.partial` directories remain separate from terminal cleanup
+tombstones. The same transition applies to any terminal discard.
+
+A failed verification keeps staging as `UNRESOLVED`, and a disagreement keeps
+it as `INTEGRITY_MISMATCH`. Cleanup failure preserves the accepted Trade Capture
+evidence but can still make the command fail after durable acceptance. An
+interruption before the terminal rename leaves the active record intact; an
+interruption after rename leaves only cleanup residue. `retry --capture-id`
+is offline. It re-runs the same handoff with the same capture ID, bytes, and
+envelope. A new HTTP response always gets a new capture ID and new timestamps.
 
 ### Commands
 
@@ -3043,12 +3081,15 @@ Both accept `--db`, `--raw-root`, and `--staging-dir`, and `acquire` also takes
 | Status | Meaning |
 |---|---|
 | 0 | `ACCEPTED` |
-| 1 | Failure before staging |
+| 1 | Acquisition error, including cleanup failure after durable acceptance |
 | 2 | Usage error or disabled live entry point |
 | 3 | `ABSENCE_NOT_RECORDED` |
 | 4 | `REJECTED` |
 | 5 | `UNRESOLVED` |
 | 6 | `INTEGRITY_MISMATCH` |
+
+The adapter keeps exit code 4 reserved for `REJECTED`, but does not classify
+ambiguous staged handoff failures as terminal rejection.
 
 Run the live command in your own terminal, not through an agent whose
 transcript would record terminal input. Never paste the token into chat.
@@ -3058,6 +3099,10 @@ transcript would record terminal input. Never paste the token into chat.
 `python test_bandarmolony_acquire.py` uses a fake transport and synthetic
 canaries. One test drives the real requests transport against a local
 127.0.0.1 server to prove the signed request line is not logged.
+Focused regressions cover credential-bearing destinations before filesystem
+or network effects, terminal cleanup interruptions and restart, zero-byte
+200 refusal before publication, and preserved staging after ambiguous parser
+failures. Static checks enforce the public Trade Capture API boundary.
 `check_ml_health.py` runs the suite, including with `--quick`. No real
 BandarmoloNY, Supabase, or Azure request, credential, Parquet, or store is
 used.

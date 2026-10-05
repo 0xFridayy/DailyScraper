@@ -24,6 +24,7 @@ independently prove legacy identity.
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
+import argparse
 import getpass
 import http.client
 from http.cookiejar import DefaultCookiePolicy
@@ -33,18 +34,18 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID, uuid4
 import warnings
 
 from bandarmolony_trade_capture import (
-    DEFAULT_DB, SIDECARS, PendingCaptureError, TradeCaptureStore, _SafeArgumentParser,
-    _fsync_dir, _private_mkdir, check_private_output,
+    DEFAULT_DB, SIDECARS, PendingCaptureError, TradeCaptureStore, check_private_output,
 )
 from bandarmolony_trade_contract import (
     JAKARTA_TIMEZONE, RECENT_SCHEMA_VERSION, CaptureEnvelope, TradeContractError,
-    canonical_json, normalize_parquet, sha256_bytes, utc_text,
+    canonical_json, sha256_bytes, utc_text,
 )
 
 
@@ -57,6 +58,7 @@ MAX_SMALL_BODY = 64 * 1024
 SAS_MIN_REMAINING = timedelta(seconds=60)
 TIMEOUT = (10, 120)
 ATTEMPT_FORMAT = "BANDARMOLONY_ACQUISITION_ATTEMPT_V1"
+CLEANUP_SUFFIX = ".cleanup"
 EXIT_CODES = {"ACCEPTED": 0, "ABSENCE_NOT_RECORDED": 3, "REJECTED": 4,
               "UNRESOLVED": 5, "INTEGRITY_MISMATCH": 6}
 # Standard Azure SAS signature fields. Anything else is refused, notably
@@ -72,10 +74,69 @@ _TICKER = re.compile(r"[A-Z][A-Z0-9]{1,11}")
 _SAS_TIME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})(?:T([0-9]{2}:[0-9]{2}(?::[0-9]{2})?)(?:\.[0-9]{1,7})?Z)?")
 _ALLOWLISTED_HEADERS = {"last-modified": "last_modified", "x-ms-creation-time": "x_ms_creation_time",
                         "x-ms-request-id": "x_ms_request_id"}
+_PATH_ASSIGNMENT = re.compile(
+    r"(?:^|[^a-z0-9])(?:sig|sv|api_key|apikey|token|access_token|refresh_token|"
+    r"authorization|password|passwd|secret|sas|bearer|session|cookie|supabase|"
+    r"credential|username)\s*=", re.IGNORECASE)
 
 
 class AcquisitionError(Exception):
     """A fixed, input-free failure. Never chained to a transport or parser error."""
+
+
+class _SingleValue(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        seen = getattr(namespace, "_single_value_options", set())
+        if self.dest in seen:
+            parser.error("repeated single-value option")
+        seen.add(self.dest)
+        setattr(namespace, "_single_value_options", seen)
+        setattr(namespace, self.dest, values)
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """Refuse ambiguous options without echoing supplied arguments."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+    def add_argument(self, *args, **kwargs):
+        if args and args[0].startswith("--") and "action" not in kwargs:
+            kwargs["action"] = _SingleValue
+        return super().add_argument(*args, **kwargs)
+
+    def error(self, message):
+        self.print_usage()
+        self.exit(2, "invalid command arguments; use --help\n")
+
+
+def _fsync_dir(path):
+    """Persist directory entries where Python supports directory fsync."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _private_mkdir(path):
+    """Create private parents and persist each new directory entry."""
+    missing = []
+    current = Path(path)
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if not directory.is_dir():
+            raise AcquisitionError("output parent is not a directory")
+        _fsync_dir(directory.parent)
 
 
 @dataclass(frozen=True)
@@ -207,10 +268,11 @@ def _sas_facts(value, now):
 
 
 def validate_sas(value, now):
-    """Accept one container SAS for the allowlisted account, as a query or a URL.
+    """Accept SAS text, with any supplied URL pinned to the account/container.
 
     The original query text is kept verbatim: re-encoding could alter the
-    signed fields. Validation reads a parsed copy only.
+    signed fields. Validation reads a parsed copy only. Phase-0 discovery
+    must still establish the supported SAS resource shape.
     """
     problem, query, expires = "SAS is malformed", None, None
     try:
@@ -346,7 +408,7 @@ def _read_body(response, limit, *, decoded=False):
 
 
 def fetch_sas(transport, endpoint, token, clock):
-    """Exchange the access token for one container SAS at the pinned endpoint."""
+    """Exchange the access token for one SAS at the pinned endpoint."""
     if not isinstance(endpoint, SasEndpoint) or not isinstance(token, Secret):
         raise AcquisitionError("SAS request requires a confirmed endpoint and a token")
     headers = {"Authorization": "Bearer " + token.reveal(), "Accept": "application/json",
@@ -398,6 +460,8 @@ def fetch_blob(transport, locator, sas, clock, *, max_bytes=MAX_BLOB_BYTES):
             if "content-encoding" in headers:
                 raise AcquisitionError("Content-Encoding is refused; exact stored bytes are required")
             body = _read_body(response, max_bytes)
+            if not body:
+                raise AcquisitionError("HTTP 200 body is empty")
         elif status == 404:
             if headers.get("x-ms-error-code") != "BlobNotFound":
                 raise AcquisitionError("HTTP 404 without BlobNotFound is not an absence observation")
@@ -426,16 +490,49 @@ class _Paths:
 
 
 def _paths(db, raw_root, staging_root):
-    db = Path(db).resolve()
-    raw = Path(raw_root).resolve() if raw_root is not None else db.parent / "trade_raw"
-    staging = Path(staging_root).resolve() if staging_root is not None else db.parent / "acquisition_staging"
+    # Validate both operator spelling and resolved destinations. No path may
+    # create artifacts or dispatch a request before every destination passes.
+    db_path = _output_path(db)
+    raw_path = None if raw_root is None else _output_path(raw_root)
+    staging_path = None if staging_root is None else _output_path(staging_root)
+    resolved = None
+    try:
+        db = db_path.resolve()
+        raw = raw_path.resolve() if raw_path is not None else db.parent / "trade_raw"
+        staging = staging_path.resolve() if staging_path is not None else db.parent / "acquisition_staging"
+        resolved = db, raw, staging
+    except (OSError, RuntimeError, ValueError):
+        pass
+    if resolved is None:
+        raise AcquisitionError("output path is invalid")
+    db, raw, staging = resolved
+    lock = _output_path(str(db) + ".acquisition-lock")
+    for path in (db, raw, staging, lock):
+        _output_path(path)
     for inner, outer in ((staging, raw), (raw, staging), (db, staging)):
         if inner == outer or outer in inner.parents:
             raise AcquisitionError("staging must be separate from the trade store")
-    lock = Path(str(db) + ".acquisition-lock")
+    check_private_output(db, SIDECARS)
+    check_private_output(raw)
+    check_private_output(raw / ".private-output-probe")
     check_private_output(staging)
     check_private_output(lock, SIDECARS)
     return _Paths(db, raw, staging, lock)
+
+
+def _output_path(value):
+    text, path = None, None
+    try:
+        text = os.fspath(value)
+        if isinstance(text, str):
+            path = Path(text)
+    except (TypeError, ValueError, OSError):
+        pass
+    if not isinstance(text, str) or _PATH_ASSIGNMENT.search(text):
+        raise AcquisitionError("output paths cannot contain credential assignments")
+    if path is None:
+        raise AcquisitionError("output path is invalid")
+    return path
 
 
 @contextmanager
@@ -486,6 +583,8 @@ def _stage(staging, envelope, body):
     The attempt record holds only CaptureEnvelope fields, which are exactly
     what Trade Capture persists, plus the received hash and length.
     """
+    if envelope.http_status == 200 and not body:
+        raise AcquisitionError("HTTP 200 body is empty")
     digest = None if body is None else sha256_bytes(body)
     record = {"format": ATTEMPT_FORMAT, "envelope": asdict(envelope), "raw_sha256": digest,
               "content_length": None if body is None else len(body)}
@@ -535,7 +634,51 @@ def _staged_attempts(staging):
     if not staging.is_dir():
         return []
     return [_load_attempt(path) for path in sorted(staging.iterdir())
-            if path.is_dir() and not path.name.endswith(".partial")]
+            if not path.name.endswith(".partial") and not _is_cleanup_name(path.name)
+            and path.is_dir()]
+
+
+def _is_cleanup_name(name):
+    if not name.endswith(CLEANUP_SUFFIX):
+        return False
+    identifier = name[:-len(CLEANUP_SUFFIX)]
+    try:
+        return str(UUID(identifier)) == identifier
+    except ValueError:
+        return False
+
+
+def _cleanup_tombstone(directory):
+    """Delete only the two reserved files, without following symlinks."""
+    if not _is_cleanup_name(directory.name) or not stat.S_ISDIR(directory.lstat().st_mode):
+        raise AcquisitionError("terminal cleanup directory is invalid")
+    for child in sorted(directory.iterdir()):
+        if child.name not in {"body.parquet", "attempt.json"}:
+            raise AcquisitionError("terminal cleanup contains unexpected entries")
+        mode = child.lstat().st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            raise AcquisitionError("terminal cleanup contains unexpected entries")
+    for name in ("body.parquet", "attempt.json"):
+        try:
+            (directory / name).unlink()
+        except FileNotFoundError:
+            pass
+    directory.rmdir()
+    _fsync_dir(directory.parent)
+
+
+def _remove_cleanup_tombstones(staging):
+    """Best-effort startup cleanup; residue never participates in discovery."""
+    try:
+        directories = sorted(staging.iterdir())
+    except OSError:
+        return
+    for directory in directories:
+        if _is_cleanup_name(directory.name):
+            try:
+                _cleanup_tombstone(directory)
+            except (OSError, AcquisitionError):
+                pass
 
 
 def _remove_partials(staging):
@@ -548,12 +691,13 @@ def _remove_partials(staging):
 
 
 def _discard(attempt):
-    # Body first: a crash after it leaves the record, which retry can acknowledge.
-    for path in (attempt.body, attempt.directory / "attempt.json"):
-        if path.exists():
-            path.unlink()
-    attempt.directory.rmdir()
-    _fsync_dir(attempt.directory.parent)
+    # Once renamed, interrupted deletion cannot leave a malformed active attempt.
+    tombstone = attempt.directory.with_name(attempt.directory.name + CLEANUP_SUFFIX)
+    if not _is_cleanup_name(tombstone.name) or not stat.S_ISDIR(attempt.directory.lstat().st_mode):
+        raise AcquisitionError("terminal cleanup directory is invalid")
+    os.replace(attempt.directory, tombstone)
+    _fsync_dir(tombstone.parent)
+    _cleanup_tombstone(tombstone)
 
 
 def _record(store, attempt):
@@ -574,32 +718,17 @@ def _record(store, attempt):
 def _reconcile(attempt, paths):
     """After any writer failure, commit is unknown until the store answers.
 
-    COMMITTED: the body exists and resume() made or confirmed its acceptance.
-    REJECTED: no body exists and Trade Capture's own pure contract refuses
-    these staged bytes, so no retry can ever record them. Anything else is
-    UNRESOLVED and keeps the attempt.
+    COMMITTED: public resume() made or confirmed durable acceptance. Every
+    other failure is ambiguous and keeps the attempt as UNRESOLVED, including
+    parser failures that could succeed after an environment repair.
     """
     capture_id = attempt.envelope.capture_id
-    exists = None
     try:
         with TradeCaptureStore(paths.db, paths.raw_root) as store:
-            exists = store.conn.execute(
-                "SELECT 1 FROM trade_captures WHERE capture_id=?", (capture_id,)).fetchone() is not None
-            if exists:
-                store.resume(capture_id)
-                return "COMMITTED"
+            store.resume(capture_id)
+        return "COMMITTED"
     except Exception:
         pass
-    if exists is False and attempt.envelope.http_status == 200:
-        rejected = False
-        try:
-            normalize_parquet(attempt.body.read_bytes(), attempt.envelope)
-        except TradeContractError:
-            rejected = True
-        except Exception:
-            pass
-        if rejected:
-            return "REJECTED"
     return "UNRESOLVED"
 
 
@@ -648,9 +777,8 @@ def _result(outcome, *, envelope=None, digest=None, length=None, metadata=None, 
 def _handoff(attempt, paths):
     """Record a staged attempt, then acknowledge it by independent verification.
 
-    Staging is deleted only after a fresh read-only verify() matches the
-    attempt (ACCEPTED) or after Trade Capture refuses the staged bytes
-    (REJECTED). Every other outcome keeps the attempt and its capture_id for
+    Staging leaves the active namespace only after a fresh read-only verify()
+    matches the attempt (ACCEPTED). Every other outcome keeps its capture_id for
     `retry`, which reuses the same bytes and envelope.
     """
     envelope = attempt.envelope
@@ -669,9 +797,6 @@ def _handoff(attempt, paths):
             pass
         if not recorded:
             state = _reconcile(attempt, paths)
-            if state == "REJECTED":
-                _discard(attempt)
-                return _result("REJECTED", **facts)
             if state != "COMMITTED":
                 return _result("UNRESOLVED", staged=True, **facts)
     # The writer is closed. Only a fresh read-only store acknowledges the attempt.
@@ -699,7 +824,7 @@ def acquire_one(ticker, trade_date, *, token, endpoint, transport, db=DEFAULT_DB
 
     Errors before staging raise AcquisitionError or TradeContractError and
     record nothing. After staging, the result's outcome is ACCEPTED,
-    REJECTED, UNRESOLVED or INTEGRITY_MISMATCH. A 404 is recorded only with
+    UNRESOLVED or INTEGRITY_MISMATCH. A 404 is recorded only with
     record_absence=True and otherwise reports ABSENCE_NOT_RECORDED.
     """
     clock = _utc_clock if clock is None else clock
@@ -710,6 +835,7 @@ def acquire_one(ticker, trade_date, *, token, endpoint, transport, db=DEFAULT_DB
         raise AcquisitionError("trade date is in the future")
     paths = _paths(db, raw_root, staging_root)
     with _exclusive(paths.lock):
+        _remove_cleanup_tombstones(paths.staging)
         _remove_partials(paths.staging)
         if any((attempt.envelope.ticker, attempt.envelope.trade_date) == (ticker, trade_date)
                for attempt in _staged_attempts(paths.staging)):
@@ -739,6 +865,7 @@ def retry(capture_id, *, db=DEFAULT_DB, raw_root=None, staging_root=None):
         raise AcquisitionError("capture ID is not a staged attempt identifier")
     paths = _paths(db, raw_root, staging_root)
     with _exclusive(paths.lock):
+        _remove_cleanup_tombstones(paths.staging)
         directory = paths.staging / capture_id
         if not directory.is_dir():
             raise AcquisitionError("no staged attempt has this capture ID")

@@ -8,6 +8,7 @@ executions only.
 """
 
 from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
+import ast
 import copy
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ import logging
 import os
 from pathlib import Path
 import pickle
+import re
 import sqlite3
 import sys
 import tempfile
@@ -39,7 +41,7 @@ from test_bandarmolony_trade_capture import make_tree_writable, sample_rows, sou
 # A JWT-shaped bearer that also carries every credential marker the scans look for.
 TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJUT0tFTkNBTkFSWSJ9.TOKENCANARY-api_key=apikey=sig=sv=7f3a"
 SIGNATURE = "SIGCANARY9c1d%2Bapi_key%3Dapikey%3D"
-UNIQUE_MARKERS = ("TOKENCANARY", "SIGCANARY", "APIKEYCANARY", "REFRESHCANARY", "LOCATIONCANARY")
+UNIQUE_MARKERS = ("TOKENCANARY", "SIGCANARY", "APIKEYCANARY", "REFRESHCANARY", "LOCATIONCANARY", "PATHCANARY")
 TEXT_MARKERS = UNIQUE_MARKERS + ("eyJ", "sig=", "sv=", "api_key=", "apikey=", "Bearer")
 ENDPOINT = acquire.SasEndpoint(host="api.example.test", path="/api/api/test/sas-token",
                                json_field="sasToken", phase0_confirmed=True)
@@ -175,8 +177,9 @@ class AcquisitionTestCase(unittest.TestCase):
             try:
                 return acquire.acquire_one(
                     ticker, trade_date, token=acquire.Secret(TOKEN), endpoint=options.pop("endpoint", ENDPOINT),
-                    transport=self.transport, db=self.db, raw_root=self.raw,
-                    staging_root=self.staging, clock=self.clock, **options)
+                    transport=self.transport, db=options.pop("db", self.db),
+                    raw_root=options.pop("raw_root", self.raw),
+                    staging_root=options.pop("staging_root", self.staging), clock=self.clock, **options)
             finally:
                 self.assert_clean_text(out.getvalue(), err.getvalue(), self.logs.getvalue())
 
@@ -320,6 +323,70 @@ class SecretAndSasTests(AcquisitionTestCase):
             self.assert_sas_refused(value, "malformed")
 
 
+class OutputPathSafetyTests(AcquisitionTestCase):
+    def assert_path_refused(self, **options):
+        error = self.refused(sas_response(), **options)
+        self.assertEqual(self.transport.requests, [])
+        self.assertEqual(list(self.root.rglob("*")), [])
+        self.assertNotIn("PATHCANARY", str(error))
+        self.assert_no_persisted_secrets()
+        return str(error)
+
+    def test_credential_assignments_in_every_configurable_path_are_refused_early(self):
+        assignments = ("sig", "sv", "api_key", "apikey", "token", "access_token",
+                       "refresh_token", "authorization", "password", "passwd", "secret", "sas")
+        messages = set()
+        for option in ("db", "raw_root", "staging_root"):
+            for assignment in assignments:
+                for spelling in (assignment, assignment.upper()):
+                    with self.subTest(path=option, assignment=spelling):
+                        unsafe = self.root / (spelling + "=PATHCANARY") / "output"
+                        messages.add(self.assert_path_refused(**{option: unsafe}))
+        self.assertEqual(len(messages), 1, "path refusals must use one fixed message")
+
+    def test_derived_lock_path_is_validated_independently(self):
+        derived = str(self.db.resolve()) + ".acquisition-lock"
+        unsafe_lock = self.root / "authorization=PATHCANARY.acquisition-lock"
+
+        def path(value):
+            return unsafe_lock if str(value) == derived else Path(value)
+
+        with patch.object(acquire, "Path", side_effect=path):
+            self.assert_path_refused()
+
+    def test_offline_retry_refuses_credential_paths_without_creating_artifacts(self):
+        capture_id = "04a7fdd2-aef6-4c6d-b2a5-a115ae0c1dc8"
+        for option in ("db", "raw_root", "staging_root"):
+            with self.subTest(path=option):
+                paths = dict(db=self.db, raw_root=self.raw, staging_root=self.staging)
+                paths[option] = self.root / "ReFrEsH_ToKeN=PATHCANARY" / "output"
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err), \
+                        self.assertRaises(acquire.AcquisitionError) as caught:
+                    acquire.retry(capture_id, **paths)
+                self.assert_safe_error(caught.exception)
+                self.assert_clean_text(out.getvalue(), err.getvalue(), self.logs.getvalue())
+                self.assertEqual(list(self.root.rglob("*")), [])
+
+
+class PublicCaptureApiTests(unittest.TestCase):
+    def test_acquisition_uses_no_private_capture_imports_connection_or_schema_sql(self):
+        tree = ast.parse(Path(acquire.__file__).read_text(encoding="utf-8"))
+        private_imports, connections, capture_sql = [], [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "bandarmolony_trade_capture":
+                private_imports.extend(alias.name for alias in node.names if alias.name.startswith("_"))
+            if isinstance(node, ast.Attribute) and node.attr == "conn":
+                connections.append(node.lineno)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if (re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\b", node.value, re.I)
+                        and re.search(r"\btrade_(captures|acceptances|store_meta)\b", node.value, re.I)):
+                    capture_sql.append(node.lineno)
+        self.assertEqual(private_imports, [])
+        self.assertEqual(connections, [])
+        self.assertEqual(capture_sql, [])
+
+
 class TransportBoundaryTests(AcquisitionTestCase):
     def test_exact_bytes_flow_from_download_to_raw_object(self):
         data = self.parquet()
@@ -433,6 +500,22 @@ class TransportBoundaryTests(AcquisitionTestCase):
                 self.refused(sas_response(), response)
             self.assert_nothing_recorded()
 
+    def test_empty_http_200_is_refused_before_stage_or_ingest(self):
+        with patch.object(acquire, "_stage", side_effect=KeyboardInterrupt("stage reached")) as stage, \
+                patch.object(capture.TradeCaptureStore, "ingest",
+                             side_effect=AssertionError("ingest reached")) as ingest:
+            for length in (True, False):
+                with self.subTest(content_length=length):
+                    response = blob_response(b"", length=length)
+                    error = self.refused(sas_response(), response)
+                    self.assertIn("empty", str(error).lower())
+                    self.assertTrue(response.closed)
+                    self.assertEqual(len(self.transport.requests), 2)
+                    self.assert_nothing_recorded()
+                    self.assertFalse(self.staging.exists())
+            stage.assert_not_called()
+            ingest.assert_not_called()
+
     def test_transport_exceptions_are_replaced_without_context(self):
         leaky = ConnectionError(f"HTTPSConnectionPool: Max retries exceeded with url: {CLEAN_PATH}?sig={SIGNATURE}")
         error = self.refused(leaky)
@@ -471,7 +554,7 @@ class TransportBoundaryTests(AcquisitionTestCase):
 
 
 class CaptureHandoffTests(AcquisitionTestCase):
-    def test_trade_capture_rejections_remain_trade_capture_rejections(self):
+    def test_contract_failures_preserve_staging_as_unresolved(self):
         raised = []
         original_ingest = capture.TradeCaptureStore.ingest
 
@@ -491,14 +574,27 @@ class CaptureHandoffTests(AcquisitionTestCase):
             "zero rows": self.parquet([]),
         }
         with patch.object(capture.TradeCaptureStore, "ingest", recording_ingest):
-            for label, data in cases.items():
+            for index, (label, data) in enumerate(cases.items()):
                 with self.subTest(label):
+                    self.staging = self.root / "private" / f"acquisition_staging_{index}"
                     raised.clear()
                     result = self.acquire_bytes(data)
-                    self.assertEqual(result["outcome"], "REJECTED")
-                    self.assertFalse(result["staging_preserved"])
+                    self.assertEqual(result["outcome"], "UNRESOLVED")
+                    self.assertTrue(result["staging_preserved"])
                     self.assertEqual(raised, [contract.TradeContractError])
-                    self.assert_nothing_recorded()
+                    directory = self.staging / result["capture_id"]
+                    record = (directory / "attempt.json").read_bytes()
+                    self.assertEqual((directory / "body.parquet").read_bytes(), data)
+                    self.assertEqual(self.counts(), (0, 0))
+                    self.assertEqual(self.raw_objects(), [])
+                    self.assertEqual(self.staged(), [result["capture_id"]])
+                    raised.clear()
+                    retried = self.run_retry(result["capture_id"])
+                    self.assertEqual((retried["outcome"], retried["capture_id"]),
+                                     ("UNRESOLVED", result["capture_id"]))
+                    self.assertEqual(raised, [contract.TradeContractError])
+                    self.assertEqual((directory / "body.parquet").read_bytes(), data)
+                    self.assertEqual((directory / "attempt.json").read_bytes(), record)
         self.assert_no_persisted_secrets()
 
     def test_new_http_observation_receives_new_capture_id(self):
@@ -605,6 +701,61 @@ class RecoveryTests(AcquisitionTestCase):
         self.assertEqual(self.staged(), [result["capture_id"]])
         return result
 
+    def assert_parser_failure_recovers_after_repair(self, data, failure_patch):
+        raised = []
+        original_ingest = capture.TradeCaptureStore.ingest
+
+        def recording_ingest(store, file, envelope):
+            try:
+                return original_ingest(store, file, envelope)
+            except contract.TradeContractError as error:
+                raised.append(type(error))
+                raise
+
+        with failure_patch, \
+                patch.object(capture.TradeCaptureStore, "ingest", recording_ingest), \
+                patch.object(capture, "normalize_parquet", wraps=contract.normalize_parquet) as normalize:
+            first = self.acquire_bytes(data)
+            self.assertEqual(first["outcome"], "UNRESOLVED")
+            self.assertTrue(first["staging_preserved"])
+            self.assertEqual(raised, [contract.TradeContractError])
+            self.assertEqual(normalize.call_count, 1, "reconciliation must not reparse to classify rejection")
+            directory = self.staging / first["capture_id"]
+            record_bytes = (directory / "attempt.json").read_bytes()
+            record = json.loads(record_bytes)
+            self.assertEqual((directory / "body.parquet").read_bytes(), data)
+            self.assertEqual(self.counts(), (0, 0))
+            retried = self.run_retry(first["capture_id"])
+            self.assertEqual((retried["outcome"], retried["capture_id"]),
+                             ("UNRESOLVED", first["capture_id"]))
+            self.assertEqual(normalize.call_count, 2)
+            self.assertEqual((directory / "body.parquet").read_bytes(), data)
+            self.assertEqual((directory / "attempt.json").read_bytes(), record_bytes)
+            self.assertEqual(self.staged(), [first["capture_id"]])
+            self.assert_no_persisted_secrets()
+
+        result = self.run_retry(first["capture_id"])
+        self.assertEqual((result["outcome"], result["capture_id"]), ("ACCEPTED", first["capture_id"]))
+        metadata = self.reader_verify(first["capture_id"])
+        self.assertEqual({key: metadata[key] for key in record["envelope"]}, record["envelope"])
+        self.assertEqual(metadata["raw_response_sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(metadata["content_length"], len(data))
+        self.assertEqual(self.raw_objects()[0].read_bytes(), data)
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertEqual(self.staged(), [])
+
+    def test_missing_parser_dependency_preserves_bytes_until_environment_repair(self):
+        data = self.parquet()
+        self.assert_parser_failure_recovers_after_repair(
+            data, patch.dict(sys.modules, {"pyarrow": None, "pyarrow.parquet": None}))
+
+    def test_parser_resource_failure_preserves_bytes_until_environment_repair(self):
+        import pyarrow.parquet as pq
+
+        data = self.parquet()
+        self.assert_parser_failure_recovers_after_repair(
+            data, patch.object(pq, "ParquetFile", side_effect=MemoryError(f"parser sig={SIGNATURE}")))
+
     def test_stable_capture_id_retry(self):
         data = self.parquet()
         first = self.unresolved_first_attempt(data)
@@ -674,27 +825,6 @@ class RecoveryTests(AcquisitionTestCase):
         self.assertEqual(self.counts(), (1, 1))
         self.assertEqual(self.staged(), [])
 
-    def test_crash_during_cleanup_is_acknowledged_from_the_attempt_record(self):
-        data = self.parquet()
-        original_unlink = Path.unlink
-        crashed = []
-
-        def crash_after_body(path, *args, **kwargs):
-            original_unlink(path, *args, **kwargs)
-            if path.name == "body.parquet" and not crashed:
-                crashed.append(path)
-                raise KeyboardInterrupt
-
-        with patch.object(Path, "unlink", crash_after_body):
-            with self.assertRaises(KeyboardInterrupt):
-                self.acquire_bytes(data)
-        (capture_id,) = self.staged()
-        self.assertFalse((self.staging / capture_id / "body.parquet").exists())
-        result = self.run_retry(capture_id)
-        self.assertEqual((result["outcome"], result["capture_id"]), ("ACCEPTED", capture_id))
-        self.assertEqual(self.counts(), (1, 1))
-        self.assertEqual(self.staged(), [])
-
     def test_pending_predecessor_is_resumed_before_new_observation(self):
         data = self.parquet()
         predecessor = contract.CaptureEnvelope(
@@ -760,6 +890,200 @@ class RecoveryTests(AcquisitionTestCase):
         self.assertEqual(self.staged(), [result["capture_id"]])
         self.assertEqual(self.run_retry(result["capture_id"])["outcome"], "ACCEPTED")
         self.assertEqual(self.staged(), [])
+
+
+class TerminalCleanupTests(AcquisitionTestCase):
+    def exercise_cleanup_interruption(self, boundary):
+        data = self.parquet()
+        attempts = []
+        original_discard = acquire._discard
+        original_replace = os.replace
+        original_unlink = Path.unlink
+        original_rmdir = Path.rmdir
+        original_fsync = acquire._fsync_dir
+
+        def discard(attempt):
+            attempts.append(attempt)
+            return original_discard(attempt)
+
+        def replace(source, destination):
+            if (boundary == "rename" and Path(source).parent == self.staging
+                    and Path(destination).name.endswith(".cleanup")):
+                raise KeyboardInterrupt
+            return original_replace(source, destination)
+
+        def unlink(path, *args, **kwargs):
+            result = original_unlink(path, *args, **kwargs)
+            if path.parent.name.endswith(".cleanup") and (
+                    (boundary == "body deletion" and path.name == "body.parquet")
+                    or (boundary == "record deletion" and path.name == "attempt.json")):
+                raise KeyboardInterrupt
+            return result
+
+        def rmdir(path):
+            if boundary == "directory removal" and path.name.endswith(".cleanup"):
+                raise KeyboardInterrupt
+            return original_rmdir(path)
+
+        def fsync(path):
+            if Path(path) == self.staging and attempts:
+                tombstone = self.staging / (attempts[0].envelope.capture_id + ".cleanup")
+                if ((boundary == "after rename" and tombstone.is_dir())
+                        or (boundary == "final fsync" and not any(self.staging.iterdir()))):
+                    raise KeyboardInterrupt
+            return original_fsync(path)
+
+        with patch.object(acquire, "_discard", discard), \
+                patch.object(os, "replace", replace), patch.object(Path, "unlink", unlink), \
+                patch.object(Path, "rmdir", rmdir), patch.object(acquire, "_fsync_dir", fsync):
+            with self.assertRaises(KeyboardInterrupt):
+                self.acquire_bytes(data)
+
+        self.assertEqual(len(attempts), 1)
+        capture_id = attempts[0].envelope.capture_id
+        active = self.staging / capture_id
+        tombstone = self.staging / (capture_id + ".cleanup")
+        verified = self.reader_verify(capture_id)
+        self.assertEqual(verified["raw_response_sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(verified["content_length"], len(data))
+        self.assertIsNotNone(verified["durable_accepted_at"])
+        self.assertEqual(self.counts(), (1, 1))
+        discovered = acquire._staged_attempts(self.staging)
+        self.assertEqual([attempt.envelope.capture_id for attempt in discovered],
+                         [capture_id] if boundary == "rename" else [])
+        if boundary == "rename":
+            self.assertTrue(active.is_dir())
+            self.assertFalse(tombstone.exists())
+            self.assertEqual((active / "body.parquet").read_bytes(), data)
+        else:
+            self.assertFalse(active.exists())
+            self.assertEqual(tombstone.exists(), boundary != "final fsync")
+        if boundary == "after rename":
+            self.assertEqual((tombstone / "body.parquet").read_bytes(), data)
+            self.assertTrue((tombstone / "attempt.json").is_file())
+        if boundary == "body deletion":
+            self.assertFalse((tombstone / "body.parquet").exists())
+            self.assertTrue((tombstone / "attempt.json").is_file())
+        if boundary in ("record deletion", "directory removal"):
+            self.assertEqual(list(tombstone.iterdir()), [])
+
+        unrelated = self.parquet([source_row(STK_CODE="BBCA")])
+        if tombstone.exists():
+            # A permanently unavailable cleanup residue must never enter active
+            # discovery or prevent a different ticker-day from being captured.
+            def deny_unlink(path, *args, **kwargs):
+                if path.parent == tombstone:
+                    raise PermissionError("synthetic unavailable cleanup")
+                return original_unlink(path, *args, **kwargs)
+
+            def deny_rmdir(path):
+                if path == tombstone:
+                    raise PermissionError("synthetic unavailable cleanup")
+                return original_rmdir(path)
+
+            with patch.object(Path, "unlink", deny_unlink), patch.object(Path, "rmdir", deny_rmdir):
+                result = self.acquire_bytes(unrelated, ticker="BBCA")
+            self.assertEqual(result["outcome"], "ACCEPTED")
+            self.assertTrue(tombstone.is_dir())
+            self.assertEqual(acquire._staged_attempts(self.staging), [])
+            # On a subsequent clean restart, the same tombstone is removed.
+            self.assertEqual(self.acquire_bytes(unrelated, ticker="BBCA")["outcome"], "ACCEPTED")
+        else:
+            self.assertEqual(self.acquire_bytes(unrelated, ticker="BBCA")["outcome"], "ACCEPTED")
+        if active.exists():
+            result = self.run_retry(capture_id)
+            self.assertEqual((result["outcome"], result["capture_id"]), ("ACCEPTED", capture_id))
+        self.assertEqual(self.reader_verify(capture_id), verified)
+        self.assertEqual(self.staged(), [])
+        self.assert_no_persisted_secrets()
+
+    def test_terminal_rename_interruption_keeps_a_readable_active_attempt(self):
+        self.exercise_cleanup_interruption("rename")
+
+    def test_interruption_after_terminal_rename_uses_recoverable_tombstone(self):
+        self.exercise_cleanup_interruption("after rename")
+
+    def test_interruption_after_body_deletion_uses_recoverable_tombstone(self):
+        self.exercise_cleanup_interruption("body deletion")
+
+    def test_interruption_after_record_deletion_uses_recoverable_tombstone(self):
+        self.exercise_cleanup_interruption("record deletion")
+
+    def test_directory_removal_failure_uses_recoverable_tombstone(self):
+        self.exercise_cleanup_interruption("directory removal")
+
+    def test_final_cleanup_fsync_interruption_preserves_accepted_evidence(self):
+        self.exercise_cleanup_interruption("final fsync")
+
+    def test_terminal_discard_without_committed_capture_uses_the_same_safe_namespace(self):
+        capture_id = "e4f779a3-08f5-47a1-86f6-4fded77da6a9"
+        envelope = contract.CaptureEnvelope(
+            ticker="DEWA", trade_date="2026-10-01", capture_id=capture_id,
+            requested_at="2026-10-01T12:00:00Z", response_at="2026-10-01T12:00:01Z",
+            created_by=acquire.CREATED_BY)
+        attempt = acquire._stage(self.staging, envelope, b"malformed staged input")
+        original_unlink = Path.unlink
+
+        def interrupt(path, *args, **kwargs):
+            original_unlink(path, *args, **kwargs)
+            if path.name == "attempt.json":
+                raise KeyboardInterrupt
+
+        with patch.object(Path, "unlink", interrupt), self.assertRaises(KeyboardInterrupt):
+            acquire._discard(attempt)
+        self.assertEqual(self.counts(), (0, 0))
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [capture_id + ".cleanup"])
+        result = self.acquire_bytes(self.parquet([source_row(STK_CODE="BBCA")]), ticker="BBCA")
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual(self.counts(), (1, 1))
+        self.assertEqual(self.staged(), [])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_cleanup_tombstone_symlink_never_deletes_external_files(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "attempt.json"
+        sentinel.write_bytes(b"external evidence")
+        self.staging.mkdir(parents=True)
+        tombstone = self.staging / "b89bcf13-546d-4772-b37c-cb926a1fc900.cleanup"
+        try:
+            tombstone.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("symlink creation unavailable")
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual(sentinel.read_bytes(), b"external evidence")
+        self.assertTrue(tombstone.is_symlink())
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_cleanup_unlinks_reserved_child_symlink_without_following_it(self):
+        sentinel = self.root / "external-evidence"
+        sentinel.write_bytes(b"external evidence")
+        tombstone = self.staging / "668fd95b-f4d3-412f-bb2a-cc47d973cda3.cleanup"
+        tombstone.mkdir(parents=True)
+        try:
+            (tombstone / "body.parquet").symlink_to(sentinel)
+        except OSError:
+            self.skipTest("symlink creation unavailable")
+        (tombstone / "attempt.json").write_bytes(b"discarded record")
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual(sentinel.read_bytes(), b"external evidence")
+        self.assertEqual(self.staged(), [])
+
+    def test_cleanup_does_not_recurse_through_unknown_children_or_block_acquisition(self):
+        tombstone = self.staging / "61f862bb-c809-4d74-b9b3-c1a226da8fe5.cleanup"
+        unknown = tombstone / "unexpected-directory"
+        unknown.mkdir(parents=True)
+        sentinel = unknown / "keep"
+        sentinel.write_bytes(b"unrecognized contents")
+        result = self.acquire_bytes(self.parquet())
+        self.assertEqual(result["outcome"], "ACCEPTED")
+        self.assertEqual(sentinel.read_bytes(), b"unrecognized contents")
+        self.assertEqual(acquire._staged_attempts(self.staging), [])
+        self.assertEqual(self.staged(), [tombstone.name])
 
 
 class CommandLineTests(AcquisitionTestCase):
@@ -882,6 +1206,45 @@ class CommandLineTests(AcquisitionTestCase):
         self.assertEqual(code, 3)
         self.assertEqual(json.loads(out)["outcome"], "ABSENCE_NOT_RECORDED")
         self.assertEqual(self.counts(), (0, 0))
+
+    def test_cli_cleanup_failure_returns_one_after_durable_acceptance(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        data = self.parquet()
+        transport = FakeTransport([sas_response(), blob_response(data)])
+        original_rmdir = Path.rmdir
+
+        def fail_terminal_rmdir(path):
+            if path.name.endswith(".cleanup"):
+                raise OSError(f"synthetic cleanup failure sig={SIGNATURE}")
+            return original_rmdir(path)
+
+        with patch.object(acquire, "LIVE_SAS_ENDPOINT", ENDPOINT), \
+                patch.object(acquire, "_utc_clock", self.clock), \
+                patch.object(getpass, "getpass", return_value=TOKEN), \
+                patch.object(Path, "rmdir", fail_terminal_rmdir):
+            code, out, err, calls = self.main(self.acquire_argv(), stdin=Terminal(), transport=transport)
+        self.assertEqual((code, out, err), (1, "", "acquisition failed\n"))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(transport.closed)
+        self.assertEqual(self.counts(), (1, 1))
+        (tombstone_name,) = self.staged()
+        self.assertTrue(tombstone_name.endswith(".cleanup"))
+        self.assertEqual(list((self.staging / tombstone_name).iterdir()), [])
+        capture_id = tombstone_name.removesuffix(".cleanup")
+        verified = self.reader_verify(capture_id)
+        self.assertIsNotNone(verified["durable_accepted_at"])
+        self.assertEqual(verified["raw_response_sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(verified["content_length"], len(data))
+
+        unrelated = self.acquire_bytes(self.parquet([source_row(STK_CODE="BBCA")]), ticker="BBCA")
+        self.assertEqual(unrelated["outcome"], "ACCEPTED")
+        self.assertEqual(self.counts(), (2, 2))
+        self.assertEqual(self.reader_verify(capture_id), verified)
+        self.assertEqual(self.staged(), [])
+        self.assert_no_persisted_secrets()
 
 
 class _QuietHandler(BaseHTTPRequestHandler):
