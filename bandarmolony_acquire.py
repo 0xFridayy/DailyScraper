@@ -509,6 +509,8 @@ def _paths(db, raw_root, staging_root):
     lock = _output_path(str(db) + ".acquisition-lock")
     for path in (db, raw, staging, lock):
         _output_path(path)
+    if db == raw or raw in db.parents:
+        raise AcquisitionError("database must be separate from the raw object store")
     for inner, outer in ((staging, raw), (raw, staging), (db, staging)):
         if inner == outer or outer in inner.parents:
             raise AcquisitionError("staging must be separate from the trade store")
@@ -569,6 +571,19 @@ class StagedAttempt:
         return self.directory / "body.parquet"
 
 
+def _is_real_directory(path):
+    """Inspect the entry itself; Windows junctions can have directory mode."""
+    metadata = None
+    try:
+        metadata = path.lstat()
+    except OSError:
+        pass
+    return (metadata is not None and stat.S_ISDIR(metadata.st_mode)
+            and not stat.S_ISLNK(metadata.st_mode)
+            and not (getattr(metadata, "st_file_attributes", 0)
+                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+
+
 def _write_new(path, data):
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
     with os.fdopen(descriptor, "wb") as handle:
@@ -591,6 +606,8 @@ def _stage(staging, envelope, body):
     _private_mkdir(staging)
     partial = staging / (envelope.capture_id + ".partial")
     partial.mkdir(mode=0o700)
+    if not _is_real_directory(partial):
+        raise AcquisitionError("staged attempt directory is invalid")
     if body is not None:
         _write_new(partial / "body.parquet", body)
         if sha256_bytes((partial / "body.parquet").read_bytes()) != digest:
@@ -598,12 +615,16 @@ def _stage(staging, envelope, body):
     _write_new(partial / "attempt.json", canonical_json(record).encode("utf-8"))
     _fsync_dir(partial)
     final = staging / envelope.capture_id
+    if not _is_real_directory(partial):
+        raise AcquisitionError("staged attempt directory is invalid")
     os.replace(partial, final)
     _fsync_dir(staging)
     return StagedAttempt(final, envelope, digest, record["content_length"])
 
 
 def _load_attempt(directory):
+    if not _is_real_directory(directory):
+        raise AcquisitionError("staged attempt directory is invalid")
     record = None
     try:
         record = json.loads((directory / "attempt.json").read_text(encoding="utf-8"))
@@ -631,11 +652,11 @@ def _load_attempt(directory):
 
 
 def _staged_attempts(staging):
-    if not staging.is_dir():
+    if not _is_real_directory(staging):
         return []
     return [_load_attempt(path) for path in sorted(staging.iterdir())
             if not path.name.endswith(".partial") and not _is_cleanup_name(path.name)
-            and path.is_dir()]
+            and _is_real_directory(path)]
 
 
 def _is_cleanup_name(name):
@@ -649,8 +670,8 @@ def _is_cleanup_name(name):
 
 
 def _cleanup_tombstone(directory):
-    """Delete only the two reserved files, without following symlinks."""
-    if not _is_cleanup_name(directory.name) or not stat.S_ISDIR(directory.lstat().st_mode):
+    """Delete only the two reserved files in a real, non-reparse directory."""
+    if not _is_cleanup_name(directory.name) or not _is_real_directory(directory):
         raise AcquisitionError("terminal cleanup directory is invalid")
     for child in sorted(directory.iterdir()):
         if child.name not in {"body.parquet", "attempt.json"}:
@@ -669,6 +690,8 @@ def _cleanup_tombstone(directory):
 
 def _remove_cleanup_tombstones(staging):
     """Best-effort startup cleanup; residue never participates in discovery."""
+    if not _is_real_directory(staging):
+        return
     try:
         directories = sorted(staging.iterdir())
     except OSError:
@@ -683,8 +706,10 @@ def _remove_cleanup_tombstones(staging):
 
 def _remove_partials(staging):
     """A .partial directory was never renamed, so it was never handed off."""
-    if staging.is_dir():
+    if _is_real_directory(staging):
         for partial in staging.glob("*.partial"):
+            if not _is_real_directory(partial):
+                continue
             for child in partial.iterdir():
                 child.unlink()
             partial.rmdir()
@@ -693,7 +718,7 @@ def _remove_partials(staging):
 def _discard(attempt):
     # Once renamed, interrupted deletion cannot leave a malformed active attempt.
     tombstone = attempt.directory.with_name(attempt.directory.name + CLEANUP_SUFFIX)
-    if not _is_cleanup_name(tombstone.name) or not stat.S_ISDIR(attempt.directory.lstat().st_mode):
+    if not _is_cleanup_name(tombstone.name) or not _is_real_directory(attempt.directory):
         raise AcquisitionError("terminal cleanup directory is invalid")
     os.replace(attempt.directory, tombstone)
     _fsync_dir(tombstone.parent)
@@ -781,6 +806,8 @@ def _handoff(attempt, paths):
     matches the attempt (ACCEPTED). Every other outcome keeps its capture_id for
     `retry`, which reuses the same bytes and envelope.
     """
+    if not _is_real_directory(attempt.directory):
+        raise AcquisitionError("staged attempt directory is invalid")
     envelope = attempt.envelope
     facts = dict(envelope=envelope, digest=attempt.raw_sha256, length=attempt.content_length)
     # Only an acknowledged 200 attempt has lost its body: verify it from the record.
@@ -867,7 +894,7 @@ def retry(capture_id, *, db=DEFAULT_DB, raw_root=None, staging_root=None):
     with _exclusive(paths.lock):
         _remove_cleanup_tombstones(paths.staging)
         directory = paths.staging / capture_id
-        if not directory.is_dir():
+        if not _is_real_directory(directory):
             raise AcquisitionError("no staged attempt has this capture ID")
         return _handoff(_load_attempt(directory), paths)
 
