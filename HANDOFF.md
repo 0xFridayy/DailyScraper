@@ -2930,3 +2930,134 @@ and performs no login, Supabase authentication, SAS-token retrieval, Azure
 download, browser automation, network collection, or scheduled acquisition.
 No real Parquet, store, raw paid data, or credential is added. Workflow
 schedules and unrelated production modules are unchanged.
+
+## BANDARMOLONY ACQUISITION V1
+
+`bandarmolony_acquire.py` acquires one `done_detail` ticker-day for an attending
+operator and hands the exact bytes to Trade Capture v1, which is unchanged.
+It has no scheduler, history range, listing, or network retry.
+
+### Flow
+
+The fixed flow is: the operator's browser access token, one sas-token request,
+SAS validation, one blob GET, private staging, `CaptureEnvelope`,
+`TradeCaptureStore.ingest()`, durable acceptance, an independent read-only
+`verify()`, and staging deletion.
+
+The blob URL is routed only from the validated ticker and ISO date:
+`https://storagebandarmolony.blob.core.windows.net/trading-data-v2/done_detail/{YYYYMMDD}/STOCK/{TICKER}.parquet`.
+That clean locator is the envelope's `source_path_without_query_or_token`.
+The adapter never derives provenance from a signed URL. Legacy 14-column files
+contain no ticker or date. For them this requested-path routing is an adapter
+precondition, and capture cannot independently prove their identity. Results
+report `ticker_date_evidence` as `SOURCE_COLUMNS_AND_REQUESTED_PATH` or
+`REQUESTED_PATH_ONLY`.
+
+### Phase-0 gate
+
+The SPA API host, the sas-token path, and the JSON field holding the SAS are
+not confirmed. `LIVE_SAS_ENDPOINT` is therefore `None`, and
+`acquire` exits with status 2 before prompting for a token. Phase-0 browser
+discovery fills `SasEndpoint(host, path, json_field, phase0_confirmed=True)`.
+The SAS validator also expects the audited shape: a container SAS for that
+account and container, given as a query string or container URL.
+
+### Secrets
+
+The access token comes only from a hidden `getpass` prompt at an interactive
+terminal. There is no token option, environment variable, or `.env` key.
+Echoing fallbacks and piped input are refused. The token is sent only to the
+confirmed API host. The blob request carries the SAS query and no
+`Authorization` header.
+
+The requests transport sets `trust_env=False` and keeps TLS verification on.
+It disables redirects, uses a cookie policy that accepts nothing, and silences
+urllib3 logging, which would otherwise print the signed request line. Every
+transport and parser failure is replaced by a fixed message with no exception
+context.
+
+The token, SAS, signed URL, cookies, unrestricted headers, and response objects
+are never persisted. Only `Last-Modified`, `x-ms-creation-time`, and
+`x-ms-request-id` cross into the envelope. Python cannot wipe string memory, so
+the process stays short-lived.
+
+A valid SAS must:
+- be for the allowlisted host and container, over HTTPS only (`spr=https`);
+- include read permission;
+- be valid for at least 60 more seconds;
+- contain only standard SAS fields, so listing parameters and response-header
+  overrides are refused.
+
+### Exact bytes and status routing
+
+For a 200 response, any `Content-Encoding` is refused. A present
+`Content-Length` must equal the received length, a 256 MiB cap applies, and the
+complete body is read before hashing. An incomplete body never reaches Trade
+Capture.
+
+A 404 counts as an absence observation only when its `x-ms-error-code` is
+`BlobNotFound`. It is recorded through `observe_absence()` only with
+`--record-absence`, and otherwise reports `ABSENCE_NOT_RECORDED`. A 404 never
+means zero trades. Every other status, including redirects, records nothing.
+
+`requested_at` is read immediately before the blob request is sent.
+`response_at` is read after the complete 200 body, or the complete 404
+response, has been received.
+
+### Staging, serialization, and recovery
+
+Staging defaults to `acquisition_staging` beside the store database and passes
+the same private-output guard. Each attempt is written to `<capture_id>.partial`
+with `body.parquet` and `attempt.json`, then renamed into place. `attempt.json`
+holds only envelope fields, the received SHA-256, and the content length.
+The path of the staged body is what goes to `ingest()`.
+
+A non-waiting SQLite lock, `<db>.acquisition-lock`, serializes attempts per
+store. A new attempt for a ticker-day is refused while an earlier staged
+attempt for that ticker-day is unresolved.
+
+`PendingCaptureError` is handled before any other capture error: the pending
+predecessor is resumed and the ingest is retried once. Any other writer failure
+is reconciled. If the body exists, `resume()` accepts it. If no body exists and
+Trade Capture's own `normalize_parquet` refuses the staged bytes, the outcome
+is `REJECTED` and staging is deleted. Everything else is `UNRESOLVED`, and the
+attempt is kept.
+
+After the writer closes, a fresh `TradeCaptureStore(..., read_only=True)` must
+reproduce every envelope fact, the raw SHA-256, and the length. A match
+deletes staging. A failed verification keeps staging as `UNRESOLVED`, and a
+disagreement keeps it as `INTEGRITY_MISMATCH`. `retry --capture-id` is offline.
+It re-runs the same handoff with the same capture ID, bytes, and envelope. A
+new HTTP response always gets a new capture ID and new timestamps.
+
+### Commands
+
+```bash
+python bandarmolony_acquire.py acquire --ticker DEWA --trade-date 2026-10-01
+python bandarmolony_acquire.py retry --capture-id CAPTURE_ID
+```
+
+Both accept `--db`, `--raw-root`, and `--staging-dir`, and `acquire` also takes
+`--record-absence`. Exit statuses:
+
+| Status | Meaning |
+|---|---|
+| 0 | `ACCEPTED` |
+| 1 | Failure before staging |
+| 2 | Usage error or disabled live entry point |
+| 3 | `ABSENCE_NOT_RECORDED` |
+| 4 | `REJECTED` |
+| 5 | `UNRESOLVED` |
+| 6 | `INTEGRITY_MISMATCH` |
+
+Run the live command in your own terminal, not through an agent whose
+transcript would record terminal input. Never paste the token into chat.
+
+### Tests
+
+`python test_bandarmolony_acquire.py` uses a fake transport and synthetic
+canaries. One test drives the real requests transport against a local
+127.0.0.1 server to prove the signed request line is not logged.
+`check_ml_health.py` runs the suite, including with `--quick`. No real
+BandarmoloNY, Supabase, or Azure request, credential, Parquet, or store is
+used.

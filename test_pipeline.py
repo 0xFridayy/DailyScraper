@@ -1479,12 +1479,11 @@ def test_ml_health_runs_and_counts_inventory_evidence_tests():
     print("test_ml_health_runs_and_counts_inventory_evidence_tests passed")
 
 
-def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
+def _assert_ml_health_runs_and_counts_unittest_suite(suite, label):
     import subprocess
     from unittest.mock import patch
     import check_ml_health as health
 
-    suite = "test_bandarmolony_trade_capture.py"
     launched = []
 
     def successful_suite(args, **kwargs):
@@ -1505,10 +1504,10 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
                 patch.object(health, "check_model_runs") as model_fit:
             problems, _, stats = health.check(quick=quick)
         assert launched.count(suite) == 1, \
-            "ml-health must run the trade capture behavioral suite exactly once"
+            f"ml-health must run the {label} behavioral suite exactly once"
         assert not problems
         assert stats["tests_passed"] == len(launched) - 1 + 23, \
-            "ml-health must count the trade suite's unittest summary"
+            f"ml-health must count the {label} suite's unittest summary"
         if quick:
             model_fit.assert_not_called()
 
@@ -1525,10 +1524,19 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
         health.check_unit_tests(problems, stats)
     assert launched.count(suite) == 1
     assert any(f"{suite} FAILED" in problem for problem in problems), \
-        "trade capture failures must fail the health check"
+        f"{label} failures must fail the health check"
     assert stats["tests_passed"] == len(launched) - 1, \
         "a failed unittest suite must not contribute passing tests"
+
+
+def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
+    _assert_ml_health_runs_and_counts_unittest_suite("test_bandarmolony_trade_capture.py", "trade capture")
     print("test_ml_health_runs_and_counts_bandarmolony_trade_tests passed")
+
+
+def test_ml_health_runs_and_counts_bandarmolony_acquire_tests():
+    _assert_ml_health_runs_and_counts_unittest_suite("test_bandarmolony_acquire.py", "acquisition")
+    print("test_ml_health_runs_and_counts_bandarmolony_acquire_tests passed")
 
 
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
@@ -2954,6 +2962,7 @@ if __name__ == "__main__":
     test_ml_health_workflow_runs_the_canonical_migration_suite()
     test_ml_health_runs_and_counts_inventory_evidence_tests()
     test_ml_health_runs_and_counts_bandarmolony_trade_tests()
+    test_ml_health_runs_and_counts_bandarmolony_acquire_tests()
     test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
     test_hold_days_one_uses_entry_session_high_low_and_close()
     test_tp_and_sl_hit_on_entry_session_are_detected()
