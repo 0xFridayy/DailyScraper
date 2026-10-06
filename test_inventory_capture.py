@@ -918,6 +918,108 @@ def test_backfill_uses_the_audit_limit_tiers_and_tolerance():
     print("  ok test_backfill_uses_the_audit_limit_tiers_and_tolerance")
 
 
+def test_backfill_refuses_real_rounding_limit_bypasses_before_writes():
+    from price_audit import ARB_BOUND, TOL, ara_bound, detect, load
+    pairs = [
+        (1711322726938932081, 2062143885961413072),
+        (1079319711050908758, 912025155838017932),
+    ]
+    for previous, close in pairs:
+        # The original Python integer quotient passes, but persisted REALs fail.
+        assert ARB_BOUND - TOL <= close / previous - 1 <= ara_bound(previous) + TOL
+        bars = [price_bar("2026-07-01", previous), price_bar("2026-07-02", close)]
+        with price_db() as conn:
+            conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", [
+                (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
+                for b in bars])
+            assert detect(load(conn)).iloc[-1]["limit_violation"]
+        for stored_previous in (False, True):
+            with price_db() as conn:
+                if stored_previous:
+                    bf.insert_inventory(conn, "ENRG", price_payload(bars[:1]))
+                    conn.commit()
+                body = price_payload(bars[1:] if stored_previous else bars)
+                body["data"]["nlot"] = {"AK": [10] * len(body["data"]["date"])}
+                refuse_prices(conn, body, "limit_violation")
+                assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (
+                    int(stored_previous),)
+                assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+    print("  ok test_backfill_refuses_real_rounding_limit_bypasses_before_writes")
+
+
+def test_backfill_written_closes_match_the_validated_real_and_price_audit():
+    import math
+    from price_audit import detect, load
+    pairs = [
+        (100, 135), (200, 250.0), (5000.0, 6250), (6000, 7200.0),
+        (1440, 1230), (1030.5, 1050.25),
+        (1711322726938932081, math.nextafter(float(2062143885961413072), 0)),
+        (1079319711050908758, math.nextafter(float(912025155838017932), math.inf)),
+        (10 ** 100 + 1, 10 ** 100 + 2),
+    ]
+    for previous, close in pairs:
+        with price_db() as conn:
+            bars = [price_bar("2026-07-01", previous), price_bar("2026-07-02", close)]
+            # Keep the other fields ordinary; only close normalization is under test.
+            for bar in bars:
+                bar.update(open=1000, high=1005.25, low=995, volume=1234)
+            body = price_payload(bars)
+            body["data"]["nlot"] = {"AK": [10, -5]}
+            assert bf.insert_inventory(conn, "ENRG", body)[:2] == (2, 2)
+            written = conn.execute(
+                "SELECT close, typeof(close), open, high, low, volume "
+                "FROM price_history ORDER BY date").fetchall()
+            assert written == [(float(v), "real", 1000, 1005.25, 995, 1234)
+                               for v in (previous, close)]
+            assert not detect(load(conn))["limit_violation"].any()
+            flows = conn.execute("SELECT netval FROM broker_flow ORDER BY date").fetchall()
+            assert flows == [(10 * 100 * float(previous) / 1e9,),
+                             (-5 * 100 * float(close) / 1e9,)]
+            assert [b["close"] for b in bars] == [previous, close], "writer mutated its payload"
+    print("  ok test_backfill_written_closes_match_the_validated_real_and_price_audit")
+
+
+def test_backfill_compares_unchanged_closes_in_real_representation():
+    from price_audit import detect, load
+    bars = [price_bar("2026-10-01", 10 ** 18 + 1),
+            price_bar("2026-10-02", 2 * 10 ** 18 + 3)]
+    with price_db() as conn:
+        conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", [
+            (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
+            for b in bars])
+        conn.commit()
+        assert bars[0]["close"] != conn.execute("SELECT close FROM price_history ORDER BY date").fetchone()[0]
+        assert bf.insert_inventory(conn, "ENRG", price_payload(bars))[1] == 2
+        assert detect(load(conn)).loc[lambda px: px.limit_violation, "date"].tolist() == ["2026-10-02"]
+    print("  ok test_backfill_compares_unchanged_closes_in_real_representation")
+
+
+def test_backfill_refuses_real_conversion_failures_before_writes():
+    from decimal import Decimal
+    from fractions import Fraction
+    for close in (10 ** 400, -(10 ** 400), float("nan"), float("inf"),
+                  -float("inf"), 0, -0.0, -1, True, False, "1030", None,
+                  Decimal("1030"), Fraction(1030)):
+        with price_db() as conn:
+            body = price_payload([price_bar("2026-07-01", close)])
+            body["data"]["nlot"] = {"AK": [10]}
+            refuse_prices(conn, body, "close")
+            assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+    print("  ok test_backfill_refuses_real_conversion_failures_before_writes")
+
+
+def test_backfill_refuses_malformed_dates_before_writes():
+    for day in (None, 20260701, "2026-02-30", "2026-7-1", "20260701", "2026-07-01T00:00:00"):
+        with price_db() as conn:
+            body = price_payload([price_bar(day, 1030)])
+            body["data"]["nlot"] = {"AK": [10]}
+            refuse_prices(conn, body, "price date")
+            assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+    print("  ok test_backfill_refuses_malformed_dates_before_writes")
+
+
 def test_backfill_refuses_ambiguous_close_or_duplicate_date():
     for close in (None, "1030", float("nan"), float("inf"), 0, -1, True):
         with price_db() as conn:
@@ -925,6 +1027,92 @@ def test_backfill_refuses_ambiguous_close_or_duplicate_date():
     with price_db() as conn:
         refuse_prices(conn, price_payload([price_bar("2026-10-02", 1440)] * 2), "duplicate date")
     print("  ok test_backfill_refuses_ambiguous_close_or_duplicate_date")
+
+
+def assert_original_rejection_snapshot(root, ticker, response):
+    with open(os.path.join(root, "topup-failure.json"), encoding="utf-8", newline="") as fh:
+        assert fh.read() == response.text(), "snapshot lost original response text"
+    caps = ic.read_captures(only_manifest(root))
+    rejected = next(c for c in caps if c["ticker"] == ticker)
+    assert rejected["status"] == ic.REJECTED, rejected
+    assert rejected["response_sha256"] == hashlib.sha256(response.body()).hexdigest()
+    assert rejected["response_bytes"] == len(response.body())
+    events = [json.loads(line) for line in manifest_text(root).splitlines()]
+    assert not any(e["event"] == "persisting" and e["capture_id"] == rejected["capture_id"]
+                   for e in events), "rejected response announced persistence"
+    return caps
+
+
+def test_backfill_preserves_duplicate_close_keys_in_rejection_snapshot():
+    # Both prices and nonzero AK lots qualify for writes by date. The parser's
+    # final 1030 close violates the limit from 1440; the earlier 1500 is evidence.
+    raw = ''' {
+      "success":true,"meta":{"symbol":"ENRG"},
+      "data":{"date":["2026-06-30","2026-07-01"],"nlot":{"AK":[23,51]},
+        "ohlc":[{"date":"2026-06-30","close":1440},
+                {"date":"2026-07-01","close":1500,"close":1030}]}
+    }
+'''
+    raw = raw.replace("\n", "\r\n")
+    response = Resp(200, text=raw)
+    parsed = json.loads(response.text())
+    assert [bar["close"] for bar in parsed["data"]["ohlc"]] == [1440, 1030]
+    assert all(day <= bf.BACKFILL_END for day in parsed["data"]["date"])
+    assert parsed["data"]["nlot"]["AK"] == [23, 51]
+    with price_db() as conn:
+        refuse_prices(conn, parsed, "limit_violation")
+        assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+    script = {"ENRG": [response], "BBBB": [ok(payload(base=2000), "BBBB")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _, request = run_backfill(tmp, script, ["ENRG", "BBBB"])
+        caps = assert_original_rejection_snapshot(tmp, "ENRG", response)
+        with open(os.path.join(tmp, "topup-failure.json"), encoding="utf-8") as fh:
+            assert '"close":1500,"close":1030' in fh.read()
+        assert db_counts(tmp) == ({"BBBB": 120}, {"BBBB": 240})
+    assert [(c["ticker"], c["status"]) for c in caps] == [
+        ("ENRG", ic.REJECTED), ("BBBB", ic.OK)]
+    assert len(request.urls) == 2 and all(request.recorded_first)
+    assert "limit_violation" in out and "1440" in out and "1030" in out
+    print("  ok test_backfill_preserves_duplicate_close_keys_in_rejection_snapshot")
+
+
+def test_backfill_preserves_original_text_for_rejected_symbols():
+    for meta in ('{}', '{"symbol":"ENRG","symbol":"BBBB"}'):
+        raw = (' {"success":true, "meta":' + meta + ',\n'
+               '"data":{"date":["2026-07-01"], "nlot":{"AK":[51]},\n'
+               '"ohlc":[{"date":"2026-07-01","close":1500}]}}\n')
+        response = Resp(200, text=raw)
+        with price_db() as conn:
+            refuse_prices(conn, json.loads(raw), "symbol")
+            assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
+            assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+        script = {"ENRG": [response], "CCCC": [ok(payload(base=3000), "CCCC")]}
+        with tempfile.TemporaryDirectory() as tmp:
+            out, _, _ = run_backfill(tmp, script, ["ENRG", "CCCC"])
+            caps = assert_original_rejection_snapshot(tmp, "ENRG", response)
+            assert db_counts(tmp) == ({"CCCC": 120}, {"CCCC": 240})
+        assert [(c["ticker"], c["status"]) for c in caps] == [
+            ("ENRG", ic.REJECTED), ("CCCC", ic.OK)]
+        assert "symbol" in out and "Failed tickers: ['ENRG']" in out
+    print("  ok test_backfill_preserves_original_text_for_rejected_symbols")
+
+
+def test_backfill_preserves_original_text_for_later_stale_series_rejection():
+    first = payload(base=1000)
+    raw = json.dumps({"success": True, "meta": {"symbol": "BBBB"}, "data": first},
+                     indent=2) + "\n"
+    response = Resp(200, text=raw)
+    script = {"AAAA": [ok(first, "AAAA")], "BBBB": [response],
+              "CCCC": [ok(payload(base=3000), "CCCC")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
+        caps = assert_original_rejection_snapshot(tmp, "BBBB", response)
+        assert db_counts(tmp) == ({"AAAA": 120, "CCCC": 120}, {"AAAA": 240, "CCCC": 240})
+    assert [(c["ticker"], c["status"]) for c in caps] == [
+        ("AAAA", ic.OK), ("BBBB", ic.REJECTED), ("CCCC", ic.OK)]
+    assert "series identical to AAAA" in out and "Failed tickers: ['BBBB']" in out
+    print("  ok test_backfill_preserves_original_text_for_later_stale_series_rejection")
 
 
 def test_backfill_records_selector_captures_and_behaves_as_before():
