@@ -792,6 +792,141 @@ def test_harvest_records_a_failed_cache_write_and_still_retries():
 
 # ── backfill_inventory (selectors, no cache) ───────────────────────────────
 
+def price_db(path=":memory:"):
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE price_history (date TEXT, ticker TEXT, open REAL, high REAL, "
+                 "low REAL, close REAL, volume REAL, PRIMARY KEY(date, ticker))")
+    conn.execute("CREATE TABLE broker_flow (date TEXT, ticker TEXT, broker_code TEXT, "
+                 "bval REAL, sval REAL, netval REAL, bavg REAL, savg REAL, "
+                 "PRIMARY KEY(date, ticker, broker_code))")
+    return conn
+
+
+def price_payload(bars, symbol="ENRG"):
+    return {"success": True, "meta": {"symbol": symbol}, "data": {
+        "date": [b["date"] for b in bars], "nlot": {}, "ohlc": bars}}
+
+
+def price_bar(day, close):
+    return dict(date=day, open=close, high=close, low=close, close=close, volume=1000)
+
+
+# Exact stored bars at master d6975fb. This reconstructs the writer input;
+# the successful inventory response itself was not archived in the repository.
+ENRG_BARS = [
+    dict(date="2026-10-02", open=1425, high=1440, low=1400, close=1440, volume=74202900),
+    dict(date="2026-10-05", open=1080, high=1085, low=1000, close=1030, volume=109977800),
+]
+
+
+def refuse_prices(conn, body, reason):
+    before = conn.total_changes
+    try:
+        bf.insert_inventory(conn, "ENRG", body)
+    except bf.InventoryError as e:
+        assert reason in str(e), str(e)
+    else:
+        raise AssertionError(f"writer accepted {reason}")
+    assert conn.total_changes == before, "rejection happened after SQL writes"
+
+
+def test_backfill_refuses_enrg_limit_violation_before_any_price_write():
+    from price_audit import detect, load
+    with price_db() as conn:
+        refuse_prices(conn, price_payload(ENRG_BARS), "limit_violation")
+        assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
+        # Pin the detector's evidence and rule independently of the writer.
+        conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", [
+            (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
+            for b in ENRG_BARS])
+        flagged = detect(load(conn)).iloc[-1]
+        assert flagged["limit_violation"] and flagged["prev_close"] == 1440
+        assert abs(flagged["pct_chg"] - (1030 / 1440 - 1)) < 1e-12
+    print("  ok test_backfill_refuses_enrg_limit_violation_before_any_price_write")
+
+
+def test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers():
+    body = price_payload(ENRG_BARS[1:])
+    script = {"ENRG": [Resp(200, body)], "BBBB": [ok(payload(base=2000), "BBBB")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        with price_db(os.path.join(tmp, "neobdm.db")) as conn:
+            bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS[:1]))
+        out, _, request = run_backfill(tmp, script, ["ENRG", "BBBB"])
+        prices, _ = db_counts(tmp)
+        with sqlite3.connect(os.path.join(tmp, "neobdm.db")) as conn:
+            assert conn.execute("SELECT date,close FROM price_history WHERE ticker='ENRG'").fetchall() == [
+                ("2026-10-02", 1440)]
+        caps = ic.read_captures(only_manifest(tmp))
+        assert [(c["ticker"], c["status"]) for c in caps] == [("ENRG", ic.REJECTED), ("BBBB", ic.OK)]
+        assert caps[0]["response_sha256"] == hashlib.sha256(script["ENRG"][0].body()).hexdigest()
+        events = [json.loads(line) for line in manifest_text(tmp).splitlines()]
+        assert not any(e["event"] == "persisting" and e["capture_id"] == caps[0]["capture_id"] for e in events)
+    assert prices == {"ENRG": 1, "BBBB": 120}, prices
+    assert request.params(0)["symbol"] == ["ENRG"]
+    assert "limit_violation" in out and "2026-10-05" in out and "1440" in out and "1030" in out
+    print("  ok test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers")
+
+
+def test_backfill_refuses_a_revised_close_and_a_bad_predecessor():
+    for bars, incoming in [
+        ([price_bar("2026-10-02", 1440), price_bar("2026-10-05", 1500)], ENRG_BARS[1:]),
+        ([price_bar("2026-10-02", 1440)], [price_bar("2026-10-01", 2000)]),
+    ]:
+        with price_db() as conn:
+            bf.insert_inventory(conn, "ENRG", price_payload(bars))
+            conn.commit()
+            refuse_prices(conn, price_payload(incoming), "limit_violation")
+    print("  ok test_backfill_refuses_a_revised_close_and_a_bad_predecessor")
+
+
+def test_backfill_requires_the_requested_symbol_before_writing_prices():
+    for meta in ({}, {"symbol": None}, {"symbol": ""}, {"symbol": "BBBB"}):
+        with price_db() as conn:
+            body = price_payload(ENRG_BARS[:1])
+            body["meta"] = meta
+            refuse_prices(conn, body, "symbol")
+    print("  ok test_backfill_requires_the_requested_symbol_before_writing_prices")
+
+
+def test_backfill_keeps_unchanged_historical_violations_visible():
+    from price_audit import detect, load
+    with price_db() as conn:
+        conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", [
+            (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
+            for b in ENRG_BARS])
+        conn.commit()
+        bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
+        flagged = detect(load(conn))
+        assert flagged.loc[flagged.limit_violation, "date"].tolist() == ["2026-10-05"]
+        assert conn.execute("SELECT close FROM price_history WHERE date='2026-10-06'").fetchone() == (1050,)
+    print("  ok test_backfill_keeps_unchanged_historical_violations_visible")
+
+
+def test_backfill_uses_the_audit_limit_tiers_and_tolerance():
+    for previous, close, allowed in [
+        (100, 135, True), (100, 136, False), (200, 250, True), (200, 252, False),
+        (5000, 6250, True), (5000, 6300, False), (6000, 7200, True), (6000, 7260, False),
+        (1440, 1230, True), (1440, 1200, False),
+    ]:
+        with price_db() as conn:
+            body = price_payload([price_bar("2026-10-02", previous), price_bar("2026-10-05", close)])
+            if allowed:
+                assert bf.insert_inventory(conn, "ENRG", body)[1] == 2
+            else:
+                refuse_prices(conn, body, "limit_violation")
+    print("  ok test_backfill_uses_the_audit_limit_tiers_and_tolerance")
+
+
+def test_backfill_refuses_ambiguous_close_or_duplicate_date():
+    for close in (None, "1030", float("nan"), float("inf"), 0, -1, True):
+        with price_db() as conn:
+            refuse_prices(conn, price_payload([price_bar("2026-10-02", close)]), "close")
+    with price_db() as conn:
+        refuse_prices(conn, price_payload([price_bar("2026-10-02", 1440)] * 2), "duplicate date")
+    print("  ok test_backfill_refuses_ambiguous_close_or_duplicate_date")
+
+
 def test_backfill_records_selector_captures_and_behaves_as_before():
     a = payload(base=1000.0, brokers=("AK", "BK", "XL"), zero=("XL",))
     boom = RuntimeError(f"APIRequestContext.get: Timeout 60000ms exceeded.\nCall log:\n"

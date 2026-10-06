@@ -72,16 +72,17 @@ Usage: py backfill_inventory.py TICKER1 TICKER2 ...
 
 import sys
 import json
+import math
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 import inventory_capture as ic
 from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 from price_audit import (series_signature, should_fail_run, inventory_window,
-                         inventory_window_is_short)
+                         inventory_window_is_short, ara_bound, ARB_BOUND, TOL)
 
 # Priming this page first sets the csrftoken/sessionid cookies for the inventory
 # path. The data GET is authenticated by the sessionid cookie alone (no CSRF).
@@ -174,6 +175,51 @@ def fetch_inventory(req, ticker, start_date, end_date, captures):
     return payload, cap
 
 
+def validate_inventory_prices(conn, ticker, ohlc):
+    """Refuse new limit violations before either table receives any writes.
+
+    Judge the proposed series, including stored neighbours outside the response.
+    A revised predecessor can invalidate an unchanged successor. Unchanged
+    historical violations remain visible to the audit without blocking every
+    future top-up of the rolling year. No corporate-action exception is inferred.
+    """
+    incoming = {}
+    for bar in ohlc:
+        day, close = bar.get("date"), bar.get("close")
+        try:
+            canonical = date.fromisoformat(day).isoformat()
+        except (TypeError, ValueError):
+            canonical = None
+        if canonical is None or canonical != day:
+            raise InventoryError(f"{ticker}: ambiguous price date {day!r}")
+        if day in incoming:
+            raise InventoryError(f"{ticker}: duplicate date {day} in ohlc")
+        if (isinstance(close, bool) or not isinstance(close, (int, float))
+                or not math.isfinite(close) or close <= 0):
+            raise InventoryError(f"{ticker} {day}: ambiguous close {close!r}")
+        incoming[day] = close
+
+    stored = dict(conn.execute(
+        "SELECT date, close FROM price_history WHERE ticker=? ORDER BY date", (ticker,)))
+    changed = {d for d, close in incoming.items() if d not in stored or close != stored[d]}
+    proposed = stored | incoming
+    days = sorted(proposed)
+    for previous_day, day in zip(days, days[1:]):
+        if day not in changed and previous_day not in changed:
+            continue
+        previous, close = proposed[previous_day], proposed[day]
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) or v <= 0 for v in (previous, close)):
+            raise InventoryError(f"{ticker} {day}: ambiguous close baseline on {previous_day}")
+        change = close / previous - 1
+        lower, upper = ARB_BOUND - TOL, ara_bound(previous) + TOL
+        if change < lower or change > upper:
+            raise InventoryError(
+                f"{ticker} {day}: limit_violation, close {previous:g} on {previous_day} "
+                f"-> {close:g} ({change:+.2%}), allowed {lower:+.2%}..{upper:+.2%} "
+                f"— refusing to store")
+
+
 def insert_inventory(conn, ticker, payload):
     """Store price_history (all days) + broker_flow (days <= BACKFILL_END).
 
@@ -185,13 +231,23 @@ def insert_inventory(conn, ticker, payload):
     # Hard gate: the API is symbol-keyed, but never store a payload whose meta
     # disagrees with what we asked for.
     shown = str(meta.get("symbol") or "").upper()
-    if shown and shown != ticker.upper():
+    if not shown:
+        raise InventoryError(f"API omitted symbol for requested {ticker} — refusing to store",
+                             raw=json.dumps(payload))
+    if shown != ticker.upper():
         raise InventoryError(
-            f"API returned symbol {shown} for requested {ticker} — refusing to store")
+            f"API returned symbol {shown} for requested {ticker} — refusing to store",
+            raw=json.dumps(payload))
 
     ohlc = data.get("ohlc") or []
     if not ohlc:
         return 0, 0, [], None
+
+    try:
+        validate_inventory_prices(conn, ticker, ohlc)
+    except InventoryError as e:
+        e.raw = json.dumps(payload)
+        raise
 
     price_rows = [
         (o["date"], ticker, o.get("open"), o.get("high"),
