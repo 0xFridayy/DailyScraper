@@ -64,6 +64,8 @@ def load_ohlcv():
 
 def analyze_ticker(ticker):
     """Analyze one ticker: patterns aligned with broker/category flow."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("analyze_ticker_patterns.analyze_ticker")
     print(f"\n{'='*70}")
     print(f"TICKER: {ticker}")
     print(f"{'='*70}")
@@ -170,6 +172,8 @@ def analyze_ticker(ticker):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("analyze_ticker_patterns.main")
     for ticker in FOCUS_TICKERS:
         analyze_ticker(ticker)
 

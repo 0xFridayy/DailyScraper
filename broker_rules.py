@@ -161,6 +161,8 @@ def window_cost(NL, NV, BL, SL, low, high):
 
 def eligibility(state):
     """§4.2: the rows that form the universe (and base rate) for a date."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.eligibility")
     with np.errstate(invalid="ignore"):
         return ((state.n_sessions >= MIN_SESSIONS)
                 & (state.val20 >= MIN_VAL20)
@@ -195,6 +197,8 @@ def evaluate(state):
     whether or not the rule fires (the alpha library reads the a_* set on all
     of them), and are NaN/None elsewhere. Rules are False on ineligible rows.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.evaluate")
     n = len(state.dates)
     elig = eligibility(state)
     out = {c: np.full(n, np.nan) for c in EXPLAIN_FLOAT}

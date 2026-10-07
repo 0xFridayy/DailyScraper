@@ -257,11 +257,11 @@ def _price_features_and_target(px):
     `clean_panel(conn, horizons=(1,), open_anchored=True)` and pass the
     result in; there is no other supported path to a `target` column.
     """
+    from price_contract_frame import require_price_frame
+    require_price_frame(px, ("lag_1", "lag_5", "fwd_1", "fwd_oo_1"))
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["momentum_1d"] = px["lag_1"] if "lag_1" in px else (
-        (px["close"] - px["prev_close"]) / px["prev_close"]
-    )
+    px["momentum_1d"] = px["lag_1"]
     px["vol_ma5"] = px.groupby("ticker")["volume"].transform(lambda s: s.shift(1).rolling(5).mean())
     if "lag_5" in px:
         px["vol_ma5"] = px["vol_ma5"].where(px["lag_5"].notna())
@@ -279,10 +279,7 @@ def _price_features_and_target(px):
         )
     px["target"] = px["fwd_oo_1"]
 
-    if "fwd_1" in px:
-        px["target_cc"] = px["fwd_1"]
-    else:
-        px["target_cc"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
+    px["target_cc"] = px["fwd_1"]
 
     return px[["ticker", "date", "momentum_1d", "volume_ratio", "target", "target_cc"]]
 
@@ -543,6 +540,8 @@ def build_panel(conn, *, broker_flow_db_path, broker_flow_manifest_path):
     canonical broker flow of broker_flow_db_path under broker_flow_manifest_path,
     read as one snapshot by load_canonical_inputs() (see there for the checks
     and what it raises). Provenance: panel.attrs["broker_flow"]."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("walk_forward_backtest.build_panel")
     px, bf, canonical, image = load_canonical_inputs(
         conn, broker_flow_db_path=broker_flow_db_path,
         broker_flow_manifest_path=broker_flow_manifest_path,
@@ -699,6 +698,8 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3,
     (see make_walk_forward_splits). pooled_stats carries a `split_report` with
     the skipped/infeasible fold counts — at h=20 on a ~258-date panel some
     folds are arithmetically impossible, and that is reported, not hidden."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("walk_forward_backtest.run_walk_forward")
     splits, split_report = make_walk_forward_splits(
         sorted(panel["date"].unique()), horizon=horizon, train_min=train_min,
         test_window=test_window, embargo=embargo,

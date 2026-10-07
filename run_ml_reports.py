@@ -42,11 +42,7 @@ from strategy_variants import run_strategy_search
 # The episode frame comes from the torch-free module (ddqn_entry_exit re-exports
 # the same function), so the DDQN input wiring is testable without torch.
 from ddqn_episode_data import build_episode_frame
-from ddqn_entry_exit import (
-    split_search_holdout, fit_normalizer,
-    normalize_features, make_envs, train_ddqn, evaluate_policy,
-    evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
-)
+
 from signal_metrics import trade_stats, format_trade_stats
 from price_audit import clean_panel
 import neobdm_source_contract as nsc
@@ -97,6 +93,8 @@ def refresh_broker_flow_manifest(db_path=DB_PATH, out=BROKER_FLOW_MANIFEST_OUT):
 
 
 def run_xgboost_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.run_xgboost_report")
     panel = build_panel(conn, broker_flow_db_path=db_path,
                         broker_flow_manifest_path=broker_flow_manifest_path)
     _, pooled, trade_log = run_walk_forward(panel)
@@ -109,6 +107,8 @@ def run_xgboost_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
 
 
 def run_strategy_variants_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.run_strategy_variants_report")
     panel = build_panel(conn, broker_flow_db_path=db_path,
                         broker_flow_manifest_path=broker_flow_manifest_path)
     px = clean_panel(conn, horizons=(1,), lags=(1,), open_anchored=True)
@@ -126,6 +126,13 @@ def run_strategy_variants_report(conn, broker_flow_manifest_path, db_path=DB_PAT
 def run_ddqn_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
     """DDQN on the canonical episode frame, under the SAME manifest and
     database the XGBoost/strategy panels were built from; never refreshes."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.run_ddqn_report")
+    from ddqn_entry_exit import (
+        split_search_holdout, fit_normalizer,
+        normalize_features, make_envs, train_ddqn, evaluate_policy,
+        evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
+    )
     panel = build_episode_frame(conn, broker_flow_db_path=db_path,
                                 broker_flow_manifest_path=broker_flow_manifest_path)
     search_df, holdout_df = split_search_holdout(panel)
@@ -185,6 +192,8 @@ def run_konglo_watch_report(conn, max_days=KONGLO_TRACK_DAYS):
     (day-max_days close) return feeds pooled non-annualized trade statistics.
     A handful of observations is still not meaningful, so small n is called
     out explicitly."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.run_konglo_watch_report")
     try:
         watch = pd.read_sql("SELECT flag_date, ticker, sources FROM konglo_signal_watch", conn)
     except pd.errors.DatabaseError:
@@ -439,6 +448,8 @@ def write_step_summary(xgb, strat, ddqn, konglo):
 
 
 def main(argv=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.main")
     ap = argparse.ArgumentParser(description="Daily ML report (see ml-daily-report.yml).")
     ap.add_argument("--broker-flow-manifest", default=None, metavar="PATH",
                     help="a broker_flow evidence manifest describing neobdm.db; without it the "

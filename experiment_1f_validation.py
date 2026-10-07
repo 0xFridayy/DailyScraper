@@ -759,6 +759,8 @@ def repair_governance(candidate_dir):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_validation.main")
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--candidate-dir", default=cand.CANDIDATE_DIR)

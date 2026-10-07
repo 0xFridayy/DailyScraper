@@ -231,6 +231,8 @@ def _print_concentration_summary(table, id_column, full_delta):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1_robustness.main")
     parser = argparse.ArgumentParser()
     parser.add_argument("--jci", default=os.path.join(os.path.dirname(__file__), "jci_daily.csv"))
     parser.add_argument(

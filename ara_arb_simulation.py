@@ -46,39 +46,32 @@ from walk_forward_backtest import (build_panel, DB_PATH, connect_price_db,
 from strategy_variants import get_walk_forward_predictions
 from signal_metrics import trade_stats, format_trade_stats
 
-NEAR_LIMIT_TOLERANCE = 0.01  # within 1 percentage point of the theoretical limit counts as "stuck"
+from price_contract import ara_bound, ARB_BOUND, NEAR_LIMIT_TOLERANCE
+from price_contract_frame import annotate_prices, require_price_frame, default_registry, span_result
 
 
-def ara_bound(prev_close):
-    if prev_close < 200:
-        return 0.35
-    if prev_close <= 5000:
-        return 0.25
-    return 0.20
-
-
-ARB_BOUND = -0.15
-
-
-def annotate_limits(px):
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["prev_close"] = px.groupby("ticker")["close"].shift(1)
-    px["pct_chg"] = px["lag_1"] if "lag_1" in px else (
-        (px["close"] - px["prev_close"]) / px["prev_close"]
-    )
-    px["prev_close"] = px["close"] / (1 + px["pct_chg"])
-    px["ara_bound"] = px["prev_close"].apply(ara_bound)
-    px["at_ara"] = px["pct_chg"] >= (px["ara_bound"] - NEAR_LIMIT_TOLERANCE)
-    px["at_arb"] = px["pct_chg"] <= (ARB_BOUND + NEAR_LIMIT_TOLERANCE)
+def annotate_limits(px, *, registry=None, representation=None):
+    px = annotate_prices(px.sort_values(["ticker", "date"]).reset_index(drop=True),
+                         registry=registry, representation=representation)
+    px["prev_close"] = px["previous_actual_close"]
+    px["pct_chg"] = px["close"] / px["prev_close"] - 1  # raw diagnostic only
+    px["ara_bound"] = px["limit_reference_price"].apply(ara_bound)
+    resolved = px["limit_reference_status"].eq("RESOLVED")
+    px["at_ara"] = (px["limit_change"] >= px["ara_bound"] - NEAR_LIMIT_TOLERANCE).where(resolved)
+    px["at_arb"] = (px["limit_change"] <= ARB_BOUND + NEAR_LIMIT_TOLERANCE).where(resolved)
     return px
 
 
-def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_date):
+def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_date, *, registry=None):
     """1-day fixed exit, no TP/SL - but entry-blocked trades are excluded and
     ARB-stuck exits roll forward to the first unstuck day."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
+        return None
+    registry = registry or default_registry()
+    identity = require_price_frame(g, ("fwd_1", "at_ara", "at_arb"), registry=registry)
+    if g[["at_ara", "at_arb"]].isna().any().any():
         return None
     i0 = idx_map[entry_date]
     if g.loc[i0, "at_ara"]:
@@ -96,6 +89,11 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
         j += 1
     if j >= len(g):
         j = len(g) - 1
+    held = span_result(ticker, g.loc[i0, "date"], g.loc[j, "date"],
+                       registry=registry, representation=identity["input_representation"],
+                       market=identity["market"], session_axis=g.date.tolist())
+    if held.status != "COMPARABLE":
+        return None
     exit_price = g.loc[j, "close"]
     return (exit_price - entry_price) / entry_price, (j - i0)
 

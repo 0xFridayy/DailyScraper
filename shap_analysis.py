@@ -27,6 +27,8 @@ from walk_forward_backtest import (build_panel, FEATURES, DB_PATH, connect_price
 
 
 def run_shap_analysis(panel):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("shap_analysis.run_shap_analysis")
     X = panel[FEATURES].fillna(0)
     y = panel["target"]
 

@@ -45,6 +45,8 @@ FULL_FEATURES = BROKER_FEATURES + PRICE_FEATURES
 
 
 def build_multi_horizon_panel(conn, horizons=(1, 3, 5)):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("feature_ablation.build_multi_horizon_panel")
     px = clean_panel(conn, horizons=horizons, lags=(1, 5))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
     bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")

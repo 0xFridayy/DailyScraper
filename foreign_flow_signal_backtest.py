@@ -100,6 +100,8 @@ def index_price(px):
 def generate_trades(signals_df, H, px_by_ticker, date_idx_by_ticker):
     """For each (ticker,date) signal, simulate a fixed-H-day hold with
     ARA-entry-exclusion and ARB-exit-roll-forward. Returns list of trade dicts."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("foreign_flow_signal_backtest.generate_trades")
     trades = []
     n_signals = 0
     n_entry_blocked = 0
@@ -216,6 +218,8 @@ def evaluate_combo(signals_df, H, px_by_ticker, date_idx_by_ticker, cutoff_date,
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("foreign_flow_signal_backtest.main")
     flow, px = load_data()
     dates_all = sorted(flow["date"].unique())
     cutoff_idx = int(len(dates_all) * SEARCH_FRACTION)

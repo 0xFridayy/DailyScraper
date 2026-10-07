@@ -1566,6 +1566,8 @@ def render(ctx):
     """The full HTML document for a dashboard context (contract in the module
     header of broker_learning_run.py / BROKER_LEARNING.md §6). Tolerates a
     missing or partial ctx: every section has an empty state."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard.render")
     ctx = _d(ctx)
     tickers = _ordered([t for t in _l(ctx.get("tickers")) if isinstance(t, dict)])
     rules = [r for r in _l(ctx.get("rules")) if isinstance(r, dict)]

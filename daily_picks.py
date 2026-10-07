@@ -120,6 +120,8 @@ def _lost_session(prev_date, cur_date, captured):
 
 def load_snapshots(conn):
     """One Snapshot per real trading session, oldest first."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.load_snapshots")
     by_date = {}
     query = f"SELECT date, ticker, {', '.join(FIELDS)} FROM market_summary_daily"
     for day, ticker, *values in conn.execute(query):
@@ -166,30 +168,21 @@ def neobdm_lists(conn, capture_date):
 
 # ── Price helpers ──────────────────────────────────────────────────────────
 
+from price_contract import ara_bound
+
+
 def limit_up(prev_close):
-    """IDX auto-reject upper band: Rp50-200 35%, >200-5000 25%, >5000 20%.
-    (price_audit.ara_bound puts exactly Rp200 in the 25% tier.)"""
-    if prev_close <= 200:
-        return 0.35
-    if prev_close <= 5000:
-        return 0.25
-    return 0.20
+    return ara_bound(prev_close)
 
 
 def corporate_action_hint(prev_close, close):
-    """Text when a one-session move is outside the normal daily limits, which
-    usually means a split, rights/bonus issue or a data error; else None."""
+    """A gap is unresolved data; it cannot establish an action or ratio."""
     if not prev_close or not close:
         return None
-    r = close / prev_close
-    if 0.84 <= r <= 1 + limit_up(prev_close) + 0.01:
+    change = close / prev_close - 1
+    if -.16 <= change <= limit_up(prev_close) + .01:
         return None
-    for n in SPLIT_FACTORS:
-        if abs(r * n - 1) < 0.03:
-            return f"looks like a 1:{n} stock split"
-        if abs(r / n - 1) < 0.03:
-            return f"looks like a {n}:1 reverse split"
-    return "moved past the normal daily limit"
+    return "unresolved price discontinuity; verified reference required"
 
 
 def _close(snaps, j, ticker):
@@ -202,6 +195,8 @@ def _close(snaps, j, ticker):
 
 
 def day_move(snaps, k, ticker):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.day_move")
     if k < 1:
         return None
     prev, cur = _close(snaps, k - 1, ticker), _close(snaps, k, ticker)
@@ -209,7 +204,7 @@ def day_move(snaps, k, ticker):
 
 
 def price_break(snaps, a, b, ticker):
-    """First likely corporate action between snapshots a and b, comparing each
+    """First unresolved price discontinuity between snapshots a and b, comparing each
     available close with the previous available one (so a split on a day the
     name was missing from the list is still caught): (index, hint) or None."""
     prev = None
@@ -338,6 +333,8 @@ def session_returns(snaps, entry, exit_):
     """{ticker: close-to-close return} from snapshot entry to exit, skipping
     names with a likely corporate action inside the window. Empty when a
     session inside the window was never captured."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.session_returns")
     if _gap_inside(snaps, entry, exit_):
         return {}
     rets = {}
@@ -368,6 +365,8 @@ def machine_returns(snaps, k, h=HORIZON):
     Include signal -> entry in the gap check: a missing next session cannot
     be replaced by the next available snapshot. Never postpone either anchor.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.machine_returns")
     entry, exit_ = machine_window(k, h)
     if exit_ >= len(snaps) or _gap_inside(snaps, k, exit_):
         return {}
@@ -377,6 +376,8 @@ def machine_returns(snaps, k, h=HORIZON):
 def forward_excess(snaps, k, ticker, h=HORIZON):
     """(return, return minus the average name) for a pick made from snapshot
     k, or None while the exit session hasn't happened or data is missing."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.forward_excess")
     rets = machine_returns(snaps, k, h)
     if ticker not in rets:
         return None
@@ -544,6 +545,8 @@ def reference_index(snaps, ticker, since_utc, sent_at=None):
 
 
 def follow_lines(snaps, ticker, since_utc, sent_at=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.follow_lines")
     k = len(snaps) - 1
     row = snaps[k].rows.get(ticker)
     if row is not None and _num(row, "tval") == 0:
@@ -756,6 +759,8 @@ def machine_holding(snaps, pick_rows, recorded):
     An unresolved signal or session gap has no reliable exit. Keep its slot
     reserved until the source data is repaired instead of opening a duplicate.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.machine_holding")
     index = {s.date: i for i, s in enumerate(snaps)}
     k = len(snaps) - 1
     holding = set()
@@ -777,6 +782,8 @@ def machine_progress(snaps, pick_rows, recorded):
     """(running line texts, [(lines, result)] finished) for machine picks.
     pick_rows: (signal snapshot_date, ticker, tags, timing); recorded: {(source, ticker,
     started)} already in pick_results."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.machine_progress")
     index = {s.date: i for i, s in enumerate(snaps)}
     k = len(snaps) - 1
     running, finished = [], []
@@ -818,6 +825,8 @@ def machine_progress(snaps, pick_rows, recorded):
 
 
 def record_results(conn, results, now_utc):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.record_results")
     rows = []
     for r in results:
         f = r.get("facts") or {}
@@ -1107,6 +1116,8 @@ def run_morning(now_utc, send, neobdm_db=NEOBDM_DB, picks_db=PICKS_DB,
     delivered, "stale_send_failed" (nothing recorded) when the send fails.
     preview=True ignores those checks and writes/sends nothing.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.run_morning")
     local = now_utc.astimezone(MYT)
     today = local.date()
     if local.weekday() >= 5 and not preview:

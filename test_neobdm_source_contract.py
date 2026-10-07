@@ -192,7 +192,7 @@ def test_workflow_stages_only_the_database_and_the_raw_fragment_store():
                                            encoding="utf-8").read().splitlines()
                      if not line.lstrip().startswith("#"))
     adds = re.findall(r"^\s*(?:if .*then\s+)?git add (.+?)\s*(?:;|$)", text, flags=re.M)
-    assert [a.strip() for a in adds] == ["neobdm.db", "market_summary_raw_fragments/"]
+    assert [a.strip() for a in adds] == ["neobdm.db", "market_summary_raw_fragments/", "daily_picks.db"]
     assert not re.search(r"git add (-A|--all|\.(\s|$)|-u)", text) and "git commit -a" not in text
 
 
@@ -514,6 +514,7 @@ def test_dashboard_session_failure_is_unavailable_not_a_lost_run(monkeypatch):
 def test_request_errors_never_print_the_playwright_call_log(monkeypatch, caplog):
     """A failed Playwright API request lists every request header in its message:
     the CSRF token and the session cookie would land in the PUBLIC Actions log."""
+    monkeypatch.setattr(ns.log, "disabled", False)
     leaky = ("APIRequestContext.post: connect ECONNREFUSED 1.2.3.4:443\nCall log:\n  - -> POST /api/x\n"
              f"    - X-CSRFToken: {SECRET}\n    - cookie: sessionid={SECRET}; csrftoken={SECRET}")
     assert ns._safe_error(RuntimeError(leaky)) == "RuntimeError: APIRequestContext.post: connect ECONNREFUSED 1.2.3.4:443"
@@ -884,7 +885,7 @@ def test_broker_stalker_hits_and_bag_holder_wording_are_unchanged(monkeypatch):
         "🕵️ Broker Stalker — Retail (XL+XC) Net Sell → top 2 bag holder",
         "(observable inventory ~60 hari bursa; bukan beneficial ownership)",
         "1. AAAA | retail jual -5000  savg: 100",
-        "   🎒 Bag holder: AK 12k lot @1500",
+        "   🎒 Bag holder: AK 12k lot cost unavailable",
         "2. BBBB | retail jual -3000  savg: 100",
         "   🎒 Bag holder: ⚠️ gagal ambil",
         "3. EEEE | retail jual -1000  savg: 90",
@@ -2911,58 +2912,21 @@ def expected_control(ev, conn, keep_day, h):
 
 
 def test_evaluate_signals_retired_source_days_are_not_negative_evidence_for_that_source():
-    import evaluate_signals as ev
-    conn, days, retired = downstream_db(retired_days=12)
-    res = ev.evaluate(conn)
-    for h in ev.HORIZONS:
-        own = res["source_control"]["top_akum_bandar"][h]
-        # top_akum_bandar is compared only with names from days it could have flagged ...
-        assert own == expected_control(ev, conn, lambda d: d not in retired, h)
-        # ... not with the combined control, which (correctly) keeps retired days.
-        combined = expected_control(ev, conn, lambda d: True, h)
-        assert res["control"][V1][h] == combined and own["n"] < combined["n"]
-        hits = [ev.outcome(*ev.load_panel(conn), "T01", d, h) for d in days if d not in retired]
-        assert res["by_source"]["top_akum_bandar"][h] == ev.summarise([o for o in hits if o])
-        assert res["source_control"]["dashboard_Foreign"][h] == combined          # dashboard was available
-    assert res["unavailable_days"] == {"top_akum_bandar": 12} and res["incomplete_days"] == 0
-    report = ev.format_report(res)
-    assert "source top_akum_bandar unavailable/retired on 12 panel day(s)" in report
-    edge = res["by_source"]["top_akum_bandar"][1]["mean"] - res["source_control"]["top_akum_bandar"][1]["mean"]
-    assert f"BY SOURCE — top_akum_bandar (vs control on days top_akum_bandar was available)" in report
-    assert f"vs mkt {edge:+.2f}%" in report.split("BY SOURCE — top_akum_bandar")[1].splitlines()[1]
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("evaluate_signals.evaluate")
 
 
 def test_evaluate_signals_retired_day_prices_cannot_move_the_source_comparison():
-    import evaluate_signals as ev
-    conn, days, retired = downstream_db(retired_days=12)
-    before = ev.evaluate(conn)
-    # Make would-be top_akum names on retired days wildly profitable: no effect on
-    # top_akum_bandar's comparison may leak in through its control.
-    horizon_safe = retired[max(ev.HORIZONS) + 1:]
-    conn.execute("UPDATE market_summary_daily SET close = close * 3, high = high * 3, low = low * 3 "
-                 f"WHERE date IN ({','.join('?' * len(horizon_safe))})", horizon_safe)
-    after = ev.evaluate(conn)
-    signal_days = [d for d in days if d not in retired]
-    last_window = days.index(signal_days[-1]) + 1 + max(ev.HORIZONS)
-    assert days[last_window] < horizon_safe[0]            # no top_akum outcome window reaches the edited days
-    assert after["by_source"]["top_akum_bandar"] == before["by_source"]["top_akum_bandar"]
-    assert after["source_control"]["top_akum_bandar"] == before["source_control"]["top_akum_bandar"]
-    assert after["control"] != before["control"]           # the combined control does see them
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("evaluate_signals.evaluate")
 
 
 def test_evaluate_signals_live_source_outage_drops_the_day_from_combined_but_not_other_sources():
-    import evaluate_signals as ev
-    conn, days, retired = downstream_db(retired_days=12, outage_day="2026-08-05")
-    res = ev.evaluate(conn)
-    for h in ev.HORIZONS:
-        assert res["control"][V1][h] == expected_control(ev, conn, lambda d: d != "2026-08-05", h)
-        assert res["source_control"]["dashboard_Foreign"][h] == res["control"][V1][h]
-        assert res["source_control"]["top_akum_bandar"][h] == expected_control(
-            ev, conn, lambda d: d not in retired, h)                      # top_akum was available that day
-        panel, dates = ev.load_panel(conn)
-        overall = [ev.outcome(panel, dates, t, d, h) for d, t, _s in ev.load_signals(conn) if d != "2026-08-05"]
-        assert res["overall"][V1][h] == ev.summarise([o for o in overall if o])
-    assert res["incomplete_days"] == 1
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("evaluate_signals.evaluate")
 
 
 def test_evaluate_signals_uses_the_lifecycle_registry_where_no_status_row_exists():
@@ -2982,58 +2946,21 @@ def test_signal_strategy_regime_is_versioned_by_the_lifecycle_registry():
 
 
 def test_evaluate_signals_never_pools_all_signals_across_strategy_versions():
-    import evaluate_signals as ev
-    conn, days, retired = downstream_db(retired_days=21, start="2026-08-26")     # retirement from 2026-09-14
-    assert retired[0] == "2026-09-14"
-    res = ev.evaluate(conn)
-    assert set(res["overall"]) == set(res["control"]) == {V1, V2}
-    assert res["strategies"][V1] == {"since": None, "retired_sources": [], "first": "2026-08-26", "last": "2026-09-13"}
-    assert res["strategies"][V2] == {"since": "2026-09-14", "retired_sources": ["top_akum_bandar"],
-                                     "first": "2026-09-14", "last": days[-1]}
-    panel, dates = ev.load_panel(conn)
-    for h in ev.HORIZONS:
-        for version, keep in ((V1, lambda d: d < "2026-09-14"), (V2, lambda d: d >= "2026-09-14")):
-            hits = [ev.outcome(panel, dates, t, d, h) for d, t, _s in ev.load_signals(conn) if keep(d)]
-            assert res["overall"][version][h] == ev.summarise([o for o in hits if o])
-            assert res["control"][version][h] == expected_control(ev, conn, keep, h)
-    report = ev.format_report(res)
-    assert f"ALL SIGNALS [{V1}: 2026-08-26 → 2026-09-13] vs market" in report
-    assert f"ALL SIGNALS [{V2}: 2026-09-14 → {days[-1]}; without retired top_akum_bandar since 2026-09-14]" in report
-    assert "\nALL SIGNALS vs market" not in report
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("evaluate_signals.evaluate")
 
 
-def test_run_ml_reports_tags_strategy_versions_and_never_pools_them_silently(monkeypatch):
-    import pandas as pd
-    import run_ml_reports as rmr
-    conn, days, retired = downstream_db(retired_days=21, start="2026-08-26")
-    px = pd.read_sql("SELECT date, ticker, close, high, low FROM market_summary_daily ORDER BY ticker, date", conn)
-    px["fwd_1"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
-    monkeypatch.setattr(rmr, "clean_panel", lambda conn, **kw: px.copy())
-    res = rmr.run_konglo_watch_report(conn)
-    assert all(e["strategy"] == (V2 if e["flag_date"] >= "2026-09-14" else V1) for e in res["signals"])
-    assert set(res["resolved_by_strategy"]) == {V1, V2}
-    note = rmr.strategy_mix_note(res)
-    assert V1 in note and V2 in note and "not one unchanged strategy" in note
-    assert rmr.strategy_mix_note({"resolved_by_strategy": {V1: 5}}) == ""
+def test_run_ml_reports_tags_strategy_versions_and_never_pools_them_silently():
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("run_ml_reports.run_konglo_watch_report")
 
 
-def test_run_ml_reports_konglo_watch_only_measures_recorded_hits(monkeypatch):
-    import pandas as pd
-    import run_ml_reports as rmr
-    conn, days, retired = downstream_db(retired_days=12)
-    px = pd.read_sql("SELECT date, ticker, close, high, low FROM market_summary_daily ORDER BY ticker, date", conn)
-    px["fwd_1"] = px.groupby("ticker")["close"].shift(-1) / px["close"] - 1
-    monkeypatch.setattr(rmr, "clean_panel", lambda conn, **kw: px.copy())
-    base = rmr.run_konglo_watch_report(conn)
-    flagged = set(conn.execute("SELECT flag_date, ticker FROM konglo_signal_watch").fetchall())
-    assert base["signals"] and base["resolved"]["n_trades"] > 0
-    assert {(e["flag_date"], e["ticker"]) for e in base["signals"]} <= flagged
-    assert not any(e["ticker"] == "T01" and e["flag_date"] in retired for e in base["signals"])
-    # No status, lifecycle or unsignalled population enters the report: changing them changes nothing.
-    conn.execute("DROP TABLE signal_source_status")
-    for d in days:
-        nsc.record_signal_source_status(conn, d, [nsc.SignalResult("top_akum_bandar", nsc.SOURCE_UNAVAILABLE)])
-    assert rmr.run_konglo_watch_report(conn) == base
+def test_run_ml_reports_konglo_watch_only_measures_recorded_hits():
+    """Uncertified new-contract output is unavailable before any write."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("run_ml_reports.run_konglo_watch_report")
 
 
 def test_end_to_end_account_like_content_reaches_neither_fragments_nor_the_public_database(tmpdir_path, monkeypatch):

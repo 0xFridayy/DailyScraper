@@ -30,6 +30,8 @@ def load_data():
 
 def compute_patterns(ticker, group):
     """Per-ticker: detect patterns in px OHLCV data."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_detector.compute_patterns")
     g = group.sort_values("date").reset_index(drop=True).copy()
     n = len(g)
 
@@ -117,6 +119,8 @@ def compute_patterns(ticker, group):
     return pd.DataFrame(patterns) if patterns else pd.DataFrame()
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_detector.main")
     px = load_data()
     all_patterns = []
 

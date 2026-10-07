@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "registry_version": "idx-ca-2026-10-07.v1",
+  "reviewed_coverage": [],
+  "coverage_notes": "Event records establish their boundaries only. No complete action-free universe/date interval has been certified. Legacy source representation remains UNKNOWN.",
+  "events": [
+    {
+      "event_id": "IDX:ENRG:RIGHTS:2026-10-05:REGULAR_NEGOTIATED",
+      "revision": 1,
+      "venue": "IDX",
+      "market_scope": [
+        "REGULAR",
+        "NEGOTIATED"
+      ],
+      "ticker": "ENRG",
+      "effective_session": "2026-10-05",
+      "event_type": "RIGHTS_ISSUE",
+      "status": "CONFIRMED_REFERENCE",
+      "reference_price": "1065",
+      "reference_kind": "OFFICIAL_JATS_EX_RIGHTS_REFERENCE",
+      "currency_unit": "IDR_PER_SHARE",
+      "source": {
+        "author": "PT Bursa Efek Indonesia",
+        "published_on": "2026-10-02",
+        "retrieval_medium": "FinancialFilings full document transcription",
+        "url": "https://financialfilings.com/filings/energi-mega-persada-tbk/share-issuecapital-change/2026/64667882/"
+      },
+      "source_document_id": "Peng-00187/BEI.POP/10-2026",
+      "observed_at": {
+        "date": "2026-10-06",
+        "precision": "DAY",
+        "timezone": "Asia/Jakarta"
+      },
+      "verified_at": {
+        "date": "2026-10-06",
+        "precision": "DAY",
+        "timezone": "Asia/Jakarta"
+      },
+      "evidence_refs": {
+        "investigation_report": "ENRG_root_cause_report.md",
+        "report_content_sha256": "420a16f75af1ce4b4fda64bb80b6694df229b4ae82b6650ede3d3b55053c1942",
+        "direct_exchange_original_sha256": null,
+        "issuer_document": "ENRG-PUT-IV-Prospektus-Ringkas-25-Sept-26.pdf",
+        "issuer_url": "https://www.emp.id/wp-content/uploads/2026/09/ENRG-PUT-IV-Prospektus-Ringkas-25-Sept-26.pdf",
+        "ksei_url": "https://web.ksei.co.id/services/registered-securities/shares/lc/ENRG"
+      },
+      "notes": "Issuer/KSEI confirm regular/negotiated cum Oct2 and ex Oct5, 2 old shares to 1 new at IDR310. Exchange transcription states actual cum close1440, TERP1063.333 and JATS reference1065. Direct IDX original was not retrieved. This record does not establish vendor rewriting or economic-return adjustment.",
+      "enrolled_at": {
+        "timestamp": "2026-10-07T14:28:14.828335+00:00",
+        "precision": "INSTANT",
+        "timezone": "UTC"
+      }
+    },
+    {
+      "event_id": "IDX:SINI:RIGHTS:2026-07-09:REGULAR_NEGOTIATED",
+      "revision": 1,
+      "venue": "IDX",
+      "market_scope": [
+        "REGULAR",
+        "NEGOTIATED"
+      ],
+      "ticker": "SINI",
+      "effective_session": "2026-07-09",
+      "event_type": "RIGHTS_ISSUE",
+      "status": "PENDING_REFERENCE",
+      "reference_price": null,
+      "reference_kind": "OFFICIAL_JATS_EX_RIGHTS_REFERENCE",
+      "currency_unit": "IDR_PER_SHARE",
+      "source": {
+        "author": "PT Singaraja Putra Tbk / KSEI",
+        "retrieval_medium": "Prior investigation summarized in authoritative audit",
+        "url": "https://singarajaputra.com/wp-content/uploads/2026/07/SINI_Informasi-Tambahan-PMHMETD-fn.pdf"
+      },
+      "source_document_id": "SINI_Informasi-Tambahan-PMHMETD-fn.pdf",
+      "observed_at": {
+        "precision": "UNKNOWN"
+      },
+      "verified_at": {
+        "date": "2026-10-07",
+        "precision": "DAY",
+        "timezone": "Asia/Jakarta"
+      },
+      "enrolled_at": {
+        "timestamp": "2026-10-07T14:28:14.828335+00:00",
+        "precision": "INSTANT",
+        "timezone": "UTC"
+      },
+      "evidence_refs": {
+        "audit": "Corporate_action_contract_impact_audit.md",
+        "audit_sha256": "a432d91a4477353bb779c519b57f4d3b201a9e4f62e9d74bc1f77ba80819b361",
+        "ksei_url": "https://web.ksei.co.id/services/registered-securities/shares/lc/SINI",
+        "direct_exchange_original_sha256": null
+      },
+      "notes": "Confirmed boundary only. Official exchange reference missing. Theoretical 7380 is not an executable reference."
+    }
+  ]
+}

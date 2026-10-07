@@ -377,6 +377,8 @@ def ingest(candidate_dir):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_candidate.main")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command", choices=["snapshot", "verify", "ingest",
                                         "snapshot-ohlc"])

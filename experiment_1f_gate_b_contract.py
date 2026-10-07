@@ -588,6 +588,8 @@ def verify_inputs(recompute_logical=True, recompute_ledgers=False, root=HERE):
 
 def write_contract(directory=CONTRACT_DIR):
     """Write the contract document once; an existing document is never changed (identical rewrite is a no-op)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b_contract.write_contract")
     body = contract_body()
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{CONTRACT_VERSION}_{body['status'].lower()}.json")
@@ -603,6 +605,8 @@ def write_contract(directory=CONTRACT_DIR):
 
 
 def main(argv=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b_contract.main")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--verify-ledgers", action="store_true")

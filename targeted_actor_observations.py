@@ -486,6 +486,8 @@ def observe(conn, ticker, discovery_as_of=None, include_series=True):
     connection open_readonly() did not make, ReadOnlySourceStateError,
     SnapshotNotFoundError, PanelIntegrityError, BasisReferenceError, or
     ObservationContractError."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("targeted_actor_observations.observe")
     _check_ticker(ticker)
     if discovery_as_of is not None and not _is_date(discovery_as_of):
         raise ValueError(f"discovery_as_of {discovery_as_of!r} is not a YYYY-MM-DD date")
@@ -526,6 +528,8 @@ def observe_inventory_evidence(conn, ticker, *, anchor, cutoff, availability_cut
     invented from the OHLC arrays. Market volumes require separately validated
     MarketObservation inputs; stored inventory volume_sma20 is never used.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("targeted_actor_observations.observe_inventory_evidence")
     import inventory_evidence as ie
     _check_ticker(ticker)
     if not isinstance(scope, ie.Scope) or scope.capture_scope != tdb.COVERAGE_SCOPE:

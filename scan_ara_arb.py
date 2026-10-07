@@ -41,12 +41,16 @@ def model():
 
 
 def refresh():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("scan_ara_arb.refresh")
     for step in ["harvest_inventory.py", "build_inventory_db.py", "inventory_features.py"]:
         print(f"--- {step}")
         subprocess.run([sys.executable, os.path.join(HERE, step)], check=True)
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("scan_ara_arb.main")
     ap = argparse.ArgumentParser()
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--refresh", action="store_true")

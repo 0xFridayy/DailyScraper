@@ -164,6 +164,8 @@ class TickerEnv:
     happens here."""
 
     def __init__(self, feats_z, daily_return, at_ara, at_arb, ticker=None, dates=None):
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("ddqn_entry_exit.TickerEnv")
         self.feats_z = feats_z          # (T, len(FEATURES)) already z-scored
         self.daily_return = daily_return  # (T,)
         self.at_ara = at_ara
@@ -228,6 +230,8 @@ class TickerEnv:
 
 
 def make_envs(panel):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.make_envs")
     envs = []
     group_cols = ["ticker", "episode_id"] if "episode_id" in panel else ["ticker"]
     for key, g in panel.groupby(group_cols):
@@ -274,6 +278,8 @@ class ReplayBuffer:
 
 def train_ddqn(train_envs, state_dim, n_epochs=40, batch_size=64, lr=1e-3,
                target_sync_every=200, seed=0):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.train_ddqn")
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)

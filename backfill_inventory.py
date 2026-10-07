@@ -84,6 +84,19 @@ from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, 
 from price_audit import (series_signature, should_fail_run, inventory_window,
                          inventory_window_is_short, ara_bound, ARB_BOUND, TOL)
 
+from price_contract import (RAW_ACTUAL, PreviousActual, resolve_limit_reference,
+                            validate_actual_price, positive_real, actual_bar_reason)
+from price_contract_frame import default_registry
+
+
+class ValidatedPriceValues(dict):
+    """Normalized source prices with independent per-session dispositions."""
+
+    def __init__(self):
+        super().__init__()
+        self.dispositions = []
+
+
 # Priming this page first sets the csrftoken/sessionid cookies for the inventory
 # path. The data GET is authenticated by the sessionid cookie alone (no CSRF).
 INVENTORY_CHART_URL = "https://neobdm.tech/inventory-chart/"
@@ -189,7 +202,7 @@ def _real_close(close, ticker, day):
     return normalized
 
 
-def validate_inventory_prices(conn, ticker, ohlc):
+def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representation="UNKNOWN", market="REGULAR"):
     """Refuse new limit violations before either table receives any writes.
 
     Judge the proposed series, including stored neighbours outside the response.
@@ -197,7 +210,8 @@ def validate_inventory_prices(conn, ticker, ohlc):
     historical violations remain visible to the audit without blocking every
     future top-up of the rolling year. No corporate-action exception is inferred.
     """
-    incoming = {}
+    registry = registry or default_registry()
+    incoming = ValidatedPriceValues()
     for bar in ohlc:
         day, close = bar.get("date"), bar.get("close")
         try:
@@ -209,36 +223,88 @@ def validate_inventory_prices(conn, ticker, ohlc):
         if day in incoming:
             raise InventoryError(f"{ticker}: duplicate date {day} in ohlc")
         incoming[day] = _real_close(close, ticker, day)
+        reason = actual_bar_reason(bar)
+        if reason:
+            raise InventoryError(f"{ticker} {day}: OHLC domain: {reason}")
 
-    stored = dict(conn.execute(
-        "SELECT date, close FROM price_history WHERE ticker=? ORDER BY date", (ticker,)))
+    fields = ("date", "open", "high", "low", "close", "volume")
+    stored_bars = {row[0]: dict(zip(fields, row)) for row in conn.execute(
+        "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker=? ORDER BY date", (ticker,))}
+    proposed_bars = stored_bars | {bar["date"]: bar for bar in ohlc}
+    stored = {day: bar["close"] for day, bar in stored_bars.items()}
     changed = {d for d, close in incoming.items() if d not in stored or close != stored[d]}
     proposed = stored | incoming
     days = sorted(proposed)
-    for previous_day, day in zip(days, days[1:]):
-        if day not in changed and previous_day not in changed:
+    quarantined = set()
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='price_quarantine' AND type='table'").fetchone():
+        quarantined = {r[0] for r in conn.execute("SELECT date FROM price_quarantine WHERE ticker=?", (ticker,))}
+    predecessor_trust = {}
+    for i, day in enumerate(days):
+        previous_day = days[i - 1] if i else None
+        preserved = day not in changed and previous_day not in changed
+        previous = None
+        if previous_day is not None:
+            try:
+                value = _real_close(proposed[previous_day], ticker, previous_day)
+            except InventoryError:
+                # Preserve corrupt historical provenance without making it a
+                # baseline. An official event reference is independent of it.
+                value = proposed[previous_day]
+            previous = PreviousActual(previous_day, value, "proposed-price-history", previous_day not in quarantined and predecessor_trust.get(previous_day, False))
+        events = registry.matching(ticker, market, day)
+        # An ordinary-band check on an unknown vendor basis is a narrow diagnostic,
+        # never evidence that the capture is raw or its returns are comparable.
+        diagnostic_rep = RAW_ACTUAL if representation == "UNKNOWN" and (not events or preserved) else representation
+        ref = resolve_limit_reference(ticker, day, market, previous, registry,
+                                      input_representation=diagnostic_rep)
+        admission = validate_actual_price(proposed[day], ref)
+        volume = proposed_bars[day].get("volume")
+        traded = (not isinstance(volume, bool) and isinstance(volume, (int, float))
+                  and math.isfinite(float(volume)) and volume > 0)
+        predecessor_trust[day] = (day not in quarantined and traded and actual_bar_reason(proposed_bars[day]) is None
+                                  and admission.status != "OUT_OF_BAND"
+                                  and (admission.status != "UNRESOLVED" or previous is None))
+        if preserved:
+            if day in incoming:
+                incoming.dispositions.append({"session": day, "status": "PRESERVED_UNADJUDICATED"})
             continue
-        try:
-            previous = _real_close(proposed[previous_day], ticker, previous_day)
-            close = _real_close(proposed[day], ticker, day)
-        except InventoryError as e:
+        if not traded:
+            raise InventoryError(f"{ticker} {day}: UNRESOLVED UNVERIFIED_TRADING_SESSION - refusing to store")
+        if admission.status == "OUT_OF_BAND":
             raise InventoryError(
-                f"{ticker} {day}: ambiguous close baseline on {previous_day}") from e
-        change = close / previous - 1
-        lower, upper = ARB_BOUND - TOL, ara_bound(previous) + TOL
-        if change < lower or change > upper:
-            raise InventoryError(
-                f"{ticker} {day}: limit_violation, close {previous:g} on {previous_day} "
-                f"-> {close:g} ({change:+.2%}), allowed {lower:+.2%}..{upper:+.2%} "
-                f"— refusing to store")
+                f"{ticker} {day}: limit_violation, reference {ref.price:g}, previous "
+                f"{previous.price if previous else None} on {previous_day}, close {proposed[day]:g} "
+                f"({admission.limit_change:+.2%}) - refusing to store")
+        if admission.status == "UNRESOLVED":
+            # A first source observation may be preserved, without approval of a
+            # daily comparison. All changed transitions and event records require
+            # a resolved reference before any write.
+            if previous is not None or events or admission.reason != "MISSING_PREDECESSOR":
+                raise InventoryError(f"{ticker} {day}: UNRESOLVED {admission.reason} - refusing to store")
+            status = "SOURCE_CAPTURE_UNADJUDICATED"
+        else:
+            status = "IN_BAND" if representation == RAW_ACTUAL else "ORDINARY_DIAGNOSTIC_ONLY"
+            for field in ("open", "high", "low"):
+                bar = next((b for b in ohlc if b["date"] == day), None)
+                if bar and validate_actual_price(positive_real(bar[field]), ref).status != "IN_BAND":
+                    raise InventoryError(f"{ticker} {day}: {field} limit_violation - refusing to store")
+        incoming.dispositions.append({"session": day, "status": status,
+                                      "unresolved_reason": admission.reason or None,
+                                      "reference_kind": ref.kind, "reference_price": ref.price,
+                                      "previous_actual_session": previous_day,
+                                      "previous_actual_close": previous.price if previous else None,
+                                      "event_id": ref.event_id,
+                                      "registry_sha256": registry.content_sha256})
+
     return incoming
 
 
-def insert_inventory(conn, ticker, payload):
+def insert_inventory(conn, ticker, payload, *, registry=None, representation="UNKNOWN", market="REGULAR"):
     """Store price_history (all days) + broker_flow (days <= BACKFILL_END).
 
     Returns (broker_rows, price_rows, returned_broker_codes, signature).
     """
+    registry = registry or default_registry()
     data = payload.get("data") or {}
     meta = payload.get("meta") or {}
 
@@ -255,11 +321,15 @@ def insert_inventory(conn, ticker, payload):
     if not ohlc:
         return 0, 0, [], None
 
-    close_by_date = validate_inventory_prices(conn, ticker, ohlc)
+    close_by_date = validate_inventory_prices(conn, ticker, ohlc, registry=registry,
+                                              representation=representation, market=market)
+    print(json.dumps({"ticker": ticker, "price_dispositions": close_by_date.dispositions,
+                      "price_contract": registry.identity,
+                      "input_representation": representation}, sort_keys=True))
 
     price_rows = [
-        (o["date"], ticker, o.get("open"), o.get("high"),
-         o.get("low"), close_by_date[o["date"]], o.get("volume"))
+        (o["date"], ticker, positive_real(o["open"]), positive_real(o["high"]),
+         positive_real(o["low"]), close_by_date[o["date"]], float(o["volume"]))
         for o in ohlc
     ]
     conn.executemany(
@@ -299,6 +369,7 @@ def insert_inventory(conn, ticker, payload):
 
 
 def run_backfill(tickers):
+    run_registry = default_registry()
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS price_history (
@@ -319,6 +390,7 @@ def run_backfill(tickers):
     print(f"Inventory window: {start_date} .. {end_date} "
           f"(brokers={INVENTORY_BROKERS}, investor_type={INVESTOR_TYPE})")
 
+    print("price_contract=" + json.dumps(run_registry.identity, sort_keys=True))
     failed = []
     sessions = []   # sessions each stored ticker actually got back
     captures = ic.CaptureLog(ic.NO_CACHE_ROOT, "backfill_inventory", writes_cache=False,
@@ -350,7 +422,7 @@ def run_backfill(tickers):
                 payload, cap, response_raw = fetch_inventory(
                     req, ticker, start_date, end_date, captures)
                 broker_n, price_n, returned, signature = insert_inventory(
-                    conn, ticker, payload)
+                    conn, ticker, payload, registry=run_registry)
 
                 if price_n == 0:
                     cap.finish(ic.EMPTY, "no ohlc rows: nothing stored")

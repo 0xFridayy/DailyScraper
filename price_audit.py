@@ -27,12 +27,12 @@ lot_diff is unaffected:
 
 DETECTORS
 ---------
-1. limit_violation  (HIGH confidence - these are physically impossible)
-   IDX auto-rejection caps a daily move at +35/25/20% (tiered by prev close)
-   and -15%. Any close-to-close move outside that band cannot happen on a
-   real IDX listing. Note: a genuine corporate action (stock split, reverse
-   split, rights issue) also breaks this test, so violations are reviewed,
-   not auto-deleted.
+1. limit_violation (reference-scoped diagnostic, requiring review)
+   IDX auto-rejection caps a daily move at +35/25/20% (tiered by reference)
+   and -15%. Compare actual prices with the resolved session reference.
+   A raw discontinuity alone cannot establish corruption or a corporate action.
+   Confirmed scoped event references resolve admission independently of that
+   discontinuity. Violations remain review findings rather than automatic deletions.
 
 2. cross_ticker_dup (HIGH confidence)
    Identical (open, high, low, close, volume) under 2+ tickers on one date.
@@ -70,18 +70,9 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "neobdm.db")
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 
-def ara_bound(prev_close):
-    if pd.isna(prev_close):
-        return np.nan
-    if prev_close < 200:
-        return 0.35
-    if prev_close <= 5000:
-        return 0.25
-    return 0.20
-
-
-ARB_BOUND = -0.15
-TOL = 0.005  # half a percentage point of slack for rounding
+# Compatibility exports. Financial rules have one dependency-free owner.
+from price_contract import ara_bound, ARB_BOUND, TOL, RAW_ACTUAL
+from price_contract_frame import default_registry, annotate_prices, span_result
 
 
 def load(conn):
@@ -89,7 +80,7 @@ def load(conn):
     return px.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
-def detect(px, trusted=None):
+def detect(px, trusted=None, *, registry=None, representation=None):
     """Flag suspect rows. `trusted` is an optional boolean mask aligned to px.
 
     A row that is NOT trusted (typically: already quarantined) still gets
@@ -106,34 +97,27 @@ def detect(px, trusted=None):
     the baseline is dropped rather than bridged to the last surviving close: a
     multi-day jump cannot be judged against a one-day ARA/ARB band either.
     """
-    px = px.copy()
+    px = annotate_prices(px, registry=registry, representation=representation, trusted=trusted)
     g = px.groupby("ticker")
-    if trusted is None:
-        px["prev_close"] = g["close"].shift(1)
-    else:
-        base = px["close"].where(np.asarray(trusted, dtype=bool))
-        px["prev_close"] = base.groupby(px["ticker"]).shift(1)
-    px["pct_chg"] = px["close"] / px["prev_close"] - 1
-    px["ara"] = px["prev_close"].apply(ara_bound)
-
-    px["limit_violation"] = (
-        (px["pct_chg"] > px["ara"] + TOL) | (px["pct_chg"] < ARB_BOUND - TOL)
-    ).fillna(False)
+    px["prev_close"] = px["previous_actual_close"]
+    px["pct_chg"] = px["close"] / px["prev_close"] - 1  # raw discontinuity diagnostic
+    px["ara"] = px["limit_reference_price"].apply(ara_bound)
+    px["limit_violation"] = px["limit_admission_status"].eq("OUT_OF_BAND")
 
     dup_mask = px.duplicated(["date"] + OHLCV, keep=False)
     px["cross_ticker_dup"] = dup_mask & px[OHLCV].notna().all(axis=1)
 
-    med = g["close"].transform(lambda s: s.rolling(21, center=True, min_periods=5).median())
+    med = px.groupby(["ticker", "price_segment_id"])["close"].transform(lambda s: s.rolling(21, center=True, min_periods=5).median())
     ratio = px["close"] / med
     px["series_break"] = ((ratio > 5) | (ratio < 0.2)).fillna(False)
 
-    px["suspect"] = px[["limit_violation", "cross_ticker_dup", "series_break"]].any(axis=1)
+    px["suspect"] = px[["limit_violation", "cross_ticker_dup", "series_break", "domain_violation"]].any(axis=1)
     return px
 
 
 def _reasons(row):
     return "+".join(
-        r for r in ["limit_violation", "cross_ticker_dup", "series_break"] if row[r]
+        r for r in ["limit_violation", "cross_ticker_dup", "series_break", "domain_violation"] if row[r]
     )
 
 
@@ -206,7 +190,8 @@ def bagholders_from_payloads(payloads, n=2):
         shares = cum * 100
         holders.append({
             "code": code, "cum": cum,
-            "avg": (row["value"] / shares) if shares else 0,
+            "avg": None,
+            "cost_status": "WITHHELD_UNKNOWN_SHARE_BASIS",
             "observed_trading_days": len(observed_dates),
         })
     holders.sort(key=lambda h: h["cum"], reverse=True)
@@ -339,248 +324,154 @@ def inventory_window_is_short(session_counts, min_sessions):
 #  guard below, limit violations in the target drop to zero.
 # ─────────────────────────────────────────────
 
-def load_clean(conn, strict=False):
-    """price_history with quarantined (date, ticker) rows dropped.
+def load_clean(conn, strict=False, *, registry=None, representation=None):
+    """Current derived adjudication over immutable raw rows and old quarantine.
 
-    Prefers the price_quarantine table written by the `quarantine` command. If
-    that table is absent the detectors are run in-memory instead, so a caller
-    that forgot to quarantine still gets clean rows rather than silently
-    training on dirty ones. Pass strict=True to require the table instead.
+    A sole old ordinary-limit reason is superseded only by a current official
+    reference admission. Independent and undocumented reasons remain blocked.
     """
+    registry = registry or default_registry()
     px = load(conn)
     has_table = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
     ).fetchone()[0]
-
-    if has_table:
-        q = pd.read_sql("SELECT date, ticker FROM price_quarantine", conn)
-    elif strict:
-        raise RuntimeError("price_quarantine missing — run: py price_audit.py quarantine")
-    else:
-        d = detect(px)
-        q = d.loc[d["suspect"], ["date", "ticker"]]
-
-    bad = set(zip(q["date"], q["ticker"]))
-    keep = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
-    return px[keep].reset_index(drop=True)
+    q = pd.read_sql("SELECT * FROM price_quarantine", conn) if has_table else pd.DataFrame()
+    if strict and not has_table:
+        raise RuntimeError("price_quarantine missing")
+    bad = set(zip(q.get("date", []), q.get("ticker", [])))
+    trusted = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
+    audited = detect(px, trusted=trusted, registry=registry, representation=representation)
+    for row in q.to_dict("records"):
+        key = row["date"], row["ticker"]
+        current = audited[(audited.date == key[0]) & (audited.ticker == key[1])]
+        if (row.get("reasons") == "limit_violation" and len(current) == 1
+                and current.iloc[0]["limit_reference_kind"] == "OFFICIAL_CORPORATE_ACTION_REFERENCE"
+                and current.iloc[0]["price_step_admissible"] and not current.iloc[0]["suspect"]):
+            bad.discard(key)
+    keep = [(d, t) not in bad for d, t in zip(audited["date"], audited["ticker"])]
+    # A recovered event bar may now back the following ordinary session.
+    audited = detect(px, trusted=keep, registry=registry, representation=representation)
+    result = audited[pd.Series(keep, index=audited.index, dtype=bool) & ~audited["suspect"]].reset_index(drop=True)
+    result.attrs.update(audited.attrs)
+    return result
 
 
 def _open_anchor_valid(px, g):
-    """Rows whose OPEN is usable as a trade anchor.
+    """Open admission is independent of return comparability and later close."""
+    return px["entry_open_admissible"]
 
-    detect() and _step_valid both validate `close` and nothing else:
-    limit_violation is close-vs-prev_close, series_break is close-vs-rolling-
-    median, and cross_ticker_dup only touches `open` incidentally via the
-    all-five-identical test. NOTHING validates `open` on its own, so a corrupt
-    open can hide behind a perfectly ordinary close. Audited on the cleaned
-    panel: 0 rows have open <= 0, 0 have open outside [low, high], but 11 have
-    an open outside the ARA/ARB band against the previous close — and some
-    defeat the close-based guard outright:
 
-        FAST 2025-10-14   prev_close 580  open 870 (+50%)  close 720
+def _return_context(px, all_dates, registry, representation, market, as_of):
+    registry = registry or default_registry()
+    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
+    px = annotate_prices(px, registry=registry, representation=representation, market=market, as_of=as_of)
+    px["_pos"] = px["date"].map({d: i for i, d in enumerate(all_dates)})
+    return px, registry, px.attrs["price_contract"]["input_representation"]
 
-    close-to-close there is +24.1%, inside the 25% band, so _step_valid PASSES
-    while an entry anchored on 870 is fabricated. That is why an open-anchored
-    target needs its own mask rather than inheriting the close-to-close one.
 
-    Same philosophy as _step_valid: never delete the row, just refuse to
-    produce a target anchored on it. A corporate action (RAJA 2025-08-25,
-    2710 -> 546 on a split) fails the band and the target goes NaN rather than
-    being silently "repaired".
-
-    A row with no previous close cannot be judged and is invalid here, exactly
-    as it already is for _step_valid — .between() is False against NaN.
-    """
-    prev_close = g["close"].shift(1)
-    open_chg = px["open"] / prev_close - 1
-    upper = prev_close.apply(ara_bound) + TOL
-    return (
-        (px["open"] > 0)
-        & (px["low"] <= px["open"])
-        & (px["open"] <= px["high"])
-        & open_chg.between(ARB_BOUND - TOL, upper)
-    )
+def _span_masks(px, starts, ends, all_dates, registry, representation, market,
+                start_phase="CLOSE", end_phase="CLOSE", as_of=None):
+    results = [span_result(t, a if isinstance(a, str) else None,
+                           b if isinstance(b, str) else None, registry=registry,
+                           representation=representation, market=market,
+                           session_axis=all_dates, start_phase=start_phase,
+                           end_phase=end_phase, as_of=as_of)
+               for t, a, b in zip(px.ticker, starts, ends)]
+    return (pd.Series([r.status == "COMPARABLE" for r in results], index=px.index, dtype=bool),
+            pd.Series([r.reason for r in results], index=px.index, dtype=object))
 
 
 def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
-                        open_anchored=False):
-    """Attach gap-guarded forward returns to a filtered price frame.
+                        open_anchored=False, *, registry=None, representation=None,
+                        market="REGULAR", as_of=None):
+    """Raw anchors, independent admission, and full phase-aware Option A masks.
 
-    all_dates: every date in the UNFILTERED panel, in order. Positions on this
-    axis are what makes a removed row detectable — the surviving rows keep
-    their original spacing, so a hole shows up as a jump in position.
-
-    For each horizon h, `fwd_{h}` is only defined when the row h steps ahead in
-    the ticker's surviving series also sits exactly h dates ahead on the panel
-    axis. Because positions are strictly increasing, that single equality also
-    proves every intermediate step was contiguous — so the same mask makes the
-    `max_{h}` / `mdd_{h}` windows safe, not just the endpoint.
-
-    A ticker suspended for a day is treated the same as a quarantined row:
-    the window is dropped rather than bridged.
-
-    open_anchored=True additionally emits the EXECUTABLE-contract labels. A
-    decision taken at EOD(T) cannot transact at close(T) — the day's own
-    closing auction and the post-session broker summary are both inputs to it —
-    so the earliest anchor is open(T+1):
-
-        fwd_oo_{h}   open(T+1) -> open(T+1+h)    headline; the T+1->T+2 gap is
-                                                 captured legitimately because
-                                                 it happens AFTER entry
-        fwd_oc_{h}   open(T+1) -> close(T+h)     secondary (intraday at h=1)
-        gap_1        close(T)  -> open(T+1)      the pre-entry, UNREACHABLE
-                                                 component, for diagnosis only
-
-    These compose multiplicatively, never additively:
-        1 + fwd_1 == (1 + gap_1) * (1 + fwd_oc_1)
-
-    `fwd_{h}` is left exactly as it was; this is purely additive.
+    Unknown legacy representation/registry coverage yields withheld labels.
+    Explicit registry and representation arguments are required for certified
+    reconstructed fixtures or a source adapter with evidence of actual prices.
     """
-    pos = {d: i for i, d in enumerate(all_dates)}
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["_pos"] = px["date"].map(pos)
+    px, registry, representation = _return_context(px, all_dates, registry, representation, market, as_of)
     g = px.groupby("ticker")
-
-    one_contig = (g["_pos"].shift(-1) - px["_pos"]) == 1
-    one_return = g["close"].shift(-1) / px["close"] - 1
-    one_upper = px["close"].apply(ara_bound) + TOL
-    px["_step_valid"] = one_contig & one_return.between(ARB_BOUND - TOL, one_upper)
+    next_admitted = g["price_step_admissible"].shift(-1).eq(True)
+    px["_step_valid"] = next_admitted & (g["_pos"].shift(-1) - px["_pos"]).eq(1)
     g = px.groupby("ticker")
-
     if open_anchored:
-        missing = [c for c in ("open", "high", "low") if c not in px.columns]
-        if missing:
-            raise ValueError(
-                f"open_anchored=True needs {missing} — the executable contract "
-                "anchors entry on open(T+1), so an OHLC frame is required"
-            )
-        px["_open_valid"] = _open_anchor_valid(px, g)
-        g = px.groupby("ticker")
-        # The entry anchor is the same open(T+1) for every horizon and every
-        # open-anchored label, so resolve it once.
+        if not {"open", "high", "low"} <= set(px.columns):
+            raise ValueError("open_anchored=True needs open, high, low")
         entry_open = g["open"].shift(-1)
-        entry_ok = g["_open_valid"].shift(-1).fillna(False).astype(bool)
-
+        entry_ok = g["entry_open_admissible"].shift(-1).eq(True)
+        entry_dates = g["date"].shift(-1)
+        px["next_entry_open_admissible"] = entry_ok
     for h in horizons:
-        contig = (g["_pos"].shift(-h) - px["_pos"]) == h
-        raw_return = g["close"].shift(-h) / px["close"] - 1
-        # Every daily transition inside a multi-day window must be tradeable.
-        # This masks a 3/5/10/20-day target that crosses a stock split just as
-        # firmly as the one-day target on the split itself.
+        if type(h) is not int or h <= 0:
+            raise ValueError("positive integer horizon required")
+        end_dates = g["date"].shift(-h)
+        contig = (g["_pos"].shift(-h) - px["_pos"]).eq(h)
         step_window = g["_step_valid"].transform(
-            lambda s: s.rolling(h, min_periods=h).sum().shift(-(h - 1)).eq(h)
-        )
-        valid = contig & step_window
-        px[f"fwd_{h}"] = np.where(valid, raw_return, np.nan)
-
+            lambda s: s.rolling(h, min_periods=h).sum().shift(-(h - 1)).eq(h))
+        comparable, reasons = _span_masks(px, px.date, end_dates, all_dates, registry, representation, market, as_of=as_of)
+        admitted = contig & step_window
+        valid = admitted & comparable
+        px[f"fwd_{h}"] = (g["close"].shift(-h) / px["close"] - 1).where(valid)
+        px[f"fwd_{h}_reason"] = reasons.where(~valid, "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
         if extremes:
-            # rolling(h) on the -h shifted series spans exactly rows i+1..i+h
-            hi = g["high"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).max())
-            lo = g["low"].transform(lambda s: s.shift(-h).rolling(h, min_periods=1).min())
-            px[f"max_{h}"] = np.where(valid, hi / px["close"] - 1, np.nan)
-            px[f"mdd_{h}"] = np.where(valid, lo / px["close"] - 1, np.nan)
-
+            hi = g["high"].transform(lambda s: s.shift(-h).rolling(h, min_periods=h).max())
+            lo = g["low"].transform(lambda s: s.shift(-h).rolling(h, min_periods=h).min())
+            px[f"max_{h}"] = (hi / px["close"] - 1).where(valid)
+            px[f"mdd_{h}"] = (lo / px["close"] - 1).where(valid)
         if open_anchored:
-            # fwd_oc_h: open(T+1) -> close(T+h). The EXIT anchor is
-            # close(T+h) — exactly the endpoint `valid` (above) already
-            # certifies for fwd_h: the h-step close(T)->...->close(T+h) chain,
-            # contiguity included. Reusing it, rather than re-deriving a
-            # second, differently-windowed close-step mask, is what fixes the
-            # bug where a corrupt close(T+1) at h=1 was never checked at all
-            # (the old h==1 branch hardcoded a step mask of True
-            # unconditionally). The only additional requirement is that the
-            # ENTRY anchor open(T+1) itself be valid.
-            oc_valid = valid & entry_ok
-            px[f"fwd_oc_{h}"] = np.where(
-                oc_valid, g["close"].shift(-h) / entry_open - 1, np.nan
-            )
-
-            # fwd_oo_h: open(T+1) -> open(T+1+h). The reference close backing
-            # the EXIT anchor open(T+1+h) is close(T+h) — again exactly the
-            # endpoint `step_window` already certifies via the
-            # close(T)->...->close(T+h) chain. The previous implementation
-            # instead re-derived a rolling window shifted one session later
-            # (checking close(T+1)->...->close(T+1+h)), which validates
-            # close(T+1+h) — information from AFTER the open(T+1+h) exit —
-            # while never checking close(T)->close(T+1), the very step that
-            # backs open(T+1+h)'s own previous-close reference two hops back.
-            # A corrupt close(T+1) could then pass entirely undetected as
-            # long as the *next* close happened to look locally sane. Full
-            # contiguity is extended one more session, to the exit session
-            # T+1+h, rather than reusing `contig`'s T->T+h span; the single
-            # equality below still proves every intermediate step was
-            # contiguous, exactly as the module docstring argues for `contig`
-            # (and it strictly implies `contig`, so `valid` need not be
-            # ANDed in separately).
-            oo_contig = (g["_pos"].shift(-(1 + h)) - px["_pos"]) == (1 + h)
-            exit_ok = g["_open_valid"].shift(-(1 + h)).fillna(False).astype(bool)
-            oo_valid = oo_contig & step_window & entry_ok & exit_ok
-            px[f"fwd_oo_{h}"] = np.where(
-                oo_valid, g["open"].shift(-(1 + h)) / entry_open - 1, np.nan
-            )
-
+            oc_span, oc_reasons = _span_masks(px, entry_dates, end_dates, all_dates, registry, representation, market,
+                                             "OPEN", "CLOSE", as_of)
+            oc_admitted = admitted & entry_ok
+            px[f"fwd_oc_{h}"] = (g["close"].shift(-h) / entry_open - 1).where(oc_admitted & oc_span)
+            px[f"fwd_oc_{h}_reason"] = oc_reasons.where(~(oc_admitted & oc_span), "").mask(~oc_admitted & oc_reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
+            oo_dates = g["date"].shift(-(h + 1))
+            oo_span, oo_reasons = _span_masks(px, entry_dates, oo_dates, all_dates, registry, representation, market,
+                                             "OPEN", "OPEN", as_of)
+            oo_contig = (g["_pos"].shift(-(h + 1)) - px["_pos"]).eq(h + 1)
+            exit_ok = g["entry_open_admissible"].shift(-(h + 1)).eq(True)
+            oo_admitted = oo_contig & step_window & entry_ok & exit_ok
+            px[f"fwd_oo_{h}"] = (g["open"].shift(-(h + 1)) / entry_open - 1).where(oo_admitted & oo_span)
+            px[f"fwd_oo_{h}_reason"] = oo_reasons.where(~(oo_admitted & oo_span), "").mask(~oo_admitted & oo_reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
     if open_anchored:
-        # gap_1: close(T) -> open(T+1). The pre-entry window an EOD(T) decision
-        # cannot reach. Needs the T->T+1 transition itself to be sane, which is
-        # exactly what _step_valid at T already asserts.
-        px["gap_1"] = np.where(
-            px["_step_valid"] & entry_ok, entry_open / px["close"] - 1, np.nan
-        )
-
-    drop = ["_pos", "_step_valid"] + (["_open_valid"] if open_anchored else [])
-    return px.drop(columns=drop)
+        comparable, reasons = _span_masks(px, px.date, entry_dates, all_dates, registry, representation, market,
+                                          "CLOSE", "OPEN", as_of)
+        admitted = px["_step_valid"] & entry_ok
+        px["gap_1"] = (entry_open / px["close"] - 1).where(admitted & comparable)
+        px["gap_1_reason"] = reasons.where(~(admitted & comparable), "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
+    return px.drop(columns=["_pos", "_step_valid"])
 
 
-def add_lagged_returns(px, all_dates, lags=(1,)):
-    """Backward-looking returns under the same guard.
-
-    Features bridge a hole just as readily as targets do — a momentum_1d
-    computed across a removed row is the same fabricated +92% move, only
-    landing in X instead of y. It is the less dangerous of the two (a bad
-    feature adds noise; a bad target adds false labels), but it is still an
-    extreme value a tree will happily split on, so guard it too.
-    """
-    pos = {d: i for i, d in enumerate(all_dates)}
-    px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
-    px["_pos"] = px["date"].map(pos)
+def add_lagged_returns(px, all_dates, lags=(1,), *, registry=None, representation=None,
+                       market="REGULAR", as_of=None):
+    px, registry, representation = _return_context(px, all_dates, registry, representation, market, as_of)
     g = px.groupby("ticker")
-
-    previous_one = g["close"].shift(1)
-    one_contig = (px["_pos"] - g["_pos"].shift(1)) == 1
-    one_return = px["close"] / previous_one - 1
-    one_upper = previous_one.apply(ara_bound) + TOL
-    px["_step_valid"] = one_contig & one_return.between(ARB_BOUND - TOL, one_upper)
+    px["_step_valid"] = px["price_step_admissible"] & (px["_pos"] - g["_pos"].shift(1)).eq(1)
     g = px.groupby("ticker")
-
     for k in lags:
-        contig = (px["_pos"] - g["_pos"].shift(k)) == k
-        previous = g["close"].shift(k)
-        raw_return = px["close"] / previous - 1
-        step_window = g["_step_valid"].transform(
-            lambda s: s.rolling(k, min_periods=k).sum().eq(k)
-        )
-        valid = contig & step_window
-        px[f"lag_{k}"] = np.where(valid, raw_return, np.nan)
-
+        if type(k) is not int or k <= 0:
+            raise ValueError("positive integer lag required")
+        starts = g["date"].shift(k)
+        comparable, reasons = _span_masks(px, starts, px.date, all_dates, registry, representation, market, as_of=as_of)
+        contig = (px["_pos"] - g["_pos"].shift(k)).eq(k)
+        steps = g["_step_valid"].transform(lambda s: s.rolling(k, min_periods=k).sum().eq(k))
+        admitted = contig & steps
+        valid = admitted & comparable
+        px[f"lag_{k}"] = (px["close"] / g["close"].shift(k) - 1).where(valid)
+        px[f"lag_{k}_reason"] = reasons.where(~valid, "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
     return px.drop(columns=["_pos", "_step_valid"])
 
 
 def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False,
-                open_anchored=False):
-    """load_clean() + add_forward_returns() — the one call worth importing.
-
-    open_anchored=True additionally returns the executable-contract labels
-    (fwd_oo_{h} / fwd_oc_{h} / gap_1) — see add_forward_returns().
-    """
-    all_dates = sorted(
-        r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history").fetchall()
-    )
-    px = add_forward_returns(
-        load_clean(conn, strict=strict), all_dates, horizons=horizons,
-        extremes=extremes, open_anchored=open_anchored,
-    )
+                open_anchored=False, *, registry=None, representation=None, market="REGULAR", as_of=None):
+    registry = registry or default_registry()
+    all_dates = sorted(r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history"))
+    px = add_forward_returns(load_clean(conn, strict=strict, registry=registry, representation=representation),
+                             all_dates, horizons, extremes, open_anchored, registry=registry,
+                             representation=representation, market=market, as_of=as_of)
     if lags:
-        px = add_lagged_returns(px, all_dates, lags=lags)
+        px = add_lagged_returns(px, all_dates, lags, registry=registry, representation=representation,
+                                market=market, as_of=as_of)
     return px
 
 
@@ -606,7 +497,7 @@ def report(px):
     for _, r in grp.head(8).iterrows():
         print(f"  {r['date']}  close={r['close']:>9.0f}  {r['ticker']}")
 
-    print("\nbroker_flow rows riding on suspect prices (netval will be wrong):")
+    print("\nbroker_flow rows associated with suspects (requires independent review):")
     return bad
 
 

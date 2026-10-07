@@ -52,6 +52,8 @@ XGB_PARAMS = dict(          # v1 config from IDX Trading ML System.md
 
 
 def load_panel():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("txchart_backtest.load_panel")
     con = sqlite3.connect(DB)
     px = pd.read_sql("SELECT * FROM ohlcv", con)
     flows = pd.read_sql(
@@ -68,6 +70,8 @@ def load_panel():
 
 def engineer(df, horizon):
     """Per-ticker features (trailing only) + forward-return label."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("txchart_backtest.engineer")
     out = []
     for _, g in df.groupby("ticker", sort=False):
         g = g.sort_values("date").copy()
@@ -133,6 +137,8 @@ def walk_forward(panel, feats, horizon):
 
 
 def evaluate(preds, horizon, threshold):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("txchart_backtest.evaluate")
     trades = preds[preds["pred"] > threshold].copy()
     net = trades["label"] - COST_ENTRY - COST_EXIT
 
@@ -179,6 +185,8 @@ def evaluate(preds, horizon, threshold):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("txchart_backtest.main")
     os.makedirs(OUT_DIR, exist_ok=True)
     df = load_panel()
     print(f"panel: {len(df)} rows, {df['ticker'].nunique()} tickers, "

@@ -41,6 +41,8 @@ def ci(k, n):
 
 
 def load(min_turn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("test_inventory_signal.load")
     d = pd.read_parquet(os.path.join(HERE, "panel.parquet"))
     d["date"] = pd.to_datetime(d["date"])
     n0 = len(d)
@@ -186,6 +188,8 @@ def boot_diff(sel, rest, col, n=1500):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("test_inventory_signal.main")
     ap = argparse.ArgumentParser()
     ap.add_argument("--min-turn", type=float, default=0.5, help="Rp bn 20d avg turnover")
     a = ap.parse_args()
@@ -304,3 +308,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_uncertified_inventory_signal_panel_refuses_before_read():
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("test_inventory_signal.load")
+
+
+def test_uncertified_inventory_signal_model_refuses_before_fit():
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("test_inventory_signal.main")

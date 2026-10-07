@@ -14,31 +14,13 @@ after a suspected site update. So the checks here are deliberately built to
 catch a scrape that SUCCEEDS but returns something different from what it
 returned yesterday.
 
-The strongest check available is cross-source agreement. market_summary_daily
-(screener API) and price_history (inventory Plotly chart) are two independent
-scrape paths that both carry close/high/low/volume for overlapping tickers. If
-one path breaks or starts returning another ticker's series, the two disagree.
-Nothing else in this repo compares them.
+Cross-source offset scores are exploratory. Screener capture dates, matching
+closes and a best-scoring date offset do not verify an exchange session. The
+monitor reports UNKNOWN_SOURCE_SESSION until an explicit source adapter can
+supply that evidence. Corporate-action references do not align source sessions.
 
-That comparison needs one correction first, discovered by building it:
-
-  market_summary_daily.date is the SCRAPE date, not the data date.
-
-The scrape runs 23:00 UTC = 07:00 Asia/Kuala_Lumpur, before the market opens,
-so the freshest screener data is the PREVIOUS session's close. Aligning
-market_summary_daily.date - 1 day against price_history.date matches 34 of 37
-overlapping pairs exactly (median deviation 0.00%); aligning them directly
-matches 4 of 36. All three residual mismatches are known-contaminated tickers
-(COIN, ELTY), so the offset is the alignment and the leftovers are the real
-defects. The `last_date` column, which presumably should carry the data date,
-is NULL for every row.
-
-Nothing currently joins the two tables, so this is not an active bug - it is a
-landmine for HANDOFF.md stage 5, which puts daily-signal tickers into
-TRACKED_TICKERS and would then join signals to price_history by date. The
-offset is asserted below so that a change in NeoBDM's publish timing (or in
-when the workflow runs) fails loudly instead of silently shifting every label
-by one day.
+Price monitoring also reports boundaries, unresolved references, withheld
+labels and per-ticker freshness against the verified exchange calendar.
 
 Run:  py check_signal_integrity.py            -> print status
       py check_signal_integrity.py --telegram -> also send it
@@ -65,12 +47,9 @@ DB_PATH = os.path.join(HERE, "neobdm.db")
 WINDOW_DAYS = 10          # only recent scrapes; older rows are quarantine's job
 MAX_STALE_WEEKDAYS = 2    # allows one public holiday before alerting
 
-# Cross-source agreement. Both paths quote the same exchange, so a real match is
-# exact; the tolerance only absorbs float round-tripping.
-EXPECTED_DATE_OFFSET = 1  # market_summary_daily.date - 1 == price_history.date
+# Exploratory agreement only; no source-session certification.
 CLOSE_TOLERANCE = 0.001   # 0.1%
-MIN_AGREEMENT = 0.85      # below this, one of the two scrape paths has drifted
-MIN_PAIRS_TO_JUDGE = 15   # under this the sample is too thin to fail a build on
+MIN_PAIRS_TO_JUDGE = 15   # minimum sample for an exploratory agreement score
 
 # Columns the daily signal is actually computed from, and that the screener is
 # observed to populate. Deliberately NOT the full filter set: is_liquid /
@@ -144,7 +123,9 @@ def _shift(datestr, days):
 # ── individual checks ─────────────────────────
 
 def check_freshness(conn, problems):
-    today = date.today()
+    from zoneinfo import ZoneInfo
+    from idx_calendar import is_idx_session, latest_idx_session_before, IdxCalendarUnavailable
+    today = datetime.now(ZoneInfo("Asia/Jakarta")).date()
     for table in ("market_summary_daily", "price_history", "broker_flow"):
         row = conn.execute(f"SELECT MAX(date) FROM {table}").fetchone()[0]
         if not row:
@@ -158,6 +139,21 @@ def check_freshness(conn, problems):
         stale = weekdays_between(latest, today)
         if stale > MAX_STALE_WEEKDAYS:
             problems.append(f"{table} STALE — newest {row} ({stale} weekdays ago)")
+    for ticker, latest in conn.execute("SELECT ticker, MAX(date) FROM price_history GROUP BY ticker"):
+        try:
+            expected = latest_idx_session_before(today)
+            day = date.fromisoformat(latest)
+            if not is_idx_session(day):
+                problems.append(f"price_history {ticker}: freshness UNRESOLVED, observation is not a verified session")
+                continue
+            missing = 0
+            while day < expected:
+                day += timedelta(days=1)
+                missing += int(is_idx_session(day))
+            if missing > MAX_STALE_WEEKDAYS:
+                problems.append(f"price_history {ticker} STALE: newest {latest}; {missing} verified sessions missing")
+        except (ValueError, TypeError, IdxCalendarUnavailable):
+            problems.append(f"price_history {ticker}: freshness UNRESOLVED, calendar/session unsupported")
 
 
 def check_new_contamination(conn, problems, notes, stats):
@@ -200,6 +196,14 @@ def check_new_contamination(conn, problems, notes, stats):
         [(d, t) in known for d, t in zip(recent["date"], recent["ticker"])],
         index=recent.index)]
 
+    stats["corporate_action_boundaries"] = int(recent["corporate_action_boundary"].sum())
+    stats["unresolved_limit_references"] = int(recent["limit_reference_status"].eq("UNRESOLVED").sum())
+    stats["pending_action_references"] = int(recent["corporate_action_status"].eq("PENDING_REFERENCE").sum())
+    stats["price_contract"] = px.attrs.get("price_contract")
+    if stats["corporate_action_boundaries"]:
+        notes.append(f"{stats['corporate_action_boundaries']} corporate-action boundary session(s); crossing economic returns withheld")
+    if stats["unresolved_limit_references"]:
+        notes.append(f"{stats['unresolved_limit_references']} unresolved limit reference(s); not certified price acceptance")
     stats["window_rows"] = len(recent)
     stats["fresh_suspects"] = len(flagged)
     if not len(flagged):
@@ -256,7 +260,7 @@ def check_cross_source(conn, problems, notes, stats):
         notes.append("cross-source check skipped — one of the tables is empty")
         return
 
-    best, scores = None, {}
+    scores = {}
     for offset in (0, 1, 2):
         m = ms.copy()
         m["date"] = m["date"].map(lambda d: _shift(d, offset))
@@ -267,40 +271,11 @@ def check_cross_source(conn, problems, notes, stats):
             continue
         agree = ((j["close_ph"] / j["close_ms"] - 1).abs() <= CLOSE_TOLERANCE).mean()
         scores[offset] = (len(j), agree)
-        if best is None or agree > scores[best][1]:
-            best = offset
 
     stats["offset_scores"] = {k: (n, round(a, 3)) for k, (n, a) in scores.items()}
-    if best is None:
-        notes.append(f"cross-source check skipped — fewer than {MIN_PAIRS_TO_JUDGE} "
-                     f"overlapping (date,ticker) pairs at any offset")
-        return
-
-    n_best, agree_best = scores[best]
-    stats["cross_source"] = f"offset={best}d n={n_best} agree={agree_best:.0%}"
-
-    if best != EXPECTED_DATE_OFFSET:
-        problems.append(
-            f"date alignment CHANGED — market_summary_daily now matches "
-            f"price_history at offset {best}d, not the expected "
-            f"{EXPECTED_DATE_OFFSET}d (agreement {agree_best:.0%} on {n_best} pairs). "
-            f"NeoBDM's publish timing or the workflow schedule moved; every "
-            f"date-joined label is shifted until EXPECTED_DATE_OFFSET is updated.")
-        return
-
-    if agree_best < MIN_AGREEMENT:
-        m = ms.copy()
-        m["date"] = m["date"].map(lambda d: _shift(d, best))
-        j = m.merge(ph, on=["date", "ticker"], suffixes=("_ms", "_ph"))
-        j = j[(j["close_ms"] > 0) & (j["close_ph"] > 0)].copy()
-        j["dev"] = (j["close_ph"] / j["close_ms"] - 1).abs()
-        worst = j.nlargest(4, "dev")
-        sample = ", ".join(
-            f"{r.date} {r.ticker} {r.close_ms:g}vs{r.close_ph:g}" for r in worst.itertuples())
-        problems.append(
-            f"the two scrape paths DISAGREE — only {agree_best:.0%} of {n_best} "
-            f"overlapping closes match (need {MIN_AGREEMENT:.0%}). One of the "
-            f"screener API or the inventory chart has drifted. Worst: {sample}")
+    stats["cross_source_session_status"] = "UNKNOWN"
+    stats["cross_source"] = "UNKNOWN_SOURCE_SESSION"
+    notes.append("Cross-source offsets are exploratory only. Screener capture dates do not verify exchange sessions; no corporate-action exception or canonical equality is inferred.")
 
 
 def _coverage_by_date(conn, field):
@@ -597,12 +572,30 @@ def check_value_sanity(conn, problems):
 
 # ── reporting ─────────────────────────────────
 
+def check_price_contract(conn, problems, notes, stats, *, registry=None, representation=None):
+    """Independently report withheld labels and reject published crossing ratios."""
+    from price_audit import clean_panel
+    px = clean_panel(conn, horizons=(1, 2), lags=(1, 2), extremes=True,
+                     open_anchored=True, registry=registry, representation=representation)
+    reasons = [c for c in px if c.endswith("_reason") and c.startswith(("fwd_", "lag_", "gap_"))]
+    withheld = sum(int(px[c].ne("").sum()) for c in reasons)
+    stats["withheld_price_labels"] = withheld
+    stats["price_contract"] = px.attrs.get("price_contract")
+    for reason in reasons:
+        value = reason[:-7]
+        crossing = px[reason].isin(["CORPORATE_ACTION_BOUNDARY", "UNRESOLVED_EVENT"])
+        if value in px and px.loc[crossing, value].notna().any():
+            problems.append(f"{value}: published economic return across an action boundary")
+    notes.append(f"{withheld} price label(s) withheld under the pinned price/reference/return contract")
+
+
 def check(conn):
     problems, notes, stats = [], [], {}
     check_freshness(conn, problems)
     check_schema_and_coverage(conn, problems, notes, stats)
     check_capture_contract(conn, problems, notes, stats)
     check_new_contamination(conn, problems, notes, stats)
+    check_price_contract(conn, problems, notes, stats)
     check_cross_source(conn, problems, notes, stats)
     check_signals_measurable(conn, problems, notes, stats)
     check_signal_sources(conn, problems, notes, stats)

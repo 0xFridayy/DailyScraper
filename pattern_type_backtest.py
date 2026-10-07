@@ -72,6 +72,8 @@ def dedupe_patterns(patterns):
 
 
 def prep_price_panels(px):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_type_backtest.prep_price_panels")
     px = annotate_limits(px[["date", "ticker", "close"]])
     by_ticker = {t: g.reset_index(drop=True) for t, g in px.groupby("ticker")}
     idx_by_ticker = {t: {d: i for i, d in enumerate(g["date"])} for t, g in by_ticker.items()}
@@ -82,6 +84,8 @@ def build_trades(pats, by_ticker, idx_by_ticker, hold):
     """Entry = next trading day's close after signal. Exit = HOLD trading days
     after entry, rolled forward past at_arb days (capped). Entry blocked (at_ara)
     trades excluded entirely."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_type_backtest.build_trades")
     trades = []
     for _, p in pats.iterrows():
         ticker = p["ticker"]
@@ -216,6 +220,8 @@ def evaluate_combo(pats_combo, by_ticker, idx_by_ticker, universe_trades,
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_type_backtest.main")
     px, patterns = load_data()
     patterns = dedupe_patterns(patterns)
     by_ticker, idx_by_ticker = prep_price_panels(px)

@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "contract_version": "actual-price-reference.v1",
+  "mode": "EXPLICIT_REFUSAL",
+  "routes": {
+    "analyze_ticker_patterns": [
+      "analyze_ticker",
+      "main"
+    ],
+    "ara_arb_scan": [
+      "load_prices",
+      "build",
+      "main"
+    ],
+    "ara_multiday": [
+      "load",
+      "add_horizon_labels",
+      "main"
+    ],
+    "arb_veto": [
+      "score",
+      "main"
+    ],
+    "broker_book": [
+      "average_cost_book",
+      "rolling_state",
+      "ticker_bundle"
+    ],
+    "broker_dashboard": [
+      "render"
+    ],
+    "broker_learning": [
+      "outcomes",
+      "holder_returns",
+      "broker_profitability",
+      "live_outcome_rows"
+    ],
+    "broker_learning_db": [
+      "live_summary"
+    ],
+    "broker_learning_run": [
+      "load_items",
+      "run_daily",
+      "learn",
+      "run_weekly",
+      "run_render",
+      "main"
+    ],
+    "broker_rules": [
+      "eligibility",
+      "evaluate"
+    ],
+    "check_ml_health": [
+      "check_model_runs"
+    ],
+    "daily_picks": [
+      "load_snapshots",
+      "day_move",
+      "session_returns",
+      "machine_returns",
+      "forward_excess",
+      "follow_lines",
+      "machine_holding",
+      "machine_progress",
+      "record_results",
+      "run_morning"
+    ],
+    "ddqn_entry_exit": [
+      "make_envs",
+      "train_ddqn"
+    ],
+    "ddqn_episode_data": [
+      "build_episode_frame"
+    ],
+    "evaluate_signals": [
+      "load_panel",
+      "outcome",
+      "evaluate",
+      "main"
+    ],
+    "experiment_1f_candidate": [
+      "main"
+    ],
+    "experiment_1f_evaluation": [
+      "_search_exit",
+      "slot_outcomes"
+    ],
+    "experiment_1f_features": [
+      "price_features",
+      "build_features"
+    ],
+    "experiment_1f_gate_b": [
+      "load_context",
+      "main",
+      "execute_stage1"
+    ],
+    "experiment_1f_gate_b_contract": [
+      "write_contract",
+      "main"
+    ],
+    "experiment_1f_manifest": [
+      "build",
+      "main"
+    ],
+    "experiment_1f_normalization": [
+      "main"
+    ],
+    "experiment_1f_universe_gate": [
+      "build_validated_panel",
+      "run_gate",
+      "main"
+    ],
+    "experiment_1f_validation": [
+      "main"
+    ],
+    "experiment_1f_validity": [
+      "main"
+    ],
+    "experiment_2a0_event_study": [
+      "event_return",
+      "construct_returns",
+      "run_study",
+      "main"
+    ],
+    "feature_ablation": [
+      "build_multi_horizon_panel"
+    ],
+    "foreign_flow_signal_backtest": [
+      "generate_trades",
+      "main"
+    ],
+    "horizon_scan": [
+      "build"
+    ],
+    "inventory_evidence": [
+      "_market_measurement"
+    ],
+    "inventory_features": [
+      "build"
+    ],
+    "label_compare": [
+      "load",
+      "add_labels",
+      "main"
+    ],
+    "ml_v2_experiment_1": [
+      "build_experiment_panel",
+      "run_experiment",
+      "main"
+    ],
+    "ml_v2_experiment_1_robustness": [
+      "main"
+    ],
+    "multiday_features": [
+      "build_panel_with_multiday"
+    ],
+    "pattern_backtest": [
+      "load_prices",
+      "simulate_trades",
+      "main"
+    ],
+    "pattern_detector": [
+      "compute_patterns",
+      "main"
+    ],
+    "pattern_type_backtest": [
+      "prep_price_panels",
+      "build_trades",
+      "main"
+    ],
+    "regime_gated_momentum": [
+      "load_neobdm",
+      "simulate_trade",
+      "main"
+    ],
+    "run_ml_reports": [
+      "run_xgboost_report",
+      "run_strategy_variants_report",
+      "run_ddqn_report",
+      "run_konglo_watch_report",
+      "main"
+    ],
+    "scan_ara_arb": [
+      "refresh",
+      "main"
+    ],
+    "shap_analysis": [
+      "run_shap_analysis"
+    ],
+    "smart_money_divergence": [
+      "build_panel_with_smart_money"
+    ],
+    "targeted_actor_observations": [
+      "observe",
+      "observe_inventory_evidence"
+    ],
+    "txchart_backtest": [
+      "load_panel",
+      "engineer",
+      "evaluate",
+      "main"
+    ],
+    "walk_forward_backtest": [
+      "build_panel",
+      "run_walk_forward"
+    ],
+    "test_inventory_signal": [
+      "load",
+      "main"
+    ]
+  }
+}

@@ -60,6 +60,8 @@ def _group_features(g):
 
 
 def build_panel_with_smart_money(conn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("smart_money_divergence.build_panel_with_smart_money")
     px = clean_panel(conn, horizons=(1,), lags=(1, 5))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
     bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")

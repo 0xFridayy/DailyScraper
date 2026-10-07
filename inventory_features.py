@@ -36,29 +36,27 @@ GROUPS = {
 }
 
 
+from price_contract import ara_bound, model_tick, model_snap, model_limit_price
+
+
 def ara_limit(p):
-    return np.where(p < 200, 0.35, np.where(p <= 5000, 0.25, 0.20))
+    return np.vectorize(ara_bound, otypes=[float])(p)
 
 
 def _tick(p):
-    return np.where(p < 200, 1, np.where(p < 500, 2, np.where(p < 2000, 5,
-                    np.where(p < 5000, 10, 25))))
+    return np.vectorize(model_tick, otypes=[float])(p)
 
 
 def _snap(raw, down):
-    t = _tick(raw)
-    v = np.floor(raw / t) * t if down else np.ceil(raw / t) * t
-    t2 = _tick(v)
-    v2 = np.floor(raw / t2) * t2 if down else np.ceil(raw / t2) * t2
-    return np.where(t2 == t, v, v2)
+    return np.vectorize(lambda p: model_snap(p, down), otypes=[float])(raw)
 
 
 def ara_price(prev):
-    return _snap(prev * (1 + ara_limit(prev)), True)
+    return np.vectorize(lambda p: model_limit_price(p, True), otypes=[float])(prev)
 
 
 def arb_price(prev):
-    return _snap(prev * (1 + ARB_LIM), False)
+    return np.vectorize(lambda p: model_limit_price(p, False), otypes=[float])(prev)
 
 
 def roll_sum(a, w):
@@ -76,6 +74,8 @@ def roll_mean_1d(a, w, minp=None):
 
 
 def build():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("inventory_features.build")
     o = pd.read_parquet(os.path.join(HERE, "ohlc.parquet"))
     b = pd.read_parquet(os.path.join(HERE, "broker_daily.parquet"))
     o["date"] = pd.to_datetime(o["date"])

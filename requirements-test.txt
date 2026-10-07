@@ -1,0 +1,13 @@
+pytest
+pandas
+numpy
+scipy
+scikit-learn
+xgboost
+shap
+requests
+pyarrow
+openpyxl
+schedule
+playwright
+pytz

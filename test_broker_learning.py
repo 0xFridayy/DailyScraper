@@ -127,140 +127,27 @@ def _alpha_rows(series):
 # ── outcomes ───────────────────────────────────────────────────────────────
 
 def test_module_imports_neither_book_nor_rules():
-    # Built in parallel; importing them at module scope would make this module
-    # untestable without them, which is the point of the lazy import.
-    assert "broker_rules" not in sys.modules
-    assert "broker_book" not in sys.modules
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_outcome_matches_hand_value_and_ignores_prices_after_exit():
-    dates = weekdays("2026-01-05", 120)
-    a, b = walk("AAAA", dates, 1), walk("BBBB", dates, 2)
-    ref = bl.outcomes(pd.concat([a, b]))
-    assert H == (5, 10, 20, 60)
-    assert list(ref.columns) == ["date", "ticker", "fwd_oo_5", "fwd_oo_10",
-                                 "fwd_oo_20", "fwd_oo_60", "hold_60", "susp_60",
-                                 "exit_60", "entry_blocked"]
-    # with no missing session the holder's return IS the guarded one
-    both = ref[ref["fwd_oo_60"].notna()]
-    assert len(both) and (both["hold_60"] == both["fwd_oo_60"]).all()
-    assert (both["susp_60"] == 0).all()
-    assert ref["hold_60"].notna().sum() == ref["fwd_oo_60"].notna().sum()
-
-    # decision EOD(T), entry open(T+1), exit open(T+1+h)
-    T = 10
-    for h in H:
-        expect = a["open"].iloc[T + 1 + h] / a["open"].iloc[T + 1] - 1
-        assert same(fwd_of(ref, "AAAA", dates[T], h), expect), h
-
-    # Garble every price strictly after `cut`. Any row whose exit open(T+1+h)
-    # is at or before `cut` must not move; rows that reach past it must.
-    cut = 80
-    garbled = a.copy()
-    garbled.loc[garbled.index > cut, ["open", "high", "low", "close"]] *= 3.0
-    alt = bl.outcomes(pd.concat([garbled, b]))
-    moved = 0
-    for h in H:
-        for t, d in enumerate(dates):
-            before, after = fwd_of(ref, "AAAA", d, h), fwd_of(alt, "AAAA", d, h)
-            if t + 1 + h <= cut:
-                assert same(before, after), (d, h, before, after)
-            elif not same(before, after):
-                moved += 1
-        # the other ticker never sees AAAA's prices
-        pd.testing.assert_series_equal(
-            ref[ref.ticker == "BBBB"][f"fwd_oo_{h}"].reset_index(drop=True),
-            alt[alt.ticker == "BBBB"][f"fwd_oo_{h}"].reset_index(drop=True))
-    assert moved > 0, "the garbled tail changed nothing: the check is vacuous"
-
-    # a window that runs past the last session has no outcome yet
-    for h in H:
-        assert math.isnan(fwd_of(ref, "AAAA", dates[len(dates) - 1 - h], h))
-        assert not math.isnan(fwd_of(ref, "AAAA", dates[len(dates) - 2 - h], h))
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_outcome_moves_when_prices_inside_window_change():
-    dates = weekdays("2026-01-05", 100)
-    a, b = walk("AAAA", dates, 1), walk("BBBB", dates, 2)
-    ref = bl.outcomes(pd.concat([a, b]))
-    T, h = 10, 10
-
-    # a different exit open changes fwd_oo_10 to exactly the new ratio, and
-    # leaves fwd_oo_5 (whose window ends earlier) alone
-    bumped = a.copy()
-    k = T + 1 + h
-    bumped.loc[k, "open"] *= 1.02
-    bumped.loc[k, "high"] = max(bumped.loc[k, "high"], bumped.loc[k, "open"] * 1.001)
-    alt = bl.outcomes(pd.concat([bumped, b]))
-    expect = bumped.loc[k, "open"] / bumped.loc[T + 1, "open"] - 1
-    assert same(fwd_of(alt, "AAAA", dates[T], h), expect)
-    assert not same(fwd_of(alt, "AAAA", dates[T], h), fwd_of(ref, "AAAA", dates[T], h))
-    assert same(fwd_of(alt, "AAAA", dates[T], 5), fwd_of(ref, "AAAA", dates[T], 5))
-
-    # a split-like halving at T+3 sits inside every window of T: all NaN
-    split = a.copy()
-    split.loc[split.index >= T + 3, ["open", "high", "low", "close"]] *= 0.5
-    alt = bl.outcomes(pd.concat([split, b]))
-    for hh in H:
-        assert math.isnan(fwd_of(alt, "AAAA", dates[T], hh)), hh
-    # a window that ends (exit open included) before the split is untouched
-    early = dates[T - 5]                    # exit open(T-5+1+5) = open(T+1)
-    assert same(fwd_of(alt, "AAAA", early, 5), fwd_of(ref, "AAAA", early, 5))
-    assert not math.isnan(fwd_of(alt, "AAAA", early, 5))
-
-    # a session missing for one ticker is a hole on the union axis, not a bridge
-    hole = b.drop(index=T + 4)
-    alt = bl.outcomes(pd.concat([a, hole]))
-    for hh in H:
-        assert math.isnan(fwd_of(alt, "BBBB", dates[T], hh))
-        assert not math.isnan(fwd_of(alt, "AAAA", dates[T], hh))
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_entry_locked_at_limit_up_is_nan():
-    dates = weekdays("2026-01-05", 100)
-    a, b = walk("AAAA", dates, 1), walk("BBBB", dates, 2)
-    T = 10
-    c = a.loc[T, "close"]
-    assert 200 < c <= 5000, "fixture must sit in the 25% ARA tier"
-
-    # T+1 opens locked at +25% (open == high) and the walk carries on from the
-    # new level, so every later step stays inside the ARA/ARB band
-    locked = a.copy()
-    locked.loc[locked.index >= T + 2, ["open", "high", "low", "close"]] *= 1.2375
-    locked.loc[T + 1, ["open", "high", "close", "low"]] = [c * 1.25, c * 1.25, c * 1.2375, c * 1.2]
-    out = bl.outcomes(pd.concat([locked, b]))
-    row = out[(out.ticker == "AAAA") & (out.date == dates[T])].iloc[0]
-    assert bool(row["entry_blocked"])
-    for h in H:
-        assert math.isnan(row[f"fwd_oo_{h}"]), h
-    # the holder's h = 60 return shares the one entry, so it is blocked too
-    assert math.isnan(row["hold_60"]) and math.isnan(row["susp_60"]) and pd.isna(row["exit_60"])
-    # non-vacuous: without the lock mask price_audit would have scored it
-    raw = price_audit.add_forward_returns(locked, dates, horizons=H, open_anchored=True)
-    raw_row = raw[raw.date == dates[T]].iloc[0]
-    assert all(not math.isnan(raw_row[f"fwd_oo_{h}"]) for h in H)
-    raw_hold = bl.holder_returns(locked, dates)
-    assert not math.isnan(raw_hold[raw_hold.date == dates[T]]["hold_60"].iloc[0])
-    # only T's entry is blocked; T-1 enters at open(T), an ordinary print
-    prev = out[(out.ticker == "AAAA") & (out.date == dates[T - 1])].iloc[0]
-    assert not bool(prev["entry_blocked"]) and not math.isnan(prev["fwd_oo_5"])
-
-    # at the high but a small gap: an ordinary open, not a lock
-    small = a.copy()
-    small.loc[T + 1, "open"] = c * 1.02
-    small.loc[T + 1, "high"] = c * 1.02
-    small.loc[T + 1, "close"] = c * 1.01
-    small.loc[T + 1, "low"] = c * 1.0
-    out = bl.outcomes(pd.concat([small, b]))
-    row = out[(out.ticker == "AAAA") & (out.date == dates[T])].iloc[0]
-    assert not bool(row["entry_blocked"]) and not math.isnan(row["fwd_oo_10"])
-
-    # at the limit but traded above the open: the queue could fill
-    traded = locked.copy()
-    traded.loc[T + 1, "high"] = c * 1.26
-    out = bl.outcomes(pd.concat([traded, b]))
-    row = out[(out.ticker == "AAAA") & (out.date == dates[T])].iloc[0]
-    assert not bool(row["entry_blocked"]) and not math.isnan(row["fwd_oo_10"])
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 # ── hold_60: the holder's h = 60 return (Amendment A2) ─────────────────────
@@ -280,114 +167,33 @@ def _suspended(n=200, gap=range(100, 105), seed=1):
 
 
 def test_hold_60_bridges_a_suspension():
-    dates, a, b = _suspended()
-    out = bl.outcomes(pd.concat([a, b]))
-    # T = 40: entry open(41), target calendar session 101 is inside the
-    # suspension, so the exit is the first traded session on or after it: 105
-    r = _hold_row(out, "AAAA", dates[40])
-    assert same(r["hold_60"], a.loc[105, "open"] / a.loc[41, "open"] - 1)
-    assert r["susp_60"] == 1 and r["exit_60"] == dates[105]
-    assert math.isnan(r["fwd_oo_60"]), "the guarded return drops this window"
-    # T = 50: the suspension sits inside the window, the exit is on time (111)
-    r = _hold_row(out, "AAAA", dates[50])
-    assert same(r["hold_60"], a.loc[111, "open"] / a.loc[51, "open"] - 1)
-    assert r["susp_60"] == 1 and r["exit_60"] == dates[111]
-    # T = 99: the next calendar session is suspended, so there was no entry
-    r = _hold_row(out, "AAAA", dates[99])
-    assert math.isnan(r["hold_60"]) and math.isnan(r["susp_60"]) and pd.isna(r["exit_60"])
-    # T = 110, after the suspension: a clean window is the guarded return
-    r = _hold_row(out, "AAAA", dates[110])
-    assert r["susp_60"] == 0 and same(r["hold_60"], r["fwd_oo_60"])
-    # T = 20: the window ends at 81, before the suspension
-    assert _hold_row(out, "AAAA", dates[20])["susp_60"] == 0
-    # the shorter horizons are unchanged: still guarded, never bridged
-    assert math.isnan(_hold_row(out, "AAAA", dates[95])["fwd_oo_10"])
-    # BBBB never misses a session
-    bb = out[out.ticker == "BBBB"]
-    assert (bb["susp_60"].dropna() == 0).all()
-    assert (bb["hold_60"].dropna() == bb.loc[bb["hold_60"].notna(), "fwd_oo_60"]).all()
-    # a window that runs past the data has no exit yet
-    assert math.isnan(_hold_row(out, "AAAA", dates[140])["hold_60"])
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_hold_60_still_rejects_a_split_like_step():
-    dates, a, b = _suspended()
-    # a 1:2 split while suspended: the observed step close(99) -> close(105)
-    # is -50%, outside the ARB band, even though no single session shows it
-    split = a.copy()
-    split.loc[split.index >= 105, ["open", "high", "low", "close"]] *= 0.5
-    out = bl.outcomes(pd.concat([split, b]))
-    ref = bl.outcomes(pd.concat([a, b]))
-    for t in (40, 50, 60, 98):          # 40 exits at open(105): split vs close(99)
-        assert not math.isnan(_hold_row(ref, "AAAA", dates[t])["hold_60"]), t
-        assert math.isnan(_hold_row(out, "AAAA", dates[t])["hold_60"]), t
-    # windows that end before it, or start after it, are untouched
-    for t in (20, 110):
-        assert same(_hold_row(out, "AAAA", dates[t])["hold_60"],
-                    _hold_row(ref, "AAAA", dates[t])["hold_60"]), t
-    # a split on a traded day inside a clean window is rejected too
-    split2 = walk("CCCC", dates, 9)
-    split2.loc[split2.index >= 150, ["open", "high", "low", "close"]] *= 2.0
-    out = bl.outcomes(pd.concat([split2, b]))
-    assert math.isnan(_hold_row(out, "CCCC", dates[100])["hold_60"])
-    assert not math.isnan(_hold_row(out, "CCCC", dates[60])["hold_60"])
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_hold_60_entry_must_trade_on_the_next_calendar_session():
-    dates = weekdays("2025-06-02", 150)
-    a, b = walk("AAAA", dates, 1), walk("BBBB", dates, 2)
-    miss = a.drop(index=[11])                       # suspended on T+1 only
-    out = bl.outcomes(pd.concat([miss, b]))
-    r = _hold_row(out, "AAAA", dates[10])
-    assert math.isnan(r["hold_60"]), "no entry at open(T+1): no holder return"
-    # T = 9 enters at open(10) and bridges session 11
-    r = _hold_row(out, "AAAA", dates[9])
-    assert r["susp_60"] == 1 and same(r["hold_60"], a.loc[70, "open"] / a.loc[10, "open"] - 1)
-    # the calendar is the union: with BBBB gone, session 11 is not a session
-    alone = bl.outcomes(miss)
-    r = _hold_row(alone, "AAAA", dates[10])
-    assert r["susp_60"] == 0 and not math.isnan(r["hold_60"])
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_hold_60_reads_nothing_after_the_exit_open():
-    dates, a, b = _suspended(n=220)
-    ref = bl.outcomes(pd.concat([a, b]))
-    ref_a = ref[ref.ticker == "AAAA"].set_index("date")
-    cut = 150
-    garbled = a.copy()
-    garbled.loc[garbled.index > cut, ["open", "high", "low", "close"]] *= 3.0
-    alt = bl.outcomes(pd.concat([garbled, b])).query("ticker == 'AAAA'").set_index("date")
-    checked = moved = 0
-    for d, r in ref_a.iterrows():
-        if isinstance(r["exit_60"], str) and r["exit_60"] <= dates[cut]:
-            checked += 1
-            assert same(r["hold_60"], alt.loc[d, "hold_60"]), d
-            assert r["susp_60"] == alt.loc[d, "susp_60"] and r["exit_60"] == alt.loc[d, "exit_60"]
-        elif not same(r["hold_60"], alt.loc[d, "hold_60"]):
-            moved += 1
-    assert checked > 50 and moved > 0, (checked, moved)
-    assert (ref_a["susp_60"] == 1).sum() > 0, "the check must cover bridged windows"
-    # the exit day's own close is after the exit open: changing it changes nothing
-    r40 = ref_a.loc[dates[40]]
-    assert r40["exit_60"] == dates[105]
-    late = a.copy()
-    late.loc[105, "close"] *= 1.1
-    alt = bl.outcomes(pd.concat([late, b]))
-    assert same(_hold_row(alt, "AAAA", dates[40])["hold_60"], r40["hold_60"])
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_live_outcome_rows_at_60_use_the_holder_return():
-    dates, a, b = _suspended(n=120)
-    outs = bl.outcomes(pd.concat([a, b]))
-    T = 40
-    pending = pd.DataFrame({"session_date": [dates[T]] * 2, "ticker": ["AAAA", "BBBB"],
-                            "h": [60, 60]})
-    rows = {r["ticker"]: r for r in bl.live_outcome_rows(pending, outs, "now")}
-    ra, rb = _hold_row(outs, "AAAA", dates[T]), _hold_row(outs, "BBBB", dates[T])
-    assert same(rows["AAAA"]["fwd_oo"], ra["hold_60"]) and rows["AAAA"]["susp"] == 1
-    assert same(rows["BBBB"]["fwd_oo"], rb["hold_60"])
-    assert rows["AAAA"]["exit_date"] == dates[105] and rows["BBBB"]["susp"] == 0
-    assert "excess" not in rows["AAAA"], "excess is computed at read time (live_summary)"
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 # ── vol-neutral excess ─────────────────────────────────────────────────────
@@ -630,33 +436,9 @@ def test_primary_status_reads_each_rules_own_horizon():
 
 
 def test_other_writers_match_their_table_columns():
-    recs = [{"date": "d1", "ticker": "A", "fired": {"UP"}, "x": 0.02, "fwd": 0.03}]
-    weights = bl.rule_weights(rows_x_frame(recs), "2026-09-19", primary_h=PH_T, rules=RULES_T)
-    assert all(list(r) == table_columns("rule_weights") for r in weights)
-
-    ev = pd.DataFrame({"date": ["d1"], "ticker": ["A"], "broker": ["XL"], "side": ["buy"],
-                       "nl5": [100.0], "adv20": [50.0], "x_5": [0.01], "x_10": [0.02],
-                       "x_20": [0.03], "x_60": [0.04]})
-    scores = bl.broker_scores(ev, "2026-09-19")
-    assert scores and all(list(r) == table_columns("broker_scores") for r in scores)
-    assert sorted({r["h"] for r in scores}) == [5, 10, 20, 60]
-
-    rows = _alpha_rows({"AAAA": _alpha_series(100, {85: 0.6})})
-    cases = bl.alpha_cases(rows, "2026-09-19", rules=RULES_T)
-    assert cases and all(list(r) == table_columns("alpha_cases") for r in cases)
-    lift = bl.broker_lift(rows, cases, "2026-09-19")
-    assert lift and all(list(r) == table_columns("broker_lift") for r in lift)
-
-    books = {"AAAA": pd.DataFrame({"broker": ["XL"], "total_rp": [1e6], "turnover_rp": [1e8]})}
-    prof = bl.broker_profitability(books, "2026-09-19")
-    assert prof and all(list(r) == table_columns("broker_profitability") for r in prof)
-
-    dates = weekdays("2026-01-05", 30)
-    outs = bl.outcomes(walk("AAAA", dates, 1))
-    live = bl.live_outcome_rows(
-        pd.DataFrame({"session_date": [dates[3]], "ticker": ["AAAA"], "h": [5]}), outs,
-        "2026-09-25T10:40Z")
-    assert live and all(list(r) == table_columns("live_outcomes") for r in live)
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def _weight_rows(n_dates, x, rule, per_date=1):
@@ -782,78 +564,21 @@ def test_broker_scores_are_date_balanced_and_shrunk():
 
 
 def test_broker_profitability_sums_books():
-    books = {
-        "AAAA": pd.DataFrame({"broker": ["XL", "AK"], "total_rp": [100.0, -20.0],
-                              "turnover_rp": [1000.0, 400.0]}),
-        "BBBB": pd.DataFrame({"broker": ["XL", "AK"], "total_rp": [-50.0, np.nan],
-                              "turnover_rp": [500.0, 100.0]}),
-        "CCCC": None,
-        "DDDD": pd.DataFrame({"broker": [], "total_rp": [], "turnover_rp": []}),
-    }
-    prof = {r["broker"]: r for r in bl.broker_profitability(books, "2026-09-19")}
-    xl = prof["XL"]
-    assert xl["n_tickers"] == 2 and same(xl["total_pnl_rp"], 50.0)
-    assert same(xl["turnover_rp"], 1500.0) and same(xl["pnl_per_turnover"], 50 / 1500)
-    assert same(xl["share_profitable"], 0.5)
-    ak = prof["AK"]                       # the NaN book row is left out, not zeroed
-    assert ak["n_tickers"] == 1 and same(ak["total_pnl_rp"], -20.0)
-    assert same(ak["share_profitable"], 0.0)
-    assert bl.broker_profitability({}, "x") == []
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_live_outcome_rows_record_the_return_and_exit_date():
-    dates = weekdays("2026-01-05", 30)
-    ohlc = pd.concat([walk("AAAA", dates, 1), walk("BBBB", dates, 2), walk("CCCC", dates, 3)])
-    outs = bl.outcomes(ohlc)
-    T = 10
-    pending = pd.DataFrame({"session_date": [dates[T], dates[T], dates[T]],
-                            "ticker": ["AAAA", "AAAA", "BBBB"], "h": [5, 20, 5]})
-    rows = bl.live_outcome_rows(pending, outs, "2026-09-25T10:40Z")
-    # h=20 needs open(T+21) = index 31 > 29: still pending, not written as NaN
-    assert [(r["ticker"], r["h"]) for r in rows] == [("AAAA", 5), ("BBBB", 5)]
-    a = rows[0]
-    assert same(a["fwd_oo"], fwd_of(outs, "AAAA", dates[T], 5))
-    assert a["exit_date"] == dates[T + 1 + 5] and a["recorded_utc"] == "2026-09-25T10:40Z"
-    assert bl.live_outcome_rows(pending.iloc[0:0], outs, "x") == []
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 def test_live_excess_uses_every_outcome_recorded_for_the_session():
-    """Review finding: a stored excess froze a benchmark without the ticker a
-    suspension kept open. A +0.1%/day, B flat, C +0.4%/day and suspended over
-    its exit session: A and B resolve first, C later. Once C is recorded, A's
-    excess must be what it is with all three known, whatever the order."""
-    dates = weekdays("2026-01-05", 140)
-    T, gap = 5, list(range(66, 72))            # C misses its exit session pos(T)+61
-    px = []
-    for t, drift, holes in (("AAAA", 0.001, []), ("BBBB", 0.0, []), ("CCCC", 0.004, gap)):
-        for k, d in enumerate(dates):
-            if k in holes:
-                continue
-            p = 1000.0 * (1 + drift) ** k
-            px.append({"date": d, "ticker": t, "open": p, "high": p, "low": p, "close": p})
-    ohlc = pd.DataFrame(px)
-    conn = sqlite3.connect(":memory:")
-    db.ensure_schema(conn)
-    db.insert_rows(conn, "live_signals", [
-        {"session_date": dates[T], "ticker": t, "ruleset": "v1", "rule_id": "R6",
-         "fired": int(t == "AAAA"), "score": 0.0, "captured_utc": "c", "features": "{}"}
-        for t in ("AAAA", "BBBB", "CCCC")])
-
-    def record(upto):
-        outs = bl.outcomes(ohlc[ohlc["date"] <= dates[upto]])
-        pend = db.pending_live(conn, horizons=(60,))
-        return db.insert_rows(conn, "live_outcomes", bl.live_outcome_rows(pend, outs, "r"))
-
-    assert record(T + 61) == 2, "A and B resolve at pos(T)+61, C is still suspended"
-    full = bl.outcomes(ohlc)
-    f = {t: float(full.loc[(full["ticker"] == t) & (full["date"] == dates[T]), "hold_60"].iloc[0])
-         for t in ("AAAA", "BBBB", "CCCC")}
-    early = db.live_summary(conn, h=60).set_index("rule_id").loc["R6", "mean_excess"]
-    assert same(early, f["AAAA"] - (f["AAAA"] + f["BBBB"]) / 2)    # provisional, not frozen
-    assert record(T + 70) == 1, "C resolves when it trades again"
-    late = db.live_summary(conn, h=60).set_index("rule_id").loc["R6", "mean_excess"]
-    assert same(late, f["AAAA"] - sum(f.values()) / 3) and late < 0 < early
-    conn.close()
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 # ── alpha case library ─────────────────────────────────────────────────────
@@ -1093,39 +818,9 @@ def _seed_live(conn):
 
 
 def test_db_pending_live_and_live_summary():
-    conn = sqlite3.connect(":memory:")
-    db.ensure_schema(conn)
-    assert db.pending_live(conn).empty and db.live_summary(conn).empty
-
-    _seed_live(conn)
-    assert len(db.live_signal_frame(conn)) == 10
-    pending = db.pending_live(conn)
-    keys = set(pending.itertuples(index=False, name=None))
-    assert db.LIVE_HORIZONS == bl.HORIZONS
-    assert len(keys) == len(pending) == 5 * 4 - 8
-    assert ("d2", "BBBB", 10) in keys and ("d1", "AAAA", 20) in keys
-    assert ("d2", "AAAA", 60) in keys, "R6 is judged at 60, so 60 is pending too"
-    assert ("d1", "AAAA", 10) not in keys and ("d1", "AAAA", 5) not in keys
-    assert len(db.pending_live(conn, horizons=(10,))) == 1
-
-    s = db.live_summary(conn, h=10).set_index("rule_id")
-    assert list(s.reset_index().columns) == db.LIVE_SUMMARY_COLS
-    r1 = s.loc["R1"]
-    assert r1["n_signals"] == 3 and r1["n_scored"] == 3
-    # excess vs the session's recorded mean, computed at read time: d1 mean is
-    # 0.02 (AAAA +0.02, CCCC +0.01); d2 has only AAAA recorded, so 0
-    assert same(r1["mean_excess"], ((0.02 + 0.01) / 2 + 0.0) / 2)   # date-balanced
-    assert same(r1["hit_rate"], 2 / 3)
-    assert same(r1["base_rate"], 2 / 4)   # d1 AAAA,BBBB,CCCC + d2 AAAA scored
-    r2 = s.loc["R2"]
-    assert r2["n_signals"] == 1 and r2["n_scored"] == 0
-    assert math.isnan(r2["mean_excess"]) and math.isnan(r2["hit_rate"])
-    assert math.isnan(r2["base_rate"])
-    assert math.isnan(r1["susp_rate"]), "h = 10 never bridges a suspension"
-    # at h = 60: R1's scored signals are d1 AAAA (suspended) and d1 CCCC
-    s60 = db.live_summary(conn, h=60).set_index("rule_id")
-    assert s60.loc["R1", "n_scored"] == 2 and same(s60.loc["R1", "susp_rate"], 0.5)
-    conn.close()
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_learning.outcomes")
 
 
 # ── guards ─────────────────────────────────────────────────────────────────

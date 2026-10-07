@@ -204,6 +204,8 @@ def d_state_placebo(frame, mask, draw):
 # ── features ───────────────────────────────────────────────────────────────
 def price_features(panel):
     """Variant A on the Gate-A panel; no future row enters any column."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_features.price_features")
     px = panel.sort_values(KEY, kind="mergesort").reset_index(drop=True)
     g = px.groupby("ticker", sort=False)["volume"]
     vol_ma5 = g.transform(lambda s: s.shift(1).rolling(5, min_periods=5).mean())
@@ -303,6 +305,8 @@ def assert_no_label_features(columns):
 
 def build_features(inputs, arm, c_placebo_draw=None, daily=None):
     """Decision-row feature matrix for one timing arm. Returns (frame, provenance)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_features.build_features")
     lag = TIMING_ARMS[arm]
     daily = daily or broker_daily(inputs["axis"], inputs["broker"], inputs["calendar"])
     ledger = feature_ledger(daily["codes"])

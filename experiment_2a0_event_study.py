@@ -271,6 +271,8 @@ def event_return(
     prices: dict[str, PriceSeries],
     ihsg: pd.Series,
 ) -> dict | None:
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_2a0_event_study.event_return")
     px = prices.get(ticker)
     if px is None:
         return None
@@ -294,6 +296,8 @@ def construct_returns(
     prices: dict[str, PriceSeries],
     ihsg: pd.Series,
 ) -> pd.DataFrame:
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_2a0_event_study.construct_returns")
     records = []
     for event in events.itertuples(index=False):
         for horizon in HORIZONS:
@@ -455,6 +459,8 @@ def holm_adjust(pvalues: list[float]) -> list[float]:
 
 
 def run_study(events: pd.DataFrame, prices_path: Path, ihsg_path: Path) -> dict:
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_2a0_event_study.run_study")
     price_frame, prices = load_prices(prices_path)
     idx_calendar = pd.DatetimeIndex(sorted(price_frame["date"].unique()))
     ihsg = load_ihsg(ihsg_path)
@@ -570,6 +576,8 @@ def run_study(events: pd.DataFrame, prices_path: Path, ihsg_path: Path) -> dict:
 
 
 def main() -> int:
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_2a0_event_study.main")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ownership-db", type=Path, default=Path("neobdm_ownership.db"))
     parser.add_argument("--prices", type=Path, default=Path("ohlc.parquet"))

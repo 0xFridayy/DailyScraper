@@ -406,6 +406,8 @@ def _vwap(lots, values):
 
 def average_cost_book(brokers, ohlc, anchor):
     """One row per broker that traded since the anchor (spec §3), largest position first."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book.average_cost_book")
     axis = ohlc.loc[ohlc["date"] >= anchor, "date"].tolist()
     rows = brokers[brokers["date"] >= anchor]
     if rows.empty or not axis:
@@ -532,6 +534,8 @@ def _rolling_extreme(values, w, how):
 
 def rolling_state(brokers, ohlc, flags):
     """Every §4.1 feature for every session of one ticker, each using only sessions <= T."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book.rolling_state")
     dates = ohlc["date"].tolist()
     n = len(dates)
     codes = sorted(brokers["broker"].unique().tolist()) if len(brokers) else []
@@ -593,6 +597,8 @@ def rolling_state(brokers, ohlc, flags):
 
 def ticker_bundle(data, ticker, regimes):
     """Frames, flags, anchor, book, curves and rolling state for one payload."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book.ticker_bundle")
     brokers, ohlc = frames_from_payload(data, ticker)
     flags = basis_flags(brokers, ohlc, (regimes or {}).get(ticker, []))
     dates = ohlc["date"].tolist()

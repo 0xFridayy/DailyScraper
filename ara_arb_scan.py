@@ -61,33 +61,32 @@ OWNER_BROKERS = {
 
 
 # ------------------------------------------------------------------ limits
+from price_contract import ara_bound, model_tick, model_snap, model_limit_price
+
+
 def ara_limit(p):
-    return 0.35 if p < 200 else (0.25 if p <= 5000 else 0.20)
+    return ara_bound(p)
 
 
 def tick(p):
-    return 1 if p < 200 else (2 if p < 500 else (5 if p < 2000 else (10 if p < 5000 else 25)))
+    return model_tick(p)
 
 
 def _snap(raw, down):
-    t = tick(raw)
-    v = np.floor(raw / t) * t if down else np.ceil(raw / t) * t
-    if tick(v) != t:                       # the snap crossed a tick boundary
-        t = tick(v)
-        v = np.floor(raw / t) * t if down else np.ceil(raw / t) * t
-    return v
+    return model_snap(raw, down)
 
 
 def ara_price(prev):
-    return _snap(prev * (1 + ara_limit(prev)), True)
+    return model_limit_price(prev, True)
 
 
 def arb_price(prev):
-    return _snap(prev * (1 + ARB_LIM), False)
+    return model_limit_price(prev, False)
 
 
-# ------------------------------------------------------------------ loading
 def load_prices(con):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_scan.load_prices")
     px = pd.read_sql("select * from price_history", con)
     px['date'] = pd.to_datetime(px['date'])
     px = px.sort_values(['ticker', 'date']).reset_index(drop=True)
@@ -168,6 +167,8 @@ def load_brokers(con, px):
 
 # ------------------------------------------------------------------ features
 def build(con):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_scan.build")
     px = load_prices(con)
     brk = load_brokers(con, px)
     d = px.merge(brk, on=['date', 'ticker'], how='left').sort_values(['ticker', 'date']).reset_index(drop=True)
@@ -238,6 +239,8 @@ def model():
 
 
 def main(top):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_scan.main")
     con = sqlite3.connect(DB)
     d = build(con)
     con.close()

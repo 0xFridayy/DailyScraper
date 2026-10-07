@@ -324,6 +324,8 @@ def job_columns(family, job):
 
 # ── context, rows, placebos ────────────────────────────────────────────────
 def load_context():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.load_context")
     inputs = features.load_inputs()
     daily = features.broker_daily(inputs["axis"], inputs["broker"], inputs["calendar"])
     ledger = features.feature_ledger(daily["codes"])
@@ -648,6 +650,8 @@ def dry_run():
 
 
 def main(argv=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.main")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", "--verify-plan", dest="dry_run", action="store_true")
@@ -675,6 +679,8 @@ def main(argv=None):
 
 def execute_stage1(manifest_path=MANIFEST_PATH):
     """The real Stage-1 execution. Verifies the manifest first; writes new, never-overwritten outputs."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.execute_stage1")
     authorisation = require_execution_manifest(manifest_path)
     contract.assert_frozen()
     with open(manifest_path, encoding="utf-8") as fh:

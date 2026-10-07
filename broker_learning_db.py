@@ -309,6 +309,8 @@ def live_summary(conn, h=10):
     susp_rate   share of scored signals whose window bridged a suspension;
                 NaN where no scored signal carries one (every h but 60)
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.live_summary")
     sig = _frame(conn, "SELECT session_date, ticker, rule_id, fired FROM live_signals")
     if sig.empty:
         return pd.DataFrame(columns=LIVE_SUMMARY_COLS)

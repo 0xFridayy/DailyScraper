@@ -71,6 +71,8 @@ def _load_dotenv():
 
 def load_panel(conn):
     """(date, ticker) -> (close, high, low), plus the sorted list of panel dates."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("evaluate_signals.load_panel")
     panel, dates = {}, set()
     for date, ticker, close, high, low in conn.execute(
             "select date, ticker, close, high, low from market_summary_daily "
@@ -119,6 +121,8 @@ def outcome(panel, dates, ticker, signal_date, horizon):
     """Return (ret, mfe, mae) in %, entering at the close of the day AFTER the
     signal and exiting `horizon` trading days later. None if the window is not
     fully covered by the panel."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("evaluate_signals.outcome")
     try:
         i = dates.index(signal_date)
     except ValueError:
@@ -170,6 +174,8 @@ def summarise(samples):
 
 
 def evaluate(conn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("evaluate_signals.evaluate")
     panel, dates = load_panel(conn)
     signals = load_signals(conn)
     status = load_source_status(conn)
@@ -307,6 +313,8 @@ def send_telegram(message):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("evaluate_signals.main")
     _load_dotenv()
     conn = sqlite3.connect(DB_PATH)
     try:

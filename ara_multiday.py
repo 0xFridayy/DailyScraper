@@ -63,6 +63,8 @@ def model():
 
 
 def load(min_turn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.load")
     path = os.path.join(HERE, "panel.parquet")
     if not os.path.exists(path):
         sys.exit("panel.parquet not found -- run inventory_features.py first "
@@ -78,6 +80,8 @@ def load(min_turn):
 
 def add_horizon_labels(d, h):
     """Forward ARA/ARB over T+1..T+h, plus the entry price and realised exits."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.add_horizon_labels")
     g = d.groupby("ticker", group_keys=False)
 
     fwd_ara = pd.concat([g["ARA"].shift(-k) for k in range(1, h + 1)], axis=1)
@@ -371,6 +375,8 @@ def section_robust(preds, cut=0.999):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.main")
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon", type=int, default=5)
     ap.add_argument("--min-turn", type=float, default=0.5)

@@ -61,8 +61,15 @@ def session_episode_ids(panel, sessions):
     date): a new episode starts wherever the ticker's previous row is not the
     immediately preceding entry of `sessions` (the sorted clean price session
     axis)."""
+    from price_contract_frame import default_registry
+    registry = default_registry()
     pos = panel["date"].map({d: i for i, d in enumerate(sessions)})
-    return pos.groupby(panel["ticker"]).diff().ne(1).groupby(panel["ticker"]).cumsum()
+    cuts = pos.groupby(panel["ticker"]).diff().ne(1)
+    previous = panel.groupby("ticker")["date"].shift(1)
+    for i, (ticker, start, end) in enumerate(zip(panel.ticker, previous, panel.date)):
+        if isinstance(start, str) and any(start < e.session <= end for e in registry.matching(ticker, "REGULAR")):
+            cuts.iloc[i] = True
+    return cuts.groupby(panel["ticker"]).cumsum()
 
 
 def _previous_session_observed(bf, sessions):
@@ -82,6 +89,8 @@ def build_episode_frame(conn, *, broker_flow_db_path, broker_flow_manifest_path)
     Both broker-flow arguments are required; see load_canonical_inputs() for
     the snapshot checks and what it raises. Provenance:
     panel.attrs["broker_flow"]."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_episode_data.build_episode_frame")
     px, bf, canonical, image = wfb.load_canonical_inputs(
         conn, broker_flow_db_path=broker_flow_db_path,
         broker_flow_manifest_path=broker_flow_manifest_path,

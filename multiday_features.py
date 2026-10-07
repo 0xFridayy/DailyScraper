@@ -56,6 +56,8 @@ def _buy_streak(s, w):
 
 
 def build_panel_with_multiday(conn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("multiday_features.build_panel_with_multiday")
     px = clean_panel(conn, horizons=(1,), lags=(1, 5, 10))
     bf = pd.read_sql("SELECT date, ticker, broker_code, netval FROM broker_flow", conn)
     bf = bf.merge(px[["date", "ticker"]], on=["date", "ticker"], how="inner")

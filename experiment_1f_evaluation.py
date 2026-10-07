@@ -152,6 +152,8 @@ def _search_exit(e, ticker, open_ok, step_ok, down_blocked):
 
     Returns (exit_row or None, unresolved_reason or None, blocked_down_attempts, unusable_open_attempts).
     The ticker's rows are in calendar order, so row e+1 is the first attempt (T+2 when contiguous)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation._search_exit")
     n = len(ticker)
     k = e + 1
     blocked = unusable = 0
@@ -170,6 +172,8 @@ def _search_exit(e, ticker, open_ok, step_ok, down_blocked):
 
 def slot_outcomes(panel, calendar):
     """Per decision row: attempted-H1 execution status, holding period and returns per view."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.slot_outcomes")
     px = panel.sort_values(KEY, kind="mergesort").reset_index(drop=True)
     calpos = {d: i for i, d in enumerate(calendar)}
     pos = px["date"].map(calpos).to_numpy(np.int64)

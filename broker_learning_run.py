@@ -244,6 +244,8 @@ def load_items(tickers, mode, raw_dir, legacy, regimes, failed, empty=None):
     `failed` with a reason; the run renders without it rather than stopping. A payload with
     zero sessions goes to `empty` instead (module docstring).
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.load_items")
     items, seen, unreadable = [], set(), {}
     empty = {} if empty is None else empty
     for t, data in bc.iter_cached(tickers, mode, raw_dir=raw_dir, legacy=legacy,
@@ -557,6 +559,8 @@ def _fetch(tickers, mode, raw_dir, failed, conn, run_id, empty):
 
 
 def run_daily(a):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.run_daily")
     started = _now()
     stamp = _stamp(started)
     t0 = time.time()
@@ -699,6 +703,8 @@ def write_history(bundles_frames, as_of, out_dir=HISTORY_DIR, overlap_sessions=H
 
 def learn(rows, events, ohlc, books, as_of, window):
     """The weekly metric layer: {table: rows} plus the numbers for runs.note."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.learn")
     t = time.time()
     outs = bl.outcomes(ohlc)
     rows_x = bl.attach_excess(rows, outs)
@@ -735,6 +741,8 @@ def learn(rows, events, ohlc, books, as_of, window):
 
 
 def run_weekly(a):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.run_weekly")
     started = _now()
     stamp = _stamp(started)
     t0 = time.time()
@@ -831,6 +839,8 @@ def _weekly(a, conn, regimes, stamp, t0):
 # ── render ─────────────────────────────────────────────────────────────────
 
 def run_render(a):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.run_render")
     started = _now()
     tickers = _tickers_arg(a.tickers) or bc.load_watchlist()
     path = a.db or bdb.DB_PATH
@@ -901,6 +911,8 @@ def _load_dotenv(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 
 def main(argv=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.main")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     _load_dotenv()
     a = parse_args(argv)

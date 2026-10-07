@@ -885,3 +885,31 @@ def signal_status_from_rows(source, rows):
 
 def table_exists(conn, name):
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def price_source_context(capture_date, *, source_session=None, session_evidence=None,
+                         representation="UNKNOWN", representation_evidence=None):
+    """Consumer metadata. Capture dates and matching HLC never verify a session.
+
+    Explicit source evidence is required for session and representation claims.
+    This adapter does not infer an exchange date from a clock/date offset.
+    """
+    from price_contract import canonical_session, RAW_ACTUAL
+    from idx_calendar import is_idx_session, IdxCalendarUnavailable
+    context = {"capture_date": capture_date, "source_session": None,
+               "session_status": "UNKNOWN", "input_representation": "UNKNOWN",
+               "session_evidence": session_evidence,
+               "representation_evidence": representation_evidence}
+    def evidence(value):
+        return (isinstance(value, dict) and bool(value.get("source_document_id"))
+                and isinstance(value.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]))
+    if evidence(session_evidence):
+        try:
+            if is_idx_session(canonical_session(source_session)):
+                context.update(source_session=source_session, session_status="VERIFIED")
+        except (ValueError, TypeError, IdxCalendarUnavailable):
+            context["session_status"] = "UNSUPPORTED"
+    if representation == RAW_ACTUAL and evidence(representation_evidence):
+        context["input_representation"] = RAW_ACTUAL
+    return context

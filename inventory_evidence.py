@@ -457,6 +457,8 @@ def _market_request_issue(row):
 
 
 def _market_measurement(rows, axis, n, market, kind, offset=0):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("inventory_evidence._market_measurement")
     doc = _measurement(rows, axis, n, offset=offset)
     dates = doc["window"]["session_dates"]
     if kind == "adv20":

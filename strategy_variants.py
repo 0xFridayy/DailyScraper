@@ -118,13 +118,15 @@ def get_walk_forward_predictions(panel, horizon=1, embargo=0):
     return pd.concat(pred_rows, ignore_index=True)
 
 
-def _index_price_history(px):
+def _index_price_history(px, *, registry=None):
+    from price_contract_frame import require_price_frame
+    require_price_frame(px, ("next_entry_open_admissible", "fwd_1"), registry=registry)
     px_by_ticker = {t: g.sort_values("date").reset_index(drop=True) for t, g in px.groupby("ticker")}
     date_idx_by_ticker = {t: {d: i for i, d in enumerate(g["date"])} for t, g in px_by_ticker.items()}
     return px_by_ticker, date_idx_by_ticker
 
 
-def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_days, tp_pct, sl_pct):
+def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_days, tp_pct, sl_pct, *, registry=None):
     """Decision at EOD(entry_date); enter at the NEXT session's OPEN.
 
     Entry used to be entry_date's close, which is not executable: the decision
@@ -166,18 +168,11 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     i0 = idx_map[entry_date]
     if i0 + 1 >= len(g):
         return None
-    if "gap_1" not in g:
-        raise ValueError(
-            "simulate_trade requires gap_1 -- build the price frame with "
-            "clean_panel(conn, horizons=(1,), open_anchored=True). Without "
-            "it, entry_price would read a raw open with no open-anchor "
-            "validity, ARA/ARB band, or gap guard applied at all -- exactly "
-            "the failure this contract exists to prevent."
-        )
-    if pd.isna(g.loc[i0, "gap_1"]):
-        return None  # decision->entry transition invalid: bad close step, or a fabricated open(T+1)
-    # i0 is the DECISION session; the position opens at i0+1's open, now
-    # certified valid by the gap_1 check above.
+    from price_contract_frame import require_price_frame, default_registry, span_result
+    registry = registry or default_registry()
+    identity = require_price_frame(g, ("next_entry_open_admissible", "fwd_1"), registry=registry)
+    if not g.loc[i0, "next_entry_open_admissible"]:
+        return None
     entry_price = g.loc[i0 + 1, "open"]
     if not (entry_price > 0):
         return None
@@ -188,6 +183,11 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
             break
         if k > 0 and "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
             return None  # quarantine/suspension gap: never bridge it as a hold day
+        held = span_result(ticker, g.loc[i0, "date"], g.loc[i0 + k, "date"],
+                           registry=registry, representation=identity["input_representation"],
+                           market=identity["market"], session_axis=g.date.tolist(), start_phase="OPEN")
+        if held.status != "COMPARABLE":
+            return None  # before examining TP/SL, so a reset cannot fabricate a fill
         day = g.loc[i0 + k]
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct

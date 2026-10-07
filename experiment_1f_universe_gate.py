@@ -2411,6 +2411,8 @@ def build_validated_panel(full_harvest, universe, calendar, horizons=HORIZONS,
 
     Returns (panel, flagged_full, universe_rows).
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_universe_gate.build_validated_panel")
     full = full_harvest.sort_values(["ticker", "date"]).reset_index(drop=True)
     flagged = detect(full)
     quarantined = set(zip(flagged.loc[flagged["suspect"], "date"],
@@ -2791,6 +2793,8 @@ def run_gate(xlsx_path=UNIVERSE_XLSX, refreeze=False, net_lot_sample=None,
     each one actually consumed, so the call path is an audited output rather
     than something a reader has to reconstruct from the source.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_universe_gate.run_gate")
     if establish_manifest:
         raise ManifestEstablishmentRefused(
             "Gate A cannot establish or re-establish its own manifest. A run "
@@ -3169,6 +3173,8 @@ def print_report(report):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_universe_gate.main")
     parser = argparse.ArgumentParser()
     parser.add_argument("--universe", default=UNIVERSE_XLSX)
     parser.add_argument("--json-out", default=None,

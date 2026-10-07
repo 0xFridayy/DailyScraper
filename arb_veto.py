@@ -81,6 +81,8 @@ def model():
 
 def score(panel_path=PANEL, top_n=TOP_N, min_turn=MIN_TURN, horizon=HORIZON):
     """(as_of date, DataFrame of the veto list) from the latest panel session."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("arb_veto.score")
     d = pd.read_parquet(panel_path)
     d["date"] = pd.to_datetime(d["date"])
     d = d[(d.turn20 >= min_turn) & (d.volume > 0) & d.close.notna()]
@@ -139,6 +141,8 @@ def write(as_of, top, picks_db=PICKS_DB, valid_days=VALID_DAYS):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("arb_veto.main")
     ap = argparse.ArgumentParser()
     ap.add_argument("--panel", default=PANEL)
     ap.add_argument("--picks-db", default=PICKS_DB)

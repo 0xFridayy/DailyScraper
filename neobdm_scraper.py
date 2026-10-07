@@ -2083,7 +2083,7 @@ def _broker_stalker_lines(data):
     for i, row in enumerate(data, 1):
         holders = row.get("holders", [])
         bag = ", ".join(
-            f"{h['code']} {_fmt_lot(h['cum'])} @{h.get('avg', 0):.0f}" for h in holders
+            f"{h['code']} {_fmt_lot(h['cum'])} cost unavailable" for h in holders
         ) or ("⚠️ gagal ambil" if row.get("holders_failed") else "tidak ada akumulator")
         lines.append(f"{i}. {row['symbol']} | retail jual {row['netval']}  savg: {row['savg']}")
         lines.append(f"   🎒 Bag holder: {bag}")

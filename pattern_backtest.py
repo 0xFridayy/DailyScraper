@@ -46,6 +46,8 @@ LONG_TYPES = {"breakout_up", "break_up", "bounce_up", "up_reversal"}
 
 
 def load_prices():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_backtest.load_prices")
     con = sqlite3.connect(DB)
     px = pd.read_sql("SELECT date, ticker, close FROM ohlcv", con)
     fl = pd.read_sql(
@@ -66,6 +68,8 @@ def build_regime(foreign):
 
 def simulate_trades(px, patterns):
     """Entry next close, exit close HOLD days later — per ticker, positionally safe."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_backtest.simulate_trades")
     trades = []
     for ticker, g in px.groupby("ticker"):
         g = g.sort_values("date").reset_index(drop=True)
@@ -114,6 +118,8 @@ def stats(rets, base_rate=None):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_backtest.main")
     px, foreign = load_prices()
     regime, agg_f, roll_f = build_regime(foreign)
 

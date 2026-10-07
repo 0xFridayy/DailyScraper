@@ -228,6 +228,8 @@ def outcomes(ohlc_all):
     Returns date, ticker, fwd_oo_5, fwd_oo_10, fwd_oo_20, fwd_oo_60,
     hold_60, susp_60, exit_60, entry_blocked.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.outcomes")
     need = ["date", "ticker", "open", "high", "low", "close"]
     missing = [c for c in need if c not in ohlc_all.columns]
     if missing:
@@ -288,6 +290,8 @@ def holder_returns(px, all_dates, h=HOLD_H):
     (NaN where undefined), susp_{h} (1.0 when a session inside the window
     was missing, NaN where hold is NaN) and exit_{h} (the exit session).
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.holder_returns")
     pos = {d: i for i, d in enumerate(all_dates)}
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     at = px["date"].map(pos)
@@ -664,6 +668,8 @@ def broker_profitability(books, as_of):
     This is mark-to-market trading P/L of a broker CODE over the rolling
     window. It is not a statement about who owns what.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.broker_profitability")
     frames = []
     for ticker, book in books.items():
         if book is None or len(book) == 0:
@@ -716,6 +722,8 @@ def live_outcome_rows(pending, outs, recorded_utc):
     recorded fwd_oo instead, over every outcome recorded for that session,
     exactly as attach_excess does retrospectively.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.live_outcome_rows")
     if pending is None or len(pending) == 0:
         return []
     o = outs.sort_values(["ticker", "date"]).reset_index(drop=True)

@@ -310,6 +310,8 @@ def check_panel(problems, notes, stats, broker_flow_manifest=None):
 def check_model_runs(panel, problems, notes, stats):
     """One real walk-forward cycle end to end: does it fit, and are the outputs
     finite? Cheaper than the full backtest, catches the same breakage."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("check_ml_health.check_model_runs")
     from walk_forward_backtest import run_walk_forward
 
     if panel is None or panel.empty:

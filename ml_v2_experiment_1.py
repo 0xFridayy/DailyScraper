@@ -153,6 +153,8 @@ def build_experiment_panel(conn):
     price_audit.add_forward_returns builds; it was removed for exactly the
     silent-failure risk this docstring used to warn about.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.build_experiment_panel")
     px = clean_panel(conn, horizons=(1,), lags=(1, 3, 5, 10, 20), open_anchored=True)
     bf = pd.read_sql(
         "SELECT date, ticker, broker_code, bval, sval, netval, bavg, savg "
@@ -245,6 +247,8 @@ def summarize_predictions(predictions):
 
 
 def run_experiment(panel, feature_sets, splits):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.run_experiment")
     results = []
     predictions = {}
     reference_keys = None
@@ -305,6 +309,8 @@ def print_results(table):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.main")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--determinism-check", action="store_true",

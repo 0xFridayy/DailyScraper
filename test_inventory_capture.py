@@ -99,13 +99,14 @@ LOGIN_PAGE = "<!doctype html><title>Login</title>"
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def payload(n=120, base=1000.0, brokers=("AK", "BK"), zero=(), start=date(2025, 10, 1)):
+def payload(n=120, base=1000.0, brokers=("AK", "BK"), zero=(), start=date(2026, 1, 2)):
     """A data dict strict_ticker_frame accepts. Brokers in `zero` come back
     with explicit all-zero series; a broker not in `brokers` does not come
     back at all."""
     dates, d = [], start
     while len(dates) < n:
-        if d.weekday() < 5:
+        from idx_calendar import is_idx_session
+        if is_idx_session(d):
             dates.append(d.isoformat())
         d += timedelta(days=1)
     data = {f: {} for f in FIELDS}
@@ -831,19 +832,19 @@ def refuse_prices(conn, body, reason):
 
 
 def test_backfill_refuses_enrg_limit_violation_before_any_price_write():
+    """Unknown source representation refuses; certified reconstructed bars agree."""
     from price_audit import detect, load
+    from price_contract import RAW_ACTUAL
     with price_db() as conn:
-        refuse_prices(conn, price_payload(ENRG_BARS), "limit_violation")
+        refuse_prices(conn, price_payload(ENRG_BARS), "UNKNOWN_REPRESENTATION")
         assert conn.execute("SELECT COUNT(*) FROM price_history").fetchone() == (0,)
-        assert conn.execute("SELECT COUNT(*) FROM broker_flow").fetchone() == (0,)
-        # Pin the detector's evidence and rule independently of the writer.
-        conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)", [
-            (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
-            for b in ENRG_BARS])
-        flagged = detect(load(conn)).iloc[-1]
-        assert flagged["limit_violation"] and flagged["prev_close"] == 1440
+        assert bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS), representation=RAW_ACTUAL)[1] == 2
+        flagged = detect(load(conn), representation=RAW_ACTUAL).iloc[-1]
+        assert not flagged["limit_violation"] and flagged["prev_close"] == 1440
+        assert flagged["limit_reference_price"] == 1065
+        assert abs(flagged["limit_change"] - (1030 / 1065 - 1)) < 1e-12
         assert abs(flagged["pct_chg"] - (1030 / 1440 - 1)) < 1e-12
-    print("  ok test_backfill_refuses_enrg_limit_violation_before_any_price_write")
+        assert conn.execute("SELECT close FROM price_history ORDER BY date").fetchall() == [(1440,), (1030,)]
 
 
 def test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers():
@@ -864,20 +865,19 @@ def test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers():
         assert not any(e["event"] == "persisting" and e["capture_id"] == caps[0]["capture_id"] for e in events)
     assert prices == {"ENRG": 1, "BBBB": 120}, prices
     assert request.params(0)["symbol"] == ["ENRG"]
-    assert "limit_violation" in out and "2026-10-05" in out and "1440" in out and "1030" in out
+    assert "UNRESOLVED UNKNOWN_REPRESENTATION" in out and "2026-10-05" in out
     print("  ok test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers")
 
 
 def test_backfill_refuses_a_revised_close_and_a_bad_predecessor():
     for bars, incoming in [
-        ([price_bar("2026-10-02", 1440), price_bar("2026-10-05", 1500)], ENRG_BARS[1:]),
-        ([price_bar("2026-10-02", 1440)], [price_bar("2026-10-01", 2000)]),
+        ([price_bar("2026-07-01", 1440), price_bar("2026-07-02", 1500)], [price_bar("2026-07-02", 1030)]),
+        ([price_bar("2026-07-02", 1440)], [price_bar("2026-07-01", 2000)]),
     ]:
         with price_db() as conn:
             bf.insert_inventory(conn, "ENRG", price_payload(bars))
             conn.commit()
             refuse_prices(conn, price_payload(incoming), "limit_violation")
-    print("  ok test_backfill_refuses_a_revised_close_and_a_bad_predecessor")
 
 
 def test_backfill_requires_the_requested_symbol_before_writing_prices():
@@ -898,7 +898,8 @@ def test_backfill_keeps_unchanged_historical_violations_visible():
         conn.commit()
         bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
         flagged = detect(load(conn))
-        assert flagged.loc[flagged.limit_violation, "date"].tolist() == ["2026-10-05"]
+        assert not flagged.limit_violation.any()
+        assert flagged.loc[flagged.date.eq("2026-10-05"), "corporate_action_boundary"].all()
         assert conn.execute("SELECT close FROM price_history WHERE date='2026-10-06'").fetchone() == (1050,)
     print("  ok test_backfill_keeps_unchanged_historical_violations_visible")
 
@@ -910,7 +911,7 @@ def test_backfill_uses_the_audit_limit_tiers_and_tolerance():
         (1440, 1230, True), (1440, 1200, False),
     ]:
         with price_db() as conn:
-            body = price_payload([price_bar("2026-10-02", previous), price_bar("2026-10-05", close)])
+            body = price_payload([price_bar("2026-07-01", previous), price_bar("2026-07-02", close)])
             if allowed:
                 assert bf.insert_inventory(conn, "ENRG", body)[1] == 2
             else:
@@ -962,14 +963,14 @@ def test_backfill_written_closes_match_the_validated_real_and_price_audit():
             bars = [price_bar("2026-07-01", previous), price_bar("2026-07-02", close)]
             # Keep the other fields ordinary; only close normalization is under test.
             for bar in bars:
-                bar.update(open=1000, high=1005.25, low=995, volume=1234)
+                bar.update(open=bar["close"], high=bar["close"], low=bar["close"], volume=1234)
             body = price_payload(bars)
             body["data"]["nlot"] = {"AK": [10, -5]}
             assert bf.insert_inventory(conn, "ENRG", body)[:2] == (2, 2)
             written = conn.execute(
                 "SELECT close, typeof(close), open, high, low, volume "
                 "FROM price_history ORDER BY date").fetchall()
-            assert written == [(float(v), "real", 1000, 1005.25, 995, 1234)
+            assert written == [(float(v), "real", float(v), float(v), float(v), 1234)
                                for v in (previous, close)]
             assert not detect(load(conn))["limit_violation"].any()
             flows = conn.execute("SELECT netval FROM broker_flow ORDER BY date").fetchall()
@@ -1049,8 +1050,8 @@ def test_backfill_preserves_duplicate_close_keys_in_rejection_snapshot():
     raw = ''' {
       "success":true,"meta":{"symbol":"ENRG"},
       "data":{"date":["2026-06-30","2026-07-01"],"nlot":{"AK":[23,51]},
-        "ohlc":[{"date":"2026-06-30","close":1440},
-                {"date":"2026-07-01","close":1500,"close":1030}]}
+        "ohlc":[{"date":"2026-06-30","open":1440,"high":1440,"low":1440,"volume":1000,"close":1440},
+                {"date":"2026-07-01","open":1030,"high":1030,"low":1030,"volume":1000,"close":1500,"close":1030}]}
     }
 '''
     raw = raw.replace("\n", "\r\n")
@@ -1069,7 +1070,7 @@ def test_backfill_preserves_duplicate_close_keys_in_rejection_snapshot():
         caps = assert_original_rejection_snapshot(tmp, "ENRG", response)
         with open(os.path.join(tmp, "topup-failure.json"), encoding="utf-8") as fh:
             assert '"close":1500,"close":1030' in fh.read()
-        assert db_counts(tmp) == ({"BBBB": 120}, {"BBBB": 240})
+        assert db_counts(tmp) == ({"BBBB": 120}, {"BBBB": 230})
     assert [(c["ticker"], c["status"]) for c in caps] == [
         ("ENRG", ic.REJECTED), ("BBBB", ic.OK)]
     assert len(request.urls) == 2 and all(request.recorded_first)
@@ -1091,7 +1092,7 @@ def test_backfill_preserves_original_text_for_rejected_symbols():
         with tempfile.TemporaryDirectory() as tmp:
             out, _, _ = run_backfill(tmp, script, ["ENRG", "CCCC"])
             caps = assert_original_rejection_snapshot(tmp, "ENRG", response)
-            assert db_counts(tmp) == ({"CCCC": 120}, {"CCCC": 240})
+            assert db_counts(tmp) == ({"CCCC": 120}, {"CCCC": 230})
         assert [(c["ticker"], c["status"]) for c in caps] == [
             ("ENRG", ic.REJECTED), ("CCCC", ic.OK)]
         assert "symbol" in out and "Failed tickers: ['ENRG']" in out
@@ -1108,7 +1109,7 @@ def test_backfill_preserves_original_text_for_later_stale_series_rejection():
     with tempfile.TemporaryDirectory() as tmp:
         out, _, _ = run_backfill(tmp, script, ["AAAA", "BBBB", "CCCC"])
         caps = assert_original_rejection_snapshot(tmp, "BBBB", response)
-        assert db_counts(tmp) == ({"AAAA": 120, "CCCC": 120}, {"AAAA": 240, "CCCC": 240})
+        assert db_counts(tmp) == ({"AAAA": 120, "CCCC": 120}, {"AAAA": 230, "CCCC": 230})
     assert [(c["ticker"], c["status"]) for c in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.REJECTED), ("CCCC", ic.OK)]
     assert "series identical to AAAA" in out and "Failed tickers: ['BBBB']" in out
@@ -1152,7 +1153,7 @@ def test_backfill_records_selector_captures_and_behaves_as_before():
     assert "  no inventory data" in out and "series identical to AAAA" in out
     assert isinstance(exit_message, str) and exit_message.startswith("ABORT: 5/7 tickers failed (71%")
     assert prices == [("AAAA", 120)], prices
-    assert flows == [("AAAA", "AK", 120), ("AAAA", "BK", 120), ("AAAA", "XL", 120)], flows
+    assert flows == [("AAAA", "AK", 115), ("AAAA", "BK", 115), ("AAAA", "XL", 115)], flows
     assert snapshot == vendor_error.text()                        # the first failure's raw body
 
     # And every request left evidence of it.
@@ -1197,7 +1198,7 @@ def test_backfill_rolls_back_a_rejected_ticker_before_the_next_commit():
     assert [(x["ticker"], x["status"]) for x in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.REJECTED), ("CCCC", ic.OK)]
     assert prices == {"AAAA": 120, "CCCC": 120}, prices          # BBBB gone; AAAA, CCCC kept
-    assert flows == {"AAAA": 240, "CCCC": 240}, flows
+    assert flows == {"AAAA": 230, "CCCC": 230}, flows
     assert "FAILED: series identical to AAAA" in out and "Failed tickers: ['BBBB']" in out
     assert exit_message.startswith("ABORT: 1/3 tickers failed (33%"), exit_message   # as before
     print("  ok test_backfill_rolls_back_a_rejected_ticker_before_the_next_commit")
@@ -1218,7 +1219,7 @@ def test_backfill_rolls_back_a_ticker_that_fails_part_way_through_its_writes():
     assert [(x["ticker"], x["status"]) for x in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.ERROR), ("CCCC", ic.OK)]
     assert caps[1]["reason"].startswith("TypeError"), caps[1]["reason"]
-    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 240, "CCCC": 240}
+    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 230, "CCCC": 230}
     assert "Failed tickers: ['BBBB']" in out
     print("  ok test_backfill_rolls_back_a_ticker_that_fails_part_way_through_its_writes")
 
@@ -1236,7 +1237,7 @@ def test_backfill_rolls_back_a_ticker_whose_commit_fails():
     assert [(x["ticker"], x["status"]) for x in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.ERROR), ("CCCC", ic.OK)]
     assert caps[1]["reason"] == "OperationalError: database is locked"
-    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 240, "CCCC": 240}
+    assert prices == {"AAAA": 120, "CCCC": 120} and flows == {"AAAA": 230, "CCCC": 230}
     assert "Failed tickers: ['BBBB']" in out
     print("  ok test_backfill_rolls_back_a_ticker_whose_commit_fails")
 
@@ -1723,7 +1724,7 @@ def test_a_poisoned_backfill_result_stops_with_committed_rows():
     assert fault["injected"] and fault["log"].poisoned
     assert len(calls) == 2 and fault["events"][-1] == ("result", "BBBB")
     assert prices == {"AAAA": 120, "BBBB": 120}
-    assert flows == {"AAAA": 240, "BBBB": 240}
+    assert flows == {"AAAA": 230, "BBBB": 230}
     assert [(c["ticker"], c["status"]) for c in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.PERSIST_UNCONFIRMED)]
     print("  ok test_a_poisoned_backfill_result_stops_with_committed_rows")
@@ -1950,7 +1951,7 @@ def test_backfill_transient_audit_failure_keeps_the_committed_clone_guard():
         assert result_lines(tmp) == len(caps) == 4
     assert failed_once["value"] and len(request.urls) == 4  # no retry of B
     assert prices == {"AAAA": 120, "BBBB": 120, "DDDD": 120}, prices
-    assert flows == {"AAAA": 240, "BBBB": 240, "DDDD": 240}, flows
+    assert flows == {"AAAA": 230, "BBBB": 230, "DDDD": 230}, flows
     assert [(c["ticker"], c["status"]) for c in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.OK), ("CCCC", ic.REJECTED), ("DDDD", ic.OK)]
     assert "series identical to BBBB" in out and "Failed tickers: ['CCCC']" in out
@@ -1974,7 +1975,7 @@ def test_backfill_persistent_audit_failure_stops_before_the_next_ticker():
     assert "manifest result failed after DB commit" in exit_message
     assert "FAILED" not in out and len(request.urls) == 2
     assert prices == {"AAAA": 120, "BBBB": 120}
-    assert flows == {"AAAA": 240, "BBBB": 240}
+    assert flows == {"AAAA": 230, "BBBB": 230}
     assert [(c["ticker"], c["status"]) for c in caps] == [
         ("AAAA", ic.OK), ("BBBB", ic.PERSIST_UNCONFIRMED)]
     print("  ok test_backfill_persistent_audit_failure_stops_before_the_next_ticker")

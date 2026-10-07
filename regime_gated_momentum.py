@@ -56,6 +56,8 @@ MIN_SIGNAL_DAYS_FOR_SELECTION = 20
 
 
 def load_neobdm(broker_flow_manifest_path, db_path=DB_PATH):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.load_neobdm")
     conn = connect_price_db(db_path)
     panel = build_panel(conn, broker_flow_db_path=db_path,
                         broker_flow_manifest_path=broker_flow_manifest_path)
@@ -77,6 +79,8 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date):
     """1-day fixed exit, no TP/SL, but with ARA entry-block + ARB roll-forward
     (same mechanic as ara_arb_simulation.simulate_trade_with_limits). Every
     transition must carry a gap-guarded fwd_1 from clean_panel()."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.simulate_trade")
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
     if g is None or entry_date not in idx_map:
@@ -205,6 +209,8 @@ def select_threshold(search_arm, min_signal_days=MIN_SIGNAL_DAYS_FOR_SELECTION):
 
 
 def main(argv=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.main")
     args = parse_cli(argv, description="Regime-gated momentum on the walk-forward signal.")
     panel, px = load_neobdm(args.broker_flow_manifest, args.db)
     px = annotate_limits(px)

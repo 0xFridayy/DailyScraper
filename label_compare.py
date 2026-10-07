@@ -53,6 +53,8 @@ PANEL = os.path.join(HERE, "panel.parquet")
 
 
 def load(panel_path, min_turn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.load")
     if not os.path.exists(panel_path):
         sys.exit(f"{panel_path} not found -- run harvest_inventory.py -> "
                  f"build_inventory_db.py -> inventory_features.py first")
@@ -80,6 +82,8 @@ def add_labels(d, up, down, h):
             point is that neither records which came FIRST, so a window that
             stopped out on day 2 and rallied on day 4 scores as a winner.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.add_labels")
     g = d.groupby("ticker", group_keys=False)
     entry = g["open"].shift(-1)
     hi = [g["high"].shift(-k) for k in range(1, h + 1)]
@@ -207,6 +211,8 @@ def section_trade(preds):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.main")
     ap = argparse.ArgumentParser()
     ap.add_argument("--panel", default=PANEL)
     ap.add_argument("--up", type=float, default=0.15)

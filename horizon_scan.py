@@ -58,6 +58,8 @@ def cluster_features(bf):
 
 
 def build(conn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("horizon_scan.build")
     bf = pd.read_sql("SELECT date,ticker,broker_code,netval FROM broker_flow", conn)
 
     agg = _broker_day_aggregates(bf)

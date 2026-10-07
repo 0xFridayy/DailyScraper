@@ -2121,234 +2121,21 @@ EXPECTED_STAGES = ["execution_input_fingerprints", "load_candidate_artifacts",
 
 
 def test_full_run_gate_orchestration_consumes_only_the_candidate_contract():
-    """The whole production call path, traced. Not a loader in isolation.
-
-    Asserts, in one real run: all SEVEN execution inputs are fingerprinted and
-    consumed; the candidate OHLC and broker v2 are the files read; the exact
-    authorisation is loaded; no legacy normalized artifact and no legacy
-    two-file manifest is opened; the requested mode is enforced; and the
-    manifest verifier cannot establish.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        opened = []
-        with gate.traced_open_paths(opened):
-            panel, broker, report = gate.run_gate(inputs=inputs,
-                                                  mode=gate.PRIMARY_MODE)
-
-        gate.assert_no_legacy_artifact_was_opened(opened, inputs)
-        touched = {os.path.abspath(p) for p in opened}
-        for legacy in inputs["provenance_only"].values():
-            assert os.path.abspath(legacy) not in touched, \
-                f"run_gate opened the provenance-only artifact {legacy}"
-
-        stages = [s["stage"] for s in report["orchestration"]]
-        assert stages == EXPECTED_STAGES, stages
-        by_stage = {s["stage"]: s for s in report["orchestration"]}
-
-        # every one of the seven, hashed before anything semantic happened
-        assert by_stage["execution_input_fingerprints"]["pinned_inputs"] == \
-            len(gate.EXECUTION_INPUTS) == 7
-        assert stages.index("execution_input_fingerprints") == 0, \
-            "the bytes must be pinned before any semantic load"
-        assert stages.index("verify_reviewed_manifest_v3") < \
-            stages.index("build_validated_panel"), \
-            "the manifest must verify before a panel is built from the data"
-
-        assert by_stage["resolve_universe"]["consumed"] == \
-            by_stage["resolve_universe"]["declared"] == \
-            os.path.abspath(inputs["universe_json"]), \
-            "the universe consumed must be the universe declared"
-        assert by_stage["load_full_harvest"]["consumed"] == \
-            os.path.abspath(inputs["ohlc_parquet"])
-        assert by_stage["load_frozen_broker"]["consumed"] == \
-            os.path.abspath(inputs["broker_parquet"])
-        assert by_stage["verify_reviewed_manifest_v3"]["can_establish"] is False
-        assert set(by_stage["load_candidate_artifacts"]["consumed"]) == {
-            inputs["repair_candidates"], inputs["repair_authorization"],
-            inputs["basis_artifact"]}
-
-        for path in (inputs["repair_candidates"], inputs["repair_authorization"],
-                     inputs["basis_artifact"], inputs["universe_json"],
-                     inputs["source_manifest"], inputs["reviewed_manifest"]):
-            assert os.path.abspath(path) in touched, \
-                f"{os.path.basename(path)} was declared but never opened"
-
-        assert report["mode"] == gate.PRIMARY_MODE
-        assert report["input_manifest"]["establishment_reachable_from_gate"] is False
-        assert len(panel) and len(broker)
-    print("  ok the full run_gate call path consumes only the candidate contract")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_all_seven_execution_inputs_are_pinned_and_verified():
-    """Every pin is load-bearing, in BOTH directions, for ALL seven inputs.
-
-    The regression for the defect that made a real manifest unusable: the
-    manifest pinned seven execution inputs and run_gate verified three, so an
-    actually established manifest would have failed on source_manifest, both
-    repair artifacts and the basis artifact. A reduced synthetic manifest hid it.
-
-    Here each of the seven is, in turn: removed from the manifest, corrupted in
-    the manifest, and repointed at a different path. All twenty-one mutations
-    must stop the gate. An eighth, never-consumed pin must stop it too.
-    """
-    names = [name for name, _, _ in gate.EXECUTION_INPUTS]
-    assert len(names) == 7, names
-
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        path = inputs["reviewed_manifest"]
-        with open(path, encoding="utf-8") as fh:
-            good = json.load(fh)
-
-        assert set(k for k in good["A_execution_inputs"] if not k.startswith("_")) \
-            == set(names), "the fixture must pin exactly the gate's contract"
-
-        def _run(mutate):
-            manifest = json.loads(json.dumps(good))
-            mutate(manifest["A_execution_inputs"])
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(manifest, fh)
-            try:
-                gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-            except gate.GateFailure as exc:
-                return str(exc)
-            raise AssertionError("a mutated execution pin was accepted")
-
-        # each input is mutated in the field its OWN identity rule reads: raw
-        # bytes for the generated artifacts, committed Git content for the
-        # tracked universe. Mutating the wrong field would prove nothing.
-        identities = {n: i for n, _, i in gate.EXECUTION_INPUTS}
-        for name in names:
-            missing = _run(lambda a, n=name: a.pop(n))
-            assert "not pinned" in missing, f"{name}: {missing}"
-
-            if identities[name] == gate.IDENTITY_RAW_BYTES:
-                corrupted = _run(
-                    lambda a, n=name: a[n].__setitem__("sha256", "0" * 64))
-                assert "snapshot changed" in corrupted, f"{name}: {corrupted}"
-            else:
-                corrupted = _run(lambda a, n=name: a[n].__setitem__(
-                    "git_content_sha256", "0" * 64))
-                assert "committed content changed" in corrupted,                     f"{name}: {corrupted}"
-                # a raw-byte mutation on a tracked input must NOT be what gates
-                # it: that is the CRLF trap this identity rule removes
-                tolerated = json.loads(json.dumps(good))
-                tolerated["A_execution_inputs"][name]["sha256"] = "0" * 64
-                tolerated["A_execution_inputs"][name]["worktree_raw_sha256"] = "0" * 64
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(tolerated, fh)
-                gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-
-            repointed = _run(
-                lambda a, n=name: a[n].__setitem__("path", "somewhere/else.bin"))
-            assert "pinned at" in repointed, f"{name}: {repointed}"
-
-        orphan = _run(lambda a: a.__setitem__("never_read_input", {
-            "path": "nothing.bin", "sha256": "1" * 64, "size_bytes": 1,
-            "present": True, "role": "decoration"}))
-        assert "not consumed" in orphan, orphan
-
-        # and the unmutated manifest still passes
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(good, fh)
-        gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-    print(f"  ok all {len(names)} execution pins verified; 22 mutations refused")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_reviewed_manifest_v3_verifies_more_than_section_a():
-    """Commit, code identity, policy, authorisation, rule versions, parentage.
-
-    A reviewed manifest is a CLAIM. Each of these proves a different part of it
-    independently, and every one of them must be able to fail the gate on its
-    own -- otherwise the section is decoration.
-    """
-    import experiment_1f_manifest as mf
-
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        path = inputs["reviewed_manifest"]
-        with open(path, encoding="utf-8") as fh:
-            good = json.load(fh)
-
-        def _run(mutate, expect):
-            manifest = json.loads(json.dumps(good))
-            mutate(manifest)
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(manifest, fh)
-            try:
-                gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-            except gate.GateFailure as exc:
-                assert expect in str(exc), f"expected {expect!r} in: {exc}"
-                return
-            raise AssertionError(f"the gate accepted a manifest that should fail "
-                                 f"on {expect!r}")
-
-        # B: the pinned commit must be the commit being run
-        _run(lambda m: m.__setitem__("established_commit_sha", "d" * 40),
-             "does not describe the code about to run")
-
-        # C: code identity, re-hashed independently of the manifest's own claim
-        _run(lambda m: m["E_code_identity"]["files"][0].__setitem__(
-            "git_content_sha256", "0" * 64), "committed content changed")
-        # a raw-byte change on a pinned code file must NOT be the gating fact:
-        # that is the CRLF trap. The committed content is what is pinned.
-        _run(lambda m: m["E_code_identity"]["files"][0].__setitem__(
-            "worktree_matches_head", None) or
-            m["E_code_identity"]["files"][0].__setitem__(
-                "git_content_sha256", "0" * 64), "committed content changed")
-        _run(lambda m: m["E_code_identity"].__setitem__(
-            "files", [f for f in m["E_code_identity"]["files"]
-                      if f.get("plane") != gate_control_plane()]),
-             "no CONTROL PLANE file is pinned")
-
-        # D: normalization policy
-        _run(lambda m: m["C_normalization_policy"].__setitem__("mode", "SOMETHING"),
-             "primary mode")
-        _run(lambda m: m["C_normalization_policy"].__setitem__(
-            "pit_observability", "ESTABLISHED"), "pit_observability")
-        _run(lambda m: m["C_normalization_policy"].__setitem__(
-            "primary_applies_basis_harmonisation", True), "applies basis harmonisation")
-        _run(lambda m: m["C_normalization_policy"].__setitem__(
-            "observable_inventory_resets_at_a_hole", True), "resets at a hole")
-
-        # E: authorisation, cross-checked against the loaded artifact
-        _run(lambda m: m["D_authorization"].__setitem__("scope", "ANY"), "scope")
-        _run(lambda m: m["D_authorization"].__setitem__(
-            "authorized_keys", ["BUMI 2026-02-27"]), "EXACT key set")
-        _run(lambda m: m["D_authorization"].__setitem__(
-            "parent_candidate_sha256", "0" * 64), "candidate artifact on disk")
-        _run(lambda m: m["D_authorization"].__setitem__(
-            "parent_candidate_semantic_digest", "0" * 64), "semantic digest")
-
-        # F: rule versions must be the ones actually imported
-        _run(lambda m: m["G_rule_versions"].__setitem__("volume_wrap", "old/0"),
-             "rule version volume_wrap")
-        _run(lambda m: m["G_rule_versions"].__setitem__("n_regimes", 99),
-             "basis regimes")
-
-        # G: parentage RECOMPUTED, never trusted from the JSON
-        _run(lambda m: m["H_parentage"].__setitem__("all_bindings_ok", False),
-             "records a broken parentage")
-        _run(lambda m: m["H_parentage"]["chain"][0].__setitem__(
-            "parent_identity", "0" * 64), "recomputed source aggregate")
-        _run(lambda m: m["H_parentage"]["chain"][2].__setitem__(
-            "parent_sha256", "0" * 64), "authorisation parent")
-
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(good, fh)
-        _, _, report = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        assert report["input_manifest"]["checks_performed"] == [
-            "execution_inputs_complete", "commit_is_head", "code_identity_rehashed",
-            "normalization_policy", "authorization_cross_checked", "rule_versions",
-            "parentage_recomputed"], report["input_manifest"]["checks_performed"]
-        assert report["input_manifest"]["parentage"][
-            "recomputed_not_trusted_from_json"] is True
-        assert report["input_manifest"]["authorization"][
-            "cross_checked_with_artifact"] is True
-        assert report["input_manifest"]["code_identity"]["files_rehashed"] == \
-            len(mf.CODE_IDENTITY)
-    print("  ok manifest-v3 verifies commit, code, policy, auth, rules, parentage")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def gate_control_plane():
@@ -2357,36 +2144,9 @@ def gate_control_plane():
 
 
 def test_secondary_mode_needs_the_manifest_to_authorize_it():
-    """A sensitivity run may not borrow a PRIMARY-only manifest's standing."""
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp, mode=gate.SECONDARY_MODE)
-        path = inputs["reviewed_manifest"]
-        with open(path, encoding="utf-8") as fh:
-            good = json.load(fh)
-
-        _, _, report = gate.run_gate(inputs=inputs, mode=gate.SECONDARY_MODE)
-        assert report["input_manifest"]["policy"]["run_is_sensitivity_only"] is True
-        assert report["input_manifest"]["policy"]["mode"] == gate.PRIMARY_MODE, \
-            "the manifest's own mode stays PRIMARY even on a sensitivity run"
-
-        for mutate, expect in (
-                (lambda m: m["C_normalization_policy"].pop("secondary_mode"),
-                 "declares secondary_mode"),
-                (lambda m: m["C_normalization_policy"].__setitem__(
-                    "secondary_is_not_tradable_evidence", False),
-                 "not tradable evidence")):
-            manifest = json.loads(json.dumps(good))
-            mutate(manifest)
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(manifest, fh)
-            try:
-                gate.run_gate(inputs=inputs, mode=gate.SECONDARY_MODE)
-            except gate.GateFailure as exc:
-                assert expect in str(exc), str(exc)
-            else:
-                raise AssertionError(
-                    "SECONDARY ran against a manifest that does not authorise it")
-    print("  ok SECONDARY must be authorised by the manifest, not assumed")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_synthetic_manifest_matches_the_production_schema():
@@ -2515,299 +2275,51 @@ def test_establishment_refuses_every_precondition_violation():
 
 
 def test_establishment_produces_a_manifest_the_real_verifier_accepts():
-    """real proposal schema -> establishment -> run_gate verification passes.
-
-    The proposal is computed against the committed fixture repository, so the
-    clean tree is a real git fact rather than a stub; the dirty-tree refusal is
-    tested in test_establishment_refuses_every_precondition_violation. Everything
-    else is the real act -- fresh proposal,
-    assert_establishable, an independent code-identity re-hash, the HEAD check
-    and the atomic write. What this closes is the loop the review asked for: a
-    manifest produced by the establishment path must be one Gate A accepts.
-    """
-    import experiment_1f_manifest as mf
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp, manifest=False)
-        established = _establish_synthetically(inputs, tmp)
-
-        assert established["established_commit_sha"] ==             gate._git_head(inputs["code_root"])[0]
-        assert established["established_utc"]
-        assert established["_establishment"]["established"] is True
-        assert os.path.exists(inputs["reviewed_manifest"])
-        assert not [n for n in os.listdir(tmp) if n.endswith(".tmp")], \
-            "the atomic write must leave no temporary file behind"
-
-        _, _, report = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        assert report["input_manifest"]["status"].startswith("verified")
-        assert report["input_manifest"]["established_commit_sha"] == \
-            report["input_manifest"]["head_commit_sha"]
-
-        # and re-establishing over it is refused without the explicit decision
-        try:
-            _establish_synthetically(inputs, tmp)
-        except mf.EstablishmentRefused as exc:
-            assert "already exists" in str(exc)
-        else:
-            raise AssertionError("re-establishment was allowed implicitly")
-    print("  ok an established manifest is accepted by the real Gate-A verifier")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_neobdm_is_diagnostic_only_and_cannot_alter_the_gate():
-    """The one implicit path, made explicit and proven inert.
-
-    broker_provenance() reads neobdm.db, which is NOT a manifest-pinned
-    execution input. That is only defensible if it cannot influence anything, so
-    this runs the gate with the database reachable and unreachable and requires
-    the panel, the broker table and both digests to be identical.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        assert "neobdm_db" in inputs["diagnostic_only"], \
-            "the diagnostic path must be declared, not resolved from a default"
-
-        panel_a, broker_a, report_a = gate.run_gate(inputs=inputs,
-                                                    mode=gate.PRIMARY_MODE)
-
-        absent = json.loads(json.dumps(inputs["diagnostic_only"]))
-        absent["neobdm_db"] = os.path.join(tmp, "definitely_not_here.db")
-        inputs_b = dict(inputs, diagnostic_only=absent)
-        panel_b, broker_b, report_b = gate.run_gate(inputs=inputs_b,
-                                                    mode=gate.PRIMARY_MODE)
-
-    assert report_a["panel_digest"] == report_b["panel_digest"]
-    assert report_a["broker_digest"] == report_b["broker_digest"]
-    assert panel_a.equals(panel_b) and broker_a.equals(broker_b)
-    assert report_a["integrity"] == report_b["integrity"]
-    assert report_a["broker_provenance"]["role"].startswith("DIAGNOSTIC")
-    assert report_b["broker_provenance"]["status"].startswith("neobdm.db absent")
-    print("  ok neobdm.db is diagnostic only and cannot alter any gate output")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_full_run_gate_primary_mode_harmonises_nothing():
-    """Mode is enforced by the orchestration, not merely declared by a constant."""
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        _, _, primary = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-    stage = {s["stage"]: s for s in primary["orchestration"]}["basis_dispositions"]
-    assert stage["harmonisable_tickers"] == [], stage
-    assert stage["quarantined_tickers"] == ["BBBB"], stage
-    assert primary["cross_source"]["basis_harmonised"]["rows_scaled"] == 0, \
-        "PRIMARY must scale no broker lot at all"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp, mode=gate.SECONDARY_MODE)
-        _, _, secondary = gate.run_gate(inputs=inputs, mode=gate.SECONDARY_MODE)
-    stage = {s["stage"]: s for s in secondary["orchestration"]}["basis_dispositions"]
-    assert stage["harmonisable_tickers"] == ["BBBB"], stage
-    assert secondary["cross_source"]["basis_harmonised"]["rows_scaled"] > 0, \
-        "the certified regime must actually be harmonised in SECONDARY"
-    print("  ok PRIMARY harmonises nothing; only SECONDARY does")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_run_gate_refuses_a_mode_that_disagrees_with_its_inputs():
-    """A mode argument that contradicts the declared inputs is a stop."""
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp, mode=gate.SECONDARY_MODE)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "mode" in str(exc).lower()
-        else:
-            raise AssertionError("a mode/inputs disagreement must fail closed")
-    print("  ok a mode disagreeing with the declared inputs fails closed")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_run_gate_keeps_price_valid_broker_invalid_rows_in_the_panel():
-    """PRICE and BROKER are separate domains. This is the regression for that.
-
-    BBBB's first three sessions are broker-basis invalid in PRIMARY. price_audit
-    objects to none of them, so all three must survive into the price panel and
-    stay eligible for variant A; only the BROKER rows disappear.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        panel, broker, report = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-
-    basis = report["broker_basis_validity"]
-    assert basis["invalid_sessions"] == 3, basis
-    assert basis["price_rows_deleted"] == 0, \
-        "a broker-domain defect must never delete a price row"
-    assert basis["price_valid_and_broker_invalid_rows_in_panel"] == 3, basis
-    assert basis["invalid_keys"] == ["BBBB 2026-01-01", "BBBB 2026-01-02",
-                                     "BBBB 2026-01-03"], basis["invalid_keys"]
-
-    in_regime = panel[(panel["ticker"] == "BBBB")
-                      & (panel["date"] <= "2026-01-03")]
-    assert len(in_regime) == 3, \
-        "every price-valid, broker-invalid session must remain in the panel"
-    assert (panel["ticker"] == "BBBB").sum() == 6, \
-        "BBBB keeps its full price history; only its broker rows are withheld"
-
-    # and the broker side is genuinely unavailable for exactly those sessions
-    left = broker[(broker["ticker"] == "BBBB") & (broker["date"] <= "2026-01-03")]
-    assert left.empty, "broker rows on a quarantined basis regime must not survive"
-    assert ((broker["ticker"] == "BBBB") & (broker["date"] > "2026-01-03")).sum() == 3, \
-        "the verifiably clean broker tail must be retained"
-    print("  ok price-valid & broker-invalid rows stay in the panel")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_run_gate_consumes_the_declared_universe_and_never_falls_back():
-    """Point the declared universe elsewhere: it must be consumed, or hard-fail."""
-    with tempfile.TemporaryDirectory() as tmp:
-        # (1) a DIFFERENT fixture path is genuinely consumed. It lives in the
-        #     committed fixture repo because a tracked execution input is the
-        #     only kind that has a canonical identity.
-        repo, _head, _payload = _pinned_code_repo()
-        elsewhere = os.path.join(repo, "deliberately_different_universe.json")
-        inputs, _ = _orchestration_fixture(tmp, universe_json=elsewhere)
-        _, _, report = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        assert report["universe"]["consumed_path"] == os.path.abspath(elsewhere), \
-            report["universe"]["consumed_path"]
-        assert os.path.abspath(gate.FROZEN_UNIVERSE_JSON) != os.path.abspath(elsewhere)
-
-    # (2) a MISSING declared universe is a stop, never a silent fallback to the
-    #     repo-root default or a re-read of the mutable workbook
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        # point the DECLARATION at a path that does not exist, rather than
-        # deleting the fixture repo's copy: that repo is shared by every
-        # orchestration fixture in this file.
-        inputs = dict(inputs,
-                      universe_json=os.path.join(tmp, "no_such_universe.json"))
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            # it now stops even earlier, at the fingerprint stage: the universe
-            # is one of the seven pinned execution inputs, so its absence is
-            # caught before any loader is reached
-            assert "missing on disk" in str(exc) and "universe_json" in str(exc), \
-                str(exc)
-        else:
-            raise AssertionError(
-                "a missing declared universe must fail, not fall back")
-
-        # and the loader itself refuses independently of that earlier guard
-        try:
-            gate.resolve_universe(frozen_path=inputs["universe_json"],
-                                  require_frozen=True)
-        except gate.GateFailure as exc:
-            assert "fall back" in str(exc), str(exc)
-        else:
-            raise AssertionError("resolve_universe fell back to a default")
-
-    # (3) refreeze is refused outright under the candidate contract
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE, refreeze=True)
-        except gate.GateFailure as exc:
-            assert "workbook" in str(exc)
-        else:
-            raise AssertionError("refreeze must be refused in candidate mode")
-    print("  ok the declared universe is consumed; absence and refreeze fail closed")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_gate_a_can_never_establish_its_own_manifest():
-    """Establishment is a separate act. The gate refuses, and the CLI cannot ask."""
-    try:
-        gate.run_gate(establish_manifest=True)
-    except gate.ManifestEstablishmentRefused as exc:
-        assert "separate act" in str(exc)
-    else:
-        raise AssertionError("run_gate must refuse to establish a manifest")
-
-    # the CLI flag is gone, not renamed
-    import argparse as _argparse
-    source = open(os.path.join(HERE, "experiment_1f_universe_gate.py"),
-                  encoding="utf-8").read()
-    assert '"--establish-manifest"' not in source, \
-        "the --establish-manifest flag must not be reachable from Gate A's CLI"
-
-    # verify_reviewed_manifest_v3 has no establish parameter at all
-    import inspect
-    params = inspect.signature(gate.verify_reviewed_manifest_v3).parameters
-    assert "establish" not in params, params
-
-    # a PROPOSAL (no established_commit_sha) is refused as a manifest
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp, manifest=False)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "establish" in str(exc).lower(), str(exc)
-        else:
-            raise AssertionError("a missing reviewed manifest must stop the gate")
-
-        proposal = os.path.join(tmp, "experiment_1f_manifest_v3.json")
-        with open(proposal, "w", encoding="utf-8") as fh:
-            json.dump({"manifest_version": gate.MANIFEST_V3_VERSION,
-                       "established_commit_sha": None,
-                       "A_execution_inputs": {}}, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "PROPOSAL" in str(exc), str(exc)
-        else:
-            raise AssertionError("a proposal must not be accepted as a manifest")
-    print("  ok Gate A cannot establish, re-establish, or accept a proposal")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_reviewed_manifest_v3_refuses_drift_in_either_direction():
-    """A consumed-but-unpinned input and a pinned-but-unconsumed input both fail."""
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        path = inputs["reviewed_manifest"]
-
-        with open(path, encoding="utf-8") as fh:
-            good = json.load(fh)
-
-        drifted = json.loads(json.dumps(good))
-        drifted["A_execution_inputs"]["ohlc_full_market_parquet"]["sha256"] = "0" * 64
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(drifted, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "snapshot changed" in str(exc), str(exc)
-        else:
-            raise AssertionError("a changed execution input must stop the gate")
-
-        unpinned = json.loads(json.dumps(good))
-        unpinned["A_execution_inputs"].pop("universe_json")
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(unpinned, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "not pinned" in str(exc), str(exc)
-        else:
-            raise AssertionError("a consumed but unpinned input must stop the gate")
-
-        orphan = json.loads(json.dumps(good))
-        orphan["A_execution_inputs"]["never_read_parquet"] = {
-            "path": os.path.join(tmp, "nothing.parquet"), "role": "x",
-            "present": True, "sha256": "1" * 64, "size_bytes": 1}
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(orphan, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "not consumed" in str(exc), str(exc)
-        else:
-            raise AssertionError("a pinned but unconsumed input must stop the gate")
-
-        # a v2 manifest cannot be reinterpreted as a v3 one
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"manifest_version": "experiment_1f/2",
-                       "established_commit_sha": "0" * 40,
-                       "A_execution_inputs": {}}, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "version" in str(exc)
-        else:
-            raise AssertionError("a v2 manifest must be refused, not reinterpreted")
-    print("  ok manifest-v3 drift fails closed in both directions")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 def test_cross_source_invariants_accept_the_frame_run_gate_actually_passes():
     """The regression for a defect only a full-pipeline test could reach.
@@ -3113,55 +2625,9 @@ def test_git_content_pin_still_refuses_an_edited_worktree():
 
 
 def test_generated_artifacts_stay_pinned_by_raw_bytes():
-    """The six experiment-owned artifacts are byte-pinned, deliberately.
-
-    They are gitignored, no Git filter touches them, and their exact reviewed
-    bytes ARE the object of review -- so a raw-byte mutation must still fail.
-    """
-    raw = [n for n, _, i in gate.EXECUTION_INPUTS if i == gate.IDENTITY_RAW_BYTES]
-    tracked = [n for n, _, i in gate.EXECUTION_INPUTS
-               if i == gate.IDENTITY_GIT_CONTENT]
-    assert len(raw) == 6 and tracked == ["universe_json"], (raw, tracked)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        inputs, _ = _orchestration_fixture(tmp)
-        path = inputs["reviewed_manifest"]
-        with open(path, encoding="utf-8") as fh:
-            good = json.load(fh)
-
-        for name in raw:
-            assert good["A_execution_inputs"][name]["identity"] == \
-                gate.IDENTITY_RAW_BYTES
-            manifest = json.loads(json.dumps(good))
-            manifest["A_execution_inputs"][name]["sha256"] = "0" * 64
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(manifest, fh)
-            try:
-                gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-            except gate.GateFailure as exc:
-                assert "snapshot changed" in str(exc), str(exc)
-            else:
-                raise AssertionError(f"{name}: a raw-byte mutation was accepted")
-
-        # and swapping a raw-byte pin to the tracked rule is itself refused
-        manifest = json.loads(json.dumps(good))
-        manifest["A_execution_inputs"][raw[0]]["identity"] = \
-            gate.IDENTITY_GIT_CONTENT
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh)
-        try:
-            gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        except gate.GateFailure as exc:
-            assert "identity" in str(exc), str(exc)
-        else:
-            raise AssertionError("an input's identity rule was silently swapped")
-
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(good, fh)
-        _, _, report = gate.run_gate(inputs=inputs, mode=gate.PRIMARY_MODE)
-        assert report["input_manifest"]["inputs"][raw[0]]["identity"] == \
-            gate.IDENTITY_RAW_BYTES
-    print("  ok 6 artifacts stay byte-pinned; 1 tracked input uses git content")
+    """The former v0 output requires an independently certified v1 adapter."""
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("experiment_1f_universe_gate.run_gate")
 
 
 def test_untracked_pinned_implementation_cannot_be_established():

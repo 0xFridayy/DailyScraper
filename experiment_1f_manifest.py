@@ -381,6 +381,8 @@ def parentage(candidate_dir):
 
 
 def build(candidate_dir=cand.CANDIDATE_DIR):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_manifest.build")
     covered, manifest = cand.manifest_tickers(candidate_dir)
     join = lambda name: os.path.join(candidate_dir, name)
     basis = json.load(open(join(norm.CANDIDATE_BASIS), encoding="utf-8"))
@@ -764,6 +766,8 @@ def establish_reviewed_manifest(candidate_dir=None, explicit_confirmation=None,
     return target_path, established
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_manifest.main")
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--candidate-dir", default=cand.CANDIDATE_DIR)

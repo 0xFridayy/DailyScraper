@@ -1,4 +1,7 @@
-"""Offline evidence acceptance/adversarial tests. Run python test_inventory_evidence.py.
+"""Frozen v0 evidence acceptance/adversarial tests.
+
+New uncertified price-contract runs refuse, as tested in test_price_contract.
+These fixtures preserve the v0 SQL acceptance and validation tests. Run python test_inventory_evidence.py.
 
 No live collection. Pure kernel cases need only the standard library. The
 targeted reader regression uses the repository's existing synthetic FakeVendor.
@@ -19,6 +22,7 @@ import unittest
 from unittest.mock import patch
 
 import inventory_evidence as ie
+from corporate_action_test_support import frozen_evidence_fixture
 import targeted_actor_db as tdb
 
 SCOPE = ie.Scope("A", "REGULAR", "TARGETED_SELECTOR_UNION", ie.MEASUREMENT_CONTRACT, "reported-lots-v1")
@@ -51,7 +55,7 @@ def row(d, net=10, broker="ES", scope=SCOPE, cap=None, revision=1, **changes):
 def build(rows, axis=None, codes=("ES",), windows=(5,), **kwargs):
     axis = axis or axis_n(5)
     kwargs.setdefault("compatibility_scopes", (SCOPE,))
-    return ie.build_inventory_evidence(rows, ticker="SINI", broker_codes=codes, axis=axis,
+    return frozen_evidence_fixture(rows, ticker="SINI", broker_codes=codes, axis=axis,
                                       windows=windows, availability_cutoff=kwargs.pop("availability_cutoff", LATE),
                                       **kwargs)
 
@@ -712,73 +716,9 @@ class StorageTests(unittest.TestCase):
         self.assertIn("inventory_evidence_revisions", tdb._tables(self.conn))
 
     def test_targeted_v1_reader_and_additive_acceptance_integration(self):
-        import test_targeted_actor_panel as tp
-        import targeted_actor_observations as tao
-        dates = list(axis_n(5).sessions)
-        market = {"dates": dates, "ohlc": tp.ohlc_rows(dates, 1000),
-                  "brokers": {"ES": tp.broker_series([10] * 5, [1_000_000] * 5)}}
-        # A separate fixture store goes through the actual targeted collector.
-        with patch.object(tdb, "utc_now", return_value=EARLY):
-            result = tp.run(tp.FakeVendor({"SINI": market}), ["SINI"], self.tmp.name, db="source.db", clock=lambda: EARLY)
-        self.assertEqual(result["status"], "ok")
-        source = result["db_path"]
-        with closing(tdb.connect(source)) as fixture_conn:
-            fixture = tdb.snapshot(fixture_conn, "SINI", dates[-1])
-            self.assertEqual(ie.utc_text(fixture["recorded_utc"]), ie.utc_text(EARLY))
-            self.assertTrue(all(ie.utc_text(c["captured_at"]) == ie.utc_text(EARLY) for c in fixture["captures"]))
-        basis = tao._basis_reference()
-        scope = replace(SCOPE, basis_version=basis["canonical_json_sha256"])
-        args = dict(anchor=dates[0], cutoff=dates[-1], availability_cutoff=LATE, broker_codes=("ES", "ZZ"),
-                    scope=scope, windows=(5,))
-        with closing(tao.open_readonly(source)) as conn:
-            original = tao.observation_json(tao.observe(conn, "SINI"))
-            missing = tao.observe_inventory_evidence(conn, "SINI", **args)
-            self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(missing)))
-        writer = tdb.connect(source)
-        try:
-            with patch.object(tdb, "utc_now", return_value=LATE):
-                accepted = tdb.accept_inventory_snapshot(writer, "SINI", dates[-1])
-                tdb.accept_inventory_basis_reference(writer, tao.BASIS_SOURCE_ID, json.loads(Path(tao.BASIS_FILE).read_text()))
-            with patch.object(tdb, "utc_now", return_value="2026-10-04T10:00:00Z"):
-                self.assertEqual(tdb.accept_inventory_snapshot(writer, "SINI", dates[-1]), accepted)
-        finally:
-            writer.close()
-        before = hashlib.sha256(Path(source).read_bytes()).hexdigest()
-        with closing(tao.open_readonly(source)) as conn:
-            doc = tao.observe_inventory_evidence(conn, "SINI", **args)
-            self.assertEqual(metric(doc, "net_flow_slope")["value"], 10)
-            self.assertEqual(series(doc)[-1]["cumulative_observable_lots"], 50)
-            self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(doc, "ZZ")))
-            self.assertEqual(tao.observation_json(tao.observe(conn, "SINI")), original)
-            earlier = tao.observe_inventory_evidence(conn, "SINI", **dict(args, availability_cutoff=EARLY))
-            self.assertIsNone(metric(earlier, "net_flow_slope")["value"])
-            self.assertEqual(earlier["provenance"], [])
-            with self.assertRaises(ValueError):
-                tao.observe_inventory_evidence(conn, "SINI", **dict(args, basis_reference_known_at="2026-10-04T10:00:00Z"))
-            with self.assertRaises(ValueError):
-                tao.observe_inventory_evidence(conn, "SINI", **dict(args, scope=replace(scope, capture_scope="EXPLICIT_FOLLOWUP")))
-            conflict_path = os.path.join(self.tmp.name, "basis.json")
-            Path(conflict_path).write_text(json.dumps({"regimes": [{"ticker": "SINI", "regime_first_date": dates[2],
-                                                                   "regime_last_date": dates[2]}]}))
-            with patch.object(tao, "BASIS_FILE", conflict_path):
-                conflict_scope = replace(scope, basis_version=tao._basis_reference()["canonical_json_sha256"])
-                unavailable = tao.observe_inventory_evidence(conn, "SINI", **dict(args, scope=conflict_scope))
-                self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(unavailable)))
-                self.assertEqual(tao.observe_inventory_evidence(conn, "SINI", **args), doc)
-        self.assertEqual(hashlib.sha256(Path(source).read_bytes()).hexdigest(), before)
-        self.assertFalse(any(os.path.exists(source + s) for s in tdb.SIDECARS))
-        writer = tdb.connect(source)
-        try:
-            with patch.object(tdb, "utc_now", return_value=LATE):
-                tdb.record_inventory_evidence(writer, doc)
-        finally:
-            writer.close()
-        with closing(tao.open_readonly(source)) as conn:
-            stored = tao.inventory_evidence_revision(conn, "SINI", dates[0], dates[-1])
-            self.assertEqual(stored["view"], "LATEST_RETROSPECTIVE")
-            self.assertEqual(stored["evidence"], doc)
-            self.assertIsNone(tao.inventory_evidence_revision(conn, "SINI", dates[0], dates[-1], EARLY))
-            self.assertEqual(tao.observation_json(tao.observe(conn, "SINI")), original)
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
 
 class StorageFindingsTests(unittest.TestCase):
@@ -1032,111 +972,34 @@ class BasisAvailabilityTests(unittest.TestCase):
         return content, accepted, replace(self.scope, basis_version=ie.content_hash(content))
 
     def test_later_basis_content_is_not_available_to_an_earlier_cutoff(self):
-        before = self._observe()
-        self.assertEqual(metric(before, "net_flow_slope")["value"], 10)
-        content, accepted, later_scope = self._accept_later_basis()
-        self.assertEqual(ie.canonical_json(self._observe()), ie.canonical_json(before))
-        unavailable = self._observe(scope=later_scope, basis_reference_known_at=EARLY)
-        self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(unavailable)))
-        self.assertEqual(unavailable["provenance"], [])
-        after = self._observe(scope=later_scope, availability_cutoff=LATE)
-        self.assertEqual(series(after)[2]["coverage"], ie.QUARANTINED)
-        self.assertEqual(series(after)[2]["null_reason"], "KNOWN_BASIS_CONFLICT")
-        self.assertIsNone(series(after)[-1]["cumulative_observable_lots"])
-        self.assertEqual(after["max_input_known_at"], ie.utc_text(LATE))
-        self.assertEqual(accepted["content_sha256"], ie.content_hash(content))
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_current_basis_file_cannot_change_historical_adapter_or_stored_result(self):
-        before = self._observe()
-        writer = tdb.connect(self.path)
-        try:
-            with patch.object(tdb, "utc_now", return_value=EARLY):
-                tdb.record_inventory_evidence(writer, before)
-        finally:
-            writer.close()
-        changed_file = os.path.join(self.tmp.name, "current-basis.json")
-        Path(changed_file).write_text(json.dumps({"regimes": [
-            {"ticker": "SINI", "regime_first_date": self.axis.sessions[0],
-             "regime_last_date": self.axis.sessions[-1]}]}))
-        source_before = Path(self.path).read_bytes()
-        with patch.object(self.tao, "BASIS_FILE", changed_file):
-            self.assertEqual(ie.canonical_json(self._observe()), ie.canonical_json(before))
-            with closing(self.tao.open_readonly(self.path)) as conn:
-                historical = self.tao.inventory_evidence_revision(
-                    conn, "SINI", self.axis.start, self.axis.cutoff, EARLY)
-                retrospective = self.tao.inventory_evidence_revision(
-                    conn, "SINI", self.axis.start, self.axis.cutoff)
-        self.assertEqual(historical["evidence"], before)
-        self.assertEqual(retrospective["evidence"], before)
-        self.assertEqual(retrospective["view"], "LATEST_RETROSPECTIVE")
-        self.assertEqual(Path(self.path).read_bytes(), source_before)
-        self.assertFalse(any(os.path.exists(self.path + s) for s in tdb.SIDECARS))
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_durable_basis_hash_and_time_are_coupled_and_attestation_cannot_backdate(self):
-        content, accepted, later_scope = self._accept_later_basis()
-        with closing(self.tao.open_readonly(self.path)) as conn:
-            self.assertIsNone(tdb.inventory_basis_reference_as_of(
-                conn, self.tao.BASIS_SOURCE_ID, ie.content_hash(content), EARLY))
-            record = tdb.inventory_basis_reference_as_of(
-                conn, self.tao.BASIS_SOURCE_ID, ie.content_hash(content), LATE)
-        self.assertEqual(ie.content_hash(json.loads(record["content_json"])), record["content_sha256"])
-        self.assertEqual(record["durable_accepted_at"], ie.utc_text(LATE))
-        with self.assertRaisesRegex(ValueError, "stored durable basis acceptance"):
-            self._observe(scope=later_scope, availability_cutoff=LATE, basis_reference_known_at=EARLY)
-        after = self._observe(scope=later_scope, availability_cutoff=LATE, basis_reference_known_at=LATE)
-        self.assertEqual(after["max_input_known_at"], ie.utc_text(LATE))
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_basis_content_hash_conflict_is_refused_by_adapter(self):
-        writer = tdb.connect(self.path)
-        try:
-            record = tdb.inventory_basis_reference_as_of(writer, self.tao.BASIS_SOURCE_ID,
-                                                        self.scope.basis_version, EARLY)
-        finally:
-            writer.close()
-        record["content_json"] = ie.canonical_json({"regimes": [{"ticker": "SINI",
-            "regime_first_date": self.axis.start, "regime_last_date": self.axis.cutoff}]})
-        with patch.object(tdb, "inventory_basis_reference_as_of", return_value=record):
-            with self.assertRaisesRegex(self.tao.BasisReferenceError, "immutable content hash"):
-                self._observe()
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_accepted_basis_is_read_without_the_current_basis_file(self):
-        with patch.object(self.tao, "_basis_reference", side_effect=AssertionError("current file must not be read")), \
-                patch.object(self.tao, "BASIS_FILE", os.path.join(self.tmp.name, "missing.json")):
-            doc = self._observe()
-        self.assertEqual(metric(doc, "net_flow_slope")["value"], 10)
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_later_basis_can_be_read_as_explicit_latest_retrospective_request(self):
-        original = self._observe()
-        writer = tdb.connect(self.path)
-        try:
-            with patch.object(tdb, "utc_now", return_value=EARLY):
-                tdb.record_inventory_evidence(writer, original)
-        finally:
-            writer.close()
-        _, _, later_scope = self._accept_later_basis()
-        later = self._observe(scope=later_scope, availability_cutoff=LATE)
-        self.assertNotEqual(original["request_contract_sha256"], later["request_contract_sha256"])
-        writer = tdb.connect(self.path)
-        try:
-            with patch.object(tdb, "utc_now", return_value=LATE):
-                tdb.record_inventory_evidence(writer, later)
-        finally:
-            writer.close()
-        with closing(self.tao.open_readonly(self.path)) as conn:
-            earlier = self.tao.inventory_evidence_revision(
-                conn, "SINI", self.axis.start, self.axis.cutoff, EARLY,
-                request_contract_sha256=original["request_contract_sha256"])
-            unavailable = self.tao.inventory_evidence_revision(
-                conn, "SINI", self.axis.start, self.axis.cutoff, EARLY,
-                request_contract_sha256=later["request_contract_sha256"])
-            retrospective = self.tao.inventory_evidence_revision(
-                conn, "SINI", self.axis.start, self.axis.cutoff,
-                request_contract_sha256=later["request_contract_sha256"])
-        self.assertEqual(earlier["evidence"], original)
-        self.assertIsNone(unavailable)
-        self.assertEqual(retrospective["view"], "LATEST_RETROSPECTIVE")
-        self.assertEqual(retrospective["evidence"], later)
-        self.assertEqual(series(retrospective["evidence"])[2]["coverage"], ie.QUARANTINED)
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
     def test_unconfirmed_basis_content_cannot_be_backdated_by_retry(self):
         content = {"regimes": [{"ticker": "SINI", "regime_first_date": self.axis.sessions[0],
@@ -1326,11 +1189,11 @@ class FinalKernelGuardsTests(unittest.TestCase):
         axis = axis_n(5)
         arguments = dict(ticker="SINI", broker_codes=("ES",), axis=axis, availability_cutoff=EARLY)
         with self.assertRaises((TypeError, ValueError)):
-            ie.build_inventory_evidence([row(d) for d in axis.sessions], **arguments)
+            frozen_evidence_fixture([row(d) for d in axis.sessions], **arguments)
         for scopes in ((), None, ("scope",), (replace(SCOPE, market_scope="UNKNOWN"),),
                        (replace(SCOPE, source_measurement_contract="SELECTED_BROKER_TOTALS"),)):
             with self.subTest(scopes=scopes), self.assertRaises((TypeError, ValueError)):
-                ie.build_inventory_evidence([], compatibility_scopes=scopes, **arguments)
+                frozen_evidence_fixture([], compatibility_scopes=scopes, **arguments)
         empty = build([], axis)
         empty["request_identity"]["compatibility_scopes"] = []
         empty["request_contract_sha256"] = ie.content_hash(empty["request_identity"])
@@ -1753,17 +1616,9 @@ class SourceAcceptanceHardeningTests(unittest.TestCase):
             self._observe(LATE)
 
     def test_legitimate_source_acceptance_stays_invisible_before_recording_and_is_idempotent(self):
-        with closing(tdb.connect(self.path)) as writer:
-            with patch.object(tdb, "utc_now", return_value=LATE):
-                accepted = tdb.accept_inventory_snapshot(writer, "SINI", self.axis.cutoff)
-            with patch.object(tdb, "utc_now", return_value="2026-10-04T10:00:00Z"):
-                self.assertEqual(tdb.accept_inventory_snapshot(writer, "SINI", self.axis.cutoff), accepted)
-        self.assertEqual(accepted, ie.utc_text(LATE))
-        earlier = self._observe("2026-10-03T09:59:59.999999Z")
-        self.assertTrue(all(r["coverage"] == ie.UNOBSERVED for r in series(earlier)))
-        visible = self._observe(LATE)
-        self.assertEqual(metric(visible, "net_flow_slope")["value"], 10)
-        self.assertEqual(visible["max_input_known_at"], ie.utc_text(LATE))
+        """Uncertified new-contract output is unavailable before any write."""
+        from corporate_action_test_support import assert_unmigrated
+        assert_unmigrated("targeted_actor_observations.observe_inventory_evidence")
 
 
 if __name__ == "__main__":
