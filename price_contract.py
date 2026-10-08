@@ -33,6 +33,16 @@ class PriceContractError(ValueError):
 class UnsupportedPriceContract(PriceContractError):
     """A source or consumer cannot certify this contract yet."""
 
+    def __init__(self, message, *, consumer=None):
+        super().__init__(message)
+        self.consumer = consumer
+        self.status = "UNSUPPORTED"
+        self.contract_version = CONTRACT_VERSION
+
+    def as_dict(self):
+        return {"status": self.status, "consumer": self.consumer,
+                "contract_version": self.contract_version, "reason": str(self)}
+
 
 class ExplicitStatusResult:
     def __bool__(self):
@@ -93,6 +103,22 @@ def actual_bar_reason(bar):
     except (PriceContractError, OverflowError, ValueError, TypeError):
         return "INVALID_OHLC_DOMAIN"
     return None
+
+
+def actual_predecessor_trusted(admission, *, domain_valid, traded, event=False):
+    """Only admitted bars or an ordinary initial capture can back a comparison."""
+    return (domain_valid and traded and (admission.status == "IN_BAND"
+            or not event and admission.status == "UNRESOLVED"
+            and admission.reason == "MISSING_PREDECESSOR"))
+
+
+def quarantine_recoverable(reasons, reference, *, bar_admitted, independent_defect,
+                           representation):
+    """Derived recovery never changes raw quarantine or unrelated findings."""
+    return (reasons == "limit_violation" and representation == RAW_ACTUAL
+            and reference.kind == "OFFICIAL_CORPORATE_ACTION_REFERENCE"
+            and reference.status == "RESOLVED" and bar_admitted
+            and not independent_defect)
 
 
 @dataclass(frozen=True)
@@ -190,17 +216,61 @@ def _object(pairs):
     return result
 
 
+def _text(value):
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
+
+
+def _string_list(value, supported=None):
+    return (isinstance(value, list) and bool(value)
+            and all(_text(v) for v in value) and len(set(value)) == len(value)
+            and (supported is None or set(value) <= supported))
+
+
+def _event_evidence(record):
+    source, evidence = record["source"], record["evidence_refs"]
+    if (not isinstance(source, dict) or not isinstance(evidence, dict)
+            or not all(_text(source.get(k)) for k in ("author", "retrieval_medium", "url"))
+            or not _text(record["source_document_id"]) or not _text(record.get("notes"))
+            or "direct_exchange_original_sha256" not in evidence):
+        raise PriceContractError("INVALID_EVENT_PROVENANCE")
+    hashes, identities = [], []
+    for key, value in evidence.items():
+        if not _text(key):
+            raise PriceContractError("INVALID_EVIDENCE")
+        if key.endswith("sha256"):
+            if value is None and key == "direct_exchange_original_sha256":
+                continue
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise PriceContractError("INVALID_EVIDENCE_HASH")
+            hashes.append(value)
+        elif not _text(value):
+            raise PriceContractError("INVALID_EVIDENCE_IDENTITY")
+        elif not key.endswith("url") and not value.startswith(("https://", "http://")):
+            identities.append(value)
+    if not hashes or not identities:
+        raise PriceContractError("OFFLINE_EVIDENCE_REQUIRED")
+    if record["status"] == "CONFIRMED_REFERENCE":
+        canonical_session(source["published_on"])
+
+
 def parse_registry(document):
     """Validate the whole revision atomically. Conflicts never partially load."""
     try:
         doc = json.loads(document, object_pairs_hook=_object) if isinstance(document, (str, bytes)) else document
-        if type(doc["schema_version"]) is not int or doc["schema_version"] != 1 or not isinstance(doc["registry_version"], str) or not doc["registry_version"]:
+        if (not isinstance(doc, dict) or type(doc.get("schema_version")) is not int
+                or doc["schema_version"] != 1 or not _text(doc.get("registry_version"))
+                or not isinstance(doc.get("events"), list)
+                or not isinstance(doc.get("reviewed_coverage"), list)):
             raise PriceContractError("UNSUPPORTED_REGISTRY")
         events, keys, ids = [], set(), set()
         for r in doc["events"]:
+            if not isinstance(r, dict):
+                raise PriceContractError("INVALID_EVENT")
             session = canonical_session(r["effective_session"])
             if not is_idx_session(session):
                 raise PriceContractError("EVENT_NOT_SESSION")
+            if not _string_list(r["market_scope"], {"REGULAR", "NEGOTIATED", "CASH"}):
+                raise PriceContractError("INVALID_MARKET_SCOPE")
             markets = tuple(r["market_scope"])
             if (r["venue"] != "IDX" or not markets or len(set(markets)) != len(markets)
                     or not set(markets) <= {"REGULAR", "NEGOTIATED", "CASH"}
@@ -210,14 +280,13 @@ def parse_registry(document):
                     or r["currency_unit"] != "IDR_PER_SHARE"
                     or r["status"] not in {"CONFIRMED_REFERENCE", "PENDING_REFERENCE", "REVOKED"}
                     or type(r["revision"]) is not int or r["revision"] < 1
-                    or not r["event_id"] or r["event_id"] in ids
-                    or not r["source_document_id"] or not r["source"]["author"]
-                    or not r["evidence_refs"]):
+                    or not _text(r["event_id"]) or r["event_id"] in ids):
                 raise PriceContractError("INVALID_EVENT")
+            _event_evidence(r)
             ids.add(r["event_id"])
             ref = r["reference_price"]
             if r["status"] == "CONFIRMED_REFERENCE":
-                if not isinstance(ref, str):
+                if not isinstance(ref, str) or not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d+)?", ref):
                     raise PriceContractError("DECIMAL_REFERENCE_REQUIRED")
                 ref = positive_real(Decimal(ref))
             elif ref is not None:
@@ -236,12 +305,14 @@ def parse_registry(document):
                                 r["effective_session"], r["status"], ref, r["source_document_id"], available))
         coverage = []
         for c in doc["reviewed_coverage"]:
+            if not isinstance(c, dict):
+                raise PriceContractError("INVALID_COVERAGE")
             canonical_session(c["from"])
             canonical_session(c["through"])
-            if (c["venue"] != "IDX" or c["from"] > c["through"] or not c["tickers"]
+            if (c["venue"] != "IDX" or c["from"] > c["through"] or not _string_list(c["tickers"])
                     or not all(re.fullmatch(r"[A-Z]{4}", t) for t in c["tickers"])
-                    or not c["market_scope"] or not set(c["market_scope"]) <= {"REGULAR", "NEGOTIATED", "CASH"}
-                    or not c["evidence_refs"]):
+                    or not _string_list(c["market_scope"], {"REGULAR", "NEGOTIATED", "CASH"})
+                    or not _string_list(c["evidence_refs"])):
                 raise PriceContractError("INVALID_COVERAGE")
             coverage.append(Coverage(c["venue"], tuple(c["market_scope"]), tuple(c["tickers"]), c["from"], c["through"]))
         digest = sha256(json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
@@ -379,4 +450,4 @@ def refuse_unmigrated(consumer):
         f"{consumer}: corporate-action contract {CONTRACT_VERSION} unsupported; "
         "source session/representation, complete holding windows and versioned "
         "output identity must be migrated before this route can run. "
-        "Frozen artifacts retain their original contract.")
+        "Frozen artifacts retain their original contract.", consumer=consumer)

@@ -71,8 +71,9 @@ OHLCV = ["open", "high", "low", "close", "volume"]
 
 
 # Compatibility exports. Financial rules have one dependency-free owner.
-from price_contract import ara_bound, ARB_BOUND, TOL, RAW_ACTUAL
-from price_contract_frame import default_registry, annotate_prices, span_result
+from price_contract import ara_bound, ARB_BOUND, TOL, RAW_ACTUAL, quarantine_recoverable, ReferenceResult
+from price_contract_frame import (default_registry, annotate_prices, span_result, _seal_price_frame,
+                                  frame_as_of, independent_price_defects, label_column)
 
 
 def load(conn):
@@ -97,27 +98,34 @@ def detect(px, trusted=None, *, registry=None, representation=None):
     the baseline is dropped rather than bridged to the last surviving close: a
     multi-day jump cannot be judged against a one-day ARA/ARB band either.
     """
-    px = annotate_prices(px, registry=registry, representation=representation, trusted=trusted)
+    registry = registry or default_registry()
+    # Independent defects invalidate baselines before chaining references.
+    defects = independent_price_defects(px, registry)
+    duplicate, duplicate_identity, series_break = (defects[c] for c in
+        ("cross_ticker_dup", "duplicate_identity", "series_break"))
+    external_trust = pd.Series(list(trusted) if trusted is not None else True, index=px.index)
+    baseline_trust = external_trust & ~duplicate & ~duplicate_identity & ~series_break
+    px = annotate_prices(px, registry=registry, representation=representation, trusted=baseline_trust)
     g = px.groupby("ticker")
     px["prev_close"] = px["previous_actual_close"]
     px["pct_chg"] = px["close"] / px["prev_close"] - 1  # raw discontinuity diagnostic
     px["ara"] = px["limit_reference_price"].apply(ara_bound)
     px["limit_violation"] = px["limit_admission_status"].eq("OUT_OF_BAND")
 
-    dup_mask = px.duplicated(["date"] + OHLCV, keep=False)
-    px["cross_ticker_dup"] = dup_mask & px[OHLCV].notna().all(axis=1)
+    px["cross_ticker_dup"] = duplicate
+    px["duplicate_identity"] = duplicate_identity
 
-    med = px.groupby(["ticker", "price_segment_id"])["close"].transform(lambda s: s.rolling(21, center=True, min_periods=5).median())
-    ratio = px["close"] / med
-    px["series_break"] = ((ratio > 5) | (ratio < 0.2)).fillna(False)
+    px["series_break"] = series_break
 
-    px["suspect"] = px[["limit_violation", "cross_ticker_dup", "series_break", "domain_violation"]].any(axis=1)
-    return px
+    px["suspect"] = px[["limit_violation", "cross_ticker_dup", "duplicate_identity", "series_break", "domain_violation"]].any(axis=1)
+    px.attrs["price_contract"]["producer_columns"] = ["prev_close", "pct_chg", "ara", "limit_violation",
+        "cross_ticker_dup", "duplicate_identity", "series_break", "suspect"]
+    return _seal_price_frame(px)
 
 
 def _reasons(row):
     return "+".join(
-        r for r in ["limit_violation", "cross_ticker_dup", "series_break", "domain_violation"] if row[r]
+        r for r in ["limit_violation", "cross_ticker_dup", "duplicate_identity", "series_break", "domain_violation"] if row[r]
     )
 
 
@@ -324,7 +332,7 @@ def inventory_window_is_short(session_counts, min_sessions):
 #  guard below, limit violations in the target drop to zero.
 # ─────────────────────────────────────────────
 
-def load_clean(conn, strict=False, *, registry=None, representation=None):
+def adjudicate_quarantine(conn, *, registry=None, representation=None):
     """Current derived adjudication over immutable raw rows and old quarantine.
 
     A sole old ordinary-limit reason is superseded only by a current official
@@ -336,21 +344,34 @@ def load_clean(conn, strict=False, *, registry=None, representation=None):
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
     ).fetchone()[0]
     q = pd.read_sql("SELECT * FROM price_quarantine", conn) if has_table else pd.DataFrame()
-    if strict and not has_table:
-        raise RuntimeError("price_quarantine missing")
     bad = set(zip(q.get("date", []), q.get("ticker", [])))
     trusted = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
     audited = detect(px, trusted=trusted, registry=registry, representation=representation)
     for row in q.to_dict("records"):
         key = row["date"], row["ticker"]
         current = audited[(audited.date == key[0]) & (audited.ticker == key[1])]
-        if (row.get("reasons") == "limit_violation" and len(current) == 1
-                and current.iloc[0]["limit_reference_kind"] == "OFFICIAL_CORPORATE_ACTION_REFERENCE"
-                and current.iloc[0]["price_step_admissible"] and not current.iloc[0]["suspect"]):
+        if len(current) != 1:
+            continue
+        r = current.iloc[0]
+        ref = ReferenceResult(r.limit_reference_status, r.limit_unresolved_reason,
+                              r.limit_reference_price, r.limit_reference_kind)
+        # Quarantine itself blocks anchor flags, so test actual full-bar admission.
+        if quarantine_recoverable(row.get("reasons"), ref,
+                bar_admitted=r.limit_admission_status == "IN_BAND" and not r.domain_violation,
+                independent_defect=r.cross_ticker_dup or r.duplicate_identity or r.series_break,
+                representation=audited.attrs["price_contract"]["input_representation"]):
             bad.discard(key)
     keep = [(d, t) not in bad for d, t in zip(audited["date"], audited["ticker"])]
     # A recovered event bar may now back the following ordinary session.
     audited = detect(px, trusted=keep, registry=registry, representation=representation)
+    return audited, bad, bool(has_table)
+
+
+def load_clean(conn, strict=False, *, registry=None, representation=None):
+    audited, bad, has_table = adjudicate_quarantine(conn, registry=registry, representation=representation)
+    if strict and not has_table:
+        raise RuntimeError("price_quarantine missing")
+    keep = [(d, t) not in bad for d, t in zip(audited.date, audited.ticker)]
     result = audited[pd.Series(keep, index=audited.index, dtype=bool) & ~audited["suspect"]].reset_index(drop=True)
     result.attrs.update(audited.attrs)
     return result
@@ -363,10 +384,20 @@ def _open_anchor_valid(px, g):
 
 def _return_context(px, all_dates, registry, representation, market, as_of):
     registry = registry or default_registry()
+    as_of = frame_as_of(px, as_of)
     px = px.sort_values(["ticker", "date"]).reset_index(drop=True)
     px = annotate_prices(px, registry=registry, representation=representation, market=market, as_of=as_of)
+    from hashlib import sha256
+    import json
+    axis_digest = sha256(json.dumps(list(all_dates), separators=(",", ":")).encode()).hexdigest()
+    identity = dict(px.attrs["price_contract"])
+    if identity.get("label_axis_sha256") not in (None, axis_digest):
+        from price_contract import UnsupportedPriceContract
+        raise UnsupportedPriceContract("Changed verified session axis; rebuild labels from source observations")
+    identity["label_axis_sha256"] = axis_digest
+    px.attrs["price_contract"] = identity
     px["_pos"] = px["date"].map({d: i for i, d in enumerate(all_dates)})
-    return px, registry, px.attrs["price_contract"]["input_representation"]
+    return px, registry, px.attrs["price_contract"]["input_representation"], as_of
 
 
 def _span_masks(px, starts, ends, all_dates, registry, representation, market,
@@ -390,7 +421,7 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
     Explicit registry and representation arguments are required for certified
     reconstructed fixtures or a source adapter with evidence of actual prices.
     """
-    px, registry, representation = _return_context(px, all_dates, registry, representation, market, as_of)
+    px, registry, representation, as_of = _return_context(px, all_dates, registry, representation, market, as_of)
     g = px.groupby("ticker")
     next_admitted = g["price_step_admissible"].shift(-1).eq(True)
     px["_step_valid"] = next_admitted & (g["_pos"].shift(-1) - px["_pos"]).eq(1)
@@ -410,13 +441,13 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
         step_window = g["_step_valid"].transform(
             lambda s: s.rolling(h, min_periods=h).sum().shift(-(h - 1)).eq(h))
         comparable, reasons = _span_masks(px, px.date, end_dates, all_dates, registry, representation, market, as_of=as_of)
-        admitted = contig & step_window
+        admitted = contig & step_window & px["close_anchor_admissible"]
         valid = admitted & comparable
         px[f"fwd_{h}"] = (g["close"].shift(-h) / px["close"] - 1).where(valid)
         px[f"fwd_{h}_reason"] = reasons.where(~valid, "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
         if extremes:
-            hi = g["high"].transform(lambda s: s.shift(-h).rolling(h, min_periods=h).max())
-            lo = g["low"].transform(lambda s: s.shift(-h).rolling(h, min_periods=h).min())
+            hi = g["high"].transform(lambda s: s.rolling(h, min_periods=h).max().shift(-h))
+            lo = g["low"].transform(lambda s: s.rolling(h, min_periods=h).min().shift(-h))
             px[f"max_{h}"] = (hi / px["close"] - 1).where(valid)
             px[f"mdd_{h}"] = (lo / px["close"] - 1).where(valid)
         if open_anchored:
@@ -439,12 +470,22 @@ def add_forward_returns(px, all_dates, horizons=(1,), extremes=False,
         admitted = px["_step_valid"] & entry_ok
         px["gap_1"] = (entry_open / px["close"] - 1).where(admitted & comparable)
         px["gap_1_reason"] = reasons.where(~(admitted & comparable), "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
-    return px.drop(columns=["_pos", "_step_valid"])
+    owned = set(px.attrs["price_contract"].get("label_columns", []))
+    for h in horizons:
+        owned.update((f"fwd_{h}", f"fwd_{h}_reason"))
+        if extremes:
+            owned.update((f"max_{h}", f"mdd_{h}"))
+        if open_anchored:
+            owned.update((f"fwd_oc_{h}", f"fwd_oc_{h}_reason", f"fwd_oo_{h}", f"fwd_oo_{h}_reason"))
+    if open_anchored:
+        owned.update(("gap_1", "gap_1_reason", "next_entry_open_admissible"))
+    px.attrs["price_contract"]["label_columns"] = sorted(owned)
+    return _seal_price_frame(px.drop(columns=["_pos", "_step_valid"]))
 
 
 def add_lagged_returns(px, all_dates, lags=(1,), *, registry=None, representation=None,
                        market="REGULAR", as_of=None):
-    px, registry, representation = _return_context(px, all_dates, registry, representation, market, as_of)
+    px, registry, representation, as_of = _return_context(px, all_dates, registry, representation, market, as_of)
     g = px.groupby("ticker")
     px["_step_valid"] = px["price_step_admissible"] & (px["_pos"] - g["_pos"].shift(1)).eq(1)
     g = px.groupby("ticker")
@@ -455,11 +496,15 @@ def add_lagged_returns(px, all_dates, lags=(1,), *, registry=None, representatio
         comparable, reasons = _span_masks(px, starts, px.date, all_dates, registry, representation, market, as_of=as_of)
         contig = (px["_pos"] - g["_pos"].shift(k)).eq(k)
         steps = g["_step_valid"].transform(lambda s: s.rolling(k, min_periods=k).sum().eq(k))
-        admitted = contig & steps
+        admitted = contig & steps & g["close_anchor_admissible"].shift(k).eq(True)
         valid = admitted & comparable
         px[f"lag_{k}"] = (px["close"] / g["close"].shift(k) - 1).where(valid)
         px[f"lag_{k}_reason"] = reasons.where(~valid, "").mask(~admitted & reasons.eq(""), "PRICE_PATH_UNAVAILABLE")
-    return px.drop(columns=["_pos", "_step_valid"])
+    owned = set(px.attrs["price_contract"].get("label_columns", []))
+    for k in lags:
+        owned.update((f"lag_{k}", f"lag_{k}_reason"))
+    px.attrs["price_contract"]["label_columns"] = sorted(owned)
+    return _seal_price_frame(px.drop(columns=["_pos", "_step_valid"]))
 
 
 def clean_panel(conn, horizons=(1,), lags=(), extremes=False, strict=False,

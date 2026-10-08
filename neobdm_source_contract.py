@@ -901,7 +901,9 @@ def price_source_context(capture_date, *, source_session=None, session_evidence=
                "session_evidence": session_evidence,
                "representation_evidence": representation_evidence}
     def evidence(value):
-        return (isinstance(value, dict) and bool(value.get("source_document_id"))
+        return (isinstance(value, dict) and isinstance(value.get("source_document_id"), str)
+                and value["source_document_id"] == value["source_document_id"].strip()
+                and value["source_document_id"].upper() not in {"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL"}
                 and isinstance(value.get("sha256"), str)
                 and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]))
     if evidence(session_evidence):
