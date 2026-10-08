@@ -851,11 +851,11 @@ def test_backfill_checks_the_stored_previous_close_and_keeps_other_tickers():
     body = price_payload(ENRG_BARS[1:])
     script = {"ENRG": [Resp(200, body)], "BBBB": [ok(payload(base=2000), "BBBB")]}
     with tempfile.TemporaryDirectory() as tmp:
-        with price_db(os.path.join(tmp, "neobdm.db")) as conn:
+        with contextlib.closing(price_db(os.path.join(tmp, "neobdm.db"))) as conn, conn:
             bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS[:1]))
         out, _, request = run_backfill(tmp, script, ["ENRG", "BBBB"])
         prices, _ = db_counts(tmp)
-        with sqlite3.connect(os.path.join(tmp, "neobdm.db")) as conn:
+        with contextlib.closing(sqlite3.connect(os.path.join(tmp, "neobdm.db"))) as conn:
             assert conn.execute("SELECT date,close FROM price_history WHERE ticker='ENRG'").fetchall() == [
                 ("2026-10-02", 1440)]
         caps = ic.read_captures(only_manifest(tmp))
@@ -896,15 +896,14 @@ def test_backfill_keeps_unchanged_historical_violations_visible():
             (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
             for b in ENRG_BARS])
         conn.commit()
-        # Preservation is not event admission under an UNKNOWN representation.
-        before = conn.total_changes
-        try:
-            bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
-        except bf.InventoryError as exc:
-            assert "UNTRUSTED_PREDECESSOR" in str(exc)
-        else:
-            raise AssertionError("UNKNOWN event observation became a trusted predecessor")
-        assert conn.total_changes == before
+        # Preservation is not event admission under an UNKNOWN representation:
+        # the unadjudicated event bar is never a reference, so its successor is
+        # kept only as an unadjudicated capture that can start a restart window.
+        bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
+        unknown = detect(load(conn)).set_index("date")
+        assert unknown.loc["2026-10-05", "anchor_trust_reason"] == "UNRESOLVED_EVENT_REFERENCE"
+        assert unknown.loc["2026-10-06", "limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+        assert not unknown.close_anchor_admissible.any() and not unknown.limit_violation.any()
         from price_contract import RAW_ACTUAL
         bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]), representation=RAW_ACTUAL)
         flagged = detect(load(conn), representation=RAW_ACTUAL)

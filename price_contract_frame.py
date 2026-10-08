@@ -10,10 +10,10 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
-from price_contract import (Anchor, PreviousActual, RAW_ACTUAL, parse_registry,
-                            resolve_limit_reference, return_span_status,
-                            validate_actual_price, UnsupportedPriceContract, actual_bar_reason,
-                            positive_real, PriceContractError, actual_predecessor_trusted)
+from price_contract import (Anchor, RAW_ACTUAL, parse_registry, return_span_status,
+                            UnsupportedPriceContract, adjudicate_series, canonical_session,
+                            is_idx_session, IdxCalendarUnavailable, PriceContractError,
+                            SERIES_BREAK_WINDOW, SERIES_CONTEXT_ROWS)
 
 SOURCE_COLUMNS = ("ticker", "date", "open", "high", "low", "close", "volume")
 CERTIFICATE_COLUMN = "price_contract_row_sha256"
@@ -22,11 +22,22 @@ SOURCE_IDENTITY_COLUMNS = ("source", "source_identity", "source_document_id", "s
 ADMISSION_COLUMNS = (
     "previous_actual_close", "previous_actual_session", "limit_reference_price", "limit_reference_kind",
     "limit_reference_source", "limit_reference_status", "limit_unresolved_reason", "limit_change",
-    "price_admissibility_status", "limit_admission_status", "price_step_admissible",
-    "close_anchor_admissible", "entry_open_admissible", "corporate_action_boundary",
-    "corporate_action_event_id", "corporate_action_status", "domain_violation", "price_segment_id",
-    "input_price_trusted",
+    "price_admissibility_status", "limit_admission_status", "consistency_reference_price",
+    "consistency_status", "consistency_violation", "price_step_admissible", "close_anchor_admissible",
+    "entry_open_admissible",
+    "corporate_action_boundary", "corporate_action_event_id", "corporate_action_status",
+    "domain_violation", "price_segment_id", "input_price_trusted", "anchor_trust_status",
+    "anchor_trust_reason", "restart_window_sessions",
 )
+# Placeholder-shaped identities are absence of evidence, never a source claim.
+PLACEHOLDER_TOKENS = frozenset({"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL", "N/A", "NA", "TBD",
+                                "TODO", "PLACEHOLDER", "-", "--", "?", "MISSING", "PENDING"})
+
+
+def placeholder_text(value):
+    return (not isinstance(value, str) or value != value.strip()
+            or value.strip().upper() in PLACEHOLDER_TOKENS
+            or re.fullmatch(r"[-_.?/\s0]*", value) is not None)
 
 
 def label_column(column):
@@ -85,21 +96,74 @@ def default_registry():
     return parse_registry(REGISTRY_PATH.read_bytes())
 
 
+def calendar_supported(session):
+    """Inside the pinned calendar's coverage, whether or not it is a session."""
+    try:
+        is_idx_session(canonical_session(session))
+        return True
+    except (IdxCalendarUnavailable, PriceContractError, ValueError, TypeError):
+        return False
+
+
 def independent_price_defects(px, registry, market="REGULAR"):
-    """Current source defects, shared before any predecessor/quarantine chaining."""
+    """Current source defects, shared before any predecessor/quarantine chaining.
+
+    Series-break medians run in date order within one ticker, one registry
+    segment and one side of the calendar-coverage boundary, so unsupported
+    history never shapes the evidence for a verified session. A row's backward
+    median context is complete once SERIES_CONTEXT_ROWS earlier rows of its
+    group are present; only such rows can enter a restart window.
+    """
     fields = ["open", "high", "low", "close", "volume"]
     cross = px.duplicated(["date"] + fields, keep=False) & px[fields].notna().all(axis=1)
     identity = px.duplicated(["ticker", "date"], keep=False)
     segments = pd.Series([sum(e.session <= d for e in registry.matching(t, market))
                           for t, d in zip(px.ticker, px.date)], index=px.index)
+    supported = pd.Series([calendar_supported(d) for d in px.date], index=px.index, dtype=bool)
     numeric = pd.to_numeric(px.close, errors="coerce")
     numeric = numeric.where(numeric.gt(0) & np.isfinite(numeric))
-    median = numeric.groupby([px.ticker, segments]).transform(
-        lambda s: s.rolling(21, center=True, min_periods=5).median())
-    ratio = numeric / median
+    work = pd.DataFrame({"ticker": px.ticker.values, "date": px.date.astype(str).values,
+                         "segment": segments.values, "supported": supported.values,
+                         "close": numeric.values}, index=px.index)
+    work = work.sort_values(["ticker", "segment", "supported", "date"], kind="mergesort")
+    groups = work.groupby(["ticker", "segment", "supported"], sort=False)
+    median = groups["close"].transform(
+        lambda s: s.rolling(SERIES_BREAK_WINDOW, center=True, min_periods=5).median())
+    context = groups.cumcount().ge(SERIES_CONTEXT_ROWS)
+    ratio = work["close"] / median
     series = ((ratio > 5) | (ratio < 0.2)).fillna(False)
     return pd.DataFrame({"cross_ticker_dup": cross, "duplicate_identity": identity,
-                         "series_break": series}, index=px.index)
+                         "series_break": series.reindex(px.index).astype(bool),
+                         "series_context_complete": context.reindex(px.index).astype(bool)},
+                        index=px.index)
+
+
+def source_context_known(row, representation):
+    """Optional per-row source metadata must be meaningful and must agree.
+
+    Absent columns claim nothing. A present column holding a placeholder, a
+    different session, an unverified session status or another representation
+    withdraws the observation; matching prices never substitute for it.
+    """
+    for field in ("source", "source_identity", "source_document_id"):
+        if field in row and placeholder_text(row[field]):
+            return False
+    if "source_session" in row and row["source_session"] != row["date"]:
+        return False
+    if "source_session_status" in row and row["source_session_status"] != "VERIFIED":
+        return False
+    return all(row[field] == representation for field in ("representation", "input_representation")
+               if field in row)
+
+
+def external_reasons(defects, trust):
+    """Why an observation itself is unusable, before any predecessor logic."""
+    reasons = []
+    for dup, identity, series, trusted in zip(defects.cross_ticker_dup, defects.duplicate_identity,
+                                              defects.series_break, trust):
+        reasons.append("DUPLICATE_IDENTITY" if identity else "CROSS_TICKER_DUPLICATE" if dup
+                       else "SERIES_BREAK" if series else None if trusted else "EXTERNALLY_UNTRUSTED")
+    return reasons
 
 
 def annotate_prices(px, *, registry=None, representation=None, market="REGULAR",
@@ -127,88 +191,30 @@ def annotate_prices(px, *, registry=None, representation=None, market="REGULAR",
     px = px.copy()
     source_digest = sha256(px[[c for c in ("ticker", "date", "open", "high", "low", "close", "volume")
                               if c in px]].to_csv(index=False).encode()).hexdigest()
-    previous = {}
-    records = []
     defects = independent_price_defects(px, registry, market)
-    trust = [bool(t) and not bad for t, bad in zip(trust, defects.any(axis=1))]
-    for i, row in enumerate(px.to_dict("records")):
-        ticker, session = row["ticker"], row["date"]
-        prev = previous.get(ticker)
-        events = registry.matching(ticker, market, session)
-        source_known = True
-        for field in ("source", "source_identity", "source_document_id"):
-            if field in row:
-                v = row[field]
-                source_known &= (isinstance(v, str) and v == v.strip()
-                                 and v.upper() not in {"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL"})
-        if "source_session" in row:
-            source_known &= row["source_session"] == session
-        if "source_session_status" in row:
-            source_known &= row["source_session_status"] == "VERIFIED"
-        for field in ("representation", "input_representation"):
-            if field in row:
-                source_known &= row[field] == representation
-        trust[i] &= bool(source_known)
-        # Unknown legacy basis still permits narrower ordinary-band diagnostics.
-        # They never certify representation or produce economic targets.
-        diagnostic_rep = RAW_ACTUAL if representation == "UNKNOWN" and not events else representation
-        ref = resolve_limit_reference(ticker, session, market, prev, registry,
-                                      input_representation=diagnostic_rep if source_known else "UNKNOWN", as_of=as_of)
-        close = validate_actual_price(row.get("close"), ref)
-        opened = validate_actual_price(row.get("open"), ref)
-        domain = actual_bar_reason(row) is None
-        high_admission = validate_actual_price(row.get("high"), ref)
-        low_admission = validate_actual_price(row.get("low"), ref)
-        complete_in_band = all(a.status == "IN_BAND" for a in (close, opened, high_admission, low_admission))
-        bar_status = ("OUT_OF_BAND" if any(a.status == "OUT_OF_BAND" for a in
-                      (close, opened, high_admission, low_admission)) else close.status)
-        event = events[0] if events else None
-        volume = row.get("volume")
-        traded = (not isinstance(volume, bool) and isinstance(volume, (int, float))
-                  and math.isfinite(float(volume)) and volume > 0)
-        try:
-            low, opened_price, high = (positive_real(row.get(k)) for k in ("low", "open", "high"))
-            open_domain = low <= opened_price <= high
-        except PriceContractError:
-            open_domain = False
-        records.append({
-            "previous_actual_close": prev.price if prev else None,
-            "previous_actual_session": prev.session if prev else None,
-            "limit_reference_price": ref.price,
-            "limit_reference_kind": ref.kind,
-            "limit_reference_source": ref.source,
-            "limit_reference_status": ref.status,
-            "limit_unresolved_reason": ref.reason,
-            "limit_change": close.limit_change,
-            "price_admissibility_status": ((bar_status if representation == RAW_ACTUAL else "UNRESOLVED_REPRESENTATION")
-                                           if traded else "UNVERIFIED_TRADING_SESSION") if domain else "INVALID_DOMAIN",
-            "limit_admission_status": bar_status,
-            "price_step_admissible": complete_in_band and domain and traded and bool(trust[i]),
-            "close_anchor_admissible": bool(trust[i]) and actual_predecessor_trusted(
-                close, domain_valid=domain and bar_status != "OUT_OF_BAND", traded=traded, event=bool(events)),
-            "entry_open_admissible": (opened.status == "IN_BAND" and traded and open_domain
-                                      and high_admission.status == "IN_BAND" and low_admission.status == "IN_BAND"
-                                      and bool(trust[i])),
-            "corporate_action_boundary": bool(event),
-            "corporate_action_event_id": event.event_id if event else None,
-            "corporate_action_status": event.status if event else None,
-            "domain_violation": not domain,
-            "input_price_trusted": bool(trust[i]),
-        })
-        previous[ticker] = PreviousActual(session, row.get("close"), "input-price-snapshot:" + source_digest,
-                                          bool(trust[i]) and actual_predecessor_trusted(close, domain_valid=domain and bar_status != "OUT_OF_BAND",
-                                                                                     traded=traded, event=bool(events)),
-                                          diagnostic_rep)
-    for column in (records[0] if records else ()):
-        px[column] = [r[column] for r in records]
-    if not records:
-        for column in ("corporate_action_boundary", "domain_violation", "price_step_admissible", "entry_open_admissible", "close_anchor_admissible", "input_price_trusted"):
-            px[column] = False
-        for column in ("previous_actual_close", "previous_actual_session", "limit_reference_price",
-                       "limit_reference_kind", "limit_reference_source", "limit_reference_status",
-                       "limit_unresolved_reason", "limit_change", "price_admissibility_status",
-                       "limit_admission_status", "corporate_action_event_id", "corporate_action_status"):
-            px[column] = None
+    external = external_reasons(defects, trust)
+    rows = px.to_dict("records")
+    for row, reason, complete in zip(rows, external, defects.series_context_complete):
+        row["external_reason"] = reason
+        row["source_known"] = source_context_known(row, representation)
+        row["context_complete"] = bool(complete)
+    records = [None] * len(rows)
+    by_ticker = {}
+    for i, row in enumerate(rows):
+        by_ticker.setdefault(row["ticker"], []).append(i)
+    for ticker, positions in by_ticker.items():
+        adjudicated = adjudicate_series(ticker, [rows[i] for i in positions], registry, market=market,
+                                        representation=representation, as_of=as_of,
+                                        source="input-price-snapshot:" + source_digest)
+        for i, record in zip(positions, adjudicated):
+            records[i] = record
+    for column in ADMISSION_COLUMNS:
+        if column != "price_segment_id":
+            px[column] = [r[column] for r in records] if records else None
+    for column in ("corporate_action_boundary", "domain_violation", "price_step_admissible",
+                   "entry_open_admissible", "close_anchor_admissible", "input_price_trusted",
+                   "consistency_violation"):
+        px[column] = px[column].astype(bool) if records else False
     px["price_segment_id"] = [sum(e.session <= d for e in registry.matching(t, market))
                               for t, d in zip(px.ticker, px.date)]
     px.attrs["price_contract"] = registry.identity | {

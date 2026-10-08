@@ -25,6 +25,23 @@ NEAR_LIMIT_TOLERANCE = 0.01
 MODEL_TICK_VERSION = "legacy-two-pass-tick-model.v1"
 RAW_ACTUAL = "RAW_ACTUAL_IDR_PER_SHARE"
 
+# Trust restart. A predecessor close is a limit reference only while it is an
+# evidenced anchor: an admitted official corporate-action bar, a daily step
+# admitted against an anchor, or the last session of a restart window. A
+# restart window is RESTART_SESSIONS consecutive verified sessions whose
+# observations are each admissible, whose daily full-bar steps each sit inside
+# the exchange band, and whose series-break medians each have their complete
+# backward context. Nothing positional (a frame's first row) is evidence.
+TRUST_POLICY_VERSION = "evidence-restart.v1"
+RESTART_SESSIONS = 10
+SERIES_BREAK_WINDOW = 21
+SERIES_CONTEXT_ROWS = SERIES_BREAK_WINDOW // 2
+# A frame holding this many earlier rows of a session's ticker segment
+# reproduces that session's adjudication exactly; fewer can only fail closed.
+# The window's first step is judged against the session before it, whose own
+# discontinuity status reads one session further back.
+DEPENDENCY_ROWS = SERIES_CONTEXT_ROWS + RESTART_SESSIONS + 1
+
 
 class PriceContractError(ValueError):
     """Invalid registry or missing supported consumer contract."""
@@ -105,13 +122,6 @@ def actual_bar_reason(bar):
     return None
 
 
-def actual_predecessor_trusted(admission, *, domain_valid, traded, event=False):
-    """Only admitted bars or an ordinary initial capture can back a comparison."""
-    return (domain_valid and traded and (admission.status == "IN_BAND"
-            or not event and admission.status == "UNRESOLVED"
-            and admission.reason == "MISSING_PREDECESSOR"))
-
-
 def quarantine_recoverable(reasons, reference, *, bar_admitted, independent_defect,
                            representation):
     """Derived recovery never changes raw quarantine or unrelated findings."""
@@ -178,7 +188,7 @@ class Registry:
         return {"contract_version": CONTRACT_VERSION, "registry_version": self.version,
                 "registry_sha256": self.content_sha256, "rules_version": RULES_VERSION,
                 "return_policy_version": RETURN_POLICY_VERSION, "calendar_version": CALENDAR_VERSION,
-                "model_tick_version": MODEL_TICK_VERSION}
+                "model_tick_version": MODEL_TICK_VERSION, "trust_policy_version": TRUST_POLICY_VERSION}
 
     def matching(self, ticker, market, session=None, venue="IDX"):
         return tuple(e for e in self.events if e.ticker == ticker and e.venue == venue
@@ -405,6 +415,200 @@ def validate_actual_price(actual_price, reference, rules_version=RULES_VERSION):
     change = actual / reference.price - 1
     in_band = ARB_BOUND - TOL <= change <= ara_bound(reference.price) + TOL
     return AdmissionResult("IN_BAND" if in_band else "OUT_OF_BAND", "" if in_band else "LIMIT_VIOLATION", change)
+
+
+TRADING_FIELDS = ("open", "high", "low", "close")
+
+
+def full_bar_band_status(bar, reference_price):
+    """Open, high, low and close against one reference: IN_BAND only if all are."""
+    reference = ReferenceResult("RESOLVED", "", positive_real(reference_price))
+    statuses = [validate_actual_price(bar.get(k), reference).status for k in TRADING_FIELDS]
+    if "OUT_OF_BAND" in statuses:
+        return "OUT_OF_BAND"
+    return "IN_BAND" if all(s == "IN_BAND" for s in statuses) else "UNRESOLVED"
+
+
+@dataclass(frozen=True)
+class _SessionAnchor:
+    local_ok: bool        # the observation itself is usable evidence
+    discontinuous: bool   # out of band against its own usable predecessor
+    admissible: bool
+    trusted: bool
+    has_event: bool
+    streak: int
+    close: object
+    representation: str
+
+
+def _verified_session(session):
+    try:
+        day = canonical_session(session)
+    except (PriceContractError, ValueError, TypeError):
+        return None, "NONCANONICAL_SESSION"
+    try:
+        return day, None if is_idx_session(day) else "NOT_A_SESSION"
+    except IdxCalendarUnavailable:
+        return day, "UNSUPPORTED_CALENDAR"
+
+
+def adjudicate_series(ticker, rows, registry, *, market="REGULAR", representation="UNKNOWN",
+                      as_of=None, source="input-price-snapshot"):
+    """Admission and anchor trust for one ticker, shared by writer, audit and monitor.
+
+    Each row carries its OHLCV, ``date`` and the adapter's evidence:
+    ``external_reason`` (None, or why the observation itself is unusable: a
+    duplicate, cross-ticker duplicate, series break, quarantine or contradicted
+    source context), ``source_known`` and ``context_complete`` (its series-break
+    median has SERIES_CONTEXT_ROWS earlier rows of its segment).
+
+    Predecessors come from the verified calendar, never from row positions. A
+    session whose immediate predecessor session has no admissible observation is
+    compared with nothing; it can only start a restart window. Trust therefore
+    depends on a bounded calendar window, and a missing or truncated window only
+    withholds trust. Order of ``rows`` is irrelevant; records align with it.
+    """
+    order = sorted(range(len(rows)), key=lambda i: (str(rows[i].get("date")), i))
+    occurrences = {}
+    for i in order:
+        occurrences.setdefault(rows[i].get("date"), []).append(i)
+    in_scope = (market in {"REGULAR", "NEGOTIATED", "CASH"} and isinstance(ticker, str)
+                and re.fullmatch(r"[A-Z]{4}", ticker) is not None)
+    state, records, last = {}, [None] * len(rows), None
+    for i in order:
+        row, session = rows[i], rows[i].get("date")
+        day, reason = _verified_session(session)
+        if reason is None and not in_scope:
+            reason = "UNSUPPORTED_IDENTITY_SCOPE"
+        events = registry.matching(ticker, market, session) if day is not None else ()
+        event = events[0] if events else None
+        external = row.get("external_reason")
+        if len(occurrences[session]) > 1:
+            external = external or "DUPLICATE_IDENTITY"
+        source_known = bool(row.get("source_known", True))
+        if not source_known:
+            external = external or "UNSUPPORTED_SOURCE_CONTEXT"
+        # Unknown legacy basis still permits narrower ordinary-band diagnostics.
+        # They never certify representation, admit an event or produce returns.
+        diagnostic = RAW_ACTUAL if representation == "UNKNOWN" and not events else representation
+        input_representation = diagnostic if source_known else "UNKNOWN"
+        predecessor, boundary = None, False
+        if reason is None:
+            try:
+                predecessor = latest_idx_session_before(day).isoformat()
+            except IdxCalendarUnavailable:
+                boundary = True
+        prior = state.get(predecessor) if predecessor is not None else None
+        if boundary and not events:
+            # No verified predecessor exists, whatever older rows were loaded.
+            ref = ReferenceResult("UNRESOLVED", "UNSUPPORTED_CALENDAR",
+                                  registry_sha256=registry.content_sha256)
+        else:
+            previous = None if prior is None else PreviousActual(
+                predecessor, prior.close, source, prior.trusted, prior.representation)
+            ref = resolve_limit_reference(ticker, session, market, previous, registry,
+                                          input_representation=input_representation, as_of=as_of)
+            if ref.status == "UNRESOLVED" and ref.reason == "MISSING_PREDECESSOR" and predecessor:
+                # The calendar names the predecessor session; whether older
+                # rows happen to be loaded cannot change the finding.
+                ref = ReferenceResult("UNRESOLVED", "MISSING_IMMEDIATE_PREDECESSOR",
+                                      registry_sha256=registry.content_sha256)
+        admissions = {k: validate_actual_price(row.get(k), ref) for k in TRADING_FIELDS}
+        complete_in_band = all(a.status == "IN_BAND" for a in admissions.values())
+        bar_status = ("OUT_OF_BAND" if any(a.status == "OUT_OF_BAND" for a in admissions.values())
+                      else admissions["close"].status)
+        domain = actual_bar_reason(row) is None
+        volume = row.get("volume")
+        traded = (not isinstance(volume, bool) and isinstance(volume, (int, float))
+                  and math.isfinite(float(volume)) and volume > 0)
+        try:
+            low, opened, high = (positive_real(row.get(k)) for k in ("low", "open", "high"))
+            open_domain = low <= opened <= high
+        except PriceContractError:
+            open_domain = False
+        if reason is None and not domain:
+            reason = "INVALID_DOMAIN"
+        if reason is None and not traded:
+            reason = "ZERO_VOLUME"
+        if reason is None and external:
+            reason = external
+        if reason is None and events:
+            # An event bar is admissible only through its own official reference.
+            if ref.status != "RESOLVED":
+                reason = "UNRESOLVED_EVENT_REFERENCE"
+            elif not complete_in_band:
+                reason = "LIMIT_VIOLATION"
+        if reason is None and not events and input_representation != RAW_ACTUAL:
+            reason = "UNSUPPORTED_REPRESENTATION"
+        local_ok = reason is None
+        # Consistency with a usable but not yet trusted predecessor detects a
+        # discontinuity; it never certifies the step. A step out of a bar that
+        # was itself a discontinuity (a spike's return) is not flagged again.
+        # Each decision reads at most two sessions back, never a whole chain.
+        consistency_price, consistency = None, "UNAVAILABLE"
+        if not events and prior is not None and prior.local_ok and domain:
+            consistency_price, consistency = prior.close, full_bar_band_status(row, prior.close)
+        discontinuity = consistency == "OUT_OF_BAND" and not prior.discontinuous
+        if local_ok and (bar_status == "OUT_OF_BAND" or discontinuity):
+            reason = "LIMIT_VIOLATION"
+        admissible = reason is None
+        event_admitted = admissible and bool(events)
+        linked = (admissible and not events and prior is not None and prior.admissible
+                  and consistency == "IN_BAND")
+        has_event = event_admitted or (linked and prior.has_event)
+        if not admissible or not row.get("context_complete"):
+            streak = 0
+        elif linked and prior.streak >= 1:
+            streak = min(prior.streak + 1, RESTART_SESSIONS)
+        else:
+            streak = 1
+        # Trust continues only through admitted daily steps from an anchor.
+        trusted = admissible and (has_event or streak >= RESTART_SESSIONS or (linked and prior.trusted))
+        if not admissible:
+            status = "INADMISSIBLE"
+        elif event_admitted:
+            status = "TRUSTED_EVENT_ANCHOR"
+        elif trusted and linked and prior.trusted:
+            status = "TRUSTED_CHAIN"
+        elif trusted:
+            status = "TRUSTED_RESTART_ANCHOR"
+        else:
+            status = "RESTART_PENDING"
+            reason = "SERIES_CONTEXT_INCOMPLETE" if not row.get("context_complete") else "RESTART_WINDOW_INCOMPLETE"
+        source_ok = external is None
+        records[i] = {
+            "previous_actual_close": last[1] if last else None,
+            "previous_actual_session": last[0] if last else None,
+            "limit_reference_price": ref.price,
+            "limit_reference_kind": ref.kind,
+            "limit_reference_source": ref.source,
+            "limit_reference_status": ref.status,
+            "limit_unresolved_reason": ref.reason,
+            "limit_change": admissions["close"].limit_change,
+            "price_admissibility_status": ((bar_status if representation == RAW_ACTUAL else "UNRESOLVED_REPRESENTATION")
+                                           if traded else "UNVERIFIED_TRADING_SESSION") if domain else "INVALID_DOMAIN",
+            "limit_admission_status": bar_status,
+            "consistency_reference_price": consistency_price,
+            "consistency_status": consistency,
+            "consistency_violation": discontinuity,
+            "price_step_admissible": complete_in_band and domain and traded and source_ok,
+            "close_anchor_admissible": trusted,
+            "entry_open_admissible": (admissions["open"].status == "IN_BAND" and traded and open_domain
+                                      and admissions["high"].status == "IN_BAND"
+                                      and admissions["low"].status == "IN_BAND" and source_ok),
+            "corporate_action_boundary": bool(event),
+            "corporate_action_event_id": event.event_id if event else None,
+            "corporate_action_status": event.status if event else None,
+            "domain_violation": not domain,
+            "input_price_trusted": source_ok,
+            "anchor_trust_status": status,
+            "anchor_trust_reason": reason or "",
+            "restart_window_sessions": streak,
+        }
+        state[session] = _SessionAnchor(local_ok, consistency == "OUT_OF_BAND", admissible, trusted,
+                                        has_event, streak, row.get("close"), diagnostic)
+        last = (session, row.get("close"))
+    return records
 
 
 @dataclass(frozen=True)

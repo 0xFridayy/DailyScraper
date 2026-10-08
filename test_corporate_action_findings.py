@@ -230,8 +230,11 @@ def test_f06_predecessor_revision_revalidates_stored_successor_ohlc():
 
 def strategy_trade(px, decision, hold=1, tp=None, sl=None):
     import strategy_variants as sv
-    certified = pa.add_forward_returns(px, px.date.tolist(), open_anchored=True,
+    from corporate_action_test_support import restart_evidence, strip_restart_evidence
+    extended, axis = restart_evidence(px)
+    certified = pa.add_forward_returns(extended, axis, open_anchored=True,
                                        registry=registry(), representation=pc.RAW_ACTUAL)
+    certified = strip_restart_evidence(certified, extended.attrs["restart_evidence"])
     ix, dates = sv._index_price_history(certified, registry=registry())
     return sv.simulate_trade(ix, dates, "ENRG", decision, hold, tp, sl, registry=registry())
 
@@ -281,9 +284,12 @@ def test_f17_unresolved_inside_required_span_still_withholds():
 
 
 def test_f18_first_complete_extrema_window_and_incomplete_tail():
+    from corporate_action_test_support import restart_evidence, strip_restart_evidence
     px = frame().iloc[4:].reset_index(drop=True)
-    out = pa.add_forward_returns(px, px.date.tolist(), (2,), extremes=True,
+    extended, axis = restart_evidence(px)
+    out = pa.add_forward_returns(extended, axis, (2,), extremes=True,
                                  registry=registry(), representation=pc.RAW_ACTUAL)
+    out = strip_restart_evidence(out, extended.attrs["restart_evidence"])
     assert out.loc[0, "max_2"] == pytest.approx(1080 / 1050 - 1)
     assert out.loc[0, "mdd_2"] == pytest.approx(1040 / 1050 - 1)
     assert pd.isna(out.loc[2, "max_2"]) and pd.isna(out.loc[2, "mdd_2"])
@@ -430,11 +436,17 @@ def test_f13_independent_duplicates_cannot_be_recovered_by_the_writer():
                      (bar["date"], "AAAA", bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]))
         conn.execute("CREATE TABLE price_quarantine(date,ticker,reasons)")
         conn.execute("INSERT INTO price_quarantine VALUES('2026-10-05','ENRG','limit_violation')")
-        before = conn.total_changes
-        with pytest.raises(bf.InventoryError, match="UNTRUSTED_PREDECESSOR"):
-            bf.insert_inventory(conn, "ENRG", price_payload(frame().iloc[4:5].drop(columns="ticker").to_dict("records")),
-                                representation=pc.RAW_ACTUAL)
-        assert conn.total_changes == before
+        # The duplicated event bar is never recovered as a reference, so its
+        # successor is only an unadjudicated capture: no comparison, no trust.
+        bf.insert_inventory(conn, "ENRG", price_payload(frame().iloc[4:5].drop(columns="ticker").to_dict("records")),
+                            representation=pc.RAW_ACTUAL)
+        audited, quarantined, _ = pa.adjudicate_quarantine(conn, registry=registry(), representation=pc.RAW_ACTUAL)
+        assert ("2026-10-05", "ENRG") in quarantined
+        enrg = audited[audited.ticker.eq("ENRG")].set_index("date")
+        assert enrg.loc["2026-10-05", "anchor_trust_reason"] == "CROSS_TICKER_DUPLICATE"
+        assert enrg.loc["2026-10-06", "limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+        assert not enrg.loc[["2026-10-05", "2026-10-06"], "close_anchor_admissible"].any()
+        assert not enrg.loc["2026-10-06", "price_step_admissible"]
 
 
 def test_f14_direct_label_builder_does_not_chain_duplicate_identity():

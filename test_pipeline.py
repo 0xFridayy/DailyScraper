@@ -56,8 +56,11 @@ from foreign_flow_signal_backtest import (
 from regime_gated_momentum import select_threshold, metric_selection_index
 
 
-def _sessions(count, start="2026-01-05"):
-    """Verified IDX sessions for synthetic fixtures, including holiday gaps."""
+def _sessions(count, start="2026-04-06"):
+    """Verified IDX sessions for synthetic fixtures, including holiday gaps.
+
+    The default start leaves room for the restart-evidence window that the
+    trust contract requires before a fixture's first anchor."""
     sessions, day = [], date.fromisoformat(start)
     while len(sessions) < count:
         if pc.is_idx_session(day):
@@ -108,17 +111,32 @@ def _flat_test_bars(px):
     return px
 
 
+def _evidenced(px, dates, registry):
+    """Supply the explicit restart window the trust contract requires."""
+    from corporate_action_test_support import restart_evidence
+    if "synthetic_test_axis" in px.attrs:          # already adjudicated with its evidence
+        return px, px.attrs["synthetic_test_axis"], registry or px.attrs["synthetic_test_registry"], ()
+    extended, axis = restart_evidence(px, dates)
+    return extended, axis, registry or _fixture_registry(px, axis), extended.attrs["restart_evidence"]
+
+
 def _fixture_forward(px, dates, *, registry=None, **kwargs):
-    registry = registry or _fixture_registry(px, dates)
-    out = add_forward_returns(px, dates, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    from corporate_action_test_support import strip_restart_evidence
+    extended, axis, registry, evidence = _evidenced(px, dates, registry)
+    out = add_forward_returns(extended, axis, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    out = strip_restart_evidence(out, evidence)
     out.attrs["synthetic_test_registry"] = registry
+    out.attrs["synthetic_test_axis"] = axis
     return out
 
 
 def _fixture_lag(px, dates, *, registry=None, **kwargs):
-    registry = registry or px.attrs.get("synthetic_test_registry") or _fixture_registry(px, dates)
-    out = add_lagged_returns(px, dates, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    from corporate_action_test_support import strip_restart_evidence
+    extended, axis, registry, evidence = _evidenced(px, dates, registry)
+    out = add_lagged_returns(extended, axis, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    out = strip_restart_evidence(out, evidence)
     out.attrs["synthetic_test_registry"] = registry
+    out.attrs["synthetic_test_axis"] = axis
     return out
 
 
@@ -401,8 +419,11 @@ def test_out_of_band_exit_bar_withholds_fwd_oo_1():
     assert not out.iloc[2]["entry_open_admissible"]
     # A rejected later close does not invalidate an otherwise admitted exit open.
     bounded_exit = px.copy()
-    bounded_exit.loc[2, "high"] = 107.0
+    # Close above high is a domain defect of the close alone. (999 against the
+    # restart evidence's median is also a series break, which voids the bar.)
+    bounded_exit.loc[2, ["high", "close"]] = [107.0, 108.0]
     independent = _fixture_forward(bounded_exit, dates, horizons=(1,), open_anchored=True)
+    assert independent.iloc[2]["input_price_trusted"]
     assert independent.iloc[2]["domain_violation"]
     assert independent.iloc[2]["entry_open_admissible"]
     assert abs(independent.iloc[0]["fwd_oo_1"] - (106.0 / 101.0 - 1)) < 1e-9
@@ -441,8 +462,9 @@ def test_invalid_entry_and_exit_bars_withhold_multi_session_labels():
     assert out_b.iloc[3]["limit_admission_status"] == "OUT_OF_BAND"
     assert not out_b.iloc[3]["entry_open_admissible"]
     bounded_exit = corrupt_after_exit.copy()
-    bounded_exit.loc[3, "high"] = 112.0
+    bounded_exit.loc[3, ["high", "close"]] = [112.0, 113.0]   # domain defect, not a series break
     independent = _fixture_forward(bounded_exit, dates, horizons=(2,), open_anchored=True)
+    assert independent.iloc[3]["input_price_trusted"]
     assert independent.iloc[3]["domain_violation"]
     assert independent.iloc[3]["entry_open_admissible"]
     assert abs(independent.iloc[0]["fwd_oo_2"] - (111.0 / 101.0 - 1)) < 1e-9

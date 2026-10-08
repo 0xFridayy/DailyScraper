@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-from corporate_action_mutations import FINDING_MUTANTS
+from corporate_action_mutations import FINDING_MUTANTS, RESTART_MUTANTS
 
 ROOT = Path(__file__).parent
 SUITES = [
@@ -24,7 +24,8 @@ SUITES = [
     "test_inventory_evidence.py", "test_inventory_signal.py", "test_targeted_actor_observations.py",
     "test_experiment_1f_gate_b.py", "test_experiment_1f_phase2.py", "test_experiment_2a0_event_study.py",
     "test_idx_calendar.py", "test_neobdm_source_contract.py",
-    "test_corporate_action_findings.py", "test_corporate_action_mutation_witnesses.py",
+    "test_corporate_action_findings.py", "test_corporate_action_restart.py",
+    "test_corporate_action_mutation_witnesses.py",
     "test_corporate_action_callable_coverage.py", "test_ml_health.py",
     "test_pipeline.py", "test_broker_dashboard.py", "test_targeted_actor_panel.py",
     "test_morning.py", "test_broker_collect.py", "test_bandarmolony_trade_capture.py",
@@ -126,7 +127,7 @@ def semantic_assertion_failure(status, output):
 def verify_mutants(snapshot, env, selected=None):
     original = [(name, file, old, new, f"test_price_contract.py::{test}")
                 for name, file, old, new, test in MUTANTS]
-    mutations = original + FINDING_MUTANTS
+    mutations = original + FINDING_MUTANTS + RESTART_MUTANTS
     if selected:
         mutations = [mutation for mutation in mutations if any(
             mutation[0].startswith(prefix) for prefix in selected)]
@@ -158,7 +159,7 @@ def verify_mutants(snapshot, env, selected=None):
                     shutil.copyfile(file, case / file.name)
             path = case / filename
             source = path.read_text()
-            finding_mutant = name.startswith("F")
+            finding_mutant = name.startswith(("F", "R"))  # exactly one source match
             for before, after in ((old, new), *additional):
                 occurrences = source.count(before)
                 if not occurrences or finding_mutant and occurrences != 1:

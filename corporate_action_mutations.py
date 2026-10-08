@@ -30,15 +30,16 @@ FINDING_MUTANTS = [
      '    missing = set(SOURCE_COLUMNS) - set(px.columns)',
      "test_corporate_action_mutation_witnesses.py::test_f05_missing_actual_extrema_anchors_refuse"),
     ("F06-writer-preserves-close-only-revisions", "backfill_inventory.py",
-     '                      for field in ("open", "high", "low", "close", "volume"))}',
-     '                      for field in ("close",))}',
+     '                          for field in ("open", "high", "low", "close", "volume"))}',
+     '                          for field in ("close",))}',
      "test_corporate_action_findings.py::test_f06_unchanged_close_does_not_grandfather_changed_fields"),
     ("F07-unresolved-event-becomes-trusted-predecessor", "price_contract.py",
-     '            or not event and admission.status == "UNRESOLVED"\n'
-     '            and admission.reason == "MISSING_PREDECESSOR"))',
-     '            or admission.status == "UNRESOLVED"))',
+     '            if ref.status != "RESOLVED":\n'
+     '                reason = "UNRESOLVED_EVENT_REFERENCE"\n'
+     '            elif not complete_in_band:',
+     '            if ref.status == "RESOLVED" and not complete_in_band:',
      "test_corporate_action_findings.py::test_f07_pending_event_cannot_back_ordinary_session_or_labels"),
-    ("F08-unknown-source-gets-event-exception", "price_contract_frame.py",
+    ("F08-unknown-source-gets-event-exception", "price_contract.py",
      'RAW_ACTUAL if representation == "UNKNOWN" and not events else representation',
      'RAW_ACTUAL if representation == "UNKNOWN" else representation',
      "test_corporate_action_findings.py::test_f08_unknown_event_input_cannot_receive_official_admission"),
@@ -90,4 +91,28 @@ FINDING_MUTANTS = [
      's.rolling(h, min_periods=h).max().shift(-h)',
      's.rolling(h, min_periods=h).max().shift(-h).shift(1)',
      "test_corporate_action_findings.py::test_f18_first_complete_extrema_window_and_incomplete_tail"),
+]
+
+# Evidence-restart contract (price_contract.adjudicate_series). Each mutant
+# restores one rejected trust rule; its witness must fail on an assertion.
+RESTART_MUTANTS = [
+    ("R1-once-invalid-always-invalid", "price_contract.py",
+     '        else:\n            streak = 1\n',
+     '        else:\n            streak = 0 if last is not None else 1\n',
+     "test_corporate_action_restart.py::test_w1_unsupported_history_restarts_only_on_a_complete_2026_window"),
+    ("R2-trust-first-row-of-supplied-slice", "price_contract.py",
+     'or (linked and prior.trusted))',
+     'or (linked and prior.trusted) or last is None)',
+     "test_corporate_action_restart.py::test_first_row_of_any_slice_is_never_positionally_trusted"),
+    ("R3-two-good-looking-bars-restart", "price_contract.py",
+     'RESTART_SESSIONS = 10', 'RESTART_SESSIONS = 2',
+     "test_corporate_action_restart.py::test_w3_evidence_free_short_run_cannot_bootstrap_trust"),
+    ("R4-unbounded-recursive-admissibility", "price_contract.py",
+     'prior is not None and prior.local_ok and domain:',
+     'prior is not None and prior.admissible and domain:',
+     "test_corporate_action_restart.py::test_w7_alternating_discontinuities_keep_a_bounded_dependency",
+     (('consistency == "OUT_OF_BAND" and not prior.discontinuous', 'consistency == "OUT_OF_BAND"'),)),
+    ("R5-truncated-series-context-enters-restart", "price_contract_frame.py",
+     'context = groups.cumcount().ge(SERIES_CONTEXT_ROWS)', 'context = groups.cumcount().ge(0)',
+     "test_corporate_action_restart.py::test_w7_truncated_series_break_context_cannot_widen_trust"),
 ]

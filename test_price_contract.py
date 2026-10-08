@@ -159,12 +159,22 @@ def test_full_holding_phases_and_deleted_event_row():
     assert len(span(("2026-10-02", "CLOSE"), ("2026-10-09", "CLOSE"), pc.parse_registry(d)).event_ids) == 2
 
 
+def evidenced(px):
+    """The fixture plus the explicit restart window the trust contract requires."""
+    from corporate_action_test_support import restart_evidence
+    extended, axis = restart_evidence(px)
+    return extended, axis, extended.attrs["restart_evidence"]
+
+
 def test_observed_oo_exit_cc_gap_lag_and_oc_are_independent():
+    from corporate_action_test_support import strip_restart_evidence
     px = frame()
     reg = registry()
-    result = pa.add_forward_returns(px, px.date.tolist(), (1, 2, 3), extremes=True,
+    extended, axis, evidence = evidenced(px)
+    result = pa.add_forward_returns(extended, axis, (1, 2, 3), extremes=True,
                                     open_anchored=True, registry=reg, representation=pc.RAW_ACTUAL)
-    result = pa.add_lagged_returns(result, px.date.tolist(), (1, 2, 3), registry=reg, representation=pc.RAW_ACTUAL)
+    result = pa.add_lagged_returns(result, axis, (1, 2, 3), registry=reg, representation=pc.RAW_ACTUAL)
+    result = strip_restart_evidence(result, evidence)
     by = result.set_index("date")
     assert by.loc["2026-10-05", "entry_open_admissible"]
     assert pd.isna(by.loc["2026-10-01", "fwd_oo_1"])
@@ -250,15 +260,28 @@ def test_writer_audit_parity_domain_refusals_and_actual_netval():
         assert conn.execute("SELECT close FROM price_history ORDER BY date").fetchall() == [(1440,), (1030,)]
 
 
-def test_unchanged_history_is_not_promoted_to_trusted_predecessor():
+def stored_disposition(capsys):
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    return lines[-1]["price_dispositions"]
+
+
+def test_unchanged_history_is_not_promoted_to_trusted_predecessor(capsys):
     from test_inventory_capture import bf, price_db, price_payload, price_bar
     with price_db() as conn:
         conn.execute("INSERT INTO price_history VALUES ('2026-10-01','BBBB',1000,1000,1000,1000,1000)")
         conn.execute("INSERT INTO price_history VALUES ('2026-10-02','BBBB',500,500,500,500,1000)")
-        before = conn.total_changes
-        with pytest.raises(bf.InventoryError, match="UNTRUSTED_PREDECESSOR"):
-            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-05", 510)], "BBBB"))
-        assert conn.total_changes == before
+        # The stored -50% step is a violation; its later side never becomes a
+        # reference. The next capture is checked for consistency only and kept
+        # as unadjudicated restart evidence, never as a certified step.
+        bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-05", 510)], "BBBB"))
+        assert stored_disposition(capsys)[-1]["status"] == "RESTART_PENDING"
+        out = pa.detect(pa.load(conn)).set_index("date")
+        assert out.loc["2026-10-02", "limit_violation"] and not out.loc["2026-10-02", "close_anchor_admissible"]
+        assert out.loc["2026-10-05", "limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+        assert out.loc["2026-10-05", "limit_reference_status"] == "UNRESOLVED"
+        assert out.loc["2026-10-05", "consistency_status"] == "IN_BAND"
+        assert not out.loc["2026-10-05", "limit_violation"]
+        assert not out[["close_anchor_admissible", "price_step_admissible"]].any().any()
 
     # An independent event reference may admit its actual bar while the bad
     # predecessor remains unchanged and unavailable for ordinary comparison.
@@ -269,9 +292,22 @@ def test_unchanged_history_is_not_promoted_to_trusted_predecessor():
         assert conn.execute("SELECT close FROM price_history WHERE date='2026-10-02'").fetchone()[0] == 0
     with price_db() as conn:
         conn.execute("INSERT INTO price_history VALUES ('2026-10-05','BBBB',2000,1000,1000,1000,1000)")
+        bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-06", 1010)], "BBBB"))
+        assert stored_disposition(capsys)[-1]["status"] == "SOURCE_CAPTURE_UNADJUDICATED"
+        out = pa.detect(pa.load(conn)).set_index("date")
+        assert out.loc["2026-10-05", "domain_violation"]
+        assert out.loc["2026-10-06", "limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+        assert not out.close_anchor_admissible.any()
+
+
+def test_writer_refuses_a_discontinuity_from_an_unadjudicated_predecessor():
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        conn.executemany("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                         [("2026-10-01", "BBBB", 100, 100, 100, 100, 1000)])
         before = conn.total_changes
-        with pytest.raises(bf.InventoryError, match="UNTRUSTED_PREDECESSOR"):
-            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-06", 1010)], "BBBB"))
+        with pytest.raises(bf.InventoryError, match="limit_violation.*UNADJUDICATED_PREVIOUS_ACTUAL_CLOSE"):
+            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-02", 180)], "BBBB"))
         assert conn.total_changes == before
 
 
@@ -410,7 +446,7 @@ def test_integrity_reports_boundaries_with_zero_contamination():
         assert not problems and stats["withheld_price_labels"] > 0
 
 
-def test_invalid_calendar_identity_and_quarantined_baselines_refuse_before_writes():
+def test_invalid_calendar_identity_and_quarantined_baselines_refuse_before_writes(capsys):
     from test_inventory_capture import bf, price_db, price_payload, price_bar
     for ticker, day in [("ENRG", "2025-08-25"), ("ENRG", "2026-10-04"), ("INVALID", "2026-10-05")]:
         with price_db() as conn:
@@ -421,10 +457,16 @@ def test_invalid_calendar_identity_and_quarantined_baselines_refuse_before_write
         conn.execute("INSERT INTO price_history VALUES ('2026-10-05','BBBB',1000,1000,1000,1000,1000)")
         conn.execute("CREATE TABLE price_quarantine(date,ticker,reasons)")
         conn.execute("INSERT INTO price_quarantine VALUES ('2026-10-05','BBBB','cross_ticker_dup')")
-        before = conn.total_changes
-        with pytest.raises(bf.InventoryError, match="UNTRUSTED_PREDECESSOR"):
-            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-06", 1010)], "BBBB"))
-        assert conn.total_changes == before
+        # +80% versus the quarantined close: it is never the baseline, so the new
+        # capture is neither compared with it nor refused because of it.
+        bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-10-06", 1800)], "BBBB"))
+        disposition = stored_disposition(capsys)[-1]
+        assert disposition["status"] == "SOURCE_CAPTURE_UNADJUDICATED"
+        assert disposition["consistency_reference_price"] is None
+        audited, _, _ = pa.adjudicate_quarantine(conn)
+        row = audited.set_index("date").loc["2026-10-06"]
+        assert row.limit_unresolved_reason == "UNTRUSTED_PREDECESSOR" and not row.limit_violation
+        assert not row.close_anchor_admissible
 
 
 def test_empty_price_history_produces_no_certified_outputs():

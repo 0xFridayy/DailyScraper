@@ -17,6 +17,51 @@ from types import ModuleType
 from price_contract import UnsupportedPriceContract
 
 
+def restart_evidence(px, axis=None):
+    """Prepend one explicit restart window per ticker to a synthetic fixture.
+
+    The restart contract never trusts a frame's first row. Fixtures that test
+    behaviour after an anchor therefore supply the contract's evidence:
+    DEPENDENCY_ROWS consecutive verified sessions ending on the session before
+    the ticker's first bar, flat at that bar's close with a ticker-specific
+    traded volume (never a cross-ticker duplicate). Returns the extended frame
+    and session axis; strip_restart_evidence() removes these rows from outputs.
+    """
+    import pandas as pd
+    from datetime import date, timedelta
+    from price_contract import DEPENDENCY_ROWS, is_idx_session, IdxCalendarUnavailable
+    pieces, evidence = [], set()
+    for number, (ticker, rows) in enumerate(px.groupby("ticker", sort=True)):
+        first = rows.sort_values("date").iloc[0]
+        sessions, day = [], date.fromisoformat(first["date"])
+        while len(sessions) < DEPENDENCY_ROWS:
+            day -= timedelta(days=1)
+            try:
+                if is_idx_session(day):
+                    sessions.append(day.isoformat())
+            except IdxCalendarUnavailable:
+                raise AssertionError(f"{ticker}: fixture starts too early for restart evidence")
+        close = float(first["close"])
+        for session in sorted(sessions):
+            pieces.append(dict(first.to_dict(), date=session, open=close, high=close, low=close,
+                               close=close, volume=10_000.0 + number))
+            evidence.add((ticker, session))
+    extended = pd.concat([pd.DataFrame(pieces, columns=list(px.columns)).astype(px.dtypes.to_dict(), errors="ignore"),
+                          px], ignore_index=True).sort_values(["ticker", "date"], kind="mergesort")
+    extended = extended.reset_index(drop=True)
+    extended.attrs["restart_evidence"] = sorted(evidence)
+    dates = sorted(set(axis if axis is not None else px.date) | {d for _, d in evidence})
+    return extended, dates
+
+
+def strip_restart_evidence(out, evidence):
+    evidence = set(map(tuple, evidence))
+    keep = [(t, d) not in evidence for t, d in zip(out.ticker, out.date)]
+    stripped = out.loc[keep].reset_index(drop=True)
+    stripped.attrs = dict(out.attrs)
+    return stripped
+
+
 def assert_unmigrated(route):
     module, name = route.rsplit(".", 1)
     function = getattr(importlib.import_module(module), name)

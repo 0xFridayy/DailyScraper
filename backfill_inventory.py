@@ -84,8 +84,9 @@ from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, 
 from price_audit import (series_signature, should_fail_run, inventory_window,
                          inventory_window_is_short, ara_bound, ARB_BOUND, TOL)
 
-from price_contract import (RAW_ACTUAL, PreviousActual, resolve_limit_reference,
-                            validate_actual_price, positive_real, actual_bar_reason)
+from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before
+from price_contract import (RAW_ACTUAL, resolve_limit_reference, positive_real, actual_bar_reason,
+                            adjudicate_series, full_bar_band_status, quarantine_recoverable)
 from price_contract_frame import default_registry
 
 
@@ -202,13 +203,46 @@ def _real_close(close, ticker, day):
     return normalized
 
 
+def _same_value(stored, proposed):
+    """None-safe field equality. A stored NULL repaired to a value is a change."""
+    if stored is None or proposed is None:
+        return stored is None and proposed is None
+    try:
+        return float(stored) == float(proposed)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _refusal(ticker, day, record, close):
+    reason = record["anchor_trust_reason"]
+    if reason == "LIMIT_VIOLATION":
+        official = record["limit_admission_status"] == "OUT_OF_BAND"
+        reference = record["limit_reference_price"] if official else record["consistency_reference_price"]
+        kind = record["limit_reference_kind"] if official else "UNADJUDICATED_PREVIOUS_ACTUAL_CLOSE"
+        return (f"{ticker} {day}: limit_violation, reference {reference:g} ({kind}), previous session "
+                f"{record['previous_actual_session']}, close {close:g} ({close / reference - 1:+.2%}); "
+                f"open/high/low/close all checked - refusing to store")
+    if reason in {"CROSS_TICKER_DUPLICATE", "DUPLICATE_IDENTITY", "SERIES_BREAK"}:
+        return f"{ticker} {day}: independent price defect ({reason}) - refusing to store"
+    if reason == "ZERO_VOLUME":
+        return f"{ticker} {day}: UNRESOLVED UNVERIFIED_TRADING_SESSION - refusing to store"
+    if reason == "UNRESOLVED_EVENT_REFERENCE":
+        return f"{ticker} {day}: UNRESOLVED {record['limit_unresolved_reason']} - refusing to store"
+    return f"{ticker} {day}: UNRESOLVED {reason} - refusing to store"
+
+
 def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representation="UNKNOWN", market="REGULAR"):
     """Refuse new limit violations before either table receives any writes.
 
-    Judge the proposed series, including stored neighbours outside the response.
-    A revised predecessor can invalidate an unchanged successor. Unchanged
-    historical violations remain visible to the audit without blocking every
-    future top-up of the rolling year. No corporate-action exception is inferred.
+    Judge the proposed series, including stored neighbours outside the response,
+    with the same adjudication core as the audit (price_contract.adjudicate_series).
+    A revised predecessor can invalidate an unchanged successor. A bar is
+    compared with the close of its immediately preceding exchange session when
+    that observation is admissible; otherwise it is stored only as an
+    unadjudicated source capture that can start a restart window, never as a
+    validated daily comparison. Unchanged historical observations keep their
+    audit status without blocking every future top-up of the rolling year. No
+    corporate-action exception is inferred.
     """
     registry = registry or default_registry()
     incoming = ValidatedPriceValues()
@@ -231,22 +265,20 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
     stored_bars = {row[0]: dict(zip(fields, row)) for row in conn.execute(
         "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker=? ORDER BY date", (ticker,))}
     proposed_bars = stored_bars | {bar["date"]: bar for bar in ohlc}
+    changed = {bar["date"] for bar in ohlc if bar["date"] not in stored_bars
+               or not all(_same_value(stored_bars[bar["date"]].get(field), bar.get(field))
+                          for field in ("open", "high", "low", "close", "volume"))}
     # Independent defects come from the whole proposed snapshot, before a
     # quarantine overlay or this ticker's predecessor chain can grant trust.
     import pandas as pd
-    from price_contract_frame import independent_price_defects
+    from price_contract_frame import independent_price_defects, external_reasons
     snapshot = [dict(zip(("ticker",) + fields, row)) for row in conn.execute(
         "SELECT ticker,date,open,high,low,close,volume FROM price_history WHERE ticker<>?", (ticker,))]
-    snapshot.extend(dict(bar, ticker=ticker) for bar in proposed_bars.values())
+    days = sorted(proposed_bars)
+    snapshot.extend(dict(proposed_bars[day], ticker=ticker) for day in days)
     proposed_frame = pd.DataFrame(snapshot, columns=("ticker",) + fields)
-    defects = independent_price_defects(proposed_frame, registry, market).any(axis=1)
-    independent_bad = set(proposed_frame.loc[defects & proposed_frame.ticker.eq(ticker), "date"])
-    stored = {day: bar["close"] for day, bar in stored_bars.items()}
-    changed = {bar["date"] for bar in ohlc if bar["date"] not in stored_bars
-               or any(float(bar.get(field)) != float(stored_bars[bar["date"]].get(field))
-                      for field in ("open", "high", "low", "close", "volume"))}
-    proposed = stored | incoming
-    days = sorted(proposed)
+    defects = independent_price_defects(proposed_frame, registry, market)
+    mine = proposed_frame.index[proposed_frame.ticker.eq(ticker)]
     quarantined = {}
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='price_quarantine' AND type='table'").fetchone():
         columns = {r[1] for r in conn.execute("PRAGMA table_info(price_quarantine)")}
@@ -254,72 +286,66 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
             quarantined = dict(conn.execute("SELECT date,reasons FROM price_quarantine WHERE ticker=?", (ticker,)))
         else:
             quarantined = {r[0]: None for r in conn.execute("SELECT date FROM price_quarantine WHERE ticker=?", (ticker,))}
-    predecessor_trust = {}
-    for i, day in enumerate(days):
-        previous_day = days[i - 1] if i else None
-        preserved = day not in changed and previous_day not in changed
-        previous = None
-        if previous_day is not None:
-            try:
-                value = _real_close(proposed[previous_day], ticker, previous_day)
-            except InventoryError:
-                # Preserve corrupt historical provenance without making it a
-                # baseline. An official event reference is independent of it.
-                value = proposed[previous_day]
-            previous = PreviousActual(previous_day, value, "proposed-price-history", previous_day not in quarantined and predecessor_trust.get(previous_day, False))
-        events = registry.matching(ticker, market, day)
-        # An ordinary-band check on an unknown vendor basis is a narrow diagnostic,
-        # never evidence that the capture is raw or its returns are comparable.
-        diagnostic_rep = RAW_ACTUAL if representation == "UNKNOWN" and not events else representation
-        ref = resolve_limit_reference(ticker, day, market, previous, registry,
-                                      input_representation=diagnostic_rep)
-        admission = validate_actual_price(proposed[day], ref)
-        volume = proposed_bars[day].get("volume")
-        traded = (not isinstance(volume, bool) and isinstance(volume, (int, float))
-                  and math.isfinite(float(volume)) and volume > 0)
-        from price_contract import actual_predecessor_trusted, quarantine_recoverable
-        domain_valid = actual_bar_reason(proposed_bars[day]) is None
-        full_bar_admitted = domain_valid and all(validate_actual_price(proposed_bars[day].get(k), ref).status == "IN_BAND"
-                                                for k in ("open", "high", "low", "close"))
-        if day in quarantined and quarantine_recoverable(quarantined[day], ref,
-                bar_admitted=full_bar_admitted, independent_defect=not domain_valid or day in independent_bad,
-                representation=representation):
-            quarantined.pop(day)
-        predecessor_trust[day] = (day not in quarantined and day not in independent_bad and actual_predecessor_trusted(admission,
-            domain_valid=domain_valid and (full_bar_admitted or admission.status == "UNRESOLVED"),
-            traded=traded, event=bool(events)))
-        if preserved:
+    # A quarantine record judges the stored values. A changed bar is new source
+    # evidence and is judged afresh; an official reference can recover a sole
+    # ordinary-limit quarantine of an unchanged event bar.
+    trusted = []
+    independent = external_reasons(defects.loc[mine], [True] * len(mine))
+    for day, defect in zip(days, independent):
+        blocked = day in quarantined and day not in changed
+        if blocked and not defect and registry.matching(ticker, market, day):
+            ref = resolve_limit_reference(ticker, day, market, None, registry,
+                                          input_representation=representation)
+            bar = proposed_bars[day]
+            admitted = (ref.kind == "OFFICIAL_CORPORATE_ACTION_REFERENCE" and actual_bar_reason(bar) is None
+                        and full_bar_band_status(bar, ref.price) == "IN_BAND")
+            blocked = not quarantine_recoverable(quarantined[day], ref, bar_admitted=admitted,
+                                                 independent_defect=False, representation=representation)
+        trusted.append(not blocked)
+    rows = [dict(proposed_bars[day], external_reason=reason, source_known=True, context_complete=bool(complete))
+            for day, reason, complete in zip(days, external_reasons(defects.loc[mine], trusted),
+                                             defects.loc[mine, "series_context_complete"])]
+    records = dict(zip(days, adjudicate_series(ticker, rows, registry, market=market,
+                                               representation=representation,
+                                               source="proposed-price-history")))
+    successors = set()
+    for day in days:
+        try:
+            if day not in changed and latest_idx_session_before(date.fromisoformat(day)).isoformat() in changed:
+                successors.add(day)
+        except (IdxCalendarUnavailable, ValueError, TypeError):
+            continue
+    for day in days:
+        record = records[day]
+        if day not in changed and day not in successors:
             if day in incoming:
                 incoming.dispositions.append({"session": day, "status": "PRESERVED_UNADJUDICATED"})
             continue
-        if day in independent_bad:
-            raise InventoryError(f"{ticker} {day}: independent price defect - refusing to store")
-        if not traded:
-            raise InventoryError(f"{ticker} {day}: UNRESOLVED UNVERIFIED_TRADING_SESSION - refusing to store")
-        if admission.status == "OUT_OF_BAND":
-            raise InventoryError(
-                f"{ticker} {day}: limit_violation, reference {ref.price:g}, previous "
-                f"{previous.price if previous else None} on {previous_day}, close {proposed[day]:g} "
-                f"({admission.limit_change:+.2%}) - refusing to store")
-        if admission.status == "UNRESOLVED":
-            # A first source observation may be preserved, without approval of a
-            # daily comparison. All changed transitions and event records require
-            # a resolved reference before any write.
-            if previous is not None or events or admission.reason != "MISSING_PREDECESSOR":
-                raise InventoryError(f"{ticker} {day}: UNRESOLVED {admission.reason} - refusing to store")
-            status = "SOURCE_CAPTURE_UNADJUDICATED"
-        else:
+        if record["anchor_trust_status"] == "INADMISSIBLE":
+            # A stored successor is re-judged only on its transition from the
+            # revised predecessor; its other historical findings stay with the audit.
+            if day in changed or record["anchor_trust_reason"] == "LIMIT_VIOLATION":
+                raise InventoryError(_refusal(ticker, day, record, proposed_bars[day]["close"]))
+            continue
+        if day not in incoming:
+            continue
+        if record["anchor_trust_status"] == "TRUSTED_EVENT_ANCHOR":
+            status = "IN_BAND"
+        elif record["limit_reference_status"] == "RESOLVED":
             status = "IN_BAND" if representation == RAW_ACTUAL else "ORDINARY_DIAGNOSTIC_ONLY"
-            for field in ("open", "high", "low"):
-                bar = proposed_bars[day]
-                if validate_actual_price(positive_real(bar[field]), ref).status != "IN_BAND":
-                    raise InventoryError(f"{ticker} {day}: {field} limit_violation - refusing to store")
+        elif record["consistency_status"] == "IN_BAND":
+            status = "RESTART_PENDING"
+        else:
+            status = "SOURCE_CAPTURE_UNADJUDICATED"
         incoming.dispositions.append({"session": day, "status": status,
-                                      "unresolved_reason": admission.reason or None,
-                                      "reference_kind": ref.kind, "reference_price": ref.price,
-                                      "previous_actual_session": previous_day,
-                                      "previous_actual_close": previous.price if previous else None,
-                                      "event_id": ref.event_id,
+                                      "anchor_trust_status": record["anchor_trust_status"],
+                                      "unresolved_reason": record["limit_unresolved_reason"] or None,
+                                      "reference_kind": record["limit_reference_kind"],
+                                      "reference_price": record["limit_reference_price"],
+                                      "consistency_reference_price": record["consistency_reference_price"],
+                                      "previous_actual_session": record["previous_actual_session"],
+                                      "previous_actual_close": record["previous_actual_close"],
+                                      "event_id": record["corporate_action_event_id"],
                                       "registry_sha256": registry.content_sha256})
 
     return incoming

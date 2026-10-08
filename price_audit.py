@@ -106,11 +106,13 @@ def detect(px, trusted=None, *, registry=None, representation=None):
     external_trust = pd.Series(list(trusted) if trusted is not None else True, index=px.index)
     baseline_trust = external_trust & ~duplicate & ~duplicate_identity & ~series_break
     px = annotate_prices(px, registry=registry, representation=representation, trusted=baseline_trust)
-    g = px.groupby("ticker")
     px["prev_close"] = px["previous_actual_close"]
     px["pct_chg"] = px["close"] / px["prev_close"] - 1  # raw discontinuity diagnostic
     px["ara"] = px["limit_reference_price"].apply(ara_bound)
-    px["limit_violation"] = px["limit_admission_status"].eq("OUT_OF_BAND")
+    # Out of band against an anchor, an official reference, or an admissible
+    # predecessor still inside a restart window. The last one is a detected
+    # discontinuity, not a certified reference; the bar is never admitted.
+    px["limit_violation"] = px["limit_admission_status"].eq("OUT_OF_BAND") | px["consistency_violation"]
 
     px["cross_ticker_dup"] = duplicate
     px["duplicate_identity"] = duplicate_identity
