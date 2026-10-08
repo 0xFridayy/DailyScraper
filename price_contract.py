@@ -230,6 +230,80 @@ def _text(value):
     return isinstance(value, str) and bool(value.strip()) and value == value.strip()
 
 
+# Placeholder-shaped text is absence of evidence, never a provenance claim.
+PLACEHOLDER_TOKENS = frozenset({"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL", "N/A", "NA", "TBD", "TBA",
+                                "TODO", "PLACEHOLDER", "-", "--", "?", "MISSING", "PENDING", "NAN", "XXX"})
+_PLACEHOLDER_WORD = re.compile(r"(?<![A-Z0-9])(?:UNKNOWN|UNVERIFIED|TBD|TBA|TODO|PLACEHOLDER|N/A|NULL|NONE)(?![A-Z0-9])")
+EMPTY_CONTENT_SHA256 = sha256(b"").hexdigest()
+
+
+def placeholder_text(value):
+    """True for anything that is not meaningful single-line evidence text."""
+    return (not _text(value) or value.upper() in PLACEHOLDER_TOKENS
+            or re.fullmatch(r"[\W_0]*", value) is not None)
+
+
+def meaningful_identity(value):
+    """Identity text (authors, document ids, evidence names): no placeholder words."""
+    return not placeholder_text(value) and _PLACEHOLDER_WORD.search(value.upper()) is None
+
+
+def meaningful_sha256(value):
+    """A lowercase SHA-256 that is not empty content or a degenerate pattern."""
+    return (isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+            and value != EMPTY_CONTENT_SHA256 and len(set(value)) >= 8
+            and not any(value == value[:size] * (64 // size) for size in (1, 2, 4, 8, 16, 32)))
+
+
+def meaningful_url(value):
+    from urllib.parse import urlsplit
+    if not _text(value) or any(c.isspace() for c in value):
+        return False
+    parts = urlsplit(value)
+    return (parts.scheme in {"http", "https"} and "." in (parts.hostname or "")
+            and _PLACEHOLDER_WORD.search(value.upper()) is None)
+
+
+def _interval(value, default_zone="Asia/Jakarta"):
+    """(earliest, latest) UTC instants a recorded clock can denote, or None.
+
+    A date-only value is its whole local day; nothing finer is invented.
+    """
+    if isinstance(value, str):
+        day = canonical_session(value)
+        zone = ZoneInfo(default_zone)
+    elif isinstance(value, dict) and value.get("precision") == "DAY":
+        day, zone = canonical_session(value["date"]), ZoneInfo(value["timezone"])
+    elif isinstance(value, dict) and value.get("precision") == "INSTANT":
+        stamp = _availability(value)
+        return stamp, stamp
+    else:
+        return None
+    start = datetime.combine(day, time(), zone).astimezone(timezone.utc)
+    end = datetime.combine(day + timedelta(days=1), time(), zone).astimezone(timezone.utc)
+    return start, end - timedelta(microseconds=1)
+
+
+def _coherent_chronology(record):
+    """publication <= observation <= verification <= enrolment (knowledge cutoff).
+
+    A pair contradicts only when even the latest instant the later clock can
+    denote precedes the earliest instant of the earlier one: certainly first.
+    A confirmed reference must state its publication, observation and
+    verification clocks; a pending one is checked wherever it states them.
+    """
+    clocks = [("published", record["source"].get("published_on")), ("observed", record.get("observed_at")),
+              ("verified", record.get("verified_at")), ("enrolled", record.get("enrolled_at"))]
+    known = [(name, _interval(value)) for name, value in clocks if value is not None]
+    known = [(name, span) for name, span in known if span is not None]
+    if record["status"] == "CONFIRMED_REFERENCE" and [n for n, _ in known][:3] != ["published", "observed", "verified"]:
+        raise PriceContractError("CONFIRMED_REFERENCE_CLOCKS_REQUIRED")
+    for i, (_, earlier) in enumerate(known):
+        for _, later in known[i + 1:]:
+            if later[1] < earlier[0]:
+                raise PriceContractError("CONTRADICTORY_EVIDENCE_CHRONOLOGY")
+
+
 def _string_list(value, supported=None):
     return (isinstance(value, list) and bool(value)
             and all(_text(v) for v in value) and len(set(value)) == len(value)
@@ -237,30 +311,37 @@ def _string_list(value, supported=None):
 
 
 def _event_evidence(record):
+    """Meaningful, internally coherent provenance; placeholders never qualify."""
     source, evidence = record["source"], record["evidence_refs"]
     if (not isinstance(source, dict) or not isinstance(evidence, dict)
-            or not all(_text(source.get(k)) for k in ("author", "retrieval_medium", "url"))
-            or not _text(record["source_document_id"]) or not _text(record.get("notes"))
+            or not all(meaningful_identity(source.get(k)) for k in ("author", "retrieval_medium"))
+            or not meaningful_url(source.get("url"))
+            or not meaningful_identity(record["source_document_id"])
+            or placeholder_text(record.get("notes"))
             or "direct_exchange_original_sha256" not in evidence):
         raise PriceContractError("INVALID_EVENT_PROVENANCE")
     hashes, identities = [], []
     for key, value in evidence.items():
-        if not _text(key):
+        if not meaningful_identity(key):
             raise PriceContractError("INVALID_EVIDENCE")
         if key.endswith("sha256"):
             if value is None and key == "direct_exchange_original_sha256":
                 continue
-            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            if not meaningful_sha256(value):
                 raise PriceContractError("INVALID_EVIDENCE_HASH")
             hashes.append(value)
-        elif not _text(value):
+        elif key.endswith("url"):
+            if not meaningful_url(value):
+                raise PriceContractError("INVALID_EVIDENCE_URL")
+        elif not meaningful_identity(value) or value.startswith(("https://", "http://")):
             raise PriceContractError("INVALID_EVIDENCE_IDENTITY")
-        elif not key.endswith("url") and not value.startswith(("https://", "http://")):
+        else:
             identities.append(value)
     if not hashes or not identities:
         raise PriceContractError("OFFLINE_EVIDENCE_REQUIRED")
     if record["status"] == "CONFIRMED_REFERENCE":
         canonical_session(source["published_on"])
+    _coherent_chronology(record)
 
 
 def parse_registry(document):
@@ -268,7 +349,7 @@ def parse_registry(document):
     try:
         doc = json.loads(document, object_pairs_hook=_object) if isinstance(document, (str, bytes)) else document
         if (not isinstance(doc, dict) or type(doc.get("schema_version")) is not int
-                or doc["schema_version"] != 1 or not _text(doc.get("registry_version"))
+                or doc["schema_version"] != 1 or not meaningful_identity(doc.get("registry_version"))
                 or not isinstance(doc.get("events"), list)
                 or not isinstance(doc.get("reviewed_coverage"), list)):
             raise PriceContractError("UNSUPPORTED_REGISTRY")
@@ -290,7 +371,7 @@ def parse_registry(document):
                     or r["currency_unit"] != "IDR_PER_SHARE"
                     or r["status"] not in {"CONFIRMED_REFERENCE", "PENDING_REFERENCE", "REVOKED"}
                     or type(r["revision"]) is not int or r["revision"] < 1
-                    or not _text(r["event_id"]) or r["event_id"] in ids):
+                    or not meaningful_identity(r["event_id"]) or r["event_id"] in ids):
                 raise PriceContractError("INVALID_EVENT")
             _event_evidence(r)
             ids.add(r["event_id"])
@@ -322,7 +403,8 @@ def parse_registry(document):
             if (c["venue"] != "IDX" or c["from"] > c["through"] or not _string_list(c["tickers"])
                     or not all(re.fullmatch(r"[A-Z]{4}", t) for t in c["tickers"])
                     or not _string_list(c["market_scope"], {"REGULAR", "NEGOTIATED", "CASH"})
-                    or not _string_list(c["evidence_refs"])):
+                    or not _string_list(c["evidence_refs"])
+                    or not all(meaningful_identity(v) for v in c["evidence_refs"])):
                 raise PriceContractError("INVALID_COVERAGE")
             coverage.append(Coverage(c["venue"], tuple(c["market_scope"]), tuple(c["tickers"]), c["from"], c["through"]))
         digest = sha256(json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()

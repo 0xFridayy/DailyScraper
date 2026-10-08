@@ -521,3 +521,124 @@ def test_f09_limit_simulator_rejects_stale_decision_index():
 def test_f09_invalid_barrier_distances_cannot_fabricate_payoff(tp, sl):
     with pytest.raises(ValueError):
         strategy_trade(frame(), "2026-10-06", tp=tp, sl=sl)
+
+
+# ── F02/F08: placeholder-shaped provenance and incoherent chronology ──
+
+EMPTY_CONTENT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+@pytest.mark.parametrize("mutation", [
+    *[(lambda token: lambda e: e["source"].update(author=token))(t)
+      for t in ("UNKNOWN", "N/A", "TBD", "PLACEHOLDER", "-", "unknown", "Unknown author", "--")],
+    lambda e: e["source"].update(retrieval_medium="TBD"),
+    *[(lambda url: lambda e: e["source"].update(url=url))(u)
+      for u in ("N/A", "https://", "ftp://exchange.example/doc", "https://UNKNOWN", "not a url",
+                "https://www.idx.co.id/tbd")],
+    *[(lambda doc: lambda e: e.update(source_document_id=doc))(d) for d in ("UNKNOWN", "TBD", "-", "0000", "N/A")],
+    lambda e: e.update(event_id="PLACEHOLDER"),
+    lambda e: e.update(notes="TBD"),
+    *[(lambda digest: lambda e: e["evidence_refs"].update(report_content_sha256=digest))(h)
+      for h in ("0" * 64, "f" * 64, EMPTY_CONTENT_SHA256, "0123456789abcdef" * 4, "ab" * 32)],
+    lambda e: e["evidence_refs"].update(investigation_report="N/A"),
+    lambda e: e["evidence_refs"].update(issuer_document="UNKNOWN"),
+])
+def test_f02_placeholder_provenance_cannot_confirm_reference(mutation):
+    doc = document()
+    mutation(doc["events"][0])
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("mutation", [
+    # Published after it was observed.
+    lambda e: e["source"].update(published_on="2026-10-07"),
+    # Observed after it was verified.
+    lambda e: e.update(observed_at={"date": "2026-10-07", "precision": "DAY", "timezone": "Asia/Jakarta"}),
+    # Enrolled before the verification day began in Jakarta.
+    lambda e: e.update(enrolled_at={"timestamp": "2026-10-05T16:59:59+00:00", "precision": "INSTANT",
+                                    "timezone": "UTC"}),
+    # An instant verification strictly before the observation day.
+    lambda e: e.update(verified_at={"timestamp": "2026-10-05T16:00:00+00:00", "precision": "INSTANT",
+                                    "timezone": "UTC"}),
+    # A confirmed reference needs known observation and verification clocks.
+    lambda e: e.update(observed_at={"precision": "UNKNOWN"}),
+    lambda e: e.update(verified_at={"precision": "UNKNOWN"}),
+    lambda e: e["source"].pop("published_on"),
+    lambda e: e["source"].update(published_on="2026/10/02"),
+])
+def test_f02_incoherent_chronology_cannot_confirm_reference(mutation):
+    doc = document()
+    mutation(doc["events"][0])
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("observed,verified,enrolled", [
+    # Date-only clocks are intervals: same-day observation and verification agree.
+    ({"date": "2026-10-06", "precision": "DAY", "timezone": "Asia/Jakarta"},
+     {"timestamp": "2026-10-06T03:00:00+00:00", "precision": "INSTANT", "timezone": "UTC"},
+     {"timestamp": "2026-10-06T03:00:00+00:00", "precision": "INSTANT", "timezone": "UTC"}),
+    ({"date": "2026-10-06", "precision": "DAY", "timezone": "Asia/Jakarta"},
+     {"date": "2026-10-06", "precision": "DAY", "timezone": "Asia/Jakarta"},
+     {"timestamp": "2026-10-05T17:00:00+00:00", "precision": "INSTANT", "timezone": "UTC"}),
+])
+def test_f02_precision_aware_chronology_does_not_invent_contradictions(observed, verified, enrolled):
+    doc = document()
+    doc["events"][0].update(observed_at=observed, verified_at=verified, enrolled_at=enrolled)
+    event = pc.parse_registry(doc).matching("ENRG", "REGULAR", "2026-10-05")[0]
+    # Availability stays conservative: never before the whole observed day ends.
+    assert event.available_at >= datetime(2026, 10, 6, 17, 0, tzinfo=timezone.utc)
+
+
+def test_f02_pending_records_cannot_carry_placeholder_provenance():
+    doc = document()
+    doc["events"][1]["source"]["author"] = "UNKNOWN"
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+    doc = document()
+    doc["events"][1]["evidence_refs"]["audit_sha256"] = "0" * 64
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("evidence", [
+    {"source_document_id": "VERIFIED_SESSION_EVIDENCE_FIXTURE", "sha256": "0" * 64},
+    {"source_document_id": "VERIFIED_SESSION_EVIDENCE_FIXTURE", "sha256": "1" * 64},
+    {"source_document_id": "VERIFIED_SESSION_EVIDENCE_FIXTURE", "sha256": EMPTY_CONTENT_SHA256},
+    {"source_document_id": "N/A", "sha256": "5f2c" * 16},
+    {"source_document_id": "TBD", "sha256": "9b1f6c2e" * 8},
+    {"source_document_id": "-", "sha256": "9b1f6c2e" * 8},
+])
+def test_f08_placeholder_session_evidence_does_not_verify(evidence):
+    from neobdm_source_contract import price_source_context
+    out = price_source_context("2026-10-06", source_session="2026-10-05", session_evidence=evidence,
+                               representation=pc.RAW_ACTUAL, representation_evidence=evidence)
+    assert out["session_status"] == "UNKNOWN" and out["input_representation"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source", "N/A"), ("source", "TBD"), ("source", "PLACEHOLDER"), ("source", "-"),
+    ("source_identity", "unknown"), ("source_document_id", "0000"), ("source_document_id", ""),
+])
+def test_f08_placeholder_source_columns_cannot_admit_matching_event_prices(field, value):
+    px = frame()                       # exactly the observed ENRG anchors
+    px[field] = value
+    out = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+    event = out.loc[out.date.eq("2026-10-05")].iloc[0]
+    assert event.limit_reference_status != "RESOLVED"
+    assert event.anchor_trust_status == "INADMISSIBLE"
+    assert not event.close_anchor_admissible and not event.price_step_admissible
+
+
+def test_f08_unknown_representation_never_gets_event_semantics_from_matching_prices():
+    from test_inventory_capture import bf, price_db, price_payload
+    px = frame()
+    out = annotate_prices(px, registry=registry(), representation="UNKNOWN").set_index("date")
+    assert out.loc["2026-10-05", "limit_reference_kind"] != "OFFICIAL_CORPORATE_ACTION_REFERENCE"
+    assert out.loc["2026-10-05", "anchor_trust_reason"] == "UNRESOLVED_EVENT_REFERENCE"
+    assert not out.loc["2026-10-05":, "price_step_admissible"].any()
+    with price_db() as conn:
+        with pytest.raises(bf.InventoryError, match="UNKNOWN_REPRESENTATION"):
+            bf.insert_inventory(conn, "ENRG", price_payload(px.drop(columns="ticker").to_dict("records")))
+        assert conn.total_changes == 0

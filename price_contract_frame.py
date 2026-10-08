@@ -13,7 +13,7 @@ import numpy as np
 from price_contract import (Anchor, RAW_ACTUAL, parse_registry, return_span_status,
                             UnsupportedPriceContract, adjudicate_series, canonical_session,
                             is_idx_session, IdxCalendarUnavailable, PriceContractError,
-                            SERIES_BREAK_WINDOW, SERIES_CONTEXT_ROWS)
+                            SERIES_BREAK_WINDOW, SERIES_CONTEXT_ROWS, meaningful_identity)
 
 SOURCE_COLUMNS = ("ticker", "date", "open", "high", "low", "close", "volume")
 CERTIFICATE_COLUMN = "price_contract_row_sha256"
@@ -29,15 +29,6 @@ ADMISSION_COLUMNS = (
     "domain_violation", "price_segment_id", "input_price_trusted", "anchor_trust_status",
     "anchor_trust_reason", "restart_window_sessions",
 )
-# Placeholder-shaped identities are absence of evidence, never a source claim.
-PLACEHOLDER_TOKENS = frozenset({"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL", "N/A", "NA", "TBD",
-                                "TODO", "PLACEHOLDER", "-", "--", "?", "MISSING", "PENDING"})
-
-
-def placeholder_text(value):
-    return (not isinstance(value, str) or value != value.strip()
-            or value.strip().upper() in PLACEHOLDER_TOKENS
-            or re.fullmatch(r"[-_.?/\s0]*", value) is not None)
 
 
 def label_column(column):
@@ -146,7 +137,7 @@ def source_context_known(row, representation):
     withdraws the observation; matching prices never substitute for it.
     """
     for field in ("source", "source_identity", "source_document_id"):
-        if field in row and placeholder_text(row[field]):
+        if field in row and not meaningful_identity(row[field]):
             return False
     if "source_session" in row and row["source_session"] != row["date"]:
         return False

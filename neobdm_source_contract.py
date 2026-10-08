@@ -894,18 +894,16 @@ def price_source_context(capture_date, *, source_session=None, session_evidence=
     Explicit source evidence is required for session and representation claims.
     This adapter does not infer an exchange date from a clock/date offset.
     """
-    from price_contract import canonical_session, RAW_ACTUAL
+    from price_contract import canonical_session, RAW_ACTUAL, meaningful_identity, meaningful_sha256
     from idx_calendar import is_idx_session, IdxCalendarUnavailable
     context = {"capture_date": capture_date, "source_session": None,
                "session_status": "UNKNOWN", "input_representation": "UNKNOWN",
                "session_evidence": session_evidence,
                "representation_evidence": representation_evidence}
     def evidence(value):
-        return (isinstance(value, dict) and isinstance(value.get("source_document_id"), str)
-                and value["source_document_id"] == value["source_document_id"].strip()
-                and value["source_document_id"].upper() not in {"", "UNKNOWN", "UNVERIFIED", "NONE", "NULL"}
-                and isinstance(value.get("sha256"), str)
-                and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]))
+        # Placeholder ids and degenerate or empty-content hashes are not evidence.
+        return (isinstance(value, dict) and meaningful_identity(value.get("source_document_id"))
+                and meaningful_sha256(value.get("sha256")))
     if evidence(session_evidence):
         try:
             if is_idx_session(canonical_session(source_session)):

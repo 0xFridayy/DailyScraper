@@ -367,7 +367,12 @@ def test_screener_capture_is_not_a_source_session():
     from neobdm_source_contract import price_source_context
     raw = price_source_context("2026-10-06")
     assert raw["session_status"] == "UNKNOWN" and raw["source_session"] is None
-    evidence = {"source_document_id": "RECONSTRUCTED_VERIFIED_FIXTURE", "sha256": "1" * 64}
+    from hashlib import sha256
+    evidence = {"source_document_id": "RECONSTRUCTED_VERIFIED_FIXTURE",
+                "sha256": sha256(b"reconstructed verified session evidence fixture").hexdigest()}
+    # A degenerate placeholder digest is not evidence for the same claim.
+    assert price_source_context("2026-10-06", source_session="2026-10-05",
+                                session_evidence=dict(evidence, sha256="1" * 64))["session_status"] == "UNKNOWN"
     valid = price_source_context("2026-10-06", source_session="2026-10-05", session_evidence=evidence,
                                  representation=pc.RAW_ACTUAL, representation_evidence=evidence)
     assert valid["session_status"] == "VERIFIED" and valid["source_session"] == "2026-10-05"
