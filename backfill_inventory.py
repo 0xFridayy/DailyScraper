@@ -85,9 +85,8 @@ from price_audit import (series_signature, should_fail_run, inventory_window,
                          inventory_window_is_short, ara_bound, ARB_BOUND, TOL)
 
 from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before
-from price_contract import (RAW_ACTUAL, resolve_limit_reference, positive_real, actual_bar_reason,
-                            adjudicate_series, full_bar_band_status, quarantine_recoverable)
-from price_contract_frame import default_registry
+from price_contract import RAW_ACTUAL, positive_real, actual_bar_reason, adjudicate_series
+from price_contract_frame import default_registry, quarantine_withholds
 
 
 class ValidatedPriceValues(dict):
@@ -292,16 +291,9 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
     trusted = []
     independent = external_reasons(defects.loc[mine], [True] * len(mine))
     for day, defect in zip(days, independent):
-        blocked = day in quarantined and day not in changed
-        if blocked and not defect and registry.matching(ticker, market, day):
-            ref = resolve_limit_reference(ticker, day, market, None, registry,
-                                          input_representation=representation)
-            bar = proposed_bars[day]
-            admitted = (ref.kind == "OFFICIAL_CORPORATE_ACTION_REFERENCE" and actual_bar_reason(bar) is None
-                        and full_bar_band_status(bar, ref.price) == "IN_BAND")
-            blocked = not quarantine_recoverable(quarantined[day], ref, bar_admitted=admitted,
-                                                 independent_defect=False, representation=representation)
-        trusted.append(not blocked)
+        trusted.append(day not in quarantined or day in changed or not quarantine_withholds(
+            ticker, day, proposed_bars[day], quarantined[day], registry=registry, market=market,
+            representation=representation, independent_defect=defect is not None))
     rows = [dict(proposed_bars[day], external_reason=reason, source_known=True, context_complete=bool(complete))
             for day, reason, complete in zip(days, external_reasons(defects.loc[mine], trusted),
                                              defects.loc[mine, "series_context_complete"])]

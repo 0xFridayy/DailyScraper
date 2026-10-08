@@ -93,11 +93,17 @@ FINDING_MUTANTS = [
      '                              for t, d in zip(px.ticker, px.date)]',
      '    px["price_segment_id"] = px.groupby("ticker")["corporate_action_boundary"].cumsum()',
      "test_corporate_action_findings.py::test_f15_missing_event_row_does_not_join_median_segments"),
-    ("F16-integrity-trusts-producer-reasons", "check_signal_integrity.py",
-     '        if ordered.loc[pd.Series(illegal, index=ordered.index), column].notna().any():',
-     '        if (column + "_reason" in ordered and\n'
-     '                ordered.loc[ordered[column + "_reason"].ne(""), column].notna().any()):',
-     "test_corporate_action_findings.py::test_f16_integrity_checks_actual_spans_with_blank_producer_reasons"),
+    ("F16-integrity-trusts-producer-frame", "check_signal_integrity.py",
+     '    observed = adjudicate_observations(raw, registry=registry, representation=representation,\n'
+     '                                       market=market, quarantine=quarantine)',
+     '    observed = {(r["ticker"], r["date"]): r for r in px.to_dict("records")}',
+     "test_corporate_action_monitor.py::test_label_from_a_quarantined_anchor_is_rejected"),
+    ("F16-monitor-skips-path-admission", "check_signal_integrity.py",
+     '    if not all(observed[s]["price_step_admissible"] for s in steps):\n'
+     '        return "INADMISSIBLE_PATH", None\n'
+     '    if kind in',
+     '    if kind in',
+     "test_corporate_action_monitor.py::test_label_ending_in_an_out_of_band_observation_is_rejected"),
     ("F17-ancient-unresolved-row-blocks-local-trade", "ara_arb_simulation.py",
      '    i0 = idx_map[entry_date]',
      '    if g["at_ara"].isna().any() or g["at_arb"].isna().any():\n'

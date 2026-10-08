@@ -13,7 +13,9 @@ import numpy as np
 from price_contract import (Anchor, RAW_ACTUAL, parse_registry, return_span_status,
                             UnsupportedPriceContract, adjudicate_series, canonical_session,
                             is_idx_session, IdxCalendarUnavailable, PriceContractError,
-                            SERIES_BREAK_WINDOW, SERIES_CONTEXT_ROWS, meaningful_identity)
+                            SERIES_BREAK_WINDOW, SERIES_CONTEXT_ROWS, meaningful_identity,
+                            resolve_limit_reference, actual_bar_reason, full_bar_band_status,
+                            quarantine_recoverable)
 
 SOURCE_COLUMNS = ("ticker", "date", "open", "high", "low", "close", "volume")
 CERTIFICATE_COLUMN = "price_contract_row_sha256"
@@ -127,6 +129,52 @@ def independent_price_defects(px, registry, market="REGULAR"):
                          "series_break": series.reindex(px.index).astype(bool),
                          "series_context_complete": context.reindex(px.index).astype(bool)},
                         index=px.index)
+
+
+def quarantine_withholds(ticker, session, bar, reasons, *, registry, market, representation,
+                         independent_defect, as_of=None):
+    """Whether a stored quarantine record still withholds this observation.
+
+    Only a sole ordinary-limit reason on an event bar admitted by its own
+    official reference is superseded; independent defects never are.
+    """
+    if independent_defect or not registry.matching(ticker, market, session):
+        return True
+    ref = resolve_limit_reference(ticker, session, market, None, registry,
+                                  input_representation=representation, as_of=as_of)
+    admitted = (ref.kind == "OFFICIAL_CORPORATE_ACTION_REFERENCE" and actual_bar_reason(bar) is None
+                and full_bar_band_status(bar, ref.price) == "IN_BAND")
+    return not quarantine_recoverable(reasons, ref, bar_admitted=admitted, independent_defect=False,
+                                      representation=representation)
+
+
+def adjudicate_observations(raw, *, registry, representation, market="REGULAR", quarantine=None, as_of=None):
+    """Admission records for raw observations, keyed by (ticker, date).
+
+    Recomputed from stored values and the quarantine table only. Consumers that
+    must not trust a producer's frame (the integrity monitor) call this.
+    """
+    raw = raw.reset_index(drop=True)
+    defects = independent_price_defects(raw, registry, market)
+    quarantine = quarantine or {}
+    rows = raw.to_dict("records")
+    trust = []
+    for row, defect in zip(rows, defects[["cross_ticker_dup", "duplicate_identity", "series_break"]].any(axis=1)):
+        key = (row["date"], row["ticker"])
+        trust.append(key not in quarantine or not quarantine_withholds(
+            row["ticker"], row["date"], row, quarantine[key], registry=registry, market=market,
+            representation=representation, independent_defect=bool(defect), as_of=as_of))
+    for row, reason, complete in zip(rows, external_reasons(defects, trust), defects.series_context_complete):
+        row.update(external_reason=reason, source_known=True, context_complete=bool(complete))
+    records = {}
+    by_ticker = {}
+    for row in rows:
+        by_ticker.setdefault(row["ticker"], []).append(row)
+    for ticker, series in by_ticker.items():
+        for row, record in zip(series, adjudicate_series(ticker, series, registry, market=market,
+                                                         representation=representation, as_of=as_of)):
+            records[(ticker, row["date"])] = dict(record, **{k: row[k] for k in SOURCE_COLUMNS})
+    return records
 
 
 def source_context_known(row, representation):

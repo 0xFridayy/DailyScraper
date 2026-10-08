@@ -29,6 +29,7 @@ Exit code is non-zero when something is wrong, so the workflow goes red too:
 """
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -568,48 +569,147 @@ def check_value_sanity(conn, problems):
 
 # ── reporting ─────────────────────────────────
 
+LABEL_COLUMN = re.compile(r"(fwd(?:_oo|_oc)?|lag|max|mdd|gap)_(\d+)")
+
+
+def _sessions_after(day, count):
+    """The next `count` verified sessions after `day`; None if the calendar cannot say."""
+    from idx_calendar import is_idx_session, IdxCalendarUnavailable
+    out, current = [], date.fromisoformat(day)
+    try:
+        while len(out) < count:
+            current += timedelta(days=1)
+            if is_idx_session(current):
+                out.append(current.isoformat())
+    except IdxCalendarUnavailable:
+        return None
+    return out
+
+
+def _sessions_before(day, count):
+    from idx_calendar import latest_idx_session_before, IdxCalendarUnavailable
+    out, current = [], date.fromisoformat(day)
+    try:
+        for _ in range(count):
+            current = latest_idx_session_before(current)
+            out.append(current.isoformat())
+    except IdxCalendarUnavailable:
+        return None
+    return out[::-1]
+
+
+def _independent_label(kind, h, day, observed, span):
+    """(reason, expected) for one published label, from stored observations only.
+
+    Sessions come from the verified calendar, so a missing ticker row is never
+    bridged. An empty reason means the label is eligible and `expected` is the
+    value the stored observations imply. No producer column is consulted.
+    """
+    if kind == "lag":
+        path = _sessions_before(day, h)
+        if path is None:
+            return "UNSUPPORTED_CALENDAR", None
+        start, steps = path[0], path[1:] + [day]
+        if any(observed.get(s) is None for s in [start] + steps):
+            return "MISSING_TICKER_SESSION", None
+        if not observed[start]["close_anchor_admissible"]:
+            return "UNTRUSTED_ANCHOR", None
+        if not all(observed[s]["price_step_admissible"] for s in steps):
+            return "INADMISSIBLE_PATH", None
+        return span(start, "CLOSE", day, "CLOSE"), observed[day]["close"] / observed[start]["close"] - 1
+    after = _sessions_after(day, h + 1 if kind == "fwd_oo" else h)
+    if after is None:
+        return "UNSUPPORTED_CALENDAR", None
+    if any(observed.get(s) is None for s in [day] + after):
+        return "MISSING_TICKER_SESSION", None
+    anchor, steps, first, last = observed[day], after[:h], observed[after[0]], observed[after[-1]]
+    if kind != "fwd_oo" and not anchor["close_anchor_admissible"]:
+        return "UNTRUSTED_ANCHOR", None
+    if not all(observed[s]["price_step_admissible"] for s in steps):
+        return "INADMISSIBLE_PATH", None
+    if kind in {"fwd_oc", "fwd_oo", "gap"} and not first["entry_open_admissible"]:
+        return "INADMISSIBLE_ENTRY_OPEN", None
+    if kind == "fwd_oo" and not last["entry_open_admissible"]:
+        return "INADMISSIBLE_EXIT_OPEN", None
+    if kind in {"fwd", "max", "mdd"}:
+        values = {"fwd": last["close"], "max": max(observed[s]["high"] for s in steps),
+                  "mdd": min(observed[s]["low"] for s in steps)}
+        return span(day, "CLOSE", after[-1], "CLOSE"), values[kind] / anchor["close"] - 1
+    if kind == "fwd_oc":
+        return span(after[0], "OPEN", after[-1], "CLOSE"), last["close"] / first["open"] - 1
+    if kind == "fwd_oo":
+        return span(after[0], "OPEN", after[-1], "OPEN"), last["open"] / first["open"] - 1
+    return span(day, "CLOSE", after[0], "OPEN"), first["open"] / anchor["close"] - 1
+
+
+def _same_value(left, right):
+    if left is None or right is None or pd.isna(left) or pd.isna(right):
+        return (left is None or pd.isna(left)) and (right is None or pd.isna(right))
+    return float(left) == float(right)
+
+
 def check_price_contract(conn, problems, notes, stats, *, registry=None, representation=None):
-    """Independently report withheld labels and reject published crossing ratios."""
+    """Re-adjudicate every published label from stored observations.
+
+    The producer frame supplies only which labels were published and their
+    values. Admission, anchors, paths, extrema, spans and the values themselves
+    are recomputed from price_history and price_quarantine through the shared
+    adjudication core, so forged or stale reasons, flags, certificates and
+    identities cannot vouch for invalid underlying data.
+    """
     from price_audit import clean_panel
+    from price_contract_frame import default_registry, span_result, adjudicate_observations, SOURCE_COLUMNS
     px = clean_panel(conn, horizons=(1, 2), lags=(1, 2), extremes=True,
                      open_anchored=True, registry=registry, representation=representation)
     reasons = [c for c in px if c.endswith("_reason") and c.startswith(("fwd_", "lag_", "gap_"))]
     withheld = sum(int(px[c].ne("").sum()) for c in reasons)
     stats["withheld_price_labels"] = withheld
     stats["price_contract"] = px.attrs.get("price_contract")
-    from price_contract_frame import default_registry, span_result, frame_as_of
     registry = registry or default_registry()
-    identity = px.attrs.get("price_contract", {})
-    representation = representation or identity.get("input_representation", "UNKNOWN")
-    market = identity.get("market", "REGULAR")
-    axis = sorted(r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history"))
-    ordered = px.sort_values(["ticker", "date"])
-    grouped = ordered.groupby("ticker")
-    # Derive anchors independently, including extrema; reason strings are evidence only.
-    for column in ordered:
-        match = re.fullmatch(r"(fwd(?:_oo|_oc)?|lag|max|mdd|gap)_(\d+)", column)
+    representation = representation or "UNKNOWN"       # never the producer's own claim
+    market = "REGULAR"
+    raw = pd.read_sql("SELECT ticker, date, open, high, low, close, volume FROM price_history", conn)
+    quarantine = {}
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='price_quarantine'").fetchone():
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(price_quarantine)")}
+        quarantine = {(d, t): r for d, t, r in conn.execute(
+            "SELECT date, ticker, " + ("reasons" if "reasons" in columns else "NULL") + " FROM price_quarantine")}
+    observed = adjudicate_observations(raw, registry=registry, representation=representation,
+                                       market=market, quarantine=quarantine)
+    axis = sorted(set(raw.date))
+    differing = [f"{t} {d}" for t, d, *values in px[list(SOURCE_COLUMNS)].itertuples(index=False, name=None)
+                 if (t, d) not in observed or not all(
+                     _same_value(v, observed[(t, d)][f]) for f, v in zip(SOURCE_COLUMNS[2:], values))]
+    if differing:
+        problems.append(f"published observation differs from stored price_history for {len(differing)} "
+                        f"row(s) (e.g. {', '.join(differing[:3])}); its labels are not evidence")
+    by_ticker = {}
+    for (ticker, day), record in observed.items():
+        by_ticker.setdefault(ticker, {})[day] = record
+    for column in px:
+        match = LABEL_COLUMN.fullmatch(column)
         if not match:
             continue
         kind, h = match.group(1), int(match.group(2))
-        start, end = ordered.date, grouped.date.shift(-h)
-        start_phase, end_phase = "CLOSE", "CLOSE"
-        if kind == "lag":
-            start, end = grouped.date.shift(h), ordered.date
-        elif kind in {"fwd_oo", "fwd_oc"}:
-            start, start_phase = grouped.date.shift(-1), "OPEN"
-            if kind == "fwd_oo":
-                end, end_phase = grouped.date.shift(-(h + 1)), "OPEN"
-        elif kind == "gap":
-            end_phase = "OPEN"
-        illegal = []
-        for ticker, a, b in zip(ordered.ticker, start, end):
-            span = span_result(ticker, a if isinstance(a, str) else None,
-                               b if isinstance(b, str) else None, registry=registry,
-                               representation=representation, market=market, session_axis=axis,
-                               start_phase=start_phase, end_phase=end_phase, as_of=frame_as_of(px))
-            illegal.append(span.status != "COMPARABLE")
-        if ordered.loc[pd.Series(illegal, index=ordered.index), column].notna().any():
-            problems.append(f"{column}: published economic value on an independently ineligible span")
+        bad = []
+        for ticker, day, value in zip(px.ticker, px.date, px[column]):
+            if pd.isna(value):
+                continue
+
+            def span(start, start_phase, end, end_phase, ticker=ticker):
+                result = span_result(ticker, start, end, registry=registry, representation=representation,
+                                     market=market, session_axis=axis, start_phase=start_phase,
+                                     end_phase=end_phase)
+                return "" if result.status == "COMPARABLE" else result.reason
+
+            reason, expected = _independent_label(kind, h, day, by_ticker.get(ticker, {}), span)
+            if not reason and not math.isclose(float(value), expected, rel_tol=1e-9, abs_tol=1e-12):
+                reason = "VALUE_MISMATCH"
+            if reason:
+                bad.append(f"{ticker} {day} {reason}")
+        if bad:
+            problems.append(f"{column}: published economic value on an independently ineligible span "
+                            f"({len(bad)}: {', '.join(bad[:3])})")
     notes.append(f"{withheld} price label(s) withheld under the pinned price/reference/return contract")
 
 
