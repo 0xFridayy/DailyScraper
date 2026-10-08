@@ -25,6 +25,7 @@ SUITES = [
     "test_experiment_1f_gate_b.py", "test_experiment_1f_phase2.py", "test_experiment_2a0_event_study.py",
     "test_idx_calendar.py", "test_neobdm_source_contract.py",
     "test_corporate_action_findings.py", "test_corporate_action_restart.py", "test_corporate_action_monitor.py",
+    "test_corporate_action_cold_cli.py",
     "test_corporate_action_mutation_witnesses.py",
     "test_corporate_action_callable_coverage.py", "test_ml_health.py",
     "test_pipeline.py", "test_broker_dashboard.py", "test_targeted_actor_panel.py",

@@ -453,6 +453,8 @@ def evaluate_policy_with_trade_log(net, envs, top_k_features=3):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.__main__")
     args = parse_cli()
     conn = connect_price_db(args.db)
     try:

@@ -130,6 +130,50 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(stats["tests_passed"], 34)
 
+    def test_artifact_gated_checks_are_unavailable_not_passes(self):
+        problems, stats = [], {}
+        def gated(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0,
+                "All 5 tests passed. (2 skipped: strict equivalence: inventory_raw/ cache not present; "
+                "real-cache invariant: inventory_raw/ cache not present)\n", "")
+        with patch.object(health.subprocess, "run", side_effect=gated):
+            health.check_unit_tests(problems, stats)
+        suites = len(stats["suite_results"])
+        self.assertEqual(problems, [])
+        self.assertEqual(stats["tests_passed"], 3 * suites)
+        self.assertEqual(len(stats["tests_unavailable"]), 2 * suites)
+        self.assertEqual(stats["mandatory_unavailable"], [])
+        self.assertTrue(all(r["status"] == "PASS" for r in stats["suite_results"]))
+
+    def test_a_suite_that_executed_nothing_is_mandatory_unavailable_not_pass(self):
+        for stdout, stderr in (("", "Ran 3 tests in 0.0s\n\nOK (skipped=3)\n"), ("", "Ran 0 tests in 0.0s\nOK\n"),
+                               ("All 2 tests passed. (2 skipped: a: absent; b: absent)\n", ""),
+                               ("no summary\n", "")):
+            problems, stats = [], {}
+            def empty(args, **kwargs):
+                return subprocess.CompletedProcess(args, 0, stdout, stderr)
+            with patch.object(health.subprocess, "run", side_effect=empty):
+                health.check_unit_tests(problems, stats)
+            self.assertEqual(stats["tests_passed"], 0)
+            self.assertEqual(len(stats["mandatory_unavailable"]), len(stats["suite_results"]))
+            self.assertTrue(all(r["status"] == "UNAVAILABLE" for r in stats["suite_results"]))
+
+    def test_mandatory_unavailable_blocks_a_complete_pass_claim(self):
+        stats = {"tests_passed": 10, "mandatory_unavailable": ["test_pipeline.py: no test executed"],
+                 "tests_unavailable": ["x: absent"], "tests_skipped": 1}
+        report = health.format_report([], [], stats)
+        self.assertNotIn("ML health OK", report)
+        self.assertIn("INCOMPLETE", report)
+        self.assertIn("UNAVAILABLE", report)
+        with patch.object(health, "check", return_value=([], [], stats)), \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as result:
+            health.main([])
+        self.assertNotEqual(result.exception.code, 0)
+        ok = health.format_report([], [], {"tests_passed": 10, "tests_unavailable": ["x: absent"],
+                                           "mandatory_unavailable": [], "tests_skipped": 0})
+        self.assertIn("ML health OK", ok)
+        self.assertIn("1 optional check(s) UNAVAILABLE", ok)
+
     def test_every_health_suite_uses_a_fresh_process(self):
         launched = []
         def successful(args, **kwargs):

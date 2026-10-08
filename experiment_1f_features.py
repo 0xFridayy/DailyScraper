@@ -498,4 +498,6 @@ def preparation_ledgers(inputs):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_features.__main__")
     print(json.dumps(preparation_ledgers(load_inputs()), indent=1, sort_keys=True))

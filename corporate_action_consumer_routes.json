@@ -81,7 +81,8 @@
       "load_broker_scores",
       "load_profitability",
       "load_alpha_cases",
-      "load_broker_lift"
+      "load_broker_lift",
+      "live_signal_frame"
     ],
     "broker_learning_run": [
       "load_items",
@@ -161,7 +162,8 @@
       "load_panel",
       "outcome",
       "evaluate",
-      "main"
+      "main",
+      "format_report"
     ],
     "experiment_1f_candidate": [
       "main"
@@ -338,11 +340,16 @@
     ]
   },
   "cli_routes": {
-    "horizon_scan": "__main__",
+    "ara_arb_simulation": "__main__",
+    "ddqn_entry_exit": "__main__",
+    "experiment_1f_features": "__main__",
     "feature_ablation": "__main__",
+    "horizon_scan": "__main__",
     "multiday_features": "__main__",
+    "shap_analysis": "__main__",
     "smart_money_divergence": "__main__",
-    "strategy_variants": "__main__"
+    "strategy_variants": "__main__",
+    "walk_forward_backtest": "__main__"
   },
   "coverage_notes": "Callable price/model, quantity-basis, persisted presentation and persistence boundaries traced independently; generic numerical statistics, actual cash-flow ingestion, ownership and index-only calculations retain their own contracts. Refusal coverage does not certify migrations.",
   "conditional_routes": {

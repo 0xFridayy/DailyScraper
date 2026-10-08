@@ -161,7 +161,6 @@ from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
-import shap
 from xgboost import XGBRegressor
 
 from price_audit import clean_panel
@@ -742,6 +741,7 @@ def run_walk_forward(panel, train_min=30, test_window=6, top_k_features=3,
 
         triggered = test_df[test_df["pred"] > TRADE_THRESHOLD]
         if len(triggered):
+            import shap  # lazily: importing it initialises matplotlib caches
             explainer = shap.TreeExplainer(model)
             shap_vals = explainer.shap_values(triggered[FEATURES])
             for row_i, (_, row) in enumerate(triggered.iterrows()):
@@ -799,6 +799,8 @@ def parse_cli(argv=None, description=None):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("walk_forward_backtest.__main__")
     args = parse_cli()
     conn = connect_price_db(args.db)
     try:

@@ -72,6 +72,8 @@ def test_report_refusal_is_importable_without_messaging_credentials(monkeypatch)
     ("ml_v2_experiment_1_robustness", "paired_bootstrap_report", (UnreadableInput(),)),
     ("experiment_1f_gate_b", "graduation_report", (UnreadableInput(),)),
     ("experiment_1f_gate_b", "sensitivity_report", (UnreadableInput(),)),
+    # A cached outcome report (mean return, hit rate) is economic output.
+    ("evaluate_signals", "format_report", (UnreadableInput(),)),
 ])
 def test_cached_financial_result_presentations_refuse_without_identity(module, name, args):
     route = module + "." + name
@@ -244,3 +246,17 @@ def test_anonymous_numerical_helpers_retain_rank_slot_and_selection_semantics():
     metrics = [[0.9, 0.8], [0.5, 0.4], [0.5, 0.7], [np.nan, 1]]
     assert regime.metric_selection_index(metrics, [1, 20, 20, 100], 20) == (2, True)
     assert regime.metric_selection_index(metrics, [1, 1, 1, 1], 20) == (0, False)
+
+
+def test_stored_v0_rule_signals_are_not_returned_by_a_direct_reader(tmp_path):
+    import broker_learning_db as db
+    with pytest.raises(UnsupportedPriceContract) as caught:
+        db.live_signal_frame(UnreadableInput())
+    assert caught.value.consumer == "broker_learning_db.live_signal_frame"
+    path = tmp_path / "bl.db"
+    with sqlite3.connect(path) as conn:
+        db.ensure_schema(conn)
+        before = conn.total_changes
+        with pytest.raises(UnsupportedPriceContract):
+            db.live_signal_frame(conn)
+        assert conn.total_changes == before

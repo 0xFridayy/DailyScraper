@@ -220,6 +220,9 @@ def _frame(conn, sql, params=()):
 
 
 def live_signal_frame(conn):
+    """Stored rule firings predate the current price contract; never returned as signals."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.live_signal_frame")
     return _frame(conn, "SELECT * FROM live_signals ORDER BY session_date, ticker, ruleset, rule_id")
 
 

@@ -20,7 +20,6 @@ walk_forward_backtest.py's docstring for the 2026-07-07 result on the full
 
 import numpy as np
 import pandas as pd
-import shap
 from xgboost import XGBRegressor
 from walk_forward_backtest import (build_panel, FEATURES, DB_PATH, connect_price_db,
                                    format_broker_flow_provenance, parse_cli)
@@ -29,6 +28,7 @@ from walk_forward_backtest import (build_panel, FEATURES, DB_PATH, connect_price
 def run_shap_analysis(panel):
     from price_contract import refuse_unmigrated
     refuse_unmigrated("shap_analysis.run_shap_analysis")
+    import shap  # never initialised for a refused route
     X = panel[FEATURES].fillna(0)
     y = panel["target"]
 
@@ -49,6 +49,8 @@ def run_shap_analysis(panel):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("shap_analysis.__main__")
     args = parse_cli(description="SHAP feature importance on the walk-forward panel.")
     conn = connect_price_db(args.db)
     try:

@@ -206,8 +206,13 @@ def check_unit_tests(problems, stats):
 
     test_bandarmolony_trade_capture.py checks offline trade normalization, private
     output, immutable captures, and verification. It also runs in --quick.
+
+    PASS, FAIL, SKIP and UNAVAILABLE stay separate. A check that returned early
+    because an optional artifact is absent ("N skipped: name: why") is
+    UNAVAILABLE, never a pass. Every listed suite is mandatory: one that ran
+    and passed nothing is a mandatory UNAVAILABLE and blocks any PASS claim.
     """
-    passed = 0
+    passed, skipped, unavailable, mandatory, results = 0, 0, [], [], []
     for name in ("test_pipeline.py", "test_experiment_1f_phase2.py", "test_daily_picks.py",
                  "test_broker_book.py", "test_broker_rules.py", "test_broker_learning.py",
                  "test_broker_dashboard.py", "test_broker_collect.py",
@@ -219,19 +224,34 @@ def check_unit_tests(problems, stats):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
         unittest_summary = re.search(r"^Ran (\d+) tests? in ", r.stderr, flags=re.M)
-        script_summary = re.search(r"^All (\d+) tests? (?:passed|OK)\b", r.stdout, flags=re.M)
+        script_summary = re.search(r"^All (\d+) tests? (?:passed|OK)\b\.?(?: \((\d+) skipped: (.*)\))?$",
+                                   r.stdout, flags=re.M)
+        executed, gated, suite_skips = 0, [], 0
         if r.returncode == 0:
             if unittest_summary:
-                skipped = re.search(r"\bskipped=(\d+)", r.stderr)
-                passed += int(unittest_summary.group(1)) - (int(skipped.group(1)) if skipped else 0)
+                found = re.search(r"\bskipped=(\d+)", r.stderr)
+                suite_skips = int(found.group(1)) if found else 0
+                executed = int(unittest_summary.group(1)) - suite_skips
             elif script_summary:
-                passed += int(script_summary.group(1))
+                gated = [f"{name}: {item}" for item in (script_summary.group(3) or "").split("; ") if item]
+                executed = int(script_summary.group(1)) - len(gated)
             else:
-                passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
-        if r.returncode != 0:
+                executed = r.stdout.count(" passed") + r.stdout.count("  ok ")
+            status = "PASS" if executed > 0 else "UNAVAILABLE"
+            if status == "UNAVAILABLE":
+                mandatory.append(f"{name}: no test executed")
+        else:
+            status = "FAIL"
             tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
             problems.append(f"{name} FAILED — " + " | ".join(tail))
-    stats["tests_passed"] = passed
+        passed += executed if status == "PASS" else 0
+        skipped += suite_skips
+        unavailable.extend(gated)
+        results.append({"suite": name, "status": status, "passed": executed if status == "PASS" else 0,
+                        "skipped": suite_skips, "unavailable": len(gated)})
+    stats.update(tests_passed=passed, tests_skipped=skipped, tests_unavailable=unavailable,
+                 suite_results=results)
+    stats["mandatory_unavailable"] = stats.get("mandatory_unavailable", []) + mandatory
 
 
 def _expects_refusal(consumer):
@@ -497,7 +517,14 @@ def check(quick=False, broker_flow_manifest=None):
 
 
 def format_report(problems, notes, stats):
-    head = "🔴 ML HEALTH FAILED" if problems else "🟢 ML health OK"
+    mandatory = stats.get("mandatory_unavailable") or []
+    if problems:
+        head = "🔴 ML HEALTH FAILED"
+    elif mandatory:
+        head = ("🟠 ML HEALTH INCOMPLETE — mandatory check(s) UNAVAILABLE; no PASS claim: "
+                + "; ".join(mandatory[:4]))
+    else:
+        head = "🟢 ML health OK"
     lines = [head]
 
     bits = []
@@ -505,6 +532,10 @@ def format_report(problems, notes, stats):
         bits.append(f"{stats['modules_ok']} modules import")
     if "tests_passed" in stats:
         bits.append(f"{stats['tests_passed']} tests pass")
+    if stats.get("tests_skipped"):
+        bits.append(f"{stats['tests_skipped']} skipped")
+    if stats.get("tests_unavailable"):
+        bits.append(f"{len(stats['tests_unavailable'])} optional check(s) UNAVAILABLE")
     if "panel" in stats:
         bits.append(f"panel {stats['panel']}")
     if bits:
@@ -576,10 +607,11 @@ def main(argv=None):
                                    broker_flow_manifest=args.broker_flow_manifest)
     report = format_report(problems, notes, stats)
     print(report)
-    # Quiet when healthy: Telegram only hears about problems.
-    if args.telegram and problems:
+    # Quiet when healthy: Telegram only hears about problems or missing checks.
+    incomplete = bool(stats.get("mandatory_unavailable"))
+    if args.telegram and (problems or incomplete):
         send_telegram(report)
-    sys.exit(1 if problems else 0)
+    sys.exit(1 if problems else 2 if incomplete else 0)
 
 
 if __name__ == "__main__":

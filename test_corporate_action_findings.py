@@ -642,3 +642,38 @@ def test_f08_unknown_representation_never_gets_event_semantics_from_matching_pri
         with pytest.raises(bf.InventoryError, match="UNKNOWN_REPRESENTATION"):
             bf.insert_inventory(conn, "ENRG", price_payload(px.drop(columns="ticker").to_dict("records")))
         assert conn.total_changes == 0
+
+
+# ── N01: repairing stored NULL fields is a validated change, never a crash ──
+
+def null_history(conn, fields=("open", "high", "low", "volume")):
+    from test_inventory_capture import price_bar
+    for day in ("2026-07-01", "2026-07-02", "2026-07-03"):
+        bar = price_bar(day, 100)
+        if day == "2026-07-02":
+            bar.update({field: None for field in fields})
+        conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                     (day, "BBBB", bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]))
+
+
+@pytest.mark.parametrize("fields", [("open",), ("high", "low"), ("volume",), ("open", "high", "low", "volume")])
+def test_n01_null_ohlcv_repair_is_validated_without_crashing(fields):
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        null_history(conn, fields)
+        assert bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-07-02", 100)], "BBBB"))[1] == 1
+        assert conn.execute("SELECT open, high, low, close, volume FROM price_history "
+                            "WHERE date='2026-07-02'").fetchone() == (100, 100, 100, 100, 1000)
+
+
+def test_n01_null_repair_still_checks_its_own_and_successor_transitions():
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        null_history(conn)
+        before = conn.total_changes
+        with pytest.raises(bf.InventoryError, match="limit_violation"):   # +50% vs 07-01
+            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-07-02", 150)], "BBBB"))
+        with pytest.raises(bf.InventoryError, match="limit_violation"):   # stored 07-03 is -23% from it
+            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-07-02", 130)], "BBBB"))
+        assert conn.total_changes == before
+        assert conn.execute("SELECT open FROM price_history WHERE date='2026-07-02'").fetchone() == (None,)

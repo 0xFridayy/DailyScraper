@@ -173,6 +173,8 @@ def run_ara_arb_check(threshold=0.020, *, broker_flow_manifest_path, db_path=DB_
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_simulation.__main__")
     args = parse_cli(description="ARA/ARB fill simulation of the walk-forward signal.")
     result = run_ara_arb_check(threshold=0.020, broker_flow_manifest_path=args.broker_flow_manifest,
                                db_path=args.db)

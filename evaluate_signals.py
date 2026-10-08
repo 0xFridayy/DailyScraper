@@ -253,6 +253,9 @@ def _line(tag, s, ctl):
 
 
 def format_report(res):
+    """Presents cached outcome statistics; refused without current price identity."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("evaluate_signals.format_report")
     dates = res["dates"]
     out = ["📈 Signal Evaluation — telebot entry strategy"]
     if not dates:
