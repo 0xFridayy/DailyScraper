@@ -231,13 +231,29 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
     stored_bars = {row[0]: dict(zip(fields, row)) for row in conn.execute(
         "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker=? ORDER BY date", (ticker,))}
     proposed_bars = stored_bars | {bar["date"]: bar for bar in ohlc}
+    # Independent defects come from the whole proposed snapshot, before a
+    # quarantine overlay or this ticker's predecessor chain can grant trust.
+    import pandas as pd
+    from price_contract_frame import independent_price_defects
+    snapshot = [dict(zip(("ticker",) + fields, row)) for row in conn.execute(
+        "SELECT ticker,date,open,high,low,close,volume FROM price_history WHERE ticker<>?", (ticker,))]
+    snapshot.extend(dict(bar, ticker=ticker) for bar in proposed_bars.values())
+    proposed_frame = pd.DataFrame(snapshot, columns=("ticker",) + fields)
+    defects = independent_price_defects(proposed_frame, registry, market).any(axis=1)
+    independent_bad = set(proposed_frame.loc[defects & proposed_frame.ticker.eq(ticker), "date"])
     stored = {day: bar["close"] for day, bar in stored_bars.items()}
-    changed = {d for d, close in incoming.items() if d not in stored or close != stored[d]}
+    changed = {bar["date"] for bar in ohlc if bar["date"] not in stored_bars
+               or any(float(bar.get(field)) != float(stored_bars[bar["date"]].get(field))
+                      for field in ("open", "high", "low", "close", "volume"))}
     proposed = stored | incoming
     days = sorted(proposed)
-    quarantined = set()
+    quarantined = {}
     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='price_quarantine' AND type='table'").fetchone():
-        quarantined = {r[0] for r in conn.execute("SELECT date FROM price_quarantine WHERE ticker=?", (ticker,))}
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(price_quarantine)")}
+        if "reasons" in columns:
+            quarantined = dict(conn.execute("SELECT date,reasons FROM price_quarantine WHERE ticker=?", (ticker,)))
+        else:
+            quarantined = {r[0]: None for r in conn.execute("SELECT date FROM price_quarantine WHERE ticker=?", (ticker,))}
     predecessor_trust = {}
     for i, day in enumerate(days):
         previous_day = days[i - 1] if i else None
@@ -254,20 +270,30 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
         events = registry.matching(ticker, market, day)
         # An ordinary-band check on an unknown vendor basis is a narrow diagnostic,
         # never evidence that the capture is raw or its returns are comparable.
-        diagnostic_rep = RAW_ACTUAL if representation == "UNKNOWN" and (not events or preserved) else representation
+        diagnostic_rep = RAW_ACTUAL if representation == "UNKNOWN" and not events else representation
         ref = resolve_limit_reference(ticker, day, market, previous, registry,
                                       input_representation=diagnostic_rep)
         admission = validate_actual_price(proposed[day], ref)
         volume = proposed_bars[day].get("volume")
         traded = (not isinstance(volume, bool) and isinstance(volume, (int, float))
                   and math.isfinite(float(volume)) and volume > 0)
-        predecessor_trust[day] = (day not in quarantined and traded and actual_bar_reason(proposed_bars[day]) is None
-                                  and admission.status != "OUT_OF_BAND"
-                                  and (admission.status != "UNRESOLVED" or previous is None))
+        from price_contract import actual_predecessor_trusted, quarantine_recoverable
+        domain_valid = actual_bar_reason(proposed_bars[day]) is None
+        full_bar_admitted = domain_valid and all(validate_actual_price(proposed_bars[day].get(k), ref).status == "IN_BAND"
+                                                for k in ("open", "high", "low", "close"))
+        if day in quarantined and quarantine_recoverable(quarantined[day], ref,
+                bar_admitted=full_bar_admitted, independent_defect=not domain_valid or day in independent_bad,
+                representation=representation):
+            quarantined.pop(day)
+        predecessor_trust[day] = (day not in quarantined and day not in independent_bad and actual_predecessor_trusted(admission,
+            domain_valid=domain_valid and (full_bar_admitted or admission.status == "UNRESOLVED"),
+            traded=traded, event=bool(events)))
         if preserved:
             if day in incoming:
                 incoming.dispositions.append({"session": day, "status": "PRESERVED_UNADJUDICATED"})
             continue
+        if day in independent_bad:
+            raise InventoryError(f"{ticker} {day}: independent price defect - refusing to store")
         if not traded:
             raise InventoryError(f"{ticker} {day}: UNRESOLVED UNVERIFIED_TRADING_SESSION - refusing to store")
         if admission.status == "OUT_OF_BAND":
@@ -285,8 +311,8 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
         else:
             status = "IN_BAND" if representation == RAW_ACTUAL else "ORDINARY_DIAGNOSTIC_ONLY"
             for field in ("open", "high", "low"):
-                bar = next((b for b in ohlc if b["date"] == day), None)
-                if bar and validate_actual_price(positive_real(bar[field]), ref).status != "IN_BAND":
+                bar = proposed_bars[day]
+                if validate_actual_price(positive_real(bar[field]), ref).status != "IN_BAND":
                     raise InventoryError(f"{ticker} {day}: {field} limit_violation - refusing to store")
         incoming.dispositions.append({"session": day, "status": status,
                                       "unresolved_reason": admission.reason or None,
@@ -421,6 +447,11 @@ def run_backfill(tickers):
             try:
                 payload, cap, response_raw = fetch_inventory(
                     req, ticker, start_date, end_date, captures)
+                response_bars = payload["data"].get("ohlc") or []
+                response_signature = series_signature({"x": [bar["date"] for bar in response_bars],
+                                                       "close": [bar["close"] for bar in response_bars]})
+                if response_signature is not None and response_signature == prev_signature:
+                    raise InventoryError(f"series identical to {prev_ticker} — stale response, not stored")
                 broker_n, price_n, returned, signature = insert_inventory(
                     conn, ticker, payload, registry=run_registry)
 

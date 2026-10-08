@@ -47,7 +47,7 @@ from strategy_variants import get_walk_forward_predictions
 from signal_metrics import trade_stats, format_trade_stats
 
 from price_contract import ara_bound, ARB_BOUND, NEAR_LIMIT_TOLERANCE
-from price_contract_frame import annotate_prices, require_price_frame, default_registry, span_result
+from price_contract_frame import annotate_prices, require_price_frame, default_registry, span_result, _seal_price_frame, frame_as_of
 
 
 def annotate_limits(px, *, registry=None, representation=None):
@@ -59,7 +59,10 @@ def annotate_limits(px, *, registry=None, representation=None):
     resolved = px["limit_reference_status"].eq("RESOLVED")
     px["at_ara"] = (px["limit_change"] >= px["ara_bound"] - NEAR_LIMIT_TOLERANCE).where(resolved)
     px["at_arb"] = (px["limit_change"] <= ARB_BOUND + NEAR_LIMIT_TOLERANCE).where(resolved)
-    return px
+    owned = set(px.attrs["price_contract"].get("producer_columns", []))
+    owned.update(("prev_close", "pct_chg", "ara_bound", "at_ara", "at_arb"))
+    px.attrs["price_contract"]["producer_columns"] = sorted(owned)
+    return _seal_price_frame(px)
 
 
 def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_date, *, registry=None):
@@ -67,14 +70,20 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
     ARB-stuck exits roll forward to the first unstuck day."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
-    if g is None or entry_date not in idx_map:
+    if g is None or idx_map is None or entry_date not in idx_map:
         return None
     registry = registry or default_registry()
-    identity = require_price_frame(g, ("fwd_1", "at_ara", "at_arb"), registry=registry)
-    if g[["at_ara", "at_arb"]].isna().any().any():
+    from price_contract import UnsupportedPriceContract
+    try:
+        identity = require_price_frame(g, ("fwd_1", "at_ara", "at_arb"), registry=registry)
+    except UnsupportedPriceContract:
         return None
     i0 = idx_map[entry_date]
-    if g.loc[i0, "at_ara"]:
+    if (type(i0) is not int or not 0 <= i0 < len(g) or g.iloc[i0]["date"] != entry_date
+            or not g["ticker"].eq(ticker).all() or list(g.index) != list(range(len(g)))):
+        return None
+    if (not g.loc[i0, "price_step_admissible"] or pd.isna(g.loc[i0, "at_ara"])
+            or g.loc[i0, "at_ara"]):
         return None  # entry blocked: can't reliably buy into a locked limit-up
     if i0 + 1 >= len(g):
         return None
@@ -83,15 +92,21 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
     entry_price = g.loc[i0, "close"]
 
     j = i0 + 1
-    while j < len(g) and g.loc[j, "at_arb"] and j < i0 + 20:  # cap the roll-forward search
-        if "fwd_1" in g and pd.isna(g.loc[j - 1, "fwd_1"]):
+    while j < len(g):
+        # Every examined actual exit, including the final non-ARB bar, is required.
+        if (not g.loc[j, "price_step_admissible"] or pd.isna(g.loc[j, "at_arb"])
+                or pd.isna(g.loc[j - 1, "fwd_1"])):
+            return None
+        if not g.loc[j, "at_arb"]:
+            break
+        if j >= i0 + 20:
             return None
         j += 1
     if j >= len(g):
-        j = len(g) - 1
+        return None
     held = span_result(ticker, g.loc[i0, "date"], g.loc[j, "date"],
                        registry=registry, representation=identity["input_representation"],
-                       market=identity["market"], session_axis=g.date.tolist())
+                       market=identity["market"], session_axis=g.date.tolist(), as_of=frame_as_of(g))
     if held.status != "COMPARABLE":
         return None
     exit_price = g.loc[j, "close"]
@@ -99,6 +114,8 @@ def simulate_trade_with_limits(px_by_ticker, date_idx_by_ticker, ticker, entry_d
 
 
 def run_ara_arb_check(threshold=0.020, *, broker_flow_manifest_path, db_path=DB_PATH):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_simulation.run_ara_arb_check")
     from price_audit import clean_panel
 
     conn = connect_price_db(db_path)

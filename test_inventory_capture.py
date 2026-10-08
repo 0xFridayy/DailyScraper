@@ -896,8 +896,18 @@ def test_backfill_keeps_unchanged_historical_violations_visible():
             (b["date"], "ENRG", b["open"], b["high"], b["low"], b["close"], b["volume"])
             for b in ENRG_BARS])
         conn.commit()
-        bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
-        flagged = detect(load(conn))
+        # Preservation is not event admission under an UNKNOWN representation.
+        before = conn.total_changes
+        try:
+            bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]))
+        except bf.InventoryError as exc:
+            assert "UNTRUSTED_PREDECESSOR" in str(exc)
+        else:
+            raise AssertionError("UNKNOWN event observation became a trusted predecessor")
+        assert conn.total_changes == before
+        from price_contract import RAW_ACTUAL
+        bf.insert_inventory(conn, "ENRG", price_payload(ENRG_BARS + [price_bar("2026-10-06", 1050)]), representation=RAW_ACTUAL)
+        flagged = detect(load(conn), representation=RAW_ACTUAL)
         assert not flagged.limit_violation.any()
         assert flagged.loc[flagged.date.eq("2026-10-05"), "corporate_action_boundary"].all()
         assert conn.execute("SELECT close FROM price_history WHERE date='2026-10-06'").fetchone() == (1050,)

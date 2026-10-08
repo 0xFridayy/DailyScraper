@@ -93,6 +93,8 @@ def get_walk_forward_predictions(panel, horizon=1, embargo=0):
     ticker/date on every test-set prediction instead of just aggregating
     stats, so different exit mechanics can be simulated on the same
     entry signal."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("strategy_variants.get_walk_forward_predictions")
     # One shared split helper, not a fourth divergent copy. This file used to
     # re-implement walk_forward_backtest's expanding window and 0.8 positional
     # split independently, so a fix in one never reached the other.
@@ -163,14 +165,36 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
     decision row is a legitimate per-row invalidity (skip that trade)."""
     g = px_by_ticker.get(ticker)
     idx_map = date_idx_by_ticker.get(ticker)
-    if g is None or entry_date not in idx_map:
+    if g is None or idx_map is None or entry_date not in idx_map:
         return None
     i0 = idx_map[entry_date]
+    if (type(i0) is not int or not 0 <= i0 < len(g) or g.iloc[i0]["date"] != entry_date
+            or not g["ticker"].eq(ticker).all() or list(g.index) != list(range(len(g)))):
+        return None
+    if type(hold_days) is not int or hold_days <= 0:
+        raise ValueError("hold_days must be a positive integer")
+    for barrier in (tp_pct, sl_pct):
+        if barrier is not None and (isinstance(barrier, bool) or not isinstance(barrier, (int, float))
+                                    or not np.isfinite(barrier) or barrier <= 0):
+            raise ValueError("TP/SL distances must be finite positive numbers")
+    if sl_pct is not None and sl_pct >= 1:
+        raise ValueError("SL distance must be below one")
     if i0 + 1 >= len(g):
         return None
-    from price_contract_frame import require_price_frame, default_registry, span_result
+    from datetime import date, timedelta
+    from idx_calendar import is_idx_session
+    next_day = date.fromisoformat(entry_date) + timedelta(days=1)
+    while not is_idx_session(next_day):
+        next_day += timedelta(days=1)
+    if g.iloc[i0 + 1]["date"] != next_day.isoformat():
+        return None
+    from price_contract_frame import require_price_frame, default_registry, span_result, frame_as_of
     registry = registry or default_registry()
-    identity = require_price_frame(g, ("next_entry_open_admissible", "fwd_1"), registry=registry)
+    from price_contract import UnsupportedPriceContract
+    try:
+        identity = require_price_frame(g, ("next_entry_open_admissible", "fwd_1"), registry=registry)
+    except UnsupportedPriceContract:
+        return None
     if not g.loc[i0, "next_entry_open_admissible"]:
         return None
     entry_price = g.loc[i0 + 1, "open"]
@@ -180,26 +204,32 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date, hold_da
 
     for k in range(hold_days):
         if i0 + k >= len(g):
-            break
+            g.attrs["trade_withheld_reason"] = "INCOMPLETE_HORIZON"
+            return None
         if k > 0 and "fwd_1" in g and pd.isna(g.loc[i0 + k - 1, "fwd_1"]):
             return None  # quarantine/suspension gap: never bridge it as a hold day
         held = span_result(ticker, g.loc[i0, "date"], g.loc[i0 + k, "date"],
                            registry=registry, representation=identity["input_representation"],
-                           market=identity["market"], session_axis=g.date.tolist(), start_phase="OPEN")
+                           market=identity["market"], session_axis=g.date.tolist(), start_phase="OPEN",
+                           as_of=frame_as_of(g))
         if held.status != "COMPARABLE":
             return None  # before examining TP/SL, so a reset cannot fabricate a fill
         day = g.loc[i0 + k]
+        if not day["price_step_admissible"]:
+            return None
         if sl_pct is not None and day["low"] <= entry_price * (1 - sl_pct):
             return -sl_pct
         if tp_pct is not None and day["high"] >= entry_price * (1 + tp_pct):
             return tp_pct
-        if k == hold_days - 1 or i0 + k == len(g) - 1:
+        if k == hold_days - 1:
             return (day["close"] - entry_price) / entry_price
     return None
 
 
 def eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_days, tp, sl,
                  base_rate=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("strategy_variants.eval_variant")
     triggered = preds_subset[preds_subset["pred"] > thresh]
     trade_returns = [
         r for r in (
@@ -211,6 +241,8 @@ def eval_variant(preds_subset, px_by_ticker, date_idx_by_ticker, thresh, hold_da
 
 
 def run_strategy_search(panel, px, search_frac=0.7):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("strategy_variants.run_strategy_search")
     preds = get_walk_forward_predictions(panel)
     px_by_ticker, date_idx_by_ticker = _index_price_history(px)
 
@@ -252,6 +284,8 @@ def run_strategy_search(panel, px, search_frac=0.7):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("strategy_variants.__main__")
     args = parse_cli(description="Exit-strategy variants on the walk-forward signal.")
     conn = connect_price_db(args.db)
     panel = build_panel(conn, broker_flow_db_path=args.db,
