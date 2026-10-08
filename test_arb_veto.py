@@ -1,10 +1,9 @@
 """Plain-script tests for arb_veto.write() (run by check_ml_health.py in CI,
 or directly: py -3 test_arb_veto.py).
 
-The contract: one as_of is one computation. After a successful write, the rows
-for that as_of are exactly the list just scored -- nothing survives from an
-earlier run for the same session -- and every other as_of is left as it was.
-A write that fails leaves the previous list in place, whole.
+Unversioned analytical lists must refuse before opening or mutating a database.
+Existing session lists, probabilities, ranks and timestamps remain unchanged,
+including malformed, duplicate and empty replacement attempts.
 
 Synthetic databases only; no panel, no model fit.
 """
@@ -23,6 +22,7 @@ import pandas as pd
 
 import arb_veto as av
 import daily_picks as dp
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 AS_OF = pd.Timestamp("2026-09-23")
 DAY = "2026-09-23"
@@ -64,180 +64,135 @@ def vetoed(path, session=SESSION):
 
 # ── tests ──────────────────────────────────────────────────────────────────
 
+def _seed(path, rows=None):
+    rows = rows if rows is not None else [
+        (DAY, "AAAA", .9, 1, VALID_UNTIL, "2026-09-24T12:04:57+00:00"),
+        (DAY, "BBBB", .8, 2, VALID_UNTIL, "2026-09-24T12:04:57+00:00"),
+    ]
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(av.SCHEMA)
+        conn.executemany("INSERT INTO arb_veto VALUES (?,?,?,?,?,?)", rows)
+        conn.commit()
+
+
+def _refused_write(path, top, as_of=AS_OF):
+    before = stored(path, rowid=True) if os.path.exists(path) else None
+    before_bytes = open(path, "rb").read() if before is not None else None
+    frame = top.copy(deep=True)
+    try:
+        av.write(as_of, top, path)
+    except UnsupportedPriceContract as exc:
+        status = exc.as_dict()
+        assert status["consumer"] == "arb_veto.write" and "arb_veto.write" in status["reason"]
+        assert status["status"] == "UNSUPPORTED" and status["contract_version"] == CONTRACT_VERSION
+    else:
+        raise AssertionError("an uncertified veto list was persisted")
+    pd.testing.assert_frame_equal(top, frame)
+    if before is None:
+        assert not os.path.exists(path), "refusal must precede database creation"
+    else:
+        assert stored(path, rowid=True) == before
+        with open(path, "rb") as fh:
+            assert fh.read() == before_bytes, "refusal changed database bytes"
+
+
 def test_initial_run_writes_the_list():
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        valid_until = av.write(AS_OF, veto_list(("AAAA", 0.9), ("BBBB", 0.8)), db)
-        assert valid_until == VALID_UNTIL, valid_until
-        got = listed(db)
-        assert got == {"AAAA": (0.9, 1, VALID_UNTIL), "BBBB": (0.8, 2, VALID_UNTIL)}, got
-        assert vetoed(db) == {"AAAA", "BBBB"}, vetoed(db)
-    print("  ok first run writes exactly its list")
+        path = os.path.join(tmp, "picks.db")
+        _refused_write(path, veto_list(("AAAA", .9), ("BBBB", .8)))
+        assert os.listdir(tmp) == []
 
 
 def test_same_as_of_rerun_drops_names_it_no_longer_flags():
-    """What happened to 2026-09-23 in production: the Rp0.5bn run's BTEK and
-    BAJA outlived the Rp2bn rerun that replaced it -- seven rows under a
-    top-5, ranks 2 and 5 twice -- and went on vetoing through 2026-09-30."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, veto_list(("AAAA", 0.98), ("BBBB", 0.97), ("CCCC", 0.90)), db)
-        av.write(AS_OF, veto_list(("BBBB", 0.97), ("DDDD", 0.94)), db)
-        got = listed(db)
-        assert set(got) == {"BBBB", "DDDD"}, got
-        assert sorted(rank for _, rank, _ in got.values()) == [1, 2], got
-        assert vetoed(db) == {"BBBB", "DDDD"}, vetoed(db)
-    print("  ok same-as_of rerun drops the names it no longer flags")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        _refused_write(path, veto_list(("BBBB", .97), ("DDDD", .94)))
+        assert listed(path) == {"AAAA": (.9, 1, VALID_UNTIL), "BBBB": (.8, 2, VALID_UNTIL)}
 
 
 def test_rerun_replaces_an_earlier_list_on_as_of_alone():
-    """The earlier run's rows as production holds them: their own stamp, and
-    a valid_until of their own (a run under other settings). The rerun must
-    replace them on as_of alone and restamp every row it keeps."""
     stamp = "2026-09-24T12:04:57+00:00"
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        with closing(sqlite3.connect(db)) as conn:
-            conn.execute(av.SCHEMA)
-            conn.executemany("INSERT INTO arb_veto VALUES (?,?,?,?,?,?)", [
-                (DAY, "AAAA", 0.98, 1, "2026-10-01", stamp),
-                (DAY, "BBBB", 0.97, 2, "2026-10-01", stamp),
-                (DAY, "CCCC", 0.90, 3, "2026-10-01", stamp)])
-            conn.commit()
-        av.write(AS_OF, veto_list(("BBBB", 0.97), ("DDDD", 0.94)), db)
-        rows = [r for r in stored(db) if r[0] == DAY]
-        assert [r[1:5] for r in rows] == [("BBBB", 0.97, 1, VALID_UNTIL),
-                                          ("DDDD", 0.94, 2, VALID_UNTIL)], rows
-        stamps = {r[5] for r in rows}
-        assert len(stamps) == 1 and stamp not in stamps, rows
-        assert vetoed(db, "2026-10-01") == set(), vetoed(db, "2026-10-01")
-    print("  ok rerun replaces an earlier list whatever its stamp or valid_until")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path, [(DAY, "AAAA", .98, 1, "2026-10-01", stamp),
+                     (DAY, "BBBB", .97, 2, "2026-10-01", stamp),
+                     (DAY, "CCCC", .90, 3, "2026-10-01", stamp)])
+        _refused_write(path, veto_list(("BBBB", .97), ("DDDD", .94)))
+        assert {row[5] for row in stored(path)} == {stamp}
+        assert {row[4] for row in stored(path)} == {"2026-10-01"}
 
 
 def test_same_as_of_rerun_updates_changed_rows():
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, veto_list(("AAAA", 0.90), ("BBBB", 0.80)), db)
-        av.write(AS_OF, veto_list(("BBBB", 0.95), ("AAAA", 0.85)), db)
-        got = listed(db)
-        assert got == {"BBBB": (0.95, 1, VALID_UNTIL), "AAAA": (0.85, 2, VALID_UNTIL)}, got
-    print("  ok same-as_of rerun updates p and rank of the names it keeps")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        _refused_write(path, veto_list(("BBBB", .95), ("AAAA", .85)))
+        assert listed(path) == {"AAAA": (.9, 1, VALID_UNTIL), "BBBB": (.8, 2, VALID_UNTIL)}
 
 
 def test_unchanged_rerun_is_idempotent():
-    top = veto_list(("AAAA", 0.9), ("BBBB", 0.8), ("CCCC", 0.7))
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, top, db)
-        first = stored(db)
-        av.write(AS_OF, top, db)
-        again = stored(db)
-        # recorded_utc says when the list was written, not what it says
-        assert [r[:5] for r in again] == [r[:5] for r in first], (first, again)
-        assert len({r[5] for r in again}) == 1, again      # one computation, one stamp
-        assert vetoed(db) == {"AAAA", "BBBB", "CCCC"}
-    print("  ok unchanged rerun leaves the same list")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        top = veto_list(("AAAA", .9), ("BBBB", .8))
+        first = stored(path, rowid=True)
+        _refused_write(path, top)
+        _refused_write(path, top)
+        assert stored(path, rowid=True) == first
 
 
 def test_other_as_of_lists_are_left_alone():
-    """A rerun rewrites its own session's list only: not the week before, not
-    one long expired, not a later list already written, and not another
-    list's row for a ticker it drops."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        with closing(sqlite3.connect(db)) as conn:
-            conn.execute(av.SCHEMA)
-            conn.executemany("INSERT INTO arb_veto VALUES (?,?,?,?,?,?)", [
-                ("2026-09-02", "OOOO", 0.95, 1, "2026-09-09", "2026-09-06T21:00:00+00:00"),
-                ("2026-09-16", "PPPP", 0.91, 1, "2026-09-23", "2026-09-20T21:00:00+00:00"),
-                ("2026-09-16", "QQQQ", 0.88, 2, "2026-09-23", "2026-09-20T21:00:00+00:00"),
-                ("2026-09-30", "ZZZZ", 0.93, 1, "2026-10-07", "2026-10-04T21:00:00+00:00")])
-            conn.commit()
-        history = stored(db, rowid=True)
-        av.write(AS_OF, veto_list(("AAAA", 0.9), ("PPPP", 0.8)), db)
-        av.write(AS_OF, veto_list(("CCCC", 0.7)), db)
-        after = [r for r in stored(db, rowid=True) if r[1] != DAY]
-        assert after == history, (history, after)
-        assert set(listed(db)) == {"CCCC"}, listed(db)
-        # 2026-09-23 is the 2026-09-16 list's last session and the rerun's first
-        assert vetoed(db, "2026-09-23") == {"PPPP", "QQQQ", "CCCC"}, vetoed(db, "2026-09-23")
-    print("  ok other as_of lists are untouched, row for row")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path, [("2026-09-02", "OOOO", .95, 1, "2026-09-09", "old"),
+                     ("2026-09-16", "PPPP", .91, 1, "2026-09-23", "prior"),
+                     ("2026-09-16", "QQQQ", .88, 2, "2026-09-23", "prior"),
+                     ("2026-09-30", "ZZZZ", .93, 1, "2026-10-07", "future")])
+        history = stored(path, rowid=True)
+        _refused_write(path, veto_list(("AAAA", .9), ("PPPP", .8)))
+        _refused_write(path, veto_list(("CCCC", .7)))
+        assert stored(path, rowid=True) == history and listed(path) == {}
 
 
 def test_failed_rerun_keeps_the_previous_list():
-    """The NaN is on the second row, so by the time SQLite refuses it (NaN
-    binds as NULL; p is NOT NULL) the rerun has already cleared the old list
-    and inserted DDDD. None of that may be left behind."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, veto_list(("AAAA", 0.9), ("BBBB", 0.8), ("CCCC", 0.7)), db)
-        before = stored(db, rowid=True)
-        try:
-            av.write(AS_OF, veto_list(("DDDD", 0.95), ("EEEE", math.nan)), db)
-        except sqlite3.IntegrityError:
-            pass
-        else:
-            raise AssertionError("a list with a NaN p was written")
-        assert stored(db, rowid=True) == before, stored(db, rowid=True)
-        assert vetoed(db) == {"AAAA", "BBBB", "CCCC"}, vetoed(db)
-        # and the failure left nothing open: the next rerun still goes through
-        av.write(AS_OF, veto_list(("DDDD", 0.95)), db)
-        assert set(listed(db)) == {"DDDD"}, listed(db)
-    print("  ok failed rerun leaves the previous list whole")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        _refused_write(path, veto_list(("DDDD", .95), ("EEEE", math.nan)))
+        _refused_write(path, veto_list(("DDDD", .95)))
+        assert set(listed(path)) == {"AAAA", "BBBB"}
 
 
 def test_rerun_failing_for_a_reason_outside_the_list_keeps_the_previous_one():
-    """Atomicity must not hang on the data being bad. The list is valid; a
-    trigger aborts the second insert the way a full disk or an I/O error
-    would, after the delete and the first insert have run."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, veto_list(("AAAA", 0.9), ("BBBB", 0.8), ("CCCC", 0.7)), db)
-        with closing(sqlite3.connect(db)) as conn:
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        with closing(sqlite3.connect(path)) as conn:
             conn.execute("CREATE TRIGGER boom BEFORE INSERT ON arb_veto "
                          "WHEN NEW.ticker = 'EEEE' BEGIN SELECT RAISE(ABORT, 'injected'); END")
             conn.commit()
-        before = stored(db, rowid=True)
-        try:
-            av.write(AS_OF, veto_list(("DDDD", 0.95), ("EEEE", 0.9)), db)
-        except sqlite3.DatabaseError as e:
-            assert "injected" in str(e), e
-        else:
-            raise AssertionError("the injected failure did not reach write()")
-        assert stored(db, rowid=True) == before, stored(db, rowid=True)
-        assert vetoed(db) == {"AAAA", "BBBB", "CCCC"}, vetoed(db)
-    print("  ok rerun failing mid-write for any reason leaves the previous list whole")
+        _refused_write(path, veto_list(("DDDD", .95), ("EEEE", .9)))
+        with closing(sqlite3.connect(path)) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='boom'").fetchone()[0] == 1
 
 
 def test_list_that_cannot_be_stored_exactly_is_refused_whole():
-    """(as_of, ticker) is the key, so one ticker twice cannot be stored as
-    computed. Collapsing it would drop a rank without a word; refuse the
-    whole list instead and keep the previous one."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(AS_OF, veto_list(("AAAA", 0.9), ("BBBB", 0.8)), db)
-        before = stored(db, rowid=True)
-        try:
-            av.write(AS_OF, veto_list(("CCCC", 0.95), ("DDDD", 0.9), ("CCCC", 0.85)), db)
-        except sqlite3.IntegrityError:
-            pass
-        else:
-            raise AssertionError(f"a list naming CCCC twice was written: {stored(db)}")
-        assert stored(db, rowid=True) == before, stored(db, rowid=True)
-    print("  ok list with a repeated ticker is refused and the previous list kept")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path)
+        _refused_write(path, veto_list(("CCCC", .95), ("DDDD", .9), ("CCCC", .85)))
+        assert set(listed(path)) == {"AAAA", "BBBB"}
 
 
 def test_empty_rerun_clears_that_as_of_only():
-    """--top-n 0 scores nothing, and the stored list says so. Only this
-    as_of: an empty list is not a licence to touch another session's."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = os.path.join(tmp, "picks.db")
-        av.write(pd.Timestamp("2026-09-16"), veto_list(("PPPP", 0.9)), db)
-        av.write(AS_OF, veto_list(("AAAA", 0.9)), db)
-        av.write(AS_OF, veto_list(), db)
-        assert listed(db) == {}, listed(db)
-        assert set(listed(db, "2026-09-16")) == {"PPPP"}, listed(db, "2026-09-16")
-    print("  ok empty rerun leaves that as_of empty and the rest alone")
+        path = os.path.join(tmp, "picks.db")
+        _seed(path, [("2026-09-16", "PPPP", .9, 1, "2026-09-23", "prior"),
+                     (DAY, "AAAA", .9, 1, VALID_UNTIL, "current")])
+        _refused_write(path, veto_list())
+        assert set(listed(path)) == {"AAAA"}
+        assert set(listed(path, "2026-09-16")) == {"PPPP"}
 
 
 ALL = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

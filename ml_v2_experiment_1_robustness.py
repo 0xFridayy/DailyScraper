@@ -59,6 +59,8 @@ HEADLINE_METRICS = (
 
 def paired_date_differences(pred_b, pred_c):
     """Score C-B within each date, preserving cross-sectional selection."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1_robustness.paired_date_differences")
     b = pred_b.rename(columns={"prediction": "prediction_b"})
     c = pred_c.rename(columns={"prediction": "prediction_c"})
     keys = ["ticker", "date", "target", "cycle"]
@@ -116,6 +118,8 @@ def _bootstrap_statistics(values, n_bootstrap=N_BOOTSTRAP, block_days=None, seed
 
 
 def paired_bootstrap_report(per_date):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1_robustness.paired_bootstrap_report")
     rows = []
     for index, metric in enumerate(PAIRED_METRICS):
         values = per_date[metric].dropna()
@@ -172,6 +176,8 @@ def _broker_groups(identity_features):
 
 def broker_group_ablation(panel, feature_sets, splits, pred_b, full_delta):
     """Refit unchanged C while omitting each broker code's five flow windows."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1_robustness.broker_group_ablation")
     c_features = feature_sets["broker_identity"]
     groups = _broker_groups(c_features)
     rows = []

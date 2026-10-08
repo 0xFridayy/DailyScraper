@@ -57,13 +57,11 @@ RECENT_TRADES_SHOWN = 15
 # to declare a winner.
 KONGLO_TRACK_DAYS = 3  # per explicit instruction: track flagged konglo tickers 1-3 trading days
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=15)
     if not resp.ok:
         print(f"Telegram error {resp.status_code}: {resp.text}")
 
@@ -262,6 +260,8 @@ def format_telegram_message(xgb, strat, ddqn, konglo):
     # The number that answers "is the signal any good" is hit_edge: the
     # top-decile hit rate MINUS the universe base rate. Zero means no
     # directional information, whatever the raw hit rate looks like.
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.format_telegram_message")
     p = xgb["pooled"]
     edge_line = (
         f"Signal edge: top-decile hit {p['top_hit']:.1%} vs base {p['base_rate']:.1%} "
@@ -323,6 +323,8 @@ def _write_variant_table(f, df):
 
 
 def write_step_summary(xgb, strat, ddqn, konglo):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("run_ml_reports.write_step_summary")
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return

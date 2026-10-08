@@ -399,6 +399,8 @@ def _fired(t):
 def _ordered(tickers):
     """Fired tickers first, strongest composite score first; then the rest by
     name. The caption and the page use the same order."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._ordered")
     def key(t):
         score = _num(t.get("score"))
         return (0 if _fired(t) else 1, -abs(score) if score is not None else 0.0,
@@ -725,6 +727,8 @@ def _ci_svg(stats, doms, primary=DEFAULT_PRIMARY_H):
     rule's primary horizon is in the accent, the others muted. A value past
     the domain is pinned to the edge with an open end marker; the printed
     label and the table keep the true number."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._ci_svg")
     if not any(_num(_d(_stat_for(stats, h)).get("mean_excess")) is not None for h in HORIZONS):
         return ""
     x0, x1, rh = 52, 272, 20
@@ -780,6 +784,8 @@ def _stat_for(stats, h):
 # ── page sections ───────────────────────────────────────────────────────────
 
 def _header(ctx, tickers):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._header")
     run = _d(ctx.get("run"))
     dt = _s(ctx.get("data_through"))
     gen = _s(ctx.get("generated_utc"))
@@ -812,6 +818,8 @@ def _header(ctx, tickers):
 
 
 def _rule_chip(rid, rule_map):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._rule_chip")
     r = _d(rule_map.get(rid))
     parts = [f"<b>{_e(rid)}</b>"]
     if r:
@@ -826,11 +834,15 @@ def _rule_chip(rid, rule_map):
 
 
 def _price_bits(t):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._price_bits")
     return (f'<span class="px">{_e(fmt_rp(t.get("close")))}</span> '
             f'{_signed(fmt_pct(t.get("change_1d"), 1, True))}')
 
 
 def _signals(tickers, rule_map):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._signals")
     fired = [t for t in tickers if _fired(t)]
     out = ['<section id="sinyal"><h2>Sinyal hari ini</h2>']
     if not fired:
@@ -853,6 +865,8 @@ def _signals(tickers, rule_map):
 
 
 def _facts(f):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._facts")
     f = _d(f)
     items = []
     th = _d(f.get("top_holder"))
@@ -873,6 +887,8 @@ def _facts(f):
 
 
 def _book(rows, anchor):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._book")
     rows = [_d(r) for r in _l(rows)]
     if not rows:
         return '<p class="muted">Belum ada transaksi broker sejak anchor.</p>'
@@ -909,6 +925,8 @@ def _book(rows, anchor):
 
 
 def _card(t, rule_map, dt):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._card")
     tk = _s(t.get("ticker")) or "?"
     fired = _fired(t)
     badges = []
@@ -948,6 +966,8 @@ def _card(t, rule_map, dt):
 
 
 def _cards(tickers, rule_map, dt):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._cards")
     out = ['<section id="ticker"><h2>Per ticker</h2>']
     if not tickers:
         out.append('<p class="muted">Belum ada ticker watchlist pada run ini.</p>')
@@ -960,6 +980,8 @@ def _cards(tickers, rule_map, dt):
 
 
 def _rule_block(r, doms):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._rule_block")
     stats = _d(r.get("stats"))
     rid = _s(r.get("id")) or "?"
     primary = _primary_h(r)
@@ -1010,6 +1032,8 @@ def _rule_block(r, doms):
 def _net_line(net, h):
     """§4.5's informational net-of-cost line for a buy rule: per trade, return
     minus the moderate round trip, never annualised, hit rate beside its base."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._net_line")
     net = _d(net)
     n = _num(net.get("n_trades"))
     if not net or not n:
@@ -1028,6 +1052,8 @@ def _live_h(rules):
 
 
 def _learned(ctx, rules):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._learned")
     n_rules = len(rules) or len(PRIMARY_H)
     big_txt = ", ".join(f"h={h}: ≥ {fmt_pct(v, 0, True)}" for h, v in BIG.items())
     out = ['<section id="belajar"><h2>Apa yang sudah dipelajari</h2>',
@@ -1111,6 +1137,8 @@ def _rules_txt(x):
 
 def _case(c):
     """One alpha case: the snapshot a trader could have seen at T."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._case")
     c = _d(c)
     tk = _s(c.get("ticker")) or "?"
     adv = _num(c.get("top_nl60_adv"))
@@ -1143,6 +1171,8 @@ def _case(c):
 
 
 def _alpha(a, rules):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._alpha")
     a = _d(a)
     cases = [_d(c) for c in _l(a.get("cases")) if isinstance(c, dict)]
     cases.sort(key=lambda c: (_num(c.get("hold_60")) is None,
@@ -1225,12 +1255,16 @@ def _alpha(a, rules):
 
 
 def _score_key(s):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._score_key")
     direction = -1.0 if s.get("side") == "sell" else 1.0
     v = _num(s.get("shrunk"))
     return (v is None, -(direction * v) if v is not None else 0.0, _s(s.get("broker")))
 
 
 def _brokers(b):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard._brokers")
     b = _d(b)
     out = ['<section id="broker"><h2>Papan peringkat broker</h2>',
            f'<p class="meta">Retrospektif pasar penuh per {_e(b.get("as_of") or MISSING)}. Kode broker '
@@ -1602,6 +1636,8 @@ def caption(ctx):
     """Plain-text Telegram caption, at most CAPTION_LIMIT characters however
     many tickers fired: the list is cut to what fits and ends with
     '…dan N lainnya'. The page itself always has all of them."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_dashboard.caption")
     ctx = _d(ctx)
     run = _d(ctx.get("run"))
     dt = _s(ctx.get("data_through"))[:20] or "?"

@@ -62,6 +62,23 @@ PLACEBO_QUANTILE = 0.95
 
 
 # ── label ──────────────────────────────────────────────────────────────────
+def grouped_percentile_rank(values, groups, min_count=MIN_LABEL_NAMES):
+    """Average-tie percentile ranks of anonymous values within groups.
+
+    Missing values stay missing; undersized groups have no rank. Callers own
+    the eligibility of the numbers they supply.
+    """
+    values = pd.Series(values)
+    groups = pd.Series(groups, index=values.index)
+    out = pd.Series(np.nan, index=values.index)
+    valid = values.notna()
+    grouped = values.loc[valid].groupby(groups.loc[valid])
+    n = grouped.transform("size")
+    pct = (grouped.rank(method="average") - 0.5) / n
+    out.loc[valid] = pct.where(n >= min_count)
+    return out
+
+
 def rank_label(panel, horizon=1, min_names=MIN_LABEL_NAMES):
     """Deterministic within-date percentile rank of fwd_oo_h.
 
@@ -71,14 +88,10 @@ def rank_label(panel, horizon=1, min_names=MIN_LABEL_NAMES):
     Dates with fewer than `min_names` valid labels get no label. Missing or
     censored labels stay missing; they are never imputed.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.rank_label")
     col = f"fwd_oo_{horizon}"
-    out = pd.Series(np.nan, index=panel.index, name=f"rank_label_h{horizon}")
-    valid = panel[col].notna()
-    grouped = panel.loc[valid].groupby("date")[col]
-    n = grouped.transform("size")
-    pct = (grouped.rank(method="average") - 0.5) / n
-    out.loc[valid] = pct.where(n >= min_names)
-    return out
+    return grouped_percentile_rank(panel[col], panel["date"], min_names).rename(f"rank_label_h{horizon}")
 
 
 def daily_spearman_ic(frame, score_column, return_column, min_names=MIN_IC_NAMES):
@@ -133,6 +146,8 @@ def _level(close, band):
 
 def open_usable(px):
     """Gate-A open usability: price_audit._open_anchor_valid on the Gate-A panel (reused, not redefined)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.open_usable")
     from price_audit import _open_anchor_valid
     return _open_anchor_valid(px, px.groupby("ticker", sort=False)).fillna(False).to_numpy(bool)
 
@@ -140,6 +155,8 @@ def open_usable(px):
 def close_step_in_band(px):
     """Row k: close(prev ticker row) -> close(k) inside the ARA/ARB band used by Gate A's
     _step_valid, WITHOUT its calendar-contiguity requirement (a hold may span a suspension)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.close_step_in_band")
     from price_audit import ARB_BOUND, TOL, ara_bound
     prev = px.groupby("ticker", sort=False)["close"].shift(1)
     change = px["close"] / prev - 1
@@ -294,33 +311,60 @@ def execution_diagnostics(outcomes, calendar):
     }
 
 
+def descending_positions(values, tie_values, count):
+    """Positions of the largest anonymous values, with ascending tie keys."""
+    ranked = pd.DataFrame({"value": np.asarray(values), "tie": np.asarray(tie_values),
+                           "position": np.arange(len(values))})
+    return ranked.sort_values(["value", "tie"], ascending=[False, True],
+                              kind="mergesort").head(count)["position"].to_numpy()
+
+
 def select_top_k(day, score_column, k=TOP_K):
     """Top-k by score (desc), ticker ascending on ties. Uses only the EOD(T) score;
     no post-decision status removes or replaces a pick."""
-    return day.sort_values([score_column, "ticker"], ascending=[False, True], kind="mergesort").head(k)
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.select_top_k")
+    return day.iloc[descending_positions(day[score_column], day["ticker"], k)]
+
+
+def slot_average(values, count=None, *, resolved_only=False, fill_value=0.0):
+    """Mean of anonymous numbers, optionally retaining missing or empty slots.
+
+    This numerical helper makes no claim about the eligibility of its inputs.
+    """
+    values = np.asarray(values, dtype=float)
+    if resolved_only:
+        resolved = values[~np.isnan(values)]
+        return float(resolved.mean()) if len(resolved) else np.nan
+    count = len(values) if count is None else count
+    if not count:
+        return np.nan
+    return float((np.nan_to_num(values, nan=fill_value).sum()
+                  + fill_value * (count - len(values))) / count)
 
 
 def portfolio_return(selected, view, k=TOP_K):
     """Equal ex-ante weight 1/k per slot. Unfilled and missing slots stay in cash.
     EXCLUDED (diagnostic) averages resolved slots only."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.portfolio_return")
     values = selected[VIEWS[view]].to_numpy(float)
-    if view == "EXCLUDED":
-        resolved = values[~np.isnan(values)]
-        return float(resolved.mean()) if len(resolved) else np.nan
-    return float((np.nan_to_num(values, nan=CASH_RETURN).sum() + CASH_RETURN * (k - len(values))) / k)
+    return slot_average(values, k, resolved_only=view == "EXCLUDED", fill_value=CASH_RETURN)
 
 
 def benchmark_return(day, view):
     """Membership: every eligible key on date T (fixed at EOD(T)). Equal ex-ante
     weight; unfilled entries keep their weight in cash; censoring mirrors the
     portfolio. No renormalisation except in the EXCLUDED diagnostic."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.benchmark_return")
     values = day[VIEWS[view]].to_numpy(float)
-    if view == "EXCLUDED":
-        values = values[~np.isnan(values)]
-    return float(np.nan_to_num(values, nan=CASH_RETURN).mean()) if len(values) else np.nan
+    return slot_average(values, resolved_only=view == "EXCLUDED", fill_value=CASH_RETURN)
 
 
 def daily_top3_excess(day, score_column, view="HOLD_THROUGH", k=TOP_K):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_evaluation.daily_top3_excess")
     return portfolio_return(select_top_k(day, score_column, k), view, k) - benchmark_return(day, view)
 
 

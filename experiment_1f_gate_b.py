@@ -403,6 +403,8 @@ def model_params(seed):
 
 # ── the fit path (fails closed) ────────────────────────────────────────────
 def run_job(ctx, job, authorisation):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.run_job")
     _check_authorisation(authorisation)
     contract.assert_frozen()
     import xgboost
@@ -445,6 +447,8 @@ def prediction_ledger_digest(ledger):
 # ── evaluation and graduation assembly ─────────────────────────────────────
 def job_results(ctx, predictions, with_top3=True):
     """Per job: daily IC vs raw fwd_oo_h and daily Top-3 excess per execution view (H1 only)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.job_results")
     horizon = int(predictions["horizon"].iloc[0])
     merged = predictions.merge(ctx["panel"][KEY + [f"fwd_oo_{horizon}"]], on=KEY, how="left")
     ic = evaluation.daily_spearman_ic(merged, "prediction", f"fwd_oo_{horizon}")
@@ -484,6 +488,8 @@ def _bootstrap(series, index, block):
 
 def graduation_report(results):
     """results: {job_id: job_results(...)}. Pre-registered H1 lag-1 assembly."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.graduation_report")
     seeds = list(features.MODEL_SEEDS)
     report, pvalues = {"increments": {}}, {}
     for small, large, sample, family, index in PAIRS:
@@ -555,6 +561,8 @@ def sensitivity_report(results):
     """Never decides graduation; no Holm. Each entry: 5-seed mean daily IC delta (or A's mean IC),
     circular block bootstrap at the primary block length, basic 95% interval and basic p; H1 pairs add
     Top-3 deltas for every execution view. Confirmatory pairs add their Top-3 deltas for every view."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_gate_b.sensitivity_report")
     seeds = list(features.MODEL_SEEDS)
     block = evaluation.BOOTSTRAP["block_length"]
     report = {}

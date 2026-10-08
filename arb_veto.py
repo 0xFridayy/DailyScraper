@@ -120,6 +120,8 @@ def write(as_of, top, picks_db=PICKS_DB, valid_days=VALID_DAYS):
     transaction, so a rerun that fails part way leaves the previous list
     whole. Other as_of lists are never touched.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("arb_veto.write")
     day = as_of.date().isoformat()
     valid_until = (as_of + timedelta(days=valid_days)).date().isoformat()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")

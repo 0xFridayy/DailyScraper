@@ -6,22 +6,25 @@ BROKER_LEARNING.md §6 and its 2026-09-25 amendment (R6, h=60, big-move rates,
 alpha cases, broker lift) and Amendment A2 (suspension shares at h=60, visible
 alpha cases, Rp 200 jt eligibility, a page under 1 MB), including the ugly parts: NaN prices, a one-point
 series, a basis break, a rule with no stats and a broker code named <script>.
-Writes broker_dashboard_out/fixture_preview.html (gitignored) for eyeballing.
+Public render/caption paths refuse their unsupported price contract before
+context access or output. Pure helpers, explicit HTML writes, and injected
+delivery still have offline coverage. No dashboard preview is generated.
 """
 
 import ast
 import io
-import json
 import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import date, timedelta
+from unittest.mock import patch
 
 import broker_dashboard as bd
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN = "123456:SECRET-token-for-tests"
@@ -245,20 +248,34 @@ def fixture():
     }
 
 
-def _card(html, ticker):
-    """The card's HTML up to the next card (cards nest a chart-table <details>)."""
-    m = re.search(rf'<details class="card" id="t-{ticker}"[^>]*>.*?'
-                  rf'(?=<details class="card"|</section>)', html, re.S)
-    assert m, ticker
-    return m.group(0)
-
-
-def _rule_html(html, rid):
-    """One rule block of the scorecard (not the chip in the signal list)."""
-    start = html.index(f'<div class="rule"><div class="rh"><b>{rid}</b>')
-    ends = [i for i in (html.find('<div class="rule">', start + 1), html.find("<h3>", start))
-            if i > 0]
-    return html[start:min(ends)]
+def _assert_unsupported(consumer, action):
+    """Exercise the real route and require refusal before context or file IO."""
+    out, err = io.StringIO(), io.StringIO()
+    with patch.object(bd, "_d", side_effect=AssertionError("context read before refusal")) as context_read, \
+            patch("builtins.open", side_effect=AssertionError("file IO before refusal")) as file_io, \
+            patch.object(bd.os, "makedirs", side_effect=AssertionError("directory write before refusal")) as mkdir, \
+            patch.object(bd.os, "replace", side_effect=AssertionError("file replacement before refusal")) as replace, \
+            patch.object(bd, "write", side_effect=AssertionError("dashboard write before refusal")) as write, \
+            patch.object(bd, "send_document", side_effect=AssertionError("delivery before refusal")) as send, \
+            redirect_stdout(out), redirect_stderr(err):
+        try:
+            action()
+        except UnsupportedPriceContract as exc:
+            assert type(exc) is UnsupportedPriceContract, type(exc)
+            assert exc.consumer == consumer
+            assert exc.status == "UNSUPPORTED"
+            assert exc.contract_version == CONTRACT_VERSION
+            assert exc.as_dict() == {"status": "UNSUPPORTED", "consumer": consumer,
+                                     "contract_version": CONTRACT_VERSION, "reason": str(exc)}
+            assert str(exc).startswith(
+                f"{consumer}: corporate-action contract {CONTRACT_VERSION} unsupported;")
+            assert "must be migrated before this route can run" in str(exc)
+            assert "Frozen artifacts retain their original contract." in str(exc)
+        else:
+            raise AssertionError(f"{consumer} accepted an unsupported contract")
+        for operation in (context_read, file_io, mkdir, replace, write, send):
+            operation.assert_not_called()
+    assert out.getvalue() == "" and err.getvalue() == "", "refusal must not emit output"
 
 
 # ── formatting ───────────────────────────────────────────────────────────────
@@ -291,178 +308,78 @@ def test_missing_values_print_as_dash_never_zero():
 
 # ── the page ─────────────────────────────────────────────────────────────────
 
-def test_fixture_renders_every_section_in_indonesian():
-    html = bd.render(fixture())
-    assert html.startswith("<!doctype html>") and html.rstrip().endswith("</html>")
-    assert '<html lang="id">' in html
-    for sid in ("sinyal", "ticker", "belajar", "alpha", "broker", "kualitas"):
-        assert f'<section id="{sid}">' in html, sid
-    for text in ("Sinyal hari ini", "Per ticker", "Apa yang sudah dipelajari",
-                 "Kasus alpha (retrospektif)", "Papan peringkat broker", "Kualitas data",
-                 "Ledger live", "Perubahan bobot vs minggu lalu", "Profitabilitas trading",
-                 "R1 bobot 1,00 -&gt; 1,07", "short window (12 sessions)",
-                 "BUVA: basis break on the last session", "6 aturan × 4 horizon = 24 uji"):
-        assert text in html, text
+def test_fixture_render_refuses_unmigrated_sections():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_disclaimer_in_header_and_footer():
+def test_disclaimer_contexts_refuse_unmigrated_render():
     for ctx in (fixture(), {}):
-        html = bd.render(ctx)
-        header = html[html.index("<header>"):html.index("</header>")]
-        footer = html[html.index("<footer>"):html.index("</footer>")]
-        for part in (header, footer):
-            assert "bukan kepemilikan sebenarnya" in part
-            assert "Research-grade" in part
+        _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
 
 
-def test_page_makes_no_external_request():
-    html = bd.render(fixture())
-    for bad in ("http://", "https://", "src=", "@import", "url(", "<link", "@font-face"):
-        assert bad not in html, bad
+def test_unmigrated_render_refuses_before_any_io():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_dynamic_text_is_escaped():
-    html = bd.render(fixture())
-    assert html.count("<script>") == 1, "only the page's own hover script"
-    assert "&lt;script&gt;" in html
+def test_dynamic_text_context_refuses_unmigrated_render():
     ctx = fixture()
     ctx["tickers"][3]["explain"] = ['<img onerror="x">']
     ctx["run"]["warnings"] = ["<b>bold</b>"]
     ctx["alpha"]["cases"][0]["top_broker"] = "<i>"
-    html = bd.render(ctx)
-    for raw in ('<img onerror', "<b>bold</b>", "<i></dd>"):
-        assert raw not in html, raw
-    assert "&lt;img onerror=&quot;x&quot;&gt;" in html
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
 
 
-def test_signed_values_are_coloured_and_signed():
-    html = bd.render(fixture())
-    pos = re.findall(r'<span class="pos">([^<]*)</span>', html)
-    neg = re.findall(r'<span class="neg">([^<]*)</span>', html)
-    assert pos and neg
-    assert all(t.startswith("+") for t in pos), [t for t in pos if not t.startswith("+")]
-    assert all(t.startswith(bd.MINUS) for t in neg), [t for t in neg if not t.startswith(bd.MINUS)]
-    sini = _card(html, "SINI")
-    assert '<span class="neg">−33.419</span>' in sini           # XL net 5 sesi
-    assert '<span class="pos">+117.140 lot</span>' in sini
-    assert '<span class="pos">+48,4%</span>' in sini             # XL price vs cost
-    assert "Rp 8.526" in sini and "Rp 12.460" in sini
-    assert '<span class="neg">−151.200 lot</span>' in sini
-    assert "bukan short" in sini, "a negative position is labelled as distribution"
+def test_price_cost_and_pnl_context_refuses_unmigrated_render():
+    ctx = fixture()
+    assert any(row["position_lots"] < 0 for row in ctx["tickers"][3]["book"])
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
 
 
-def test_statuses_carry_indonesian_label_and_explanation():
-    html = bd.render(fixture())
-    for code, label in bd.STATUS_LABEL.items():
-        m = re.search(rf'<span class="st" data-status="{code}" title="([^"]+)">'
-                      rf'<span aria-hidden="true">[^<]+</span> {re.escape(label)}</span>', html)
-        assert m, code
-        assert m.group(1) == bd.escape(bd.STATUS_NOTE[code], quote=True)
-    assert "belum dinilai" in html, "R5 has no status and no stats"
-    assert "terbukti" not in html.replace("belum terbukti", "").replace("&#x27;terbukti&#x27;", ""), \
-        "nothing is ever called proven"
+def test_status_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_every_hit_and_big_rate_sits_beside_its_base():
-    html = bd.render(fixture())
-    paired = re.findall(r'<span class="hb">[^<]* <span class="vs">vs</span> (?:base|rata-rata) ',
-                        html)
-    assert html.count('<span class="hb">') == len(paired) >= 20
-    assert "18,0% <span class=\"vs\">vs</span> rata-rata 4,2% (≥ +50%)" in html   # R6 h=60
-    assert "hit 57% <span class=\"vs\">vs</span> base 49%" in html               # live R1
+def test_hit_and_big_rate_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_scorecard_has_h60_primary_and_big_move_columns():
-    html = bd.render(fixture())
-    assert "Naik besar vs rata-rata" in html
-    r6 = _rule_html(html, "R6")
-    assert "h=60 (utama)" in r6 and "h=10 (utama)" not in r6
-    assert "horizon utama h=60" in r6
-    r1 = _rule_html(html, "R1")
-    assert "h=10 (utama)" in r1 and "h=60<br>" in r1
-    assert '<circle class="clip"' in r6, "the +74% CI end is past the domain and marked"
-    r5 = _rule_html(html, "R5")
-    assert "Belum ada statistik retrospektif" in r5
+def test_scorecard_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_live_ledger_shows_each_rules_own_horizon():
-    # The orchestrator passes each rule's live row at its primary h (R6 at 60);
-    # the heading must not claim one h for all of them.
+def test_live_ledger_horizons_refuse_unmigrated_render():
     def live(h):
         return {"h": h, "n_signals": 3, "n_scored": 1, "mean_excess": 0.01,
                 "hit_rate": 1.0, "base_rate": 0.5}
-    mixed = bd.render({"rules": [_rule("R1", 1, "a", "A", "LOW_N", {}, live=live(10)),
-                                 _rule("R6", 1, "f", "F", "LOW_N", {}, live=live(60))]})
-    sec = mixed[mixed.index("Ledger live"):mixed.index("Perubahan bobot")]
-    assert "h utama tiap aturan" in sec and '<th scope="col">h</th>' in sec
-    assert "<td>R1</td><td>10</td>" in sec and "<td>R6</td><td>60</td>" in sec
-    same = bd.render({"rules": [_rule("R1", 1, "a", "A", "LOW_N", {}, live=live(10))]})
-    sec = same[same.index("Ledger live"):same.index("Perubahan bobot")]
-    assert "(prospektif, h=10)" in sec and '<th scope="col">h</th>' not in sec
+    for rules in (
+            [_rule("R1", 1, "a", "A", "LOW_N", {}, live=live(10)),
+             _rule("R6", 1, "f", "F", "LOW_N", {}, live=live(60))],
+            [_rule("R1", 1, "a", "A", "LOW_N", {}, live=live(10))]):
+        _assert_unsupported("broker_dashboard.render", lambda: bd.render({"rules": rules}))
 
 
-def test_alpha_section_cases_explanation_and_lift():
-    html = bd.render(fixture())
-    sec = html[html.index('<section id="alpha">'):]
-    sec = sec[:sec.index("</section>")]
-    assert sec.index("RATU") < sec.index("PADI") < sec.index("SAME"), "largest move first"
-    assert '<span class="pos">+380%</span>' in sec
-    assert "R1, R6" in sec and "tidak ada" in sec
-    assert '<span class="pos">+3,1× ADV20</span>' in sec
-    assert "Rp 1,4 M" in sec
-    assert "jauh lebih sering" in sec and "Ujian yang sebenarnya" in sec
-    assert "naik besar vs" in sec and "h=60" in sec
-    assert "rata-rata 4,2% saham eligible naik" in sec
-    assert ("kode broker = perusahaan sekuritas berisi banyak nasabah, bukan identitas bandar"
-            in sec.lower())
-    assert "14,49×" in sec and "BK" in sec
-    assert "ZZ" not in sec, "lift from fewer than 3 cases is not shown"
-    assert "23 kasus" in sec and "19 terlihat" in sec
-    # Amendment A2: invisible cases are marked, lift is on visible cases only,
-    # and the per-case look-alike count gave way to the h = 60 big-move table
-    ratu = sec[sec.index("RATU"):sec.index("PADI")]
-    assert "fase akumulasi sebelum data dimulai — tidak terlihat" in ratu.lower()
-    assert "kena suspensi" in ratu and "Sesi sebelum T dalam data" in ratu
-    padi = sec[sec.index("PADI"):sec.index("SAME")]
-    assert "tidak terlihat" not in padi and "kena suspensi</span>" not in padi
-    assert "yang terlihat" in sec and "look-alike" not in sec.lower().replace("pengganti hitungan look-alike", "")
-    assert "Look-alike (" not in sec
+def test_alpha_cases_and_lift_refuse_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_cards_open_only_when_fired_and_flag_problems():
-    html = bd.render(fixture())
-    assert re.search(r'<details class="card" id="t-SINI" open>', html)
-    assert re.search(r'<details class="card" id="t-BNBR" open>', html)
-    assert re.search(r'<details class="card" id="t-CASS">', html)
-    assert re.search(r'<details class="card" id="t-BUVA">', html)
-    buva = _card(html, "BUVA")
-    assert "basis putus" in buva and "Basis lot dan harga" in buva and "<svg" not in buva
-    cass = _card(html, "CASS")
-    assert "tidak eligible" in cass and "Rp 200 jt" in cass and "data s.d. 2026-09-23" in cass
-    assert html.index('id="t-BNBR"') < html.index('id="t-SINI"') < html.index('id="t-BUVA"'), \
-        "fired first, strongest score first"
-    bnbr = _card(html, "BNBR")
-    assert "R6 · BK kumpulkan 45.200 lot" in bnbr
+def test_fired_and_basis_break_cards_refuse_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_mobile_first_layout():
-    html = bd.render(fixture())
-    assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in html
-    assert html.count("<table") == html.count('<div class="tw"><table') > 0
-    assert re.search(r"\.tw\{overflow-x:auto", html)
-    css = html[html.index("<style>"):html.index("</style>")]
-    for prop, px in re.findall(r"(?<![-\w(])(width|min-width):\s*(\d+)px", css):  # not @media
+def test_mobile_layout_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
+    css = bd._style()
+    assert re.search(r"\.tw\{overflow-x:auto", css)
+    for prop, px in re.findall(r"(?<![-\w(])(width|min-width):\s*(\d+)px", css):
         assert int(px) <= 360, (prop, px)
-    for w in re.findall(r'viewBox="0 0 (\d+) \d+"', html):
-        assert int(w) <= 360, w
-    assert re.search(r'<svg[^>]*\swidth="', html) is None
 
 
-def test_dark_mode_is_selected_not_flipped():
-    html = bd.render({})
-    assert "@media (prefers-color-scheme: dark){:root:not([data-theme=\"light\"])" in html
-    assert ':root[data-theme="dark"]' in html
-    assert re.search(r"body\{[^}]*background:var\(--page\)", html)
+def test_dark_mode_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render({}))
+    css = bd._style()
+    assert '@media (prefers-color-scheme: dark){:root:not([data-theme="light"])' in css
+    assert ':root[data-theme="dark"]' in css
+    assert re.search(r"body\{[^}]*background:var\(--page\)", css)
     assert bd._DARK["surface"] != bd._LIGHT["surface"]
     assert set(bd._DARK) == set(bd._LIGHT)
 
@@ -494,56 +411,45 @@ def test_chart_handles_gaps_nan_and_single_point():
     assert "<svg" in only_nan and "belum ada posisi" in only_nan
 
 
-def test_empty_and_partial_ctx_still_render():
+def test_empty_and_partial_contexts_refuse_unmigrated_render_and_caption():
     for ctx in ({}, None, {"data_through": None, "tickers": [], "rules": [], "run": {}},
                 {"tickers": [{"ticker": "AAAA"}], "rules": [{"id": "R9"}], "alpha": {"cases": [{}]},
                  "brokers": {"scores": [{}], "profitability": [{}]}}):
-        html = bd.render(ctx)
-        assert "Kasus alpha (retrospektif)" in html and "</html>" in html
-        assert "https://" not in html
-        cap = bd.caption(ctx)
-        assert 0 < len(cap) <= bd.CAPTION_LIMIT and "research-grade" in cap
-    html = bd.render({})
-    for text in ("Tidak ada aturan yang aktif", "Belum ada kasus alpha", "Belum ada skor broker",
-                 "Belum ada broker dengan ≥ 3 kasus"):
-        assert text in html, text
+        _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
+        _assert_unsupported("broker_dashboard.caption", lambda: bd.caption(ctx))
 
 
-def test_caption_is_plain_bounded_and_complete():
-    cap = bd.caption(fixture())
-    assert "<" not in cap and ">" not in cap
-    assert "2026-09-24" in cap and "research-grade" in cap
-    assert "SINI R2 · skor −1,00" in cap and "BNBR R6 · skor +1,07" in cap
-    assert cap.index("BNBR") < cap.index("SINI"), "strongest score first"
-    assert "bukan kepemilikan sebenarnya" in cap
-
+def test_caption_refuses_unmigrated_signal_context_before_delivery():
     ctx = fixture()
+    _assert_unsupported("broker_dashboard.caption", lambda: bd.caption(ctx))
     ctx["tickers"] = [{"ticker": f"T{i:03d}", "fired": ["R1", "R4", "R6"], "score": 3.0 - i / 100}
                       for i in range(50)]
-    cap = bd.caption(ctx)
-    assert len(cap) <= bd.CAPTION_LIMIT
-    m = re.search(r"…dan (\d+) lainnya", cap)
-    assert m, cap
-    shown = len(re.findall(r"^• T\d{3} R1\+R4\+R6 · skor", cap, re.M))
-    assert shown + int(m.group(1)) == 50 and shown > 5
-    assert "T000" in cap and "research-grade" in cap and "2026-09-24" in cap
+    _assert_unsupported("broker_dashboard.caption", lambda: bd.send_document(
+        TOKEN, 42, "unsupported-dashboard-must-not-be-read.html", bd.caption(ctx)))
 
 
-def test_write_names_file_after_data_through():
+def test_write_names_file_after_data_through_and_unmigrated_render_refuses():
     with tempfile.TemporaryDirectory() as tmp:
-        path = bd.write(bd.render(fixture()), out_dir=tmp)
+        _assert_unsupported("broker_dashboard.render", lambda: bd.write(bd.render(fixture()),
+                                                                      out_dir=tmp))
+        assert os.listdir(tmp) == [], "refusal must precede dashboard output writes"
+        html = '<meta name="data-through" content="2026-09-24"><p>fixture</p>'
+        path = bd.write(html, out_dir=tmp)
         assert os.path.basename(path) == "broker_dashboard_2026-09-24.html"
-        assert os.path.getsize(path) > 10_000 and not os.path.exists(path + ".tmp")
-        path = bd.write(bd.render({}), out_dir=tmp)
+        with open(path, encoding="utf-8") as fh:
+            assert fh.read() == html
+        assert not os.path.exists(path + ".tmp")
+        path = bd.write("<p>undated</p>", out_dir=tmp)
         assert os.path.basename(path) == "broker_dashboard_undated.html"
         path = bd.write("<p>x</p>", out_dir=tmp, name="../escape.html")
         assert os.path.dirname(path) == tmp
 
 
-def test_write_fixture_preview():
-    path = bd.write(bd.render(fixture()), name="fixture_preview.html")
-    assert path == os.path.join(HERE, "broker_dashboard_out", "fixture_preview.html")
-    print(f"    preview: {path} ({os.path.getsize(path):,} bytes)")
+def test_unmigrated_fixture_preview_refuses_before_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        _assert_unsupported("broker_dashboard.render", lambda: bd.write(
+            bd.render(fixture()), out_dir=tmp, name="fixture_preview.html"))
+        assert os.listdir(tmp) == []
 
 
 # ── delivery ─────────────────────────────────────────────────────────────────
@@ -657,41 +563,13 @@ def test_module_is_pure_and_clean():
     assert res.returncode == 0 and res.stdout.strip() == "False", res.stderr
 
 
-def test_every_h60_number_carries_its_suspension_share():
-    html = bd.render(fixture())
-    r6 = _rule_html(html, "R6")
-    row60 = r6[r6.index("h=60 (utama)"):]
-    row60 = row60[:row60.index("</tr>")]
-    assert '<span class="sp">kena suspensi 27%</span>' in row60
-    r1 = _rule_html(html, "R1")
-    assert "kena suspensi 12%" in r1
-    assert r1.count("kena suspensi") == 2, "the h=60 row and its CI tooltip, nothing else"
-    assert "kena suspensi 27%" in re.search(r"<title>h=60:[^<]*</title>", r6).group(0)
-    live = html[html.index("Ledger live"):html.index("Perubahan bobot")]
-    r6_live = live[live.index("<td>R6</td>"):]
-    r6_live = r6_live[:r6_live.index("</tr>")]
-    assert "kena suspensi 50%" in r6_live
-    r1_live = live[live.index("<td>R1</td>"):]
-    assert "suspensi" not in r1_live[:r1_live.index("</tr>")], "h=10 never bridges one"
-    alpha = html[html.index('<section id="alpha">'):]
-    alpha = alpha[:alpha.index("</section>")]
-    assert "kena suspensi 30%" in alpha                      # of the cases
-    assert "kena suspensi 8%" in alpha                       # of the base rate
-    table = alpha[alpha.index("Naik besar per aturan"):]
-    assert "kena suspensi 27%" in table and "kena suspensi 12%" in table
+def test_h60_suspension_share_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_h60_verdicts_explained_as_not_enough_data_yet():
-    html = bd.render(fixture())
-    sec = html[html.index('<section id="belajar">'):]
-    sec = sec[:sec.index("</section>")]
-    assert "return pemegang" in sec and "dijembatani" in sec
-    assert 'status h=60 masih "data belum cukup"' in sec.lower().replace("&quot;", '"')
-    assert "180 tanggal event" in sec and "1 tahun" in sec
-    assert "bootstrap blok melingkar" in sec
+def test_h60_verdict_context_refuses_unmigrated_render():
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
     assert "max(30, 3×h)" in bd.STATUS_NOTE["LOW_N"] and "180" in bd.STATUS_NOTE["LOW_N"]
-    q = html[html.index('<section id="kualitas">'):]
-    assert "1 kosong" in q and "DEAD" in q and "delisting" in q
 
 
 def _walk_ctx(n_tickers=46, n=240, seed=7):
@@ -741,32 +619,10 @@ def _walk_ctx(n_tickers=46, n=240, seed=7):
     return ctx, dates
 
 
-def test_page_stays_under_1mb_for_46_tickers():
+def test_large_legacy_context_refuses_unmigrated_render():
     ctx, dates = _walk_ctx()
-    html = bd.render(ctx)
-    size = len(html.encode("utf-8"))
-    print(f"    46 tickers x 240 sessions: {size:,} bytes")
-    assert size < 1_000_000, size
-    # nothing was dropped to get there: every card keeps its chart and book
-    assert html.count('<figure class="ch"') == 46 and html.count('<table class="book">') == 46
-    assert html.count('<path class="ln s') == 46 * 6 and html.count('<path class="ln px"') == 46
-    assert html.count("<tr>") > 46 * 12
-
-    # the thinned hover data decodes back to the exact curve values
-    t = ctx["tickers"][0]
-    fig = re.search(r'<figure class="ch"[^>]*data-json="([^"]*)"', html).group(1)
-    data = json.loads(fig.replace("&quot;", '"').replace("&amp;", "&"))
-    # the session list, rebuilt as the hover script does: every st-th + the last
-    idx = list(range(0, data["n"], data["st"]))
-    idx += [] if idx[-1] == data["n"] - 1 else [data["n"] - 1]
-    assert data["n"] == 240 and len(idx) <= bd.HOVER_POINTS + 1 and idx[-1] == 239
-    assert "d.i.push(k)" in html and "k+=d.st" in html
-    d0 = date.fromisoformat(data["d0"])
-    assert [(d0 + timedelta(days=g)).isoformat() for g in data["g"]] == [dates[i] for i in idx]
-    assert data["c"] == [int(t["curves"]["close"][i]) for i in idx]
-    by_broker = {s["broker"]: s["cum_lots"] for s in t["curves"]["series"]}
-    for s in data["s"]:
-        assert s["v"] == [int(by_broker[s["b"]][i]) for i in idx], s["b"]
+    assert len(ctx["tickers"]) == 46 and len(dates) == 240
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
 
 
 def _decode(d):
@@ -816,9 +672,9 @@ def test_compact_path_draws_the_same_line():
     assert len(_decode(d)[0]) == 2
 
 
-def test_mirrored_constants_match_the_ruleset():
-    """The dashboard mirrors these instead of importing them (render needs
-    only the ctx); this catches drift when the ruleset or metrics change."""
+def test_mirrored_constants_match_the_ruleset_and_render_refuses():
+    """The legacy dashboard constants still match the ruleset. They do not
+    certify the public renderer's price and return contract."""
     import broker_learning as bl
     import broker_rules as br
     assert bd.HORIZONS == tuple(bl.HORIZONS)
@@ -827,7 +683,7 @@ def test_mirrored_constants_match_the_ruleset():
     assert bd.PRIMARY_H == dict(br.PRIMARY_H)
     assert [r["id"] for r in br.RULES] == list(bd.PRIMARY_H)
     assert bd.MIN_VAL20 == br.MIN_VAL20 == 2e8
-    assert "Rp 200 jt" in bd.render({"tickers": [{"ticker": "AAAA"}]})
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render({"tickers": [{"ticker": "AAAA"}]}))
     assert (bd.HOLD_H, bd.VISIBLE_MIN) == (bl.HOLD_H, bl.VISIBLE_MIN)
     assert all(bd._low_n_min(h) == bl.low_n_min(h) for h in bd.HORIZONS)
     assert bd.ROUND_TRIP_COST == bl.ROUND_TRIP_COST
@@ -899,9 +755,7 @@ def test_send_document_retries_network_errors_and_5xx():
         os.remove(path)
 
 
-def test_failure_reasons_are_shown_in_indonesian():
-    """Review finding: the Kualitas data table printed the collector's English
-    reasons. The page shows an Indonesian label; the raw text stays in runs.note."""
+def test_failure_reason_formatting_and_unmigrated_context_refusal():
     cases = {"HTTP 503": "server menolak (HTTP 503)", "non-JSON body": "jawaban bukan JSON",
              "no cached payload": "tidak ada cache",
              "unreadable cache (EOFError)": "cache tidak terbaca · EOFError",
@@ -914,33 +768,103 @@ def test_failure_reasons_are_shown_in_indonesian():
         assert bd.fmt_reason(raw) == shown, (raw, bd.fmt_reason(raw))
     ctx = fixture()
     ctx["run"]["failed"] = {"AAAA": "HTTP 502", "BBBB": "no cached payload"}
-    html = bd.render(ctx)
-    assert "server menolak (HTTP 502)" in html and "tidak ada cache" in html
-    assert "no cached payload" not in html
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
 
 
-def test_chart_axis_text_meets_contrast_on_a_phone():
-    """Review finding: --muted text was 3.5:1 in light mode at ~10 px on a
-    375 px phone. Axis text uses --ink2; --muted stays for strokes."""
-    html = bd.render(fixture())
-    assert ".ch text,.ci text{font-size:11px;fill:var(--ink2)}" in html
-    assert "fill:var(--muted)}" not in html.split(".ch text,.ci text")[1].split("}")[0] + "}"
+def test_chart_axis_style_and_unmigrated_render_refusal():
+    css = bd._style()
+    assert ".ch text,.ci text{font-size:11px;fill:var(--ink2)}" in css
+    assert "fill:var(--muted)}" not in css.split(".ch text,.ci text")[1].split("}")[0] + "}"
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(fixture()))
 
 
-def test_buy_rules_show_net_of_cost_trade_stats():
-    """§4.5's informational net trade stats (dir = +1 rules) reach the page,
-    with the hit rate beside its base, and a rule without them shows nothing."""
+def test_buy_rule_net_of_cost_stats_refuse_unmigrated_render():
     ctx = fixture()
     net = {"n_trades": 120, "mean_ret": 0.0123, "median_ret": -0.004, "hit_rate": 0.48,
            "ret_per_risk": 0.1, "base_rate": 0.45, "hit_edge": 0.03}
-    for r in ctx["rules"]:
-        if r["id"] == "R1":
-            r["net"] = net
-    html = bd.render(ctx)
-    r1 = _rule_html(html, "R1")
-    assert "Bersih biaya 0,73% pulang-pergi" in r1 and "n=120" in r1 and "+1,23%" in r1
-    assert "48%" in r1 and "45%" in r1
-    assert "Bersih biaya" not in _rule_html(html, "R4")
+    for rule in ctx["rules"]:
+        if rule["id"] == "R1":
+            rule["net"] = net
+    _assert_unsupported("broker_dashboard.render", lambda: bd.render(ctx))
+
+
+def test_ordered_refuses_unmigrated_financial_ranking():
+    for tickers in (None, [], fixture()["tickers"]):
+        _assert_unsupported("broker_dashboard._ordered", lambda: bd._ordered(tickers))
+
+
+def test_price_bits_refuse_unmigrated_price_change():
+    for ticker in (None, {}, fixture()["tickers"][3]):
+        _assert_unsupported("broker_dashboard._price_bits", lambda: bd._price_bits(ticker))
+
+
+def test_signals_refuse_unmigrated_financial_context():
+    for tickers in (None, [], fixture()["tickers"]):
+        _assert_unsupported("broker_dashboard._signals", lambda: bd._signals(tickers, {}))
+
+
+def test_facts_refuse_unmigrated_cost_and_pnl():
+    for facts in (None, {}, fixture()["tickers"][3]["facts"]):
+        _assert_unsupported("broker_dashboard._facts", lambda: bd._facts(facts))
+
+
+def test_book_refuses_unmigrated_cost_and_pnl():
+    ticker = fixture()["tickers"][3]
+    for rows in (None, [], ticker["book"]):
+        _assert_unsupported("broker_dashboard._book", lambda: bd._book(rows, ticker["anchor"]))
+
+
+def test_card_refuses_unmigrated_financial_context():
+    for ticker in (None, {}, fixture()["tickers"][3]):
+        _assert_unsupported("broker_dashboard._card", lambda: bd._card(ticker, {}, "2026-09-24"))
+
+
+def test_cards_refuse_unmigrated_financial_context():
+    for tickers in (None, [], fixture()["tickers"]):
+        _assert_unsupported("broker_dashboard._cards", lambda: bd._cards(tickers, {}, "2026-09-24"))
+
+
+def test_rule_block_refuses_unmigrated_return_statistics():
+    for rule in (None, {}, fixture()["rules"][0]):
+        _assert_unsupported("broker_dashboard._rule_block", lambda: bd._rule_block(rule, {}))
+
+
+def test_net_line_refuses_unmigrated_net_of_cost_returns():
+    net = {"n_trades": 120, "mean_ret": 0.0123, "hit_rate": 0.48, "base_rate": 0.45}
+    for value in (None, {}, net):
+        _assert_unsupported("broker_dashboard._net_line", lambda: bd._net_line(value, 10))
+
+
+def test_ci_svg_refuses_unmigrated_return_statistics():
+    for stats in (None, {}, fixture()["rules"][0]["stats"]):
+        _assert_unsupported("broker_dashboard._ci_svg", lambda: bd._ci_svg(stats, {}))
+
+
+def test_case_refuses_unmigrated_alpha_returns():
+    for case in (None, {}, fixture()["alpha"]["cases"][0]):
+        _assert_unsupported("broker_dashboard._case", lambda: bd._case(case))
+
+
+def test_learned_refuses_unmigrated_return_statistics():
+    ctx = fixture()
+    for value in (None, {}, ctx):
+        _assert_unsupported("broker_dashboard._learned", lambda: bd._learned(value, ctx["rules"]))
+
+
+def test_alpha_refuses_unmigrated_returns_and_lift():
+    ctx = fixture()
+    for alpha in (None, {}, ctx["alpha"]):
+        _assert_unsupported("broker_dashboard._alpha", lambda: bd._alpha(alpha, ctx["rules"]))
+
+
+def test_score_key_refuses_unmigrated_broker_ranking():
+    for score in (None, {}, fixture()["brokers"]["scores"][0]):
+        _assert_unsupported("broker_dashboard._score_key", lambda: bd._score_key(score))
+
+
+def test_brokers_refuse_unmigrated_returns_and_profitability():
+    for brokers in (None, {}, fixture()["brokers"]):
+        _assert_unsupported("broker_dashboard._brokers", lambda: bd._brokers(brokers))
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

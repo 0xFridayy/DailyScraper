@@ -355,6 +355,8 @@ def anchor_after_flags(dates, flags):
 
 def _trade(pos, cost, realized, lots, price):
     """Apply a signed residual trade to (position, avg cost, realized)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book._trade")
     if pos == 0:
         return lots, price, realized
     if (pos > 0) == (lots > 0):
@@ -378,6 +380,8 @@ def average_cost_run(blot, bval, slot, sval):
     under Rp 0.5 M) cannot enter a lot position, so it is booked straight to
     realized as cash. That keeps total == sum(nlot)*100*close - sum(nval) exact.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book.average_cost_run")
     pos, cost, realized = 0, np.nan, 0.0
     for b, bv, s, sv in zip(blot, bval, slot, sval):
         pb = bv / (b * SHARES_PER_LOT) if b > 0 else np.nan
@@ -399,6 +403,8 @@ def average_cost_run(blot, bval, slot, sval):
 
 def _vwap(lots, values):
     """Σvalue/(Σlots*100) over rows that traded lots; NaN when there are none."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book._vwap")
     keep = lots > 0
     total = lots[keep].sum()
     return float(values[keep].sum() / (total * SHARES_PER_LOT)) if total > 0 else np.nan
@@ -456,6 +462,8 @@ def _clean(x):
 
 def cumulative_curves(brokers, ohlc, anchor, top_n=CURVE_TOP_N):
     """Cumulative net lots since the anchor for the top net buyers and sellers, plus close."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_book.cumulative_curves")
     axis = ohlc.loc[ohlc["date"] >= anchor, "date"].tolist()
     closes = ohlc.loc[ohlc["date"] >= anchor, "close"].tolist()
     out = {"dates": axis, "close": [_clean(c) for c in closes], "series": []}

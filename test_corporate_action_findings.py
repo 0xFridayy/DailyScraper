@@ -1,0 +1,511 @@
+"""Adversarial regression fixtures; reconstructed observations, never live data."""
+
+import copy
+from datetime import datetime, timezone
+import sqlite3
+import importlib
+import inspect
+import runpy
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+import price_contract as pc
+import price_audit as pa
+from price_contract_frame import annotate_prices, require_price_frame
+from test_price_contract import document, frame, registry
+
+
+@pytest.mark.parametrize("events", [{}, "", None, 1, [None], ["event"], [False]])
+def test_f01_invalid_collection_is_not_an_empty_registry(events):
+    doc = document()
+    doc["events"] = events
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+def test_f01_partial_revision_and_conflicting_records_are_atomic():
+    for bad in [None, {}, copy.deepcopy(document()["events"][0])]:
+        doc = document()
+        doc["events"].append(bad)
+        with pytest.raises(pc.PriceContractError):
+            pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source", []), ("source_document_id", 123), ("event_id", True),
+    ("evidence_refs", ["https://example.invalid/live"]),
+])
+def test_f02_confirmed_identity_has_strict_types(field, value):
+    doc = document()
+    doc["events"][0][field] = value
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda e: e["source"].update(author=True),
+    lambda e: e["source"].pop("published_on"),
+    lambda e: e["source"].pop("retrieval_medium"),
+    lambda e: e["evidence_refs"].update(report_content_sha256="bad"),
+    lambda e: e.update(evidence_refs={"url": "https://example.invalid/live"}),
+])
+def test_f02_incomplete_provenance_cannot_authorize_reference(mutation):
+    doc = document()
+    mutation(doc["events"][0])
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+def labeled(**kwargs):
+    px = frame()
+    return pa.add_forward_returns(px, px.date.tolist(), (1, 2), extremes=True,
+                                  open_anchored=True, registry=registry(),
+                                  representation=pc.RAW_ACTUAL, **kwargs)
+
+
+def test_f03_old_labels_cannot_gain_new_registry_identity():
+    px = labeled()
+    doc = document()
+    doc["reviewed_coverage"] = document_coverage()
+    event = copy.deepcopy(doc["events"][0])
+    event.update(event_id="SYNTHETIC:SECOND", effective_session="2026-10-08", reference_price="1070")
+    doc["events"].append(event)
+    new = pc.parse_registry(doc)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        pa.add_lagged_returns(px, px.date.tolist(), registry=new, representation=pc.RAW_ACTUAL)
+    fresh = pa.add_forward_returns(frame(), px.date.tolist(), registry=new, representation=pc.RAW_ACTUAL)
+    assert pd.isna(fresh.loc[fresh.date.eq("2026-10-07"), "fwd_1"]).all()
+
+
+def document_coverage():
+    return [{"venue": "IDX", "market_scope": ["REGULAR"], "tickers": ["ENRG"],
+             "from": "2026-09-30", "through": "2026-10-09",
+             "evidence_refs": ["RECONSTRUCTED_TEST_COVERAGE_ONLY"]}]
+
+
+def test_f03_annotation_does_not_certify_legacy_crossing_labels():
+    px = frame()
+    px["fwd_1"] = 1030 / 1440 - 1
+    px.attrs["price_contract"] = registry().identity | {"input_representation": pc.RAW_ACTUAL}
+    with pytest.raises(pc.UnsupportedPriceContract):
+        annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+
+
+def test_f03_augmentation_preserves_information_cutoff():
+    cutoff = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    px = labeled(as_of=cutoff)
+    out = pa.add_lagged_returns(px, px.date.tolist(), registry=registry())
+    assert out.attrs["price_contract"]["knowledge_mode"] == "AS_OF"
+    assert out.attrs["price_contract"]["as_of"] == cutoff.isoformat()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("open", 1), ("high", 2000), ("low", 1), ("close", 1),
+    ("date", "2026-10-09"), ("ticker", "SINI"),
+    ("price_step_admissible", False), ("fwd_1", 99),
+])
+def test_f04_certificate_is_bound_to_observations_and_outputs(field, value):
+    px = labeled()
+    px.loc[4, field] = value
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(px, ("fwd_1",), registry=registry())
+
+
+def test_f04_filtering_valid_rows_keeps_valid_certificates():
+    px = labeled().iloc[4:].reset_index(drop=True)
+    assert require_price_frame(px, ("fwd_1",), registry=registry())
+
+
+@pytest.mark.parametrize("missing", ["open", "high", "low", "volume"])
+def test_f05_projection_cannot_recertify_incomplete_bars(missing):
+    px = labeled().drop(columns=missing)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        pa.add_lagged_returns(px, px.date.tolist(), registry=registry())
+
+
+@pytest.mark.parametrize("field,value", [("high", 2000), ("low", 500)])
+def test_f05_extrema_require_full_bar_reference_admission(field, value):
+    px = frame()
+    px.loc[5, field] = value
+    out = pa.add_forward_returns(px, px.date.tolist(), extremes=True,
+                                 registry=registry(), representation=pc.RAW_ACTUAL)
+    assert not out.loc[5, "price_step_admissible"]
+    assert pd.isna(out.loc[4, "max_1"]) and pd.isna(out.loc[4, "mdd_1"])
+
+
+def test_f07_pending_event_cannot_back_ordinary_session_or_labels():
+    px = pd.DataFrame([
+        ["2026-07-08", "SINI", 10950, 10950, 10950, 10950, 1000],
+        ["2026-07-09", "SINI", 8100, 8100, 8100, 8100, 1000],
+        ["2026-07-10", "SINI", 8150, 8150, 8150, 8150, 1000],
+    ], columns=frame().columns)
+    reg = registry("SINI", "2026-07-08", "2026-07-10")
+    out = pa.add_forward_returns(px, px.date.tolist(), registry=reg, representation=pc.RAW_ACTUAL)
+    assert out.loc[1, "limit_unresolved_reason"] == "PENDING_REFERENCE"
+    assert out.loc[2, "limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+    assert pd.isna(out.loc[1, "fwd_1"])
+
+
+def test_f08_unknown_event_input_cannot_receive_official_admission():
+    out = pa.detect(frame(), registry=registry(), representation="UNKNOWN")
+    event = out.loc[out.date.eq("2026-10-05")].iloc[0]
+    assert event.limit_reference_status == "UNRESOLVED"
+    assert pd.isna(event.limit_reference_price)
+    assert not event.entry_open_admissible and not event.price_step_admissible
+
+
+def test_f13_recovered_quarantine_has_shared_writer_and_audit_trust():
+    from test_inventory_capture import bf, price_db, price_payload
+    with price_db() as conn:
+        bars = frame().iloc[:4].drop(columns="ticker").to_dict("records")
+        bf.insert_inventory(conn, "ENRG", price_payload(bars), representation=pc.RAW_ACTUAL)
+        conn.execute("CREATE TABLE price_quarantine(date,ticker,reasons)")
+        conn.execute("INSERT INTO price_quarantine VALUES('2026-10-05','ENRG','limit_violation')")
+        next_bar = frame().iloc[4:5].drop(columns="ticker").to_dict("records")
+        assert bf.insert_inventory(conn, "ENRG", price_payload(next_bar), representation=pc.RAW_ACTUAL)[1] == 1
+        bad = copy.deepcopy(next_bar)
+        bad[0].update(open=1800, high=1810, low=1790, close=1800)
+        with pytest.raises(bf.InventoryError):
+            bf.insert_inventory(conn, "ENRG", price_payload(bad), representation=pc.RAW_ACTUAL)
+        clean = pa.load_clean(conn, registry=registry(), representation=pc.RAW_ACTUAL)
+        assert "2026-10-05" in clean.date.tolist()
+
+
+def test_f14_duplicate_identity_is_not_a_predecessor():
+    px = pd.DataFrame([
+        ["2026-10-01", "MDIA", 95, 95, 95, 95, 1000],
+        ["2026-10-01", "MDIA", 200, 200, 200, 200, 2000],
+        ["2026-10-02", "MDIA", 210, 210, 210, 210, 2100],
+    ], columns=frame().columns)
+    out = pa.detect(px, representation=pc.RAW_ACTUAL)
+    assert out.iloc[-1].limit_reference_status == "UNRESOLVED"
+    assert not out.iloc[-1].limit_violation
+
+
+def test_f15_missing_event_row_does_not_join_median_segments():
+    doc = document()
+    doc["events"][0]["reference_price"] = "100"
+    reg = pc.parse_registry(doc)
+    dates = ["2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25", "2026-09-28",
+             "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02",
+             "2026-10-06", "2026-10-07", "2026-10-08"]
+    px = pd.DataFrame([[d, "ENRG", *([1000 if d < "2026-10-05" else 100] * 4), 1000]
+                       for d in dates], columns=frame().columns)
+    out = pa.detect(px, registry=reg, representation=pc.RAW_ACTUAL)
+    after = out.loc[out.date.gt("2026-10-05")]
+    assert after.price_segment_id.eq(1).all()
+    assert not after.series_break.any()
+
+
+@pytest.mark.parametrize("revision", [
+    {"open": 200, "high": 200}, {"high": 200}, {"low": 50}, {"volume": 0},
+])
+def test_f06_unchanged_close_does_not_grandfather_changed_fields(revision):
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        bars = [price_bar("2026-07-01", 100), price_bar("2026-07-02", 100)]
+        bf.insert_inventory(conn, "BBBB", price_payload(bars, "BBBB"))
+        changed = copy.deepcopy(bars[-1])
+        changed.update(revision)
+        before = conn.total_changes
+        with pytest.raises(bf.InventoryError):
+            bf.insert_inventory(conn, "BBBB", price_payload([changed], "BBBB"))
+        assert conn.total_changes == before
+
+
+def test_f06_predecessor_revision_revalidates_stored_successor_ohlc():
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        bars = [price_bar("2026-07-01", 100), price_bar("2026-07-02", 100),
+                price_bar("2026-07-03", 100)]
+        bars[-1].update(open=130, high=130)
+        bf.insert_inventory(conn, "BBBB", price_payload(bars, "BBBB"))
+        before = conn.total_changes
+        with pytest.raises(bf.InventoryError):
+            bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-07-02", 90)], "BBBB"))
+        assert conn.total_changes == before
+
+
+def strategy_trade(px, decision, hold=1, tp=None, sl=None):
+    import strategy_variants as sv
+    certified = pa.add_forward_returns(px, px.date.tolist(), open_anchored=True,
+                                       registry=registry(), representation=pc.RAW_ACTUAL)
+    ix, dates = sv._index_price_history(certified, registry=registry())
+    return sv.simulate_trade(ix, dates, "ENRG", decision, hold, tp, sl, registry=registry())
+
+
+def test_f09_rejected_same_session_close_cannot_be_payoff():
+    px = frame()
+    px.loc[5, "close"] = 0
+    assert strategy_trade(px, "2026-10-06") is None
+
+
+def limit_trade(px, entry):
+    import ara_arb_simulation as aa
+    out = pa.add_forward_returns(px, px.date.tolist(), registry=registry(), representation=pc.RAW_ACTUAL)
+    out = aa.annotate_limits(out, registry=registry(), representation=pc.RAW_ACTUAL)
+    ix = {"ENRG": out}
+    dates = {"ENRG": {d: i for i, d in enumerate(out.date)}}
+    return aa.simulate_trade_with_limits(ix, dates, "ENRG", entry, registry=registry())
+
+
+def test_f09_delayed_exit_final_non_arb_bar_requires_admission():
+    px = frame().iloc[3:6].reset_index(drop=True)
+    px.loc[1, ["open", "high", "low", "close"]] = [875, 880, 875, 875]
+    px.loc[2, ["open", "high", "low", "close"]] = [2000, 2000, 2000, 2000]
+    assert limit_trade(px, "2026-10-05") is None
+
+
+def test_f10_incomplete_timed_hold_is_not_shortened():
+    px = frame().iloc[:3].copy()
+    assert strategy_trade(px, "2026-10-01", hold=2) is None
+    assert strategy_trade(px, "2026-10-01", hold=1) == pytest.approx(1440 / 1425 - 1)
+
+
+def test_f10_real_early_barrier_exit_does_not_need_later_timed_bar():
+    px = frame().iloc[:3].copy()
+    assert strategy_trade(px, "2026-10-01", hold=2, tp=.005) == pytest.approx(.005)
+
+
+def test_f17_unrelated_history_does_not_disable_valid_local_trade():
+    assert limit_trade(frame(), "2026-10-05") == pytest.approx((1050 / 1030 - 1, 1))
+    assert limit_trade(frame().iloc[3:].reset_index(drop=True), "2026-10-05") == pytest.approx((1050 / 1030 - 1, 1))
+
+
+def test_f17_unresolved_inside_required_span_still_withholds():
+    px = frame()
+    px.loc[4, "volume"] = 0
+    assert limit_trade(px, "2026-10-05") is None
+
+
+def test_f18_first_complete_extrema_window_and_incomplete_tail():
+    px = frame().iloc[4:].reset_index(drop=True)
+    out = pa.add_forward_returns(px, px.date.tolist(), (2,), extremes=True,
+                                 registry=registry(), representation=pc.RAW_ACTUAL)
+    assert out.loc[0, "max_2"] == pytest.approx(1080 / 1050 - 1)
+    assert out.loc[0, "mdd_2"] == pytest.approx(1040 / 1050 - 1)
+    assert pd.isna(out.loc[2, "max_2"]) and pd.isna(out.loc[2, "mdd_2"])
+
+
+def test_f11_real_model_api_refuses_unversioned_reset_targets():
+    import ml_v2_experiment_1 as ml
+    panel = pd.DataFrame({"ticker": ["ENRG"] * 6, "date": frame().date.iloc[:6],
+                          "x": [0., 1.] * 3, "target": [1030 / 1440 - 1] * 6})
+    splits = [{"fit": panel.date[:2].tolist(), "eval": panel.date[2:4].tolist(),
+               "test": panel.date[4:].tolist()}]
+    with pytest.raises(pc.UnsupportedPriceContract):
+        ml.run_feature_set(panel, ["x"], splits)
+
+
+@pytest.mark.parametrize("module,name", [
+    ("ml_v2_experiment_1", "build_broker_identity_features"),
+    ("strategy_variants", "get_walk_forward_predictions"),
+    ("strategy_variants", "run_strategy_search"),
+    ("feature_ablation", "walk_forward"), ("horizon_scan", "walk_forward"),
+    ("multiday_features", "walk_forward"), ("txchart_backtest", "walk_forward"),
+    ("daily_picks", "tag_snapshot"), ("daily_picks", "rank_picks"),
+    ("daily_picks", "format_morning"), ("daily_picks", "format_scoreboard"),
+    ("broker_learning_run", "ticker_ctx"), ("broker_learning_run", "brokers_ctx"),
+    ("broker_rules", "window_cost"), ("broker_book", "average_cost_run"),
+])
+def test_f11_direct_call_refuses_before_accessing_unversioned_input(module, name):
+    fn = getattr(importlib.import_module(module), name)
+    args, kwargs = [], {}
+    for p in inspect.signature(fn).parameters.values():
+        if p.default is not inspect.Parameter.empty:
+            continue
+        if p.kind == p.KEYWORD_ONLY:
+            kwargs[p.name] = None
+        else:
+            args.append(None)
+    with pytest.raises(pc.UnsupportedPriceContract, match=f"{module}.{name}"):
+        fn(*args, **kwargs)
+
+
+def test_f11_veto_persistence_requires_current_contract(tmp_path):
+    import arb_veto
+    target = tmp_path / "picks.db"
+    top = pd.DataFrame({"ticker": ["ENRG"], "p": [.999]})
+    with pytest.raises(pc.UnsupportedPriceContract):
+        arb_veto.write("2026-10-05", top, picks_db=str(target))
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("module", ["horizon_scan", "feature_ablation", "multiday_features"])
+def test_f12_cli_refusal_creates_no_database(module, tmp_path, monkeypatch):
+    import walk_forward_backtest as wfb
+    target = tmp_path / "missing.db"
+    monkeypatch.setattr(wfb, "DB_PATH", str(target))
+    with pytest.raises(pc.UnsupportedPriceContract):
+        runpy.run_module(module, run_name="__main__")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_f12_weekly_inner_wrapper_does_not_commit_on_refusal(tmp_path):
+    import broker_learning_run as run
+    import broker_learning_db as db
+    with sqlite3.connect(":memory:") as conn:
+        db.ensure_schema(conn)
+        before = conn.total_changes
+        args = SimpleNamespace(tickers="ENRG", no_fetch=True, raw_dir=str(tmp_path), legacy_cache=True,
+                               history_dir=str(tmp_path / "history"))
+        with pytest.raises(pc.UnsupportedPriceContract):
+            run._weekly(args, conn, {}, "2026-10-07T00:00:00+00:00", 0)
+        assert conn.total_changes == before
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("column", ["fwd_1", "max_1", "mdd_1", "fwd_oo_1", "lag_1", "gap_1"])
+def test_f16_integrity_checks_actual_spans_with_blank_producer_reasons(column, monkeypatch):
+    import check_signal_integrity as integrity
+    with sqlite3.connect(":memory:") as conn:
+        frame().to_sql("price_history", conn, index=False)
+        px = labeled()
+        px = pa.add_lagged_returns(px, px.date.tolist(), registry=registry())
+        day = "2026-10-01" if column == "fwd_oo_1" else "2026-10-05" if column == "lag_1" else "2026-10-02"
+        px.loc[px.date.eq(day), column] = 1030 / 1440 - 1
+        if column + "_reason" in px:
+            px.loc[px.date.eq(day), column + "_reason"] = ""
+        monkeypatch.setattr(pa, "clean_panel", lambda *a, **k: px)
+        problems, notes, stats = [], [], {}
+        integrity.check_price_contract(conn, problems, notes, stats, registry=registry(), representation=pc.RAW_ACTUAL)
+        assert any(column in message for message in problems)
+
+
+def test_f03_changed_trust_cannot_reseal_existing_labels():
+    px = labeled()
+    with pytest.raises(pc.UnsupportedPriceContract):
+        annotate_prices(px, registry=registry(), trusted=[False] * len(px))
+
+
+def test_f03_changed_session_axis_cannot_reuse_old_labels():
+    px = labeled()
+    changed_axis = [d for d in px.date if d != "2026-10-06"]
+    with pytest.raises(pc.UnsupportedPriceContract):
+        pa.add_lagged_returns(px, changed_axis, registry=registry())
+
+
+@pytest.mark.parametrize("column", ["target", "daily_return", "payoff", "label", "y", "rule_ret"])
+def test_f03_annotation_does_not_certify_arbitrary_cached_outputs(column):
+    px = frame()
+    px[column] = 1030 / 1440 - 1
+    out = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(out, (column,), registry=registry())
+
+
+def test_f04_appending_a_label_does_not_add_it_to_the_certificate():
+    px = labeled()
+    px["fwd_3"] = 99
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(px, ("fwd_3",), registry=registry())
+
+
+def test_f04_duplicate_replay_is_not_a_valid_frame():
+    px = labeled()
+    replay = pd.concat([px.iloc[:1], px], ignore_index=True)
+    replay.attrs = copy.deepcopy(px.attrs)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(replay, registry=registry())
+
+
+@pytest.mark.parametrize("identity", [True, 123, ["fake"], {"fake": "fake"}, "UNKNOWN"])
+def test_f08_malformed_source_evidence_does_not_verify_session(identity):
+    from neobdm_source_contract import price_source_context
+    evidence = {"source_document_id": identity, "sha256": "1" * 64}
+    out = price_source_context("2026-10-06", source_session="2026-10-05", session_evidence=evidence,
+                               representation=pc.RAW_ACTUAL, representation_evidence=evidence)
+    assert out["session_status"] == "UNKNOWN" and out["input_representation"] == "UNKNOWN"
+
+
+def test_f13_independent_duplicates_cannot_be_recovered_by_the_writer():
+    from test_inventory_capture import bf, price_db, price_payload
+    with price_db() as conn:
+        bars = frame().iloc[:4].drop(columns="ticker").to_dict("records")
+        bf.insert_inventory(conn, "ENRG", price_payload(bars), representation=pc.RAW_ACTUAL)
+        bar = bars[-1]
+        conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
+                     (bar["date"], "AAAA", bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"]))
+        conn.execute("CREATE TABLE price_quarantine(date,ticker,reasons)")
+        conn.execute("INSERT INTO price_quarantine VALUES('2026-10-05','ENRG','limit_violation')")
+        before = conn.total_changes
+        with pytest.raises(bf.InventoryError, match="UNTRUSTED_PREDECESSOR"):
+            bf.insert_inventory(conn, "ENRG", price_payload(frame().iloc[4:5].drop(columns="ticker").to_dict("records")),
+                                representation=pc.RAW_ACTUAL)
+        assert conn.total_changes == before
+
+
+def test_f14_direct_label_builder_does_not_chain_duplicate_identity():
+    px = frame().iloc[3:5].copy()
+    duplicate = px.iloc[:1].copy()
+    duplicate.loc[:, ["open", "high", "low", "close"]] = 1200
+    px = pd.concat([px.iloc[:1], duplicate, px.iloc[1:]], ignore_index=True)
+    out = pa.add_forward_returns(px, sorted(px.date.unique()), registry=registry(), representation=pc.RAW_ACTUAL)
+    assert out.iloc[-1].limit_reference_status == "UNRESOLVED"
+    assert out.fwd_1.isna().all()
+
+
+def test_f09_stale_date_index_cannot_select_another_payoff():
+    import strategy_variants as sv
+    px = labeled()
+    ix, dates = sv._index_price_history(px, registry=registry())
+    dates["ENRG"]["2026-10-01"] = 4
+    assert sv.simulate_trade(ix, dates, "ENRG", "2026-10-01", 1, None, None, registry=registry()) is None
+
+
+@pytest.mark.parametrize("value", ["1_065", " 1065 ", "+1065"])
+def test_f02_reference_text_is_not_coerced(value):
+    doc = document()
+    doc["events"][0]["reference_price"] = value
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source_identity", "UNKNOWN"), ("source_document_id", True),
+    ("source_session", "UNKNOWN"), ("source_session", "2026-10-02"),
+    ("source_session_status", "UNKNOWN"), ("representation", "MIXED"),
+    ("input_representation", "UNKNOWN"),
+])
+def test_f08_explicit_unknown_or_contradictory_source_metadata_refuses_event(field, value):
+    px = frame()
+    px[field] = value
+    out = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+    event = out.loc[out.date.eq("2026-10-05")].iloc[0]
+    assert event.limit_reference_status != "RESOLVED"
+    assert not event.price_step_admissible
+    assert not event.entry_open_admissible
+    assert not event.close_anchor_admissible
+
+
+@pytest.mark.parametrize("column", ["at_ara", "at_arb", "suspect", "prev_close", "pct_chg"])
+def test_f03_annotation_does_not_own_uncomputed_derived_flags(column):
+    px = frame()
+    px[column] = False
+    out = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(out, (column,), registry=registry())
+
+
+def test_f03_closed_forward_labels_do_not_certify_cached_open_admission():
+    px = frame()
+    px["next_entry_open_admissible"] = True
+    out = pa.add_forward_returns(px, px.date.tolist(), registry=registry(), representation=pc.RAW_ACTUAL)
+    with pytest.raises(pc.UnsupportedPriceContract):
+        require_price_frame(out, ("next_entry_open_admissible",), registry=registry())
+
+
+def test_f09_limit_simulator_rejects_stale_decision_index():
+    import ara_arb_simulation as aa
+    px = aa.annotate_limits(labeled(), registry=registry(), representation=pc.RAW_ACTUAL)
+    dates = {d: i for i, d in enumerate(px.date)}
+    dates["2026-10-01"] = 4
+    assert aa.simulate_trade_with_limits({"ENRG": px}, {"ENRG": dates}, "ENRG", "2026-10-01", registry=registry()) is None
+
+
+@pytest.mark.parametrize("tp,sl", [(-.5, None), (None, -.5), (float("nan"), None), (None, 1)])
+def test_f09_invalid_barrier_distances_cannot_fabricate_payoff(tp, sl):
+    with pytest.raises(ValueError):
+        strategy_trade(frame(), "2026-10-06", tp=tp, sl=sl)

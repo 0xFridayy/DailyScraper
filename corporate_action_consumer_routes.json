@@ -10,33 +10,78 @@
     "ara_arb_scan": [
       "load_prices",
       "build",
-      "main"
+      "main",
+      "load_brokers"
     ],
     "ara_multiday": [
       "load",
       "add_horizon_labels",
-      "main"
+      "main",
+      "walk_forward",
+      "section_base",
+      "section_vol",
+      "section_model",
+      "section_trade",
+      "section_robust",
+      "report"
     ],
     "arb_veto": [
       "score",
-      "main"
+      "main",
+      "write"
     ],
     "broker_book": [
       "average_cost_book",
       "rolling_state",
-      "ticker_bundle"
+      "ticker_bundle",
+      "average_cost_run",
+      "cumulative_curves",
+      "_trade",
+      "_vwap"
     ],
     "broker_dashboard": [
-      "render"
+      "render",
+      "caption",
+      "_ordered",
+      "_price_bits",
+      "_signals",
+      "_facts",
+      "_book",
+      "_card",
+      "_cards",
+      "_rule_block",
+      "_net_line",
+      "_ci_svg",
+      "_case",
+      "_learned",
+      "_alpha",
+      "_score_key",
+      "_brokers",
+      "_header",
+      "_rule_chip"
     ],
     "broker_learning": [
       "outcomes",
       "holder_returns",
       "broker_profitability",
-      "live_outcome_rows"
+      "live_outcome_rows",
+      "attach_excess",
+      "rule_stats",
+      "rule_weights",
+      "net_trade_stats",
+      "broker_scores",
+      "alpha_cases",
+      "broker_lift",
+      "primary_status"
     ],
     "broker_learning_db": [
-      "live_summary"
+      "live_summary",
+      "load_rule_stats",
+      "load_weights",
+      "load_broker_scores",
+      "load_profitability",
+      "load_alpha_cases",
+      "load_broker_lift"
     ],
     "broker_learning_run": [
       "load_items",
@@ -44,11 +89,33 @@
       "learn",
       "run_weekly",
       "run_render",
-      "main"
+      "main",
+      "load_ticker",
+      "ticker_ctx",
+      "live_signal_rows",
+      "_book_rows",
+      "_facts",
+      "rules_ctx",
+      "alpha_ctx",
+      "brokers_ctx",
+      "build_ctx",
+      "_deliver",
+      "_daily",
+      "_weekly",
+      "features_json",
+      "_score",
+      "_ticker_order",
+      "learned_lines",
+      "_weekly_note"
     ],
     "broker_rules": [
       "eligibility",
-      "evaluate"
+      "evaluate",
+      "window_cost",
+      "track_record_events",
+      "_holder_group",
+      "composite_score",
+      "explain"
     ],
     "check_ml_health": [
       "check_model_runs"
@@ -63,11 +130,29 @@
       "machine_holding",
       "machine_progress",
       "record_results",
-      "run_morning"
+      "run_morning",
+      "price_break",
+      "recent_corporate_action",
+      "tag_snapshot",
+      "rank_picks",
+      "learn_weights",
+      "warnings",
+      "format_morning",
+      "format_scoreboard",
+      "explain",
+      "finish_pick",
+      "arb_veto",
+      "main_reason",
+      "fact_text",
+      "current_weights"
     ],
     "ddqn_entry_exit": [
       "make_envs",
-      "train_ddqn"
+      "train_ddqn",
+      "fit_normalizer",
+      "normalize_features",
+      "evaluate_policy",
+      "evaluate_policy_with_trade_log"
     ],
     "ddqn_episode_data": [
       "build_episode_frame"
@@ -83,16 +168,28 @@
     ],
     "experiment_1f_evaluation": [
       "_search_exit",
-      "slot_outcomes"
+      "slot_outcomes",
+      "rank_label",
+      "open_usable",
+      "close_step_in_band",
+      "select_top_k",
+      "portfolio_return",
+      "benchmark_return",
+      "daily_top3_excess"
     ],
     "experiment_1f_features": [
       "price_features",
-      "build_features"
+      "build_features",
+      "daily_ic_capacity"
     ],
     "experiment_1f_gate_b": [
       "load_context",
       "main",
-      "execute_stage1"
+      "execute_stage1",
+      "run_job",
+      "job_results",
+      "graduation_report",
+      "sensitivity_report"
     ],
     "experiment_1f_gate_b_contract": [
       "write_contract",
@@ -123,14 +220,16 @@
       "main"
     ],
     "feature_ablation": [
-      "build_multi_horizon_panel"
+      "build_multi_horizon_panel",
+      "walk_forward"
     ],
     "foreign_flow_signal_backtest": [
       "generate_trades",
       "main"
     ],
     "horizon_scan": [
-      "build"
+      "build",
+      "walk_forward"
     ],
     "inventory_evidence": [
       "_market_measurement"
@@ -141,18 +240,31 @@
     "label_compare": [
       "load",
       "add_labels",
-      "main"
+      "main",
+      "section_rates",
+      "section_vol",
+      "section_model",
+      "section_trade"
     ],
     "ml_v2_experiment_1": [
       "build_experiment_panel",
       "run_experiment",
-      "main"
+      "main",
+      "_historical_net_lots",
+      "build_broker_identity_features",
+      "run_feature_set",
+      "summarize_predictions",
+      "print_results"
     ],
     "ml_v2_experiment_1_robustness": [
-      "main"
+      "main",
+      "broker_group_ablation",
+      "paired_date_differences",
+      "paired_bootstrap_report"
     ],
     "multiday_features": [
-      "build_panel_with_multiday"
+      "build_panel_with_multiday",
+      "walk_forward"
     ],
     "pattern_backtest": [
       "load_prices",
@@ -171,14 +283,19 @@
     "regime_gated_momentum": [
       "load_neobdm",
       "simulate_trade",
-      "main"
+      "main",
+      "simulate_predictions",
+      "evaluate",
+      "select_threshold"
     ],
     "run_ml_reports": [
       "run_xgboost_report",
       "run_strategy_variants_report",
       "run_ddqn_report",
       "run_konglo_watch_report",
-      "main"
+      "main",
+      "format_telegram_message",
+      "write_step_summary"
     ],
     "scan_ara_arb": [
       "refresh",
@@ -188,17 +305,20 @@
       "run_shap_analysis"
     ],
     "smart_money_divergence": [
-      "build_panel_with_smart_money"
+      "build_panel_with_smart_money",
+      "walk_forward"
     ],
     "targeted_actor_observations": [
       "observe",
-      "observe_inventory_evidence"
+      "observe_inventory_evidence",
+      "_window"
     ],
     "txchart_backtest": [
       "load_panel",
       "engineer",
       "evaluate",
-      "main"
+      "main",
+      "walk_forward"
     ],
     "walk_forward_backtest": [
       "build_panel",
@@ -207,6 +327,42 @@
     "test_inventory_signal": [
       "load",
       "main"
+    ],
+    "strategy_variants": [
+      "get_walk_forward_predictions",
+      "run_strategy_search",
+      "eval_variant"
+    ],
+    "ara_arb_simulation": [
+      "run_ara_arb_check"
+    ]
+  },
+  "cli_routes": {
+    "horizon_scan": "__main__",
+    "feature_ablation": "__main__",
+    "multiday_features": "__main__",
+    "smart_money_divergence": "__main__",
+    "strategy_variants": "__main__"
+  },
+  "coverage_notes": "Callable price/model, quantity-basis, persisted presentation and persistence boundaries traced independently; generic numerical statistics, actual cash-flow ingestion, ownership and index-only calculations retain their own contracts. Refusal coverage does not certify migrations.",
+  "conditional_routes": {
+    "broker_learning_db.insert_rows": {
+      "refused_tables": "all analytical tables in TABLES except runs",
+      "allowed_tables": [
+        "runs"
+      ],
+      "reason": "actual capture and run-status records use separate source contracts; analytical outcomes lack current price identity"
+    }
+  },
+  "class_routes": {
+    "ddqn_entry_exit.TickerEnv": [
+      "__init__",
+      "reset",
+      "_state",
+      "step"
+    ],
+    "ddqn_entry_exit.QNet": [
+      "forward"
     ]
   }
 }

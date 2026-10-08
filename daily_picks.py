@@ -207,6 +207,8 @@ def price_break(snaps, a, b, ticker):
     """First unresolved price discontinuity between snapshots a and b, comparing each
     available close with the previous available one (so a split on a day the
     name was missing from the list is still caught): (index, hint) or None."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.price_break")
     prev = None
     for j in range(max(a, 0), b + 1):
         close = _close(snaps, j, ticker)
@@ -221,6 +223,8 @@ def price_break(snaps, a, b, ticker):
 
 
 def recent_corporate_action(snaps, k, ticker, sessions=5):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.recent_corporate_action")
     return price_break(snaps, k - sessions, k, ticker) is not None
 
 
@@ -255,6 +259,8 @@ def _top_buyers(row):
 def tag_snapshot(snaps, k):
     """Buy signals for every name in snapshot k that passes the basic filters.
     Reads snapshots 0..k only."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.tag_snapshot")
     tagged = {}
     for ticker, row in snaps[k].rows.items():
         tval, pct5 = _num(row, "tval"), _num(row, "pct_5")
@@ -289,6 +295,8 @@ def arb_veto(conn, session_date):
     honest answer both when nothing is flagged and when the weekly job has
     never run, and either way picks carry on as before.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.arb_veto")
     rows = conn.execute(
         "SELECT ticker FROM arb_veto WHERE as_of <= ? AND valid_until >= ?",
         (session_date, session_date)).fetchall()
@@ -297,6 +305,8 @@ def arb_veto(conn, session_date):
 
 def rank_picks(tagged, weights, n=N_PICKS, min_tags=MIN_TAGS):
     """Top n names with at least min_tags signals, by summed tag weight."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.rank_picks")
     ranked = []
     for ticker, cand in tagged.items():
         if len(cand["tags"]) < min_tags:
@@ -395,6 +405,8 @@ def learn_weights(snaps, h=HORIZON):
     windows share days, so only s/h of the s sessions count as independent:
         weight = clip(1 + 0.5 * n/(n+20) * avg_excess_pct, 0.25, 2.0), n = s/h
     Only uses snapshots inside `snaps`; pass exactly what was known then."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.learn_weights")
     per_tag = {t: [] for t in TAG_ORDER}
     for k in range(len(snaps) - 1 - h):
         rets = machine_returns(snaps, k, h)
@@ -653,6 +665,8 @@ def follow_block(snaps, ticker, follow, sent_at=None):
 
 def explain(snaps, ticker, start, end):
     """What happened while a pick was held (sessions start+1..end)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.explain")
     window = range(start + 1, end + 1)
     rows = [snaps[j].rows.get(ticker) for j in window]
     facts = {}
@@ -676,6 +690,8 @@ def explain(snaps, ticker, start, end):
 def main_reason(ret, facts):
     """The one plain reason that best fits what happened. These are
     patterns in the flow data, not proof of cause."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.main_reason")
     market = facts["market_ret"]
     excess = ret - (market or 0)
     # Only when the stock went the market's way and the gap is small.
@@ -706,6 +722,8 @@ def main_reason(ret, facts):
 
 
 def fact_text(facts):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.fact_text")
     parts = []
     for label, name in (("Bandar bought", "bandar"), ("Foreign bought", "foreign")):
         if facts[name + "_days"]:
@@ -720,6 +738,8 @@ def fact_text(facts):
 def finish_pick(snaps, ticker, start, days, who, label=None):
     """Final result of a pick held `days` sessions from snapshot `start`,
     where the caller supplies the reference/entry: (lines, result)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.finish_pick")
     end = min(start + days, len(snaps) - 1)
     result = {"end_snapshot": snaps[end].date, "start_price": None, "end_price": None,
               "ret": None, "market_ret": None, "why": None, "facts": None}
@@ -844,6 +864,8 @@ def record_results(conn, results, now_utc):
 
 
 def warnings(snaps, k, ticker):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.warnings")
     row = snaps[k].rows.get(ticker)
     out = []
     pct5 = _num(row, "pct_5")
@@ -907,6 +929,8 @@ def ensure_schema(conn):
 
 
 def current_weights(conn):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.current_weights")
     rows = conn.execute("SELECT tag, weight FROM tag_weights WHERE as_of = "
                         "(SELECT max(as_of) FROM tag_weights)").fetchall()
     return {t: w for t, w in rows}
@@ -939,6 +963,8 @@ LIST_NAMES = (("broker_stalker", "Stalker"), ("dashboard_Bandarmologi", "Bandar"
 
 def format_morning(today, snap, picks, tagged, weights, your_blocks, running,
                    finished_blocks, lists, n_sessions):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.format_morning")
     lines = [f"📈 Morning report - {today:%a} {today.day} {today:%b}",
              f"Data: {session_label(snap.date)} close", "",
              f"🤖 Machine picks - strong setups only ({MIN_TAGS}+ checks), "
@@ -985,6 +1011,8 @@ WHY_BUCKETS = (
 
 
 def format_scoreboard(snaps, conn, learned, previous):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("daily_picks.format_scoreboard")
     lines = ["📊 Weekly scoreboard (won = beat the market)"]
     rows = [dict(zip(("source", "ret", "market_ret", "bandar_share", "foreign_share",
                       "trading_ratio", "start_tags", "timing"), r))

@@ -23,6 +23,7 @@ import broker_learning as bl
 import broker_learning_db as db
 import price_audit
 import signal_metrics
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 H = bl.HORIZONS
@@ -34,6 +35,20 @@ PH_T = {"UP": 10, "DN": 60}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+def _assert_refusal(route, function, *args, **kwargs):
+    frames = [(arg, arg.copy(deep=True)) for arg in args if isinstance(arg, pd.DataFrame)]
+    try:
+        function(*args, **kwargs)
+    except UnsupportedPriceContract as exc:
+        status = exc.as_dict()
+        assert status["consumer"] == route and route in status["reason"]
+        assert status["status"] == "UNSUPPORTED" and status["contract_version"] == CONTRACT_VERSION
+    else:
+        raise AssertionError(f"{route} accepted uncertified inputs")
+    for frame, before in frames:
+        pd.testing.assert_frame_equal(frame, before)
+
 
 def weekdays(start, n):
     out, d = [], pd.Timestamp(start)
@@ -217,41 +232,14 @@ def _cross_section(seed=5):
 
 def test_excess_sums_to_zero_within_date_and_bucket():
     rows, outs = _cross_section()
-    x = bl.attach_excess(rows, outs)
-    elig = x["eligible"]
-    assert x.loc[~elig, bl.X_COLS].isna().all().all(), "ineligible rows are never scored"
-    assert x.loc[~elig, "rv20_q"].isna().all()
-
-    thick = x[elig & x.date.isin(["2026-02-02", "2026-02-03"])]
-    assert sorted(thick["rv20_q"].unique()) == [1, 2, 3, 4, 5]
-    assert (thick.groupby(["date", "rv20_q"]).size() == 8).all()
-    for _, g in thick.groupby("date"):         # buckets are ordered by rv20
-        spans = g.groupby("rv20_q")["rv20"].agg(["min", "max"]).sort_index()
-        assert (spans["max"].iloc[:-1].to_numpy() < spans["min"].iloc[1:].to_numpy()).all()
-    thin = x[elig & (x.date == "2026-02-04")]
-    assert (thin["rv20_q"] == bl.SINGLE_BUCKET).all(), "20 rows < 25: one bucket"
-
-    for h in H:
-        col = f"x_{h}"
-        sums = x[elig].groupby(["date", "rv20_q"])[col].sum()
-        assert sums.abs().max() < 1e-12, sums
-        assert x.loc[elig & x[bl.RET_COL[h]].isna(), col].isna().all()
-        # single bucket: excess vs the equal-weight eligible mean of that date
-        f = thin[bl.RET_COL[h]]
-        assert np.allclose(thin[col].dropna(), (f - f.mean()).dropna())
-
-    # an ineligible row's outcome never leaks into anyone's excess
-    outs2 = outs.copy()
-    inel = rows.loc[~rows.eligible, ["date", "ticker"]].apply(tuple, axis=1)
-    mask = outs2[["date", "ticker"]].apply(tuple, axis=1).isin(set(inel))
-    outs2.loc[mask, "fwd_oo_10"] = 9.9
-    x2 = bl.attach_excess(rows, outs2)
-    pd.testing.assert_series_equal(x["x_10"], x2["x_10"])
-
-    forced = bl.attach_excess(rows, outs, single_bucket=True)
-    assert (forced.loc[forced.eligible, "rv20_q"] == bl.SINGLE_BUCKET).all()
-    for d, g in forced[forced.eligible].groupby("date"):
-        assert abs(g["x_10"].sum()) < 1e-12, d
+    _assert_refusal("broker_learning.attach_excess", bl.attach_excess, rows, outs)
+    _assert_refusal("broker_learning.attach_excess", bl.attach_excess, rows, outs, single_bucket=True)
+    changed = outs.copy()
+    ineligible = set(rows.loc[~rows.eligible, ["date", "ticker"]].itertuples(index=False, name=None))
+    changed.loc[changed[["date", "ticker"]].apply(tuple, axis=1).isin(ineligible), "fwd_oo_10"] = 9.9
+    _assert_refusal("broker_learning.attach_excess", bl.attach_excess, rows, changed)
+    # A partial schema must still refuse before any merge or source mutation.
+    _assert_refusal("broker_learning.attach_excess", bl.attach_excess, rows.drop(columns="rv20"), outs)
 
 
 # ── bootstrap and status ───────────────────────────────────────────────────
@@ -345,83 +333,68 @@ def test_status_truth_table():
 # ── rule stats and weights ─────────────────────────────────────────────────
 
 def test_rule_stats_hand_computed_and_schema_keys():
-    recs = [
-        {"date": "d1", "ticker": "A", "fired": {"UP"}, "x": 0.02, "fwd": 0.03},
-        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": -0.01, "fwd": -0.005},
-        {"date": "d1", "ticker": "C", "x": -0.01, "fwd": 0.01},
-        {"date": "d1", "ticker": "D", "x": 0.0, "fwd": -0.02},
-        {"date": "d1", "ticker": "E", "eligible": False, "fired": {"UP"}, "fwd": 0.5},
-        {"date": "d2", "ticker": "A", "fired": {"UP"}, "x": 0.04, "fwd": 0.05, "susp": 1.0},
-        {"date": "d2", "ticker": "B", "x": -0.02, "fwd": -0.01, "susp": 1.0},
-        {"date": "d2", "ticker": "C", "x": -0.02, "fwd": -0.01},
-        {"date": "d3", "ticker": "A", "x": 0.01, "fwd": 0.02},   # not an event date
-    ]
-    stats = bl.rule_stats(rows_x_frame(recs), "2026-09-19", ("2025-10-01", "2026-09-19"),
-                          rules=RULES_T)
-    assert len(stats) == len(RULES_T) * len(H)
-    cols = table_columns("rule_stats")
-    for row in stats:
-        assert list(row) == cols, (list(row), cols)
-
-    up = next(r for r in stats if r["rule_id"] == "UP" and r["h"] == 10)
+    rows = rows_x_frame([
+        {"date": "d1", "ticker": "A", "fired": {"UP"}, "x": .02, "fwd": .03},
+        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": -.01, "fwd": -.005},
+        {"date": "d1", "ticker": "C", "x": -.01, "fwd": .01},
+        {"date": "d1", "ticker": "D", "x": 0., "fwd": -.02},
+        {"date": "d1", "ticker": "E", "eligible": False, "fired": {"UP"}, "fwd": .5},
+        {"date": "d2", "ticker": "A", "fired": {"UP"}, "x": .04, "fwd": .05, "susp": 1.},
+        {"date": "d2", "ticker": "B", "x": -.02, "fwd": -.01, "susp": 1.},
+        {"date": "d2", "ticker": "C", "x": -.02, "fwd": -.01},
+        {"date": "d3", "ticker": "A", "x": .01, "fwd": .02},
+    ])
+    _assert_refusal("broker_learning.rule_stats", bl.rule_stats, rows, "2026-09-19",
+                    ("2025-10-01", "2026-09-19"), rules=RULES_T)
+    # Retain the anonymous statistical operator's independent hand calculation.
+    events = rows.eligible & rows.UP & rows.x_10.notna()
+    universe = rows.eligible & rows.x_10.notna()
+    up = bl._event_stats(rows.x_10, rows.fwd_oo_10, rows.date, events, universe, 10)
     assert up["n_events"] == 3 and up["n_dates"] == 2
-    assert same(up["mean_excess"], (0.005 + 0.04) / 2)
-    assert same(up["hit_rate"], 2 / 3)
-    assert same(up["base_rate"], 3 / 7)
+    assert same(up["mean_excess"], (.005 + .04) / 2)
+    assert same(up["hit_rate"], 2 / 3) and same(up["base_rate"], 3 / 7)
     assert same(up["hit_edge"], 2 / 3 - 3 / 7)
     assert same(up["daily_hit_edge"], (0.0 + (1 - 1 / 3)) / 2)
-    assert up["big_rate"] == 0.0 and up["big_base_rate"] == 0.0, "no move reaches +20%"
-    # two per-date values and a 10-date block: fewer dates than one block, no CI
-    assert math.isnan(up["ci_lo"]) and math.isnan(up["ci_hi"])
-    assert up["low_n"] == 1 and up["status"] == "LOW_N"
-    assert (up["window_start"], up["window_end"]) == ("2025-10-01", "2026-09-19")
-    # susp_rate: share of the h = 60 events whose window bridged a suspension
-    # (1 of the 3 UP events; B's suspension is not an event); NULL elsewhere
-    up60 = next(r for r in stats if r["rule_id"] == "UP" and r["h"] == 60)
-    assert same(up60["susp_rate"], 1 / 3) and math.isnan(up["susp_rate"])
-    assert all(math.isnan(r["susp_rate"]) for r in stats if r["h"] != 60)
-    assert up60["low_n"] == 1 and up60["status"] == "LOW_N"
-
-    dn = next(r for r in stats if r["rule_id"] == "DN" and r["h"] == 10)
-    assert dn["n_events"] == 0 and dn["n_dates"] == 0 and dn["status"] == "LOW_N"
-    for k in ("mean_excess", "ci_lo", "ci_hi", "hit_rate", "base_rate", "hit_edge",
-              "daily_hit_edge", "big_rate", "big_base_rate", "susp_rate"):
-        assert math.isnan(dn[k]), k
-
-    # every row goes into the real table unchanged
-    conn = sqlite3.connect(":memory:")
-    db.ensure_schema(conn)
-    assert db.insert_rows(conn, "rule_stats", stats) == len(stats)
-    conn.close()
+    assert up["big_rate"] == up["big_base_rate"] == 0.
+    assert math.isnan(up["ci_lo"]) and math.isnan(up["ci_hi"]) and math.isnan(up["susp_rate"])
+    assert bl.status_of(1, up["mean_excess"], up["ci_lo"], up["ci_hi"], up["n_dates"], 10) == "LOW_N"
+    up60 = bl._event_stats(rows.x_60, rows.hold_60, rows.date, events, universe, 60, rows.susp_60)
+    assert same(up60["susp_rate"], 1 / 3)
+    dn = bl._event_stats(rows.x_10, rows.fwd_oo_10, rows.date, universe & rows.DN, universe, 10)
+    assert dn["n_events"] == dn["n_dates"] == 0
+    assert all(math.isnan(dn[k]) for k in dn if k not in {"n_events", "n_dates"})
+    assert set(up) <= set(table_columns("rule_stats"))
+    with sqlite3.connect(":memory:") as conn:
+        db.ensure_schema(conn)
+        before = conn.total_changes
+        _assert_refusal("broker_learning_db.insert_rows", db.insert_rows, conn, "rule_stats", [up])
+        assert conn.total_changes == before and conn.execute("SELECT COUNT(*) FROM rule_stats").fetchone()[0] == 0
 
 
 def test_big_rate_vs_base_on_event_dates():
-    # fwd is the same number at every h here, so each h applies its own bar:
-    # BIG = {5: .15, 10: .20, 20: .30, 60: .50}
-    recs = [
-        {"date": "d1", "ticker": "A", "fired": {"UP"}, "x": 0.1, "fwd": 0.55},
-        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": 0.0, "fwd": 0.18},
-        {"date": "d1", "ticker": "C", "x": 0.0, "fwd": 0.25},
-        {"date": "d1", "ticker": "D", "x": 0.0, "fwd": -0.1},
-        {"date": "d2", "ticker": "A", "x": 0.0, "fwd": 0.9},     # not an event date
-        {"date": "d1", "ticker": "E", "eligible": False, "fwd": 0.9},
-    ]
-    stats = {r["h"]: r for r in bl.rule_stats(rows_x_frame(recs), "a", ("s", "e"),
-                                               rules=RULES_T) if r["rule_id"] == "UP"}
-    assert sorted(stats) == [5, 10, 20, 60]
-    # events A, B; base = A, B, C, D on d1 (d2 and the ineligible E are out)
-    want = {5: (2 / 2, 3 / 4), 10: (1 / 2, 2 / 4), 20: (1 / 2, 1 / 4), 60: (1 / 2, 1 / 4)}
+    rows = rows_x_frame([
+        {"date": "d1", "ticker": "A", "fired": {"UP"}, "x": .1, "fwd": .55},
+        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": 0., "fwd": .18},
+        {"date": "d1", "ticker": "C", "x": 0., "fwd": .25},
+        {"date": "d1", "ticker": "D", "x": 0., "fwd": -.1},
+        {"date": "d2", "ticker": "A", "x": 0., "fwd": .9},
+        {"date": "d1", "ticker": "E", "eligible": False, "fwd": .9},
+    ])
+    _assert_refusal("broker_learning.rule_stats", bl.rule_stats, rows, "a", ("s", "e"), rules=RULES_T)
+    events, universe = rows.eligible & rows.UP, rows.eligible
+    want = {5: (1., 3 / 4), 10: (1 / 2, 2 / 4), 20: (1 / 2, 1 / 4), 60: (1 / 2, 1 / 4)}
     for h, (big, base) in want.items():
-        assert same(stats[h]["big_rate"], big), h
-        assert same(stats[h]["big_base_rate"], base), h
-    # the bar is inclusive: exactly +50% at h = 60 is a big move
-    recs[1]["fwd"] = 0.50
-    s60 = next(r for r in bl.rule_stats(rows_x_frame(recs), "a", ("s", "e"), rules=RULES_T)
-               if r["rule_id"] == "UP" and r["h"] == 60)
-    assert same(s60["big_rate"], 1.0)
+        stats = bl._event_stats(rows[f"x_{h}"], rows[bl.RET_COL[h]], rows.date, events, universe, h)
+        assert same(stats["big_rate"], big) and same(stats["big_base_rate"], base), h
+    values = rows.hold_60.copy()
+    values.iloc[1] = .50
+    assert bl._big(values[events], 60) == 1., "the +50% threshold is inclusive"
 
 
 def test_primary_status_reads_each_rules_own_horizon():
+    from corporate_action_test_support import assert_unmigrated, frozen_reviewed_numeric_function
+    assert_unmigrated("broker_learning.primary_status")
+    legacy = frozen_reviewed_numeric_function("broker_learning", "primary_status")
     stats = [
         {"rule_id": "UP", "h": 5, "status": "NEUTRAL"},
         {"rule_id": "UP", "h": 10, "status": "DIRECTIONAL"},
@@ -430,9 +403,9 @@ def test_primary_status_reads_each_rules_own_horizon():
         {"rule_id": "XX", "h": 10, "status": "CONSISTENT"},     # not in the ruleset
     ]
     want = {"UP": "DIRECTIONAL", "DN": "LOW_N"}
-    assert bl.primary_status(stats, primary_h=PH_T) == want
-    assert bl.primary_status(pd.DataFrame(stats), primary_h=PH_T) == want
-    assert bl.primary_status(stats[:1], primary_h=PH_T) == {}, "no primary row, no guess"
+    assert legacy(stats, primary_h=PH_T) == want
+    assert legacy(pd.DataFrame(stats), primary_h=PH_T) == want
+    assert legacy(stats[:1], primary_h=PH_T) == {}, "no primary row, no guess"
 
 
 def test_other_writers_match_their_table_columns():
@@ -451,116 +424,56 @@ def _weight_rows(n_dates, x, rule, per_date=1):
 
 
 def test_weights_mirror_learn_weights():
-    def w(rows, rule, ph=PH_T):
-        return next(r for r in bl.rule_weights(rows, "as", primary_h=ph, rules=RULES_T)
-                    if r["rule_id"] == rule)
-
-    none = w(rows_x_frame([{"date": "d1", "ticker": "A", "x": 0.03, "fwd": 0.03}]), "UP")
-    assert none["weight"] == 1.0 and none["n_dates"] == 0
-    assert math.isnan(none["avg_excess_pct"]), "nothing measured is not 0"
-
-    # 100 dates of +5% excess: n = 10, avg_pct = 5 -> 1 + 0.5 * 10/30 * 5
-    up = w(_weight_rows(100, 0.05, "UP"), "UP")
-    assert up["n_dates"] == 100 and same(up["avg_excess_pct"], 5.0, 1e-9)
-    assert same(up["weight"], 1 + 0.5 * (10 / 30) * 5, 1e-12) and up["weight"] > 1
-
-    # the same move under a bearish rule is evidence AGAINST it; DN is judged
-    # at h = 60, so 100 dates are only n = 100/60 independent looks
-    dn = w(_weight_rows(100, 0.01, "DN"), "DN")
-    assert same(dn["avg_excess_pct"], -1.0, 1e-9)
-    n60 = 100 / 60
-    assert same(dn["weight"], 1 - 0.5 * (n60 / (n60 + 20)) * 1, 1e-12) and dn["weight"] < 1
-    # at h = 10 the same rows would count as n = 10
-    dn10 = w(_weight_rows(100, 0.01, "DN"), "DN", ph={"UP": 10, "DN": 10})
-    assert same(dn10["weight"], 1 - 0.5 * (10 / 30) * 1, 1e-12)
-    # the horizon picks the column: only x_60 counts for DN
-    rows = _weight_rows(100, 0.01, "DN")
-    rows["x_60"] = np.nan
-    assert w(rows, "DN")["weight"] == 1.0 and w(rows, "DN")["n_dates"] == 0
-    try:
-        w(rows, "DN", ph={"UP": 10})
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a rule without a primary horizon must be refused")
-    # and a falling name under it is evidence for it
-    assert w(_weight_rows(100, -0.01, "DN"), "DN")["weight"] > 1
-
-    # clipping at both ends (the +50% is also capped to 15% first)
-    assert w(_weight_rows(100, 0.50, "UP"), "UP")["weight"] == bl.WEIGHT_MAX
-    assert same(w(_weight_rows(100, 0.50, "UP"), "UP")["avg_excess_pct"], 15.0, 1e-9)
-    assert w(_weight_rows(400, 0.10, "DN"), "DN")["weight"] == bl.WEIGHT_MIN
-
-    # the cap applies per event BEFORE the date mean: [0.50, -0.10] -> 0.025
-    recs = [{"date": "d1", "ticker": "A", "fired": {"UP"}, "x": 0.50, "fwd": 0.5},
-            {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": -0.10, "fwd": -0.1}]
-    one = w(rows_x_frame(recs), "UP")
-    assert same(one["avg_excess_pct"], 2.5, 1e-9)
-    n = 1 / 10
-    assert same(one["weight"], 1 + 0.5 * (n / (n + 20)) * 2.5, 1e-12)
+    for n, x, rule in [(100, .05, "UP"), (100, .01, "DN"), (100, -.01, "DN"),
+                       (100, .50, "UP"), (400, .10, "DN")]:
+        rows = _weight_rows(n, x, rule)
+        _assert_refusal("broker_learning.rule_weights", bl.rule_weights, rows, "as", primary_h=PH_T, rules=RULES_T)
+    rows = _weight_rows(100, .01, "DN").assign(x_60=np.nan)
+    _assert_refusal("broker_learning.rule_weights", bl.rule_weights, rows, "as", primary_h={"UP": 10}, rules=RULES_T)
+    # Clipping before the date mean is still tested on the numerical operator.
+    clipped = pd.Series([.50, -.10]).clip(-bl.EXCESS_CAP, bl.EXCESS_CAP)
+    per_date = bl._per_date_mean(clipped, pd.Series(["d1", "d1"]))
+    assert same(per_date.iloc[0] * 100, 2.5)
+    assert bl._per_date_mean(pd.Series(dtype=float), pd.Series(dtype=str)).empty
 
 
 def test_net_trade_stats_ship_with_base_rate():
-    recs = [
-        {"date": "d1", "ticker": "A", "fired": {"UP", "DN"}, "x": 0.02, "fwd": 0.03},
-        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": -0.01, "fwd": 0.005},
-        {"date": "d1", "ticker": "C", "x": -0.01, "fwd": 0.01},
-        {"date": "d1", "ticker": "D", "x": 0.0, "fwd": -0.02},
-    ]
-    s = bl.net_trade_stats(rows_x_frame(recs), primary_h=PH_T, rules=RULES_T)
-    assert list(s) == ["UP"], "bearish rules get no long-trade stats"
-    up = s["UP"]
-    assert up["n_trades"] == 2 and same(up["hit_rate"], 0.5)         # 0.03 and 0.005 net of 0.73%
-    assert same(up["mean_ret"], (0.03 + 0.005) / 2 - bl.ROUND_TRIP_COST)
-    assert same(up["base_rate"], 2 / 4) and same(up["hit_edge"], 0.0)
+    rows = rows_x_frame([
+        {"date": "d1", "ticker": "A", "fired": {"UP", "DN"}, "x": .02, "fwd": .03},
+        {"date": "d1", "ticker": "B", "fired": {"UP"}, "x": -.01, "fwd": .005},
+        {"date": "d1", "ticker": "C", "x": -.01, "fwd": .01},
+        {"date": "d1", "ticker": "D", "x": 0., "fwd": -.02},
+    ])
+    _assert_refusal("broker_learning.net_trade_stats", bl.net_trade_stats, rows, primary_h=PH_T, rules=RULES_T)
+    net = rows.fwd_oo_10 - bl.ROUND_TRIP_COST
+    up = signal_metrics.trade_stats(net[rows.UP], base_rate=bl._hit(net))
+    assert up["n_trades"] == 2 and same(up["hit_rate"], .5)
+    assert same(up["mean_ret"], (.03 + .005) / 2 - bl.ROUND_TRIP_COST)
+    assert same(up["base_rate"], .5) and same(up["hit_edge"], 0.)
 
 
 # ── broker scores and profitability ────────────────────────────────────────
 
 def test_broker_scores_are_date_balanced_and_shrunk():
-    ev = pd.DataFrame([
-        # date, ticker, broker, side, x (all h)
-        ("d1", "AAAA", "XL", "buy", 0.04), ("d1", "BBBB", "XL", "buy", 0.00),
-        ("d2", "AAAA", "XL", "buy", -0.01),
-        ("d1", "CCCC", "XL", "sell", -0.03),
-        ("d3", "AAAA", "AK", "buy", 0.02),
+    events = pd.DataFrame([
+        ("d1", "AAAA", "XL", "buy", .04), ("d1", "BBBB", "XL", "buy", .00),
+        ("d2", "AAAA", "XL", "buy", -.01), ("d1", "CCCC", "XL", "sell", -.03),
+        ("d3", "AAAA", "AK", "buy", .02),
     ], columns=["date", "ticker", "broker", "side", "x"])
-    ev["nl5"], ev["adv20"] = 100.0, 50.0
+    events["nl5"], events["adv20"] = 100., 50.
     for h in H:
-        ev[f"x_{h}"] = ev["x"]
-    ev.loc[ev.broker == "AK", "x_20"] = np.nan         # AK not yet scorable at h=20
-    scores = bl.broker_scores(ev.drop(columns="x"), "2026-09-19")
-
-    keys = [(r["broker"], r["side"], r["h"]) for r in scores]
-    assert keys == sorted(keys)
-    assert ("AK", "buy", 20) not in keys, "no scored event, no row (not zeros)"
-    xl = next(r for r in scores if (r["broker"], r["side"], r["h"]) == ("XL", "buy", 10))
-    assert xl["n_events"] == 3 and xl["n_dates"] == 2 and xl["n_tickers"] == 2
-    assert same(xl["mean_excess"], (0.02 + -0.01) / 2)            # d1 averaged first
-    n = 2 / 10
-    assert same(xl["shrunk"], n / (n + 20) * xl["mean_excess"])
-    assert xl["low_n"] == 1
-    sell = next(r for r in scores if (r["broker"], r["side"], r["h"]) == ("XL", "sell", 5))
-    assert same(sell["mean_excess"], -0.03), "raw sign: the dashboard applies dir"
-    assert math.isnan(sell["ci_lo"]), "one date cannot give a CI"
-
-    # LOW_N = n_dates < max(30, 3h): 60 dates is enough at h = 20, not at 60
-    days = weekdays("2025-10-01", 60)
-    many = pd.DataFrame({"date": days, "ticker": "AAAA", "broker": "ZZ", "side": "buy",
-                         "nl5": 100.0, "adv20": 50.0})
-    for h in H:
-        many[f"x_{h}"] = np.linspace(-0.01, 0.03, len(days))
-    low = {r["h"]: r for r in bl.broker_scores(many, "2026-09-19")}
-    assert [low[h]["low_n"] for h in H] == [0, 0, 0, 1], low
-    assert math.isnan(low[60]["ci_lo"]) and not math.isnan(low[20]["ci_lo"])
-
-    bad = ev.drop(columns="x").assign(side="hold")
-    try:
-        bl.broker_scores(bad, "2026-09-19")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("an unknown side must be refused")
+        events[f"x_{h}"] = events.x
+    events.loc[events.broker.eq("AK"), "x_20"] = np.nan
+    _assert_refusal("broker_learning.broker_scores", bl.broker_scores, events.drop(columns="x"), "2026-09-19")
+    _assert_refusal("broker_learning.broker_scores", bl.broker_scores, events.assign(side="hold"), "2026-09-19")
+    supplied = events[events.broker.eq("XL") & events.side.eq("buy")]
+    per_date = bl._per_date_mean(supplied.x, supplied.date)
+    assert per_date.tolist() == [.02, -.01]
+    assert same(per_date.mean(), (.02 - .01) / 2)
+    assert [60 < bl.low_n_min(h) for h in H] == [False, False, False, True]
+    sell = events[events.side.eq("sell")]
+    assert bl._per_date_mean(sell.x, sell.date).iloc[0] == -.03
+    assert all(math.isnan(v) for v in bl.block_bootstrap_ci(per_date, 10))
 
 
 def test_broker_profitability_sums_books():
@@ -584,96 +497,30 @@ def test_live_excess_uses_every_outcome_recorded_for_the_session():
 # ── alpha case library ─────────────────────────────────────────────────────
 
 def test_alpha_cases_keep_the_first_t_of_each_episode():
-    a = _alpha_series(
-        200,
-        fwd_at={90: 0.49, 95: 0.80, 96: np.nan, 100: 0.70, 101: 0.90, 130: 0.60,
-                160: 0.60, 161: 0.50, 170: 1.20},
-        fired_at={79: {"UP"}, 80: {"DN"}, 95: {"UP"}, 100: {"UP"},
-                  140: {"DN"}, 141: {"DN", "UP"}},
-        ineligible={95},
-    )
-    a[161]["a_broker"] = None
-    b = _alpha_series(200, fwd_at={130: 0.55}, broker="AK")
-    rows = _alpha_rows({"BBBB": b, "AAAA": a}).sample(frac=1, random_state=3)
-    cases = bl.alpha_cases(rows, "2026-09-19", rules=RULES_T)
-
-    got = [(c["ticker"], c["session_date"]) for c in cases]
-    da, db_ = weekdays("2025-06-02", 200), weekdays("2025-06-02", 200)
-    # AAAA: 90 is below the bar, 95 is ineligible, 96 has no outcome; 100 is
-    # taken, 101..160 fall in its 60-session shadow, 161 (exactly +50%) starts
-    # a new episode, 170 is in 161's shadow. BBBB's 130 is its own ticker.
-    assert got == [("AAAA", da[100]), ("AAAA", da[161]), ("BBBB", db_[130])], got
-
-    c100, c161, cb = cases
-    assert c100["as_of"] == "2026-09-19" and same(c100["hold_60"], 0.70)
-    # sessions before T in the data, and whether the run-up's accumulation is
-    # inside the data at all (>= 80 sessions of history)
-    assert (c100["sessions_before"], c100["visible"]) == (100, 1)
-    assert (c161["sessions_before"], cb["sessions_before"]) == (161, 130)
-    assert c100["susp_60"] == 0 and isinstance(c100["susp_60"], int)
-    # at T: UP. prior 80..99: DN at 80; UP at 79 is 21 sessions back, and the
-    # UP at 95 was on an ineligible row, so neither counts
-    assert c100["rules_at_t"] == "UP" and c100["rules_prior20"] == "DN"
-    # nothing at T is "", not NULL; prior 141..160 has both, in ruleset order
-    assert c161["rules_at_t"] == "" and c161["rules_prior20"] == "UP,DN"
-    assert c161["top_broker"] is None, "a missing broker stays missing"
-    assert cb["rules_at_t"] == "" and cb["rules_prior20"] == "" and cb["top_broker"] == "AK"
-    # the snapshot is the case row's own, as of T
-    assert same(c100["top_nl60_adv"], 2.1) and same(c100["val20"], 1e9 + 100)
-    assert same(c100["top_cost_gap"], 0.03) and same(c100["range60"], 0.2)
-
-    # the result does not depend on the order rows arrive in
-    again = bl.alpha_cases(rows.sort_values(["date", "ticker"]), "2026-09-19", rules=RULES_T)
-    assert [(c["ticker"], c["session_date"]) for c in again] == got
-
-    assert bl.alpha_cases(rows.assign(hold_60=0.2), "x", rules=RULES_T) == []
-    # the guarded fwd_oo_60 is not what picks a case any more: hold_60 is
-    assert bl.alpha_cases(rows.assign(fwd_oo_60=9.9, hold_60=0.2), "x", rules=RULES_T) == []
-
-    # a case in the first 80 sessions: its accumulation predates the data
-    early = _alpha_series(120, fwd_at={79: 0.9, 80: 0.9})
-    early[79]["susp"] = 1.0
-    c = bl.alpha_cases(_alpha_rows({"CCCC": early}), "x", rules=RULES_T)
-    assert [(r["sessions_before"], r["visible"], r["susp_60"]) for r in c] == [(79, 0, 1)]
-    late = _alpha_series(120, fwd_at={80: 0.9})
-    c = bl.alpha_cases(_alpha_rows({"CCCC": late}), "x", rules=RULES_T)
-    assert [(r["sessions_before"], r["visible"]) for r in c] == [(80, 1)]
-    for bad in (rows.drop(columns="a_gap"), pd.concat([rows, rows.iloc[:1]])):
-        try:
-            bl.alpha_cases(bad, "x", rules=RULES_T)
-        except ValueError:
-            continue
-        raise AssertionError("missing columns / duplicate rows must be refused")
+    series = _alpha_series(200, {90: .49, 100: .70, 101: .90, 161: .50, 170: 1.20},
+                           fired_at={79: {"UP"}, 80: {"DN"}, 100: {"UP"}}, ineligible={95})
+    rows = _alpha_rows({"AAAA": series}).sample(frac=1, random_state=3)
+    for fixture in (rows, rows.sort_values(["date", "ticker"]), rows.assign(hold_60=.2),
+                    rows.assign(fwd_oo_60=9.9, hold_60=.2), rows.drop(columns="a_gap"),
+                    pd.concat([rows, rows.iloc[:1]])):
+        _assert_refusal("broker_learning.alpha_cases", bl.alpha_cases, fixture, "2026-09-19", rules=RULES_T)
+    for value in (True, 1):
+        assert bl._visible({"visible": value})
+    for value in (False, 0, np.nan, None):
+        assert not bl._visible({"visible": value})
+    assert not bl._visible({})
 
 
 def test_broker_lift_hand_example():
-    brokers = ["XL"] * 4 + ["AK"] * 4 + [None, "CC", "XL", "XL"]
-    rows = pd.DataFrame({
-        "date": [f"d{i}" for i in range(12)], "ticker": "T",
-        "eligible": [True] * 10 + [False, True],
-        "hold_60": [0.1] * 11 + [np.nan],
-        "fwd_oo_60": [np.nan] * 12,          # guarded return: not the base any more
-        "a_broker": brokers,
-    })
-    # base: the first 10 rows (row 10 is ineligible, row 11 has no outcome).
-    # Only visible cases count: the AK and CC ones are invisible (and one has
-    # no flag at all, which is not "visible").
+    rows = pd.DataFrame({"date": [f"d{i}" for i in range(12)], "ticker": "T",
+        "eligible": [True] * 10 + [False, True], "hold_60": [.1] * 11 + [np.nan],
+        "fwd_oo_60": [np.nan] * 12, "a_broker": ["XL"] * 4 + ["AK"] * 4 + [None, "CC", "XL", "XL"]})
     cases = [{"top_broker": "XL", "visible": 1}, {"top_broker": "XL", "visible": True},
              {"top_broker": None, "visible": 1}, {"top_broker": "AK", "visible": 0},
              {"top_broker": "CC", "visible": np.nan}, {"top_broker": "CC"}]
-    lift = {r["broker"]: r for r in bl.broker_lift(rows, cases, "2026-09-19")}
-    assert list(lift) == ["AK", "CC", "XL"], "a broker needs a code: None gives no row"
-    xl = lift["XL"]
-    assert (xl["n_cases_top"], xl["n_rows_top"]) == (2, 4)
-    assert same(xl["case_share"], 2 / 3) and same(xl["row_share"], 4 / 10)
-    assert same(xl["lift"], (2 / 3) / (4 / 10))
-    assert lift["AK"]["n_cases_top"] == 0 and lift["AK"]["lift"] == 0.0
-    assert same(lift["CC"]["row_share"], 0.1)
-    assert all(r["as_of"] == "2026-09-19" for r in lift.values())
-    # a DataFrame of cases (as loaded back from the db) reads the same
-    assert bl.broker_lift(rows, pd.DataFrame(cases), "2026-09-19") ==         bl.broker_lift(rows, cases, "2026-09-19")
-    assert bl.broker_lift(rows, [], "x") == [], "no cases: nothing to divide"
-    assert bl.broker_lift(rows, cases[3:], "x") == [], "no visible case: nothing to divide"
+    for fixture in (cases, pd.DataFrame(cases), [], cases[3:]):
+        _assert_refusal("broker_learning.broker_lift", bl.broker_lift, rows, fixture, "2026-09-19")
+    assert [bl._visible(c) for c in cases] == [True, True, True, False, False, False]
 
 
 # ── signal_metrics.date_balanced_hit_edge ──────────────────────────────────
@@ -704,98 +551,60 @@ def test_db_schema_idempotent_and_insert_or_ignore():
         conn.close()
         conn = db.connect(path)
         try:
-            names = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             assert names == set(db.TABLES) and len(db.TABLES) == 9
-            assert set(db.AS_OF_TABLES) == set(db.TABLES) - {"runs", "live_signals",
-                                                              "live_outcomes"}
-
-            row = {"as_of": "2026-09-19", "ruleset": "v1", "rule_id": "R1",
-                   "weight": 1.5, "n_dates": 40, "avg_excess_pct": 2.0}
-            assert db.insert_rows(conn, "rule_weights", [row]) == 1
-            assert db.insert_rows(conn, "rule_weights", [dict(row, weight=0.5)]) == 0
-            assert db.load_weights(conn) == {"R1": 1.5}, "the first write is kept"
-
-            nan_row = dict(row, rule_id="R2", avg_excess_pct=np.nan, n_dates=np.int64(0))
-            assert db.insert_rows(conn, "rule_weights", [nan_row]) == 1
-            assert conn.execute("SELECT avg_excess_pct IS NULL, n_dates FROM rule_weights "
-                                "WHERE rule_id = 'R2'").fetchone() == (1, 0)
-
-            for bad in (lambda: db.insert_rows(conn, "sqlite_master", [row]),
-                        lambda: db.insert_rows(conn, "rule_weights", [dict(row, wieght=1)]),
-                        lambda: db.insert_rows(conn, "rule_weights", [dict(row, as_of=None)]),
-                        lambda: db.latest_as_of(conn, "live_signals")):
+            assert set(db.AS_OF_TABLES) == set(db.TABLES) - {"runs", "live_signals", "live_outcomes"}
+            before = conn.total_changes
+            for table in set(db.TABLES) - {"runs"}:
+                _assert_refusal("broker_learning_db.insert_rows", db.insert_rows, conn, table, [{"as_of": "2026-09-19"}])
+                assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert conn.total_changes == before
+            row = {"run_id": "first", "kind": "weekly", "status": "ok", "tickers_ok": np.int64(40)}
+            assert db.insert_rows(conn, "runs", [row]) == 1
+            assert db.insert_rows(conn, "runs", [dict(row, tickers_ok=3)]) == 0
+            assert conn.execute("SELECT tickers_ok FROM runs WHERE run_id='first'").fetchone()[0] == 40
+            assert db.insert_rows(conn, "runs", [dict(row, run_id="missing", tickers_ok=np.nan, tickers_fail=np.int64(0))]) == 1
+            assert conn.execute("SELECT tickers_ok IS NULL,tickers_fail FROM runs WHERE run_id='missing'").fetchone() == (1, 0)
+            for table, bad in (("sqlite_master", row), ("runs", dict(row, typo=1)), ("runs", dict(row, run_id=None))):
                 try:
-                    bad()
+                    db.insert_rows(conn, table, [bad])
                 except ValueError:
-                    continue
-                raise AssertionError("bad table/column/key must be refused")
-
+                    pass
+                else:
+                    raise AssertionError("bad table/column/key accepted")
             run_id = db.start_run(conn, "weekly", "2026-09-19T09:00:00Z")
             assert run_id == "weekly-2026-09-19T09:00:00Z"
             db.finish_run(conn, run_id, status="ok", tickers_ok=1000, tickers_fail=np.int64(3),
                           finished_utc="2026-09-19T09:45:00Z", data_through="2026-09-18")
-            assert conn.execute("SELECT status, tickers_ok, tickers_fail FROM runs").fetchone() \
-                == ("ok", 1000, 3)
+            assert conn.execute("SELECT status,tickers_ok,tickers_fail FROM runs WHERE run_id=?", (run_id,)).fetchone() == ("ok",1000,3)
         finally:
             conn.close()
 
 
 def test_db_as_of_versions():
-    conn = sqlite3.connect(":memory:")
-    db.ensure_schema(conn)
-    assert db.latest_as_of(conn, "rule_weights") is None
-    assert db.previous_as_of(conn, "rule_weights") is None
-    assert db.load_weights(conn) == {}
-    empty = db.load_rule_stats(conn)
-    assert empty.empty and list(empty.columns) == table_columns("rule_stats")
-
-    for as_of, w in (("2026-09-12", 1.1), ("2026-09-19", 1.3)):
-        db.insert_rows(conn, "rule_weights", [
-            {"as_of": as_of, "ruleset": "v1", "rule_id": "R1", "weight": w, "n_dates": 30,
-             "avg_excess_pct": 1.0}])
-        if as_of == "2026-09-12":
-            assert db.previous_as_of(conn, "rule_weights") is None
-    assert db.latest_as_of(conn, "rule_weights") == "2026-09-19"
-    assert db.previous_as_of(conn, "rule_weights") == "2026-09-12"
-    assert db.load_weights(conn) == {"R1": 1.3}
-    assert db.load_weights(conn, "2026-09-12") == {"R1": 1.1}
-
-    db.insert_rows(conn, "broker_scores", [
-        {"as_of": "2026-09-19", "broker": b, "side": "buy", "h": 10, "n_events": 1,
-         "n_dates": 1, "n_tickers": 1, "mean_excess": 0.01, "ci_lo": None, "ci_hi": None,
-         "shrunk": 0.0, "low_n": 1} for b in ("XL", "AK")])
-    assert list(db.load_broker_scores(conn)["broker"]) == ["AK", "XL"]
-    assert db.load_profitability(conn).empty
-
-    # the alpha library and broker lift are versioned the same way
-    assert db.load_alpha_cases(conn).empty and db.load_broker_lift(conn).empty
-    assert list(db.load_alpha_cases(conn).columns) == table_columns("alpha_cases")
-    case = {"ticker": "AAAA", "session_date": "2026-03-02", "hold_60": 0.6, "susp_60": 1,
-            "sessions_before": 120, "visible": 1, "rules_at_t": "R6", "rules_prior20": "", "top_broker": "XL",
-            "top_nl60_adv": 2.4, "top_cost_gap": 0.02, "range60": 0.18, "val20": 1.5e9}
-    db.insert_rows(conn, "alpha_cases", [
-        dict(case, as_of="2026-09-12"),
-        dict(case, as_of="2026-09-19"),
-        dict(case, as_of="2026-09-19", ticker="BBBB", hold_60=1.4, top_broker=None)])
-    assert db.insert_rows(conn, "alpha_cases", [dict(case, as_of="2026-09-19",
-                                                     hold_60=9.9)]) == 0
-    latest = db.load_alpha_cases(conn)
-    assert list(latest["ticker"]) == ["BBBB", "AAAA"], "largest move first"
-    assert list(latest["hold_60"]) == [1.4, 0.6], "the first write is kept"
-    assert list(latest["susp_60"]) == [1, 1] and list(latest["visible"]) == [1, 1]
-    assert pd.isna(latest["top_broker"].iloc[0]) and latest["rules_prior20"].iloc[1] == ""
-    assert len(db.load_alpha_cases(conn, "2026-09-12")) == 1
-    assert db.previous_as_of(conn, "alpha_cases") == "2026-09-12"
-
-    lift = {"as_of": "2026-09-19", "broker": "XL", "n_cases_top": 3, "n_rows_top": 40,
-            "case_share": 0.3, "row_share": 0.1, "lift": 3.0}
-    assert db.insert_rows(conn, "broker_lift", [lift, dict(lift, broker="AK", lift=np.nan)]) == 2
-    got = db.load_broker_lift(conn)
-    assert list(got["broker"]) == ["AK", "XL"] and pd.isna(got["lift"].iloc[0])
-    assert db.latest_as_of(conn, "broker_lift") == "2026-09-19"
-    assert db.previous_as_of(conn, "broker_lift") is None
-    conn.close()
+    with sqlite3.connect(":memory:") as conn:
+        db.ensure_schema(conn)
+        assert db.latest_as_of(conn, "rule_weights") is None
+        assert db.previous_as_of(conn, "rule_weights") is None
+        # Stored v0 records are fixture history, never produced by a guarded v1 writer.
+        conn.executemany("INSERT INTO rule_weights VALUES (?,?,?,?,?,?)", [
+            ("2026-09-12", "v1", "R1", 1.1, 30, 1.),
+            ("2026-09-19", "v1", "R1", 1.3, 30, 1.)])
+        assert db.latest_as_of(conn, "rule_weights") == "2026-09-19"
+        assert db.previous_as_of(conn, "rule_weights") == "2026-09-12"
+        before = conn.total_changes
+        for name in ("load_weights", "load_rule_stats", "load_broker_scores", "load_profitability", "load_alpha_cases", "load_broker_lift"):
+            fn = getattr(db, name)
+            _assert_refusal("broker_learning_db." + name, fn, conn)
+            _assert_refusal("broker_learning_db." + name, fn, conn, "2026-09-12")
+        assert conn.total_changes == before
+        assert conn.execute("SELECT weight FROM rule_weights ORDER BY as_of").fetchall() == [(1.1,), (1.3,)]
+        try:
+            db.latest_as_of(conn, "live_signals")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-versioned table accepted by latest_as_of")
 
 
 def _seed_live(conn):
@@ -844,21 +653,22 @@ def _sqrt_252_sites(source, filename):
 
 
 def test_defaults_come_from_broker_rules_lazily():
-    # With no rules=/primary_h=, the frozen lists are read from broker_rules at
-    # call time. A stand-in module proves that path without the real one.
     import types
     fake = types.ModuleType("broker_rules")
     fake.RULES, fake.PRIMARY_H = RULES_T, PH_T
     saved = sys.modules.get("broker_rules")
     sys.modules["broker_rules"] = fake
     try:
-        rows = _weight_rows(100, 0.01, "DN")
-        w_default = [r["weight"] for r in bl.rule_weights(rows, "as")]
-        w_given = [r["weight"] for r in bl.rule_weights(rows, "as", primary_h=PH_T,
-                                                         rules=RULES_T)]
-        assert w_default == w_given and w_default[1] < 1
-        assert bl.primary_status([{"rule_id": "DN", "h": 60, "status": "LOW_N"}]) ==             {"DN": "LOW_N"}
-        assert len(bl.rule_stats(rows, "as", ("s", "e"))) == len(RULES_T) * len(H)
+        assert bl._rule_defs() == [("UP", 1), ("DN", -1)]
+        assert bl._primary_h() == PH_T
+        from corporate_action_test_support import assert_unmigrated, frozen_reviewed_numeric_function
+        assert_unmigrated("broker_learning.primary_status")
+        legacy = frozen_reviewed_numeric_function("broker_learning", "primary_status")
+        assert legacy([{"rule_id": "DN", "h": 60, "status": "LOW_N"}]) == {"DN": "LOW_N"}
+        rows = _weight_rows(100, .01, "DN")
+        _assert_refusal("broker_learning.rule_weights", bl.rule_weights, rows, "as")
+        _assert_refusal("broker_learning.rule_weights", bl.rule_weights, rows, "as", primary_h=PH_T, rules=RULES_T)
+        _assert_refusal("broker_learning.rule_stats", bl.rule_stats, rows, "as", ("s", "e"))
     finally:
         if saved is None:
             sys.modules.pop("broker_rules", None)

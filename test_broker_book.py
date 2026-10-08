@@ -18,6 +18,7 @@ import pandas as pd
 import broker_book as bb
 import build_inventory_db as bidb
 import coverage_guard as cg
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAW = os.path.join(HERE, "inventory_raw")
@@ -348,15 +349,28 @@ def test_cumulative_curves():
             (dates[1], "BB", 0, 0.0, 7, 7e4), (dates[2], "CC", 3, 3e4, 0, 0.0),
             (dates[2], "DD", 3, 3e4, 0, 0.0), (dates[4], "EE", 2, 2e4, 2, 2e4)]
     ohlc = _ohlc(dates, [100.0, 101.0, np.nan, 103.0, 104.0])
-    cur = bb.cumulative_curves(_frame(rows), ohlc, dates[1], top_n=2)
-    assert cur["dates"] == dates[1:] and cur["close"] == [101.0, None, 103.0, 104.0]
-    got = [(s["broker"], s["side"], s["cum_lots"]) for s in cur["series"]]
-    assert got == [("AA", "buy", [0, 0, 5, 5]),              # anchor drops day-0 buy
-                   ("CC", "buy", [0, 3, 3, 3]),              # tie with DD: code order
-                   ("BB", "sell", [-7, -7, -7, -7])], got
-    assert all(isinstance(v, int) for s in cur["series"] for v in s["cum_lots"])
-    json.dumps(cur)
-    print("  ok curves carry forward, start at the anchor, rank buyers/sellers, JSON-able")
+    brokers = _frame(rows)
+    before_brokers, before_ohlc = brokers.copy(deep=True), ohlc.copy(deep=True)
+    try:
+        bb.cumulative_curves(brokers, ohlc, dates[1], top_n=2)
+    except UnsupportedPriceContract as exc:
+        status = exc.as_dict()
+        assert status["consumer"] == "broker_book.cumulative_curves"
+        assert status["status"] == "UNSUPPORTED" and status["contract_version"] == CONTRACT_VERSION
+    else:
+        raise AssertionError("unversioned curves were published")
+    pd.testing.assert_frame_equal(brokers, before_brokers)
+    pd.testing.assert_frame_equal(ohlc, before_ohlc)
+    print("  ok unversioned curves refuse before source frames change")
+
+
+def test_rolling_sum_preserves_exact_cash_and_lot_windows():
+    values = np.array([[10, -7, 3, 5, 0], [2 ** 40, 1, -2 ** 40, 3, -1]], dtype=np.int64)
+    expected = np.array([[np.nan, 3, -4, 8, 5],
+                         [np.nan, 2 ** 40 + 1, 1 - 2 ** 40, 3 - 2 ** 40, 2]])
+    np.testing.assert_allclose(bb.rolling_sum(values, 2), expected, rtol=0, atol=0, equal_nan=True)
+    assert np.isnan(bb.rolling_sum(values[:, :1], 2)).all()
+    np.testing.assert_array_equal(bb.rolling_sum(values, 1), values)
 
 
 # ── Rolling state ──────────────────────────────────────────────────────────

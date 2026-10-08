@@ -152,6 +152,8 @@ def _ratio(a, b):
 
 def window_cost(NL, NV, BL, SL, low, high):
     """cost_w = NV/(NL*100), NaN unless NL > 0, SL <= 0.5*BL and low <= cost <= high (§4.1)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.window_cost")
     cost = _ratio(NV, NL * 100.0)
     valid = (NL > 0) & _le(SL, COST_MAX_SELL_FRAC * BL) & _ge(cost, low) & _le(cost, high)
     return np.where(valid, cost, np.nan)
@@ -172,6 +174,8 @@ def eligibility(state):
 
 
 def _holder_group(NL60, NV60, close, low60, high60):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules._holder_group")
     k = min(H_K, NL60.shape[0])
     top = np.argsort(-NL60, axis=0, kind="stable")[:k]
     nl = np.take_along_axis(NL60, top, axis=0)
@@ -311,6 +315,8 @@ def evaluate(state):
 def track_record_events(state, eligible):
     """§4.4: on eligible sessions, the top 3 net buyers and bottom 3 net sellers by NL_5
     that clear 0.5*ADV20, ties broken by code. Ordered by date, buys first, then rank."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.track_record_events")
     e = np.flatnonzero(np.asarray(eligible, dtype=bool))
     nb = len(state.brokers)
     if not len(e) or not nb:
@@ -341,13 +347,20 @@ def track_record_events(state, eligible):
 
 def composite_score(rule_rows, weights):
     """Σ_r fired_r * dir_r * weight_r (dashboard ordering only). Missing weight = 1.0."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.composite_score")
+    return weighted_boolean_sum(rule_rows, {r["id"]: r["dir"] for r in RULES}, weights)
+
+
+def weighted_boolean_sum(flags, directions, weights=None):
+    """Generic Boolean sum; carries no price, rule eligibility or learned-weight claim."""
     weights = weights or {}
-    score = pd.Series(0.0, index=rule_rows.index)
-    for r in RULES:
-        if r["id"] not in rule_rows:
+    score = pd.Series(0.0, index=flags.index)
+    for key, direction in directions.items():
+        if key not in flags:
             continue
-        hit = rule_rows[r["id"]].eq(True).fillna(False).astype(bool)
-        score += hit.astype(float) * r["dir"] * float(weights.get(r["id"], 1.0))
+        hit = flags[key].eq(True).fillna(False).astype(bool)
+        score += hit.astype(float) * direction * float(weights.get(key, 1.0))
     return score
 
 
@@ -400,6 +413,8 @@ def _fired(v):
 
 def explain(row):
     """Short Indonesian lines, one per fired rule, carrying the numbers behind it."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_rules.explain")
     g = row.get
     adv = g("adv20")
     lines = []

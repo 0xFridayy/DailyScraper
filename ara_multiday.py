@@ -126,6 +126,8 @@ def add_horizon_labels(d, h):
 
 
 def section_base(d, h):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.section_base")
     print("\n" + "=" * 96)
     print(f"1. BASE RATES over T+1..T+{h}")
     print("=" * 96)
@@ -146,6 +148,8 @@ def section_base(d, h):
 
 def section_vol(d, h):
     """The guard: does anything survive inside a volatility bucket?"""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.section_vol")
     print("\n" + "=" * 96)
     print("2. VOLATILITY STRATIFICATION (rv20 quintiles)")
     print("=" * 96)
@@ -171,6 +175,8 @@ def walk_forward(data, tgt, feats, horizon, min_train=140, step=20, embargo=1):
     -- and on exactly the rows most similar to the test set, so it inflated
     AUC and lift. Dropping `horizon + embargo` sessions closes the overlap.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.walk_forward")
     dates = np.sort(data.date.unique())
     X = data[feats].replace([np.inf, -np.inf], np.nan)
     preds = []
@@ -189,6 +195,8 @@ def walk_forward(data, tgt, feats, horizon, min_train=140, step=20, embargo=1):
 
 
 def report(o, tgt, tag):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.report")
     if len(o) == 0 or o[tgt].sum() < 10:
         print(f"  {tag:28s} -- too few OOS events")
         return None
@@ -209,6 +217,8 @@ def report(o, tgt, tag):
 
 
 def section_model(d, h):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.section_model")
     print("\n" + "=" * 96)
     print(f"3. WALK-FORWARD RANKING of P(ARA within T+1..T+{h})")
     print("=" * 96)
@@ -244,6 +254,8 @@ def boot_mean_diff(sel, rest, col, n=1500):
 
 
 def section_trade(preds, h):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.section_trade")
     print("\n" + "=" * 96)
     print(f"4. TRADABILITY -- buy the T+1 open, exit at the first ARA close "
           f"(else T+{h} close)")
@@ -309,6 +321,8 @@ def section_trade(preds, h):
 def section_robust(preds, cut=0.999):
     """The top bucket is ~36 rows. Before anyone sizes a trade on it, ask the
     four questions that separate an edge from a lucky corner of the data."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_multiday.section_robust")
     print("\n" + "=" * 96)
     print("5. IS THE TOP BUCKET REAL? -- cut sensitivity, concentration, outliers, stability")
     print("=" * 96)

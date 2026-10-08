@@ -30,6 +30,7 @@ Exit code is non-zero when something is wrong, so the workflow goes red too:
 
 import json
 import os
+import re
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta
@@ -156,7 +157,7 @@ def check_freshness(conn, problems):
             problems.append(f"price_history {ticker}: freshness UNRESOLVED, calendar/session unsupported")
 
 
-def check_new_contamination(conn, problems, notes, stats):
+def check_new_contamination(conn, problems, notes, stats, *, registry=None, representation=None):
     """Unquarantined suspect rows in the recent window.
 
     "Unquarantined" is not the same as "newly written", and conflating the two
@@ -177,19 +178,14 @@ def check_new_contamination(conn, problems, notes, stats):
     has_q = conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='price_quarantine'"
     ).fetchone()[0]
-    known = set()
-    if has_q:
-        known = set(map(tuple, conn.execute(
-            "SELECT date, ticker FROM price_quarantine").fetchall()))
 
     # Quarantined rows must not serve as the baseline the NEXT row's daily move
     # is measured against, or old damage keeps manufacturing fresh alarms: on
     # 2026-08-27 this reported a clean, unique MDIA row for 08-24 as the scraper
     # "writing bad rows again", purely because the close before it was KIOS's
     # price, flagged and quarantined two weeks earlier. See price_audit.detect.
-    raw = load(conn)
-    trusted = [(d, t) not in known for d, t in zip(raw["date"], raw["ticker"])]
-    px = detect(raw, trusted=trusted)
+    from price_audit import adjudicate_quarantine
+    px, known, _ = adjudicate_quarantine(conn, registry=registry, representation=representation)
     recent = px[px["date"].isin(window)]
 
     flagged = recent[recent["suspect"] & ~pd.Series(
@@ -581,11 +577,39 @@ def check_price_contract(conn, problems, notes, stats, *, registry=None, represe
     withheld = sum(int(px[c].ne("").sum()) for c in reasons)
     stats["withheld_price_labels"] = withheld
     stats["price_contract"] = px.attrs.get("price_contract")
-    for reason in reasons:
-        value = reason[:-7]
-        crossing = px[reason].isin(["CORPORATE_ACTION_BOUNDARY", "UNRESOLVED_EVENT"])
-        if value in px and px.loc[crossing, value].notna().any():
-            problems.append(f"{value}: published economic return across an action boundary")
+    from price_contract_frame import default_registry, span_result, frame_as_of
+    registry = registry or default_registry()
+    identity = px.attrs.get("price_contract", {})
+    representation = representation or identity.get("input_representation", "UNKNOWN")
+    market = identity.get("market", "REGULAR")
+    axis = sorted(r[0] for r in conn.execute("SELECT DISTINCT date FROM price_history"))
+    ordered = px.sort_values(["ticker", "date"])
+    grouped = ordered.groupby("ticker")
+    # Derive anchors independently, including extrema; reason strings are evidence only.
+    for column in ordered:
+        match = re.fullmatch(r"(fwd(?:_oo|_oc)?|lag|max|mdd|gap)_(\d+)", column)
+        if not match:
+            continue
+        kind, h = match.group(1), int(match.group(2))
+        start, end = ordered.date, grouped.date.shift(-h)
+        start_phase, end_phase = "CLOSE", "CLOSE"
+        if kind == "lag":
+            start, end = grouped.date.shift(h), ordered.date
+        elif kind in {"fwd_oo", "fwd_oc"}:
+            start, start_phase = grouped.date.shift(-1), "OPEN"
+            if kind == "fwd_oo":
+                end, end_phase = grouped.date.shift(-(h + 1)), "OPEN"
+        elif kind == "gap":
+            end_phase = "OPEN"
+        illegal = []
+        for ticker, a, b in zip(ordered.ticker, start, end):
+            span = span_result(ticker, a if isinstance(a, str) else None,
+                               b if isinstance(b, str) else None, registry=registry,
+                               representation=representation, market=market, session_axis=axis,
+                               start_phase=start_phase, end_phase=end_phase, as_of=frame_as_of(px))
+            illegal.append(span.status != "COMPARABLE")
+        if ordered.loc[pd.Series(illegal, index=ordered.index), column].notna().any():
+            problems.append(f"{column}: published economic value on an independently ineligible span")
     notes.append(f"{withheld} price label(s) withheld under the pinned price/reference/return contract")
 
 

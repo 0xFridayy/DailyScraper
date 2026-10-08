@@ -104,6 +104,8 @@ SETS = {
 
 
 def walk_forward(panel, feats, target, train_min=60, test_window=10):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("horizon_scan.walk_forward")
     df = panel.dropna(subset=[target] + feats).copy()
     dates = sorted(df["date"].unique())
     preds, actuals, test_dates = [], [], []
@@ -131,6 +133,8 @@ def walk_forward(panel, feats, target, train_min=60, test_window=10):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("horizon_scan.__main__")
     conn = sqlite3.connect(DB_PATH)
     panel = build(conn)
     conn.close()

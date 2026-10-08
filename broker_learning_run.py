@@ -208,6 +208,8 @@ def _feature_value(v):
 
 def features_json(row, rule_id):
     """Compact JSON of the explain columns behind one rule (see RULE_FEATURES)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.features_json")
     cols = FEATURE_COMMON + RULE_FEATURES.get(rule_id, tuple(br.EXPLAIN_FLOAT + br.EXPLAIN_STR))
     return json.dumps({c: _feature_value(row.get(c)) for c in cols},
                       separators=(",", ":"), allow_nan=False)
@@ -225,6 +227,8 @@ def _records(frame, cols=None):
 
 def load_ticker(ticker, data, regimes):
     """Bundle + rule rows for one cached payload. Raises bb.PayloadError."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.load_ticker")
     bundle = bb.ticker_bundle(data, ticker, regimes)
     return {"ticker": ticker, "bundle": bundle, "rows": br.evaluate(bundle["state"])}
 
@@ -279,12 +283,16 @@ def _fired(last):
 
 
 def _score(rows, weights):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._score")
     return float(br.composite_score(rows.iloc[[-1]], weights).iloc[0])
 
 
 def live_signal_rows(items, weights, data_through, captured_utc):
     """live_signals rows: one per rule for each eligible ticker whose last
     session is data_through (see "fresh tickers" in the module docstring)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.live_signal_rows")
     out = []
     for item in items:
         rows = item["rows"]
@@ -305,6 +313,8 @@ def live_signal_rows(items, weights, data_through, captured_utc):
 
 
 def _book_rows(book):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._book_rows")
     if book is None or len(book) == 0:
         return []
     top = book.assign(_abs=book["position_lots"].abs()).sort_values(
@@ -315,6 +325,8 @@ def _book_rows(book):
 
 def _facts(book):
     """Largest holder and their cost, biggest winner, who is distributing."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._facts")
     if book is None or len(book) == 0:
         return {}
     facts = {}
@@ -338,6 +350,8 @@ def ticker_ctx(item, weights, data_through=None):
     """One dashboard card. A ticker whose last session is older than the run's
     data_through keeps its book and chart but shows no signal: rules that
     fired on an old session are not today's signals."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.ticker_ctx")
     b, rows = item["bundle"], item["rows"]
     close = b["ohlc"]["close"].astype(float)
     last = rows.iloc[-1] if len(rows) else pd.Series(dtype=object)
@@ -361,6 +375,8 @@ def ticker_ctx(item, weights, data_through=None):
 
 
 def _ticker_order(t):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._ticker_order")
     score = t.get("score") or 0.0
     return (0 if t.get("fired") else 1, -abs(score), t.get("ticker") or "")
 
@@ -375,6 +391,8 @@ def _weekly_as_of(conn):
 
 
 def rules_ctx(conn, as_of):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.rules_ctx")
     stats = bdb.load_rule_stats(conn, as_of) if as_of else pd.DataFrame()
     if len(stats):
         stats = stats[stats["ruleset"] == br.RULESET]
@@ -408,6 +426,8 @@ def rules_ctx(conn, as_of):
 def learned_lines(rules):
     """'R4 bobot 1,00 -> 1,07 (n=12 tanggal, LOW_N)' for every rule that has a
     weight from the previous weekly run to compare with."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.learned_lines")
     out = []
     for r in rules:
         w, p = r.get("weight"), r.get("prev_weight")
@@ -425,6 +445,8 @@ def learned_lines(rules):
 
 def _weekly_note(conn, as_of):
     """The JSON note of the earliest successful weekly run for as_of, or {}."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._weekly_note")
     if not as_of:
         return {}
     row = conn.execute(
@@ -441,6 +463,8 @@ def alpha_ctx(conn, as_of):
     """Cases (largest hold_60 first) with their suspension and visibility
     flags, the lift table (visible cases only, see broker_learning), and the
     universe's h = 60 big-move rate and suspension share from runs.note."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.alpha_ctx")
     cases = bdb.load_alpha_cases(conn, as_of) if as_of else pd.DataFrame()
     lift = bdb.load_broker_lift(conn, as_of) if as_of else pd.DataFrame()
     if len(lift):
@@ -466,6 +490,8 @@ def alpha_ctx(conn, as_of):
 
 
 def brokers_ctx(conn, as_of):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.brokers_ctx")
     return {
         "as_of": as_of,
         "scores": _records(bdb.load_broker_scores(conn, as_of) if as_of else None),
@@ -475,6 +501,8 @@ def brokers_ctx(conn, as_of):
 
 def build_ctx(conn, items, run, generated):
     """The broker_dashboard.render() context (contract: BROKER_LEARNING.md §6)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run.build_ctx")
     as_of = _weekly_as_of(conn)
     rules, weights = rules_ctx(conn, as_of)
     dates = [d for d in (_last_date(i) for i in items) if d]
@@ -506,6 +534,8 @@ def _stale_warnings(items, data_through):
 
 def _deliver(ctx, out_dir, dry_run):
     """Render, write, send. Returns (path, sent) with sent None on a dry run."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._deliver")
     path = bd.write(bd.render(ctx), out_dir=out_dir)
     log.info(f"dashboard written: {path} ({os.path.getsize(path):,} bytes)")
     if dry_run:
@@ -575,6 +605,8 @@ def run_daily(a):
 
 
 def _daily(a, conn, tickers, regimes, started, stamp, t0):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._daily")
     run_id = bdb.start_run(conn, "daily", stamp)
     failed, empty, warnings = {}, {}, []
     try:
@@ -755,6 +787,8 @@ def run_weekly(a):
 
 
 def _weekly(a, conn, regimes, stamp, t0):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_run._weekly")
     run_id = bdb.start_run(conn, "weekly", stamp)
     failed, empty = {}, {}
     try:

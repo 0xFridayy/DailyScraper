@@ -38,16 +38,20 @@ Run:  py check_ml_health.py            -> print status
                                        -> build the panel under that manifest
 Exit code is non-zero when unhealthy.
 
-BROKER FLOW. build_panel() reads broker flow only through broker_flow_canonical
-under an explicit manifest for the exact database (HANDOFF Lampiran V). Without
---broker-flow-manifest this check runs both layers in order, as separate
-steps: broker_flow_manifest_refresh.refresh() for neobdm.db (written to
-BROKER_FLOW_MANIFEST_OUT, hashes reported), then build_panel() under it. A
-refused refresh is a health problem, never a reason to read raw broker_flow.
+CAPABILITY. A declared unsupported panel/model route must execute its exact
+named guard. Health records a structured UNSUPPORTED result and produces no
+analytics. Missing guards, stale certificates and other errors fail health.
+
+BROKER FLOW. A supported build_panel() reads broker flow only through
+broker_flow_canonical under an explicit manifest for the exact database
+(HANDOFF Lampiran V). Without --broker-flow-manifest it refreshes the manifest
+first. An unsupported panel route refuses before either manifest or database
+access. A refused refresh remains a health problem.
 """
 
 import argparse
 import ast
+import json
 import os
 import re
 import sqlite3
@@ -155,19 +159,18 @@ def check_imports(problems, notes, stats):
     """Import every module; fall back to a compile check where importing needs
     something this check has no business requiring.
 
-    Some modules cannot be imported in a bare ML environment through no fault of
-    their own: smart_money_divergence pulls broker constants from
-    neobdm_scraper, which imports playwright AND calls _require_env() for the
-    NeoBDM login at module scope, and ddqn_entry_exit needs torch. Rather than
-    hand this check the scraper's credentials, those degrade to a syntax/compile
-    check, which still catches the breakage this exists to find.
+    Only the optional Torch dependency permits a compile-only result. A core
+    module's import/runtime error is a health failure.
     """
     ok, compiled = 0, []
     for mod in CORE_MODULES + OPTIONAL_MODULES:
         try:
             __import__(mod)
             ok += 1
-        except (ImportError, RuntimeError) as e:
+        except ModuleNotFoundError as e:
+            if mod not in OPTIONAL_MODULES or e.name != "torch":
+                problems.append(f"{mod} fails to import: {type(e).__name__}: {e}")
+                continue
             path = os.path.join(HERE, f"{mod}.py")
             try:
                 # builtin compile(), not py_compile: syntax-checks the source
@@ -183,7 +186,7 @@ def check_imports(problems, notes, stats):
     stats["modules_compiled_only"] = len(compiled)
     if compiled:
         notes.append(f"{len(compiled)} module(s) compile-checked only, not imported "
-                     f"(missing optional dependency or scraper credentials): "
+                     f"(missing optional Torch dependency): "
                      f"{', '.join(compiled)}")
 
 
@@ -212,19 +215,55 @@ def check_unit_tests(problems, stats):
                  "test_targeted_actor_panel.py", "test_arb_veto.py",
                  "test_targeted_actor_observations.py", "test_inventory_evidence.py",
                  "test_bandarmolony_trade_capture.py",
-                 "test_morning.py"):
+                 "test_morning.py", "test_ml_health.py"):
         r = subprocess.run([sys.executable, os.path.join(HERE, name)],
                            capture_output=True, text=True, cwd=HERE, timeout=900)
         unittest_summary = re.search(r"^Ran (\d+) tests? in ", r.stderr, flags=re.M)
-        if unittest_summary:
-            if r.returncode == 0:
-                passed += int(unittest_summary.group(1))
-        else:
-            passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
+        script_summary = re.search(r"^All (\d+) tests? (?:passed|OK)\b", r.stdout, flags=re.M)
+        if r.returncode == 0:
+            if unittest_summary:
+                skipped = re.search(r"\bskipped=(\d+)", r.stderr)
+                passed += int(unittest_summary.group(1)) - (int(skipped.group(1)) if skipped else 0)
+            elif script_summary:
+                passed += int(script_summary.group(1))
+            else:
+                passed += r.stdout.count(" passed") + r.stdout.count("  ok ")
         if r.returncode != 0:
             tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
             problems.append(f"{name} FAILED — " + " | ".join(tail))
     stats["tests_passed"] = passed
+
+
+def _expects_refusal(consumer):
+    """The ledger declares capability; only an executed guard proves refusal."""
+    from price_contract import CONTRACT_VERSION
+    with open(os.path.join(HERE, "corporate_action_consumer_routes.json"), encoding="utf-8") as f:
+        ledger = json.load(f)
+    if ledger.get("contract_version") != CONTRACT_VERSION or ledger.get("mode") != "EXPLICIT_REFUSAL":
+        raise ValueError("Invalid corporate-action consumer capability ledger")
+    module, name = consumer.rsplit(".", 1)
+    return name in ledger.get("routes", {}).get(module, [])
+
+
+def _check_refusal(consumer, invoke, problems, stats):
+    """Exercise a declared guard without source inputs or persistent output.
+
+    A bare UnsupportedPriceContract or a refusal from another consumer is a
+    failure. It can represent stale inputs or an unexpected downstream error.
+    """
+    from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
+    try:
+        invoke()
+    except UnsupportedPriceContract as exc:
+        if (exc.consumer == consumer and exc.status == "UNSUPPORTED"
+                and exc.contract_version == CONTRACT_VERSION):
+            stats.setdefault("unsupported_routes", []).append(exc.as_dict())
+        else:
+            problems.append(f"{consumer} raised an unexpected contract refusal: {exc}")
+    except Exception as exc:
+        problems.append(f"{consumer} guard failed: {type(exc).__name__}: {exc}")
+    else:
+        problems.append(f"{consumer} returned output despite its declared unsupported contract")
 
 
 def refresh_broker_flow_manifest(problems, stats, out=BROKER_FLOW_MANIFEST_OUT):
@@ -246,12 +285,21 @@ def check_panel(problems, notes, stats, broker_flow_manifest=None):
     """Build the real training panel and assert it is usable."""
     from walk_forward_backtest import build_panel, FEATURES
 
+    # Do this before refreshing a manifest or opening the database. The
+    # unavailable consumer must prove that it refuses without reading inputs.
+    consumer = "walk_forward_backtest.build_panel"
+    if _expects_refusal(consumer):
+        _check_refusal(consumer, lambda: build_panel(None, broker_flow_db_path=None,
+                       broker_flow_manifest_path=None), problems, stats)
+        return None
+
     if broker_flow_manifest is None:
         broker_flow_manifest = refresh_broker_flow_manifest(problems, stats)
         if broker_flow_manifest is None:
             return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = None
     try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
         panel = build_panel(conn, broker_flow_db_path=DB_PATH,
                             broker_flow_manifest_path=broker_flow_manifest)
     except Exception as e:
@@ -259,7 +307,8 @@ def check_panel(problems, notes, stats, broker_flow_manifest=None):
         traceback.print_exc()
         return None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     bf = panel.attrs["broker_flow"]
     stats["broker_flow"] = (f"db {bf['db_sha256'][:12]} manifest {bf['manifest_sha256'][:12]} "
@@ -435,7 +484,15 @@ def check(quick=False, broker_flow_manifest=None):
     if quick:
         notes.append("--quick: model smoke test skipped")
     else:
-        check_model_runs(panel, problems, notes, stats)
+        consumer = "check_ml_health.check_model_runs"
+        if _expects_refusal(consumer):
+            _check_refusal(consumer, lambda: check_model_runs(panel, problems, notes, stats),
+                           problems, stats)
+        else:
+            try:
+                check_model_runs(panel, problems, notes, stats)
+            except Exception as exc:
+                problems.append(f"{consumer} failed: {type(exc).__name__}: {exc}")
     return problems, notes, stats
 
 
@@ -452,6 +509,9 @@ def format_report(problems, notes, stats):
         bits.append(f"panel {stats['panel']}")
     if bits:
         lines.append(" | ".join(bits))
+    for refusal in stats.get("unsupported_routes", []):
+        lines.append(f"Expected {refusal['status']}: {refusal['consumer']} "
+                     f"({refusal['contract_version']}); no analytics produced")
     if "broker_flow" in stats:
         from walk_forward_backtest import PIT_WARNING
         lines.append(f"broker flow: {stats['broker_flow']}")
@@ -510,7 +570,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    _load_dotenv()
+    if args.telegram:
+        _load_dotenv()
     problems, notes, stats = check(quick=args.quick,
                                    broker_flow_manifest=args.broker_flow_manifest)
     report = format_report(problems, notes, stats)

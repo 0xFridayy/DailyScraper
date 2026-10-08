@@ -56,6 +56,8 @@ def _historical_net_lots(bf):
     the observable net-lot change. The latter remains an approximation wherever
     close differs from the true execution VWAP.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1._historical_net_lots")
     out = bf.copy()
     live = (
         out[["bval", "sval", "bavg", "savg"]].notna().all(axis=1)
@@ -76,6 +78,8 @@ def build_broker_identity_features(px, bf, broker_codes=None):
     within-clean-segment cumulative net-lot history divided by trailing 20-day
     average traded lots. No future row enters either calculation.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.build_broker_identity_features")
     px = px.sort_values(["ticker", "date"]).copy()
     bf = _historical_net_lots(bf)
     codes = tuple(sorted(broker_codes or bf["broker_code"].dropna().unique()))
@@ -207,6 +211,8 @@ def split_digest(splits):
 
 
 def run_feature_set(panel, features, splits):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.run_feature_set")
     predictions = []
     for cycle, split in enumerate(splits, 1):
         fit = panel[panel["date"].isin(split["fit"])]
@@ -228,6 +234,8 @@ def run_feature_set(panel, features, splits):
 
 
 def summarize_predictions(predictions):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.summarize_predictions")
     s = signal_stats(
         predictions["prediction"], predictions["target"], groups=predictions["date"],
     )
@@ -282,6 +290,8 @@ def prediction_digest(predictions):
 
 
 def print_results(table):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ml_v2_experiment_1.print_results")
     absolute = [
         "n_features", "n_predictions", "independent_dates", "pooled_ic",
         "mean_daily_ic", "median_daily_ic", "positive_ic_days",

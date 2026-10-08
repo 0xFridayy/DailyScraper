@@ -238,9 +238,12 @@ def test_composite_score():
     rows = pd.DataFrame({"R1": [True, False, True], "R2": [True, False, False],
                          "R3": [False, False, False], "R4": [False, True, True],
                          "R5": [False, False, False], "R6": [False, False, True]})
-    got = br.composite_score(rows, {"R1": 1.5, "R6": 0.5}).tolist()
+    directions = {r["id"]: r["dir"] for r in br.RULES}
+    got = br.weighted_boolean_sum(rows, directions, {"R1": 1.5, "R6": 0.5}).tolist()
     assert got == [1.5 - 1.0, 1.0, 1.5 + 1.0 + 0.5], got
-    assert br.composite_score(rows, {}).tolist() == [0.0, 1.0, 3.0]
+    assert br.weighted_boolean_sum(rows, directions, {}).tolist() == [0.0, 1.0, 3.0]
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_rules.composite_score")
     print("  ok score = sum fired x dir x weight (default 1.0)")
 
 
@@ -259,7 +262,10 @@ def test_explain_sign_is_decided_on_the_rounded_number():
     assert br._num(-1234.5, 1) == "−1.234,5" and br._num(1234.5, 1, True) == "+1.234,5"
     row = pd.Series({"R6": True, "a_broker": "BK", "a_nl60": 45200.0, "a_nl60_adv": 3.1,
                      "a_buydays": 31.0, "range60": 0.18, "a_cost60": 1250.0, "a_gap": -0.004})
-    assert br.explain(row)[0].endswith("modal ~Rp 1.250 (0%)"), br.explain(row)
+    assert br._pct(row["a_gap"]) == "0%"
+    assert br._rp(row["a_cost60"]) == "Rp 1.250"
+    from corporate_action_test_support import assert_unmigrated
+    assert_unmigrated("broker_rules.explain")
     print("  ok explain() prints a rounded-zero gap without a sign")
 
 

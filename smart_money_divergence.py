@@ -34,18 +34,15 @@ import pandas as pd
 from scipy import stats
 from xgboost import XGBRegressor
 from walk_forward_backtest import _broker_day_aggregates, _broker_correlation_1d, XGB_PARAMS, signal_quality, DB_PATH
-from neobdm_scraper import SMART_MONEY, RETAIL_BROKERS, BIG_PLAYER_ABSORBERS
 from price_audit import clean_panel
-
-SMART_MONEY_SET = set(SMART_MONEY)
-RETAIL_SET = set(RETAIL_BROKERS)
-ABSORBER_SET = set(BIG_PLAYER_ABSORBERS)
 
 SMART_FEATURES = ["smart_money_net", "retail_net", "absorber_net", "tod_divergence",
                    "tod_signal", "absorber_vs_retail"]
 
 
 def _group_features(g):
+    from neobdm_scraper import SMART_MONEY, RETAIL_BROKERS, BIG_PLAYER_ABSORBERS
+    SMART_MONEY_SET, RETAIL_SET, ABSORBER_SET = map(set, (SMART_MONEY, RETAIL_BROKERS, BIG_PLAYER_ABSORBERS))
     smart_net = g.loc[g["broker_code"].isin(SMART_MONEY_SET), "netval"].sum()
     retail_net = g.loc[g["broker_code"].isin(RETAIL_SET), "netval"].sum()
     absorber_net = g.loc[g["broker_code"].isin(ABSORBER_SET), "netval"].sum()
@@ -86,6 +83,8 @@ def build_panel_with_smart_money(conn):
 
 
 def walk_forward(panel, features, train_min=30, test_window=6):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("smart_money_divergence.walk_forward")
     p = panel.dropna(subset=features + ["target"]).sort_values("date").reset_index(drop=True)
     dates = sorted(p["date"].unique())
     cycles, train_end = [], train_min
@@ -112,6 +111,8 @@ def walk_forward(panel, features, train_min=30, test_window=6):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("smart_money_divergence.__main__")
     conn = sqlite3.connect(DB_PATH)
     panel = build_panel_with_smart_money(conn)
     conn.close()

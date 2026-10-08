@@ -6,6 +6,10 @@ a holder while it runs: "NeoBDM error" messages still go out immediately, the
 raw daily report is held. If the picks step fails or can't send its picks
 ("send_failed"), the held raw report is sent instead.
 
+An unsupported corporate-action picks route exposes its structured refusal
+and sends no held raw substitute. Its sender is created only when a supported
+route actually sends a message. Unexpected contract refusals report an error.
+
 When the picks step finds no fresh data, its stale warning is the only
 message. The held raw report is never sent then, because it would present a
 late or failed scrape as if it were a fresh report: "stale" means the warning
@@ -22,6 +26,9 @@ errors can contain the bot URL. Roll back by pointing the workflow at
 """
 
 from datetime import datetime, timezone
+import json
+
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 import neobdm_scraper as scraper
 
@@ -63,7 +70,14 @@ def main():
 
     try:
         import daily_picks
-        send = daily_picks.telegram_sender_from_env()
+        sender = None
+
+        def send(text):
+            nonlocal sender
+            if sender is None:
+                sender = daily_picks.telegram_sender_from_env()
+            return sender(text)
+
         run_utc = datetime.now(timezone.utc)
         status, text = daily_picks.run_morning(run_utc, send=send)
         print(f"daily picks: {status}")
@@ -77,6 +91,14 @@ def main():
                     daily_picks.record_stale_warning(run_utc, text, datetime.now(timezone.utc))
                 except Exception as e:
                     print(f"stale warning record failed: {type(e).__name__}")
+    except UnsupportedPriceContract as exc:
+        # A held price-based report cannot replace unavailable certified
+        # analytics. Preserve the refusal identity without sending that report.
+        result = exc.as_dict()
+        if (exc.consumer != "daily_picks.run_morning" or exc.status != "UNSUPPORTED"
+                or exc.contract_version != CONTRACT_VERSION):
+            result["status"] = "CONTRACT_ERROR"
+        print(json.dumps({"daily_picks": result}, sort_keys=True))
     except Exception as e:
         print(f"daily picks failed: {type(e).__name__}")
         if held:

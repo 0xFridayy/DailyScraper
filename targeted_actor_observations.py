@@ -1012,6 +1012,8 @@ def _window(series, lo, known_conflict):
     """One horizon's window of one broker's series, from session `lo` to the
     last: the six sums and both sides' implied prices (module docstring,
     IMPLIED PRICE)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("targeted_actor_observations._window")
     sums = {f: sum(series[f][lo:]) if f in LOT_FIELDS else math.fsum(series[f][lo:])
             for f in SERIES_FIELDS}
     out = {"sums": sums}

@@ -12,6 +12,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
+from types import ModuleType
 
 from price_contract import UnsupportedPriceContract
 
@@ -55,3 +56,36 @@ def frozen_evidence_fixture(*args, **kwargs):
     exec(compile(ast.Module(body=[definition], type_ignores=[]), "frozen-v0-market-fixture", "exec"), namespace)
     with patch.object(ie, "_market_measurement", namespace["_market_measurement"]):
         return ie.build_inventory_evidence(*args, **kwargs)
+
+
+def frozen_daily_numeric_fixture():
+    """Retain reviewed legacy numerical assertions separately from v1 refusal.
+
+    This exact Git object is test-only and supplies synthetic, in-memory legacy
+    calculations. It never replaces the imported production module or certifies
+    new price output. Each caller also exercises the current real refusal.
+    """
+    source = subprocess.check_output([
+        "git", "show", "9e32b14e7e828d7fb300bad051af491ea4c8cac2:daily_picks.py"], cwd=Path(__file__).parent)
+    assert hashlib.sha256(source).hexdigest() == "8c3e6e938b023b031c03d5a5d1d6b97b870d11777396e91aa1c67dff2c77bc63"
+    fixture = ModuleType("frozen_daily_numeric_fixture")
+    fixture.__file__ = str(Path(__file__).with_name("daily_picks.py"))
+    exec(compile(source, "frozen-reviewed-daily-numeric-fixture", "exec"), vars(fixture))
+    return fixture
+
+
+def frozen_reviewed_numeric_function(module, name):
+    """Pinned in-memory legacy arithmetic, never a production adapter."""
+    pins = {
+        ("broker_learning", "primary_status"): "4126c12f68fba8efcbf43bce1298d282226411e482e257bce8c897316d0cdc1f",
+        ("ml_v2_experiment_1_robustness", "paired_date_differences"): "ebc903775ff5696947ea63b4c33860b438822b90e62e0811a94d5932b4f4adab",
+        ("experiment_1f_gate_b", "graduation_report"): "114c1303f88b420833b518ad420f03554d4911ad7623e1e7c718f6afa0d706d5",
+        ("experiment_1f_gate_b", "sensitivity_report"): "114c1303f88b420833b518ad420f03554d4911ad7623e1e7c718f6afa0d706d5",
+    }
+    expected = pins[module, name]
+    source = subprocess.check_output(["git", "show", f"9e32b14e7e828d7fb300bad051af491ea4c8cac2:{module}.py"], cwd=Path(__file__).parent)
+    assert hashlib.sha256(source).hexdigest() == expected
+    definition = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == name)
+    namespace = dict(vars(importlib.import_module(module)))
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "frozen-reviewed-numeric-fixture", "exec"), namespace)
+    return namespace[name]

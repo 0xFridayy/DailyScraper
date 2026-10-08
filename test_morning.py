@@ -5,12 +5,17 @@ picks step. No network, no Playwright session, no database.
 """
 
 import os
+import io
+import json
 import sqlite3
 import sys
 import tempfile
 import types
 import zoneinfo
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout
+
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -222,40 +227,75 @@ def run_real(env, picks_results, clock_utc):
     return sent, picks_sent
 
 
-def test_delivered_retry_is_recorded_once_and_the_next_run_stays_quiet():
+def test_real_picks_refusal_is_structured_before_any_delivery_or_record():
+    """The real unversioned picks route refuses before delivery or recording."""
     run_at = RUN_MYT.astimezone(timezone.utc)
     retry_at = run_at + timedelta(minutes=1)
     with tempfile.TemporaryDirectory() as tmp:
         env = stale_env(tmp)
-        sent, picks_sent = run_real(env, [False, True], [run_at, retry_at])
-        assert sent == [], sent                                          # no raw substitute
-        assert len(picks_sent) == 2 and "No fresh NeoBDM data" in picks_sent[0]
-        assert picks_sent[1] == picks_sent[0]
-        assert stale_rows(env) == [("stale", "2026-09-29", retry_at.isoformat())]
-        # the same local date again: already warned, nothing sent, still one row
-        sent2, picks_sent2 = run_real(env, [], [run_at + timedelta(minutes=5)])
-        assert sent2 == [] and picks_sent2 == [], (sent2, picks_sent2)
-        status, _ = dp.run_morning(run_at + timedelta(minutes=6), lambda t: 1 / 0, **env)
-        assert status == "stale_already_warned", status
-        assert len(stale_rows(env)) == 1
-        # recording is idempotent (INSERT OR IGNORE): the first delivery stays
-        dp.record_stale_warning(run_at, picks_sent[0], retry_at + timedelta(hours=1), picks_db=env["picks_db"])
-        assert stale_rows(env) == [("stale", "2026-09-29", retry_at.isoformat())]
+        with redirect_stdout(io.StringIO()) as output:
+            sent, picks_sent = run_real(env, [False, True], [run_at, retry_at])
+        assert sent == [] and picks_sent == [], (sent, picks_sent)
+        refusal = json.loads(output.getvalue())["daily_picks"]
+        assert refusal["status"] == "UNSUPPORTED"
+        assert refusal["consumer"] == "daily_picks.run_morning"
+        assert refusal["contract_version"] == CONTRACT_VERSION
+        assert not os.path.exists(env["picks_db"])
 
 
-def test_failed_or_raising_retry_records_nothing_and_never_sends_raw():
+def test_unavailable_real_picks_remain_silent_on_subsequent_runs():
     run_at = RUN_MYT.astimezone(timezone.utc)
     for second in (False, RuntimeError("telegram down")):
         with tempfile.TemporaryDirectory() as tmp:
             env = stale_env(tmp)
             sent, picks_sent = run_real(env, [False, second], [run_at, run_at + timedelta(minutes=1)])
             assert sent == [], (second, sent)
-            assert len(picks_sent) == 2, picks_sent
+            assert picks_sent == [], picks_sent
             assert stale_rows(env) == [], (second, stale_rows(env))
-            # nothing recorded, so the next run warns again (and records it)
+            # The unavailable real route remains silent on subsequent runs.
             sent2, picks_sent2 = run_real(env, [True], [run_at + timedelta(minutes=5)])
-            assert sent2 == [] and len(picks_sent2) == 1
-            assert [k for k, _d, _s in stale_rows(env)] == ["stale"]
+            assert sent2 == [] and picks_sent2 == []
+            assert stale_rows(env) == []
+
+
+def test_stale_warning_recording_preserves_first_delivery_and_is_idempotent():
+    run_at = RUN_MYT.astimezone(timezone.utc)
+    retry_at = run_at + timedelta(minutes=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        env = stale_env(tmp)
+        dp.record_stale_warning(run_at, STALE_WARNING, retry_at, picks_db=env["picks_db"])
+        assert stale_rows(env) == [("stale", "2026-09-29", retry_at.isoformat())]
+        dp.record_stale_warning(run_at, STALE_WARNING, retry_at + timedelta(hours=1),
+                                picks_db=env["picks_db"])
+        assert stale_rows(env) == [("stale", "2026-09-29", retry_at.isoformat())]
+
+
+def test_real_refusal_does_not_construct_a_credential_based_sender():
+    sent = []
+    fake = types.ModuleType("daily_picks")
+    fake.run_morning = dp.run_morning
+    fake.telegram_sender_from_env = lambda: (_ for _ in ()).throw(AssertionError("sender constructed"))
+    saved = (sys.modules.get("daily_picks"), ns.run_all_jobs, ns.send_telegram)
+    sys.modules["daily_picks"] = fake
+    ns.run_all_jobs = lambda: ns.send_telegram(RAW)
+    ns.send_telegram = sent.append
+    try:
+        with redirect_stdout(io.StringIO()) as output:
+            assert morning.main() == 0
+        result = json.loads(output.getvalue())["daily_picks"]
+        assert result["status"] == "UNSUPPORTED"
+        assert result["consumer"] == "daily_picks.run_morning"
+        assert sent == []
+    finally:
+        sys.modules["daily_picks"] = saved[0]
+        ns.run_all_jobs, ns.send_telegram = saved[1], saved[2]
+
+
+def test_an_unexpected_contract_refusal_is_reported_as_an_error_without_raw_fallback():
+    with redirect_stdout(io.StringIO()) as output:
+        sent = run(raises=UnsupportedPriceContract("stale input"))
+    assert sent == []
+    assert json.loads(output.getvalue())["daily_picks"]["status"] == "CONTRACT_ERROR"
 
 
 def test_delivered_stale_warning_is_not_retried():

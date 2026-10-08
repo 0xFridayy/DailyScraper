@@ -100,22 +100,28 @@ def test_session_label_is_previous_weekday():
 # ── tags, filters and ranking ──────────────────────────────────────────────
 
 def test_tags_never_read_later_snapshots():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.tag_snapshot")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(10)
     snaps = snaps_from(days)
-    before = dp.tag_snapshot(snaps, 5)
+    before = legacy.tag_snapshot(snaps, 5)
     later = [(d, {t: dict(r, close=r["close"] * 3, m_dn_0=-1, tval=999) for t, r in rows.items()})
              for d, rows in days[6:]]
-    after = dp.tag_snapshot(snaps_from(days[:6] + later), 5)
+    after = legacy.tag_snapshot(snaps_from(days[:6] + later), 5)
     assert json.dumps(before, sort_keys=True) == json.dumps(after, sort_keys=True)
     print("  ok no future data in tags")
 
 
 def test_missing_values_are_not_zero_and_do_not_fire():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.tag_snapshot")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(4)
     days[-1][1]["AAAA"] = row(nr=None, f=0.2, cs=None)
     days[-1][1]["BBBB"] = row(tval=None)
     days[-1][1]["CCCC"] = row(pct5=None)
-    tagged = dp.tag_snapshot(snaps_from(days), 3)
+    tagged = legacy.tag_snapshot(snaps_from(days), 3)
     assert "BBBB" not in tagged and "CCCC" not in tagged
     assert "inst_foreign" not in tagged["AAAA"]["tags"]
     assert "broad_buying" not in tagged["AAAA"]["tags"]
@@ -123,41 +129,50 @@ def test_missing_values_are_not_zero_and_do_not_fire():
 
 
 def test_filters_skip_illiquid_runups_and_recent_splits():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.tag_snapshot")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(8)
     days[-1][1]["AAAA"] = row(tval=1.5)            # under Rp 2 bn
     days[-1][1]["BBBB"] = row(pct5=0.30)           # already ran 30%
     days[-3][1]["CCCC"] = row(close=200)           # 1000 -> 200: a 1:5 split
     days[-2][1]["CCCC"] = row(close=200)
     days[-1][1]["CCCC"] = row(close=200)
-    tagged = dp.tag_snapshot(snaps_from(days), 7)
+    tagged = legacy.tag_snapshot(snaps_from(days), 7)
     assert set(tagged) == {"DDDD"}, sorted(tagged)
     print("  ok filters")
 
 
 def test_rank_needs_two_signals_and_follows_weights():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.rank_picks")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(6)
     last = days[-1][1]
     last["AAAA"] = row(cs=5, nr=-0.1, f=0.1, m=-0.1)          # 1 tag
     last["BBBB"] = row(cs=4, nr=0.1, f=0.1, m=-0.1)           # broad + inst
     last["CCCC"] = row(cs=1, nr=0.1, f=0.1, m=0.1, tval=20.0)  # inst + bandar_3days + value_up
     last["DDDD"] = row(cs=0, nr=-0.1, f=-0.1, m=-0.1)         # none
-    tagged = dp.tag_snapshot(snaps_from(days), 5)
-    picks = dp.rank_picks(tagged, {}, min_tags=2)
+    tagged = legacy.tag_snapshot(snaps_from(days), 5)
+    picks = legacy.rank_picks(tagged, {}, min_tags=2)
     assert [t for t, _ in picks] == ["CCCC", "BBBB"], picks
-    picks = dp.rank_picks(tagged, {"value_up": 0.25, "bandar_3days": 0.25, "inst_foreign": 1,
+    picks = legacy.rank_picks(tagged, {"value_up": 0.25, "bandar_3days": 0.25, "inst_foreign": 1,
                                    "broad_buying": 2}, min_tags=2)
     assert [t for t, _ in picks] == ["BBBB", "CCCC"], picks
-    assert [t for t, _ in dp.rank_picks(tagged, {})] == ["CCCC"]    # the machine's 3+ bar
+    assert [t for t, _ in legacy.rank_picks(tagged, {})] == ["CCCC"]    # the machine's 3+ bar
     print("  ok ranking")
 
 
 def test_zero_clean_score_is_a_real_tiebreak_value():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.rank_picks")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(4)
     last = days[-1][1]
     last["AAAA"] = row(cs=0, nr=0.1, f=0.1)
     last["BBBB"] = row(cs=None, nr=0.1, f=0.1)
-    tagged = dp.tag_snapshot(snaps_from(days), 3)
-    ranked = dp.rank_picks(tagged, {}, n=10, min_tags=2)
+    tagged = legacy.tag_snapshot(snaps_from(days), 3)
+    ranked = legacy.rank_picks(tagged, {}, n=10, min_tags=2)
     names = [t for t, _ in ranked]
     assert names.index("AAAA") < names.index("BBBB"), names
     print("  ok zero is not missing")
@@ -345,19 +360,22 @@ def test_machine_picks_are_tracked_and_finish_with_why():
 
 
 def test_why_names_the_main_driver():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.main_reason")
+    legacy = frozen_daily_numeric_fixture()
     base = {"bandar_share": 0.5, "foreign_share": 0.5, "trading_ratio": 1.0,
             "worst_day": -0.01, "market_ret": 0.0}
-    assert dp.main_reason(0.05, dict(base, bandar_share=0.8)) == "bandar kept buying"
-    assert dp.main_reason(-0.05, dict(base, bandar_share=0.2)) == "bandar turned seller"
-    assert dp.main_reason(-0.05, dict(base, worst_day=-0.12)) == "one bad day (-12%)"
-    assert dp.main_reason(-0.04, dict(base, market_ret=-0.05)) == "mostly moved with the market"
-    assert dp.main_reason(0.03, base) == "beat the market without a clear flow signal"
+    assert legacy.main_reason(0.05, dict(base, bandar_share=0.8)) == "bandar kept buying"
+    assert legacy.main_reason(-0.05, dict(base, bandar_share=0.2)) == "bandar turned seller"
+    assert legacy.main_reason(-0.05, dict(base, worst_day=-0.12)) == "one bad day (-12%)"
+    assert legacy.main_reason(-0.04, dict(base, market_ret=-0.05)) == "mostly moved with the market"
+    assert legacy.main_reason(0.03, base) == "beat the market without a clear flow signal"
     # the phrase always agrees with the ✅/❌ mark (review cases from real data)
-    assert dp.main_reason(-0.005, dict(base, market_ret=-0.015)) == \
+    assert legacy.main_reason(-0.005, dict(base, market_ret=-0.015)) == \
         "beat the market without a clear flow signal"
-    assert dp.main_reason(0.009, dict(base, market_ret=0.019, bandar_share=0.8,
+    assert legacy.main_reason(0.009, dict(base, market_ret=0.019, bandar_share=0.8,
                                       foreign_share=0.8)) == "lagged even though bandar kept buying"
-    assert dp.main_reason(0.005, dict(base, market_ret=0.028)) == \
+    assert legacy.main_reason(0.005, dict(base, market_ret=0.028)) == \
         "lagged the market without a clear flow signal"             # not "moved with the market"
     print("  ok why")
 
@@ -597,6 +615,9 @@ def test_morning_includes_follow_ups():
 
 
 def test_failed_neobdm_list_says_unavailable_not_empty():
+    from corporate_action_test_support import frozen_daily_numeric_fixture, assert_unmigrated
+    assert_unmigrated("daily_picks.format_morning")
+    legacy = frozen_daily_numeric_fixture()
     days = panel(4, start="2026-09-14")
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "n.db")
@@ -610,7 +631,7 @@ def test_failed_neobdm_list_says_unavailable_not_empty():
         conn.commit()
         lists = dp.neobdm_lists(conn, "2026-09-17")
         conn.close()
-    text = dp.format_morning(date(2026, 9, 17), dp.Snapshot("2026-09-17", {}), [], {}, {},
+    text = legacy.format_morning(date(2026, 9, 17), dp.Snapshot("2026-09-17", {}), [], {}, {},
                              [], [], [], lists, 4)
     assert "Stalker: AAAA" in text and "Bandar: unavailable" in text and "Foreign: -" in text
     assert "Non-retail: unavailable" in text             # no status row = not tracked
@@ -674,9 +695,22 @@ def test_arb_veto_window_covers_the_session_only():
                           ("2026-09-15", "BBBB", "2026-09-22"),   # not issued yet
                           ("2026-08-24", "CCCC", "2026-08-31")])  # expired
         conn = sqlite3.connect(path)
-        assert dp.arb_veto(conn, "2026-09-14") == {"AAAA"}, dp.arb_veto(conn, "2026-09-14")
-        assert dp.arb_veto(conn, "2026-09-15") == {"BBBB"}
-        assert dp.arb_veto(conn, "2026-09-30") == set()
+        # Preserve the stored interval convention independently of unsupported
+        # model outcomes; querying those rows must never certify a live veto.
+        def interval_rows(day):
+            return {r[0] for r in conn.execute("SELECT ticker FROM arb_veto WHERE as_of<=? AND valid_until>=?", (day, day))}
+        assert interval_rows("2026-09-14") == {"AAAA"}
+        assert interval_rows("2026-09-15") == {"BBBB"}
+        assert interval_rows("2026-09-30") == set()
+        from price_contract import UnsupportedPriceContract
+        before = conn.total_changes
+        try:
+            dp.arb_veto(conn, "2026-09-14")
+        except UnsupportedPriceContract as exc:
+            assert exc.consumer == "daily_picks.arb_veto"
+        else:
+            raise AssertionError("uncertified stored veto was accepted")
+        assert conn.total_changes == before
         conn.close()
     print("  ok veto expires with its own five-session window")
 

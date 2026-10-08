@@ -133,6 +133,8 @@ def load_prices(con):
 
 
 def load_brokers(con, px):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ara_arb_scan.load_brokers")
     bf = pd.read_sql("select date,ticker,broker_code,netval from broker_flow", con)
     bf['date'] = pd.to_datetime(bf['date'])
     bf = bf[bf.date.isin(set(px.date.unique())) & bf.ticker.isin(set(px.ticker.unique()))].copy()

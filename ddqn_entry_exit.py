@@ -148,12 +148,16 @@ def split_search_holdout(panel, search_frac=0.7):
 
 
 def fit_normalizer(train_df):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.fit_normalizer")
     mean = train_df[FEATURES].mean()
     std = train_df[FEATURES].replace([np.inf, -np.inf], np.nan).std().replace(0, 1)
     return mean, std
 
 
 def normalize_features(df, mean, std):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.normalize_features")
     z = (df[FEATURES] - mean) / std
     return z.clip(-5, 5).fillna(0.0)
 
@@ -176,6 +180,8 @@ class TickerEnv:
         self.reset()
 
     def reset(self):
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("ddqn_entry_exit.TickerEnv.reset")
         self.t = 0
         self.position = 0
         self.days_in_position = 0
@@ -183,6 +189,8 @@ class TickerEnv:
         return self._state()
 
     def _state(self):
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("ddqn_entry_exit.TickerEnv._state")
         extra = np.array([self.position, self.days_in_position, self.unrealized_return], dtype=np.float32)
         return np.concatenate([self.feats_z[self.t], extra]).astype(np.float32)
 
@@ -196,6 +204,8 @@ class TickerEnv:
         chose - it doesn't get to hold longer just because it prefers to.
         The forced exit is still subject to the same ARB fill-lock realism
         as any other exit (can't force a sell into a locked limit-down)."""
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("ddqn_entry_exit.TickerEnv.step")
         prev_position = self.position
         desired = int(action)
         if prev_position == 1 and self.days_in_position >= MAX_HOLD_DAYS:
@@ -258,6 +268,8 @@ class QNet(nn.Module):
         )
 
     def forward(self, x):
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("ddqn_entry_exit.QNet.forward")
         return self.net(x)
 
 
@@ -346,6 +358,8 @@ def evaluate_policy(net, envs):
     ticker episodes moved by the same market, so it fails the independence
     assumption a Sharpe needs just as the per-trade series fails the scale
     assumption. See signal_metrics.py."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.evaluate_policy")
     daily_returns = []
     trade_returns = []
     n_entries = n_blocked_entries = n_blocked_exits = 0
@@ -395,6 +409,8 @@ def evaluate_policy_with_trade_log(net, envs, top_k_features=3):
     aren't decomposable that way - plus the top_k_features by |z-score| at
     the decision point, as a "what stood out that day" description rather
     than a "why" explanation."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("ddqn_entry_exit.evaluate_policy_with_trade_log")
     trade_rows = []
 
     for env in envs:

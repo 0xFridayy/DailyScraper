@@ -14,6 +14,7 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -27,6 +28,20 @@ CAL = tuple(f"2026-04-{d:02d}" for d in range(1, 31))
 SPEC = {"AAA": {"missing": set(), "invalid": set(), "price_bad": set()},
         "BBB": {"missing": {12}, "invalid": set(), "price_bad": set()},
         "CCC": {"missing": set(), "invalid": {8}, "price_bad": {15}}}
+
+
+def _assert_refusal(route, function, *args, **kwargs):
+    frames = [(arg, arg.copy(deep=True)) for arg in args if isinstance(arg, pd.DataFrame)]
+    try:
+        function(*args, **kwargs)
+    except UnsupportedPriceContract as exc:
+        status = exc.as_dict()
+        assert status["consumer"] == route and route in status["reason"]
+        assert status["status"] == "UNSUPPORTED" and status["contract_version"] == CONTRACT_VERSION
+    else:
+        raise AssertionError(f"{route} accepted uncertified inputs")
+    for frame, before in frames:
+        pd.testing.assert_frame_equal(frame, before)
 
 
 def lots(i):
@@ -324,10 +339,8 @@ def test_ordinary_t2_exit_equals_gate_a_fwd_oo_1():
 
 
 def test_open_usability_is_gate_a_open_anchor_validity():
-    from price_audit import _open_anchor_valid
     px = _execution_panel().sort_values(f.KEY, kind="mergesort").reset_index(drop=True)
-    expected = _open_anchor_valid(px, px.groupby("ticker", sort=False)).fillna(False).to_numpy(bool)
-    assert np.array_equal(ev.open_usable(px), expected)
+    _assert_refusal("experiment_1f_evaluation.open_usable", ev.open_usable, px)
     with open(os.path.join(HERE, "experiment_1f_evaluation.py"), encoding="utf-8") as fh:
         source = fh.read()
     assert not re.search(r"0\.35|0\.25|0\.20|-0\.15|0\.005", source), "evaluation must not redefine Gate-A bands"
@@ -363,14 +376,19 @@ def test_top3_no_backfill_benchmark_keeps_unfilled_weight_and_pairwise_delta():
                         "return_cash": [0.03, 0.0, 0.0, 0.50, -0.02],
                         "return_excluded": [0.03, 0.0, np.nan, 0.50, -0.02],
                         "status": ["EXIT_H1", "UNFILLED_SINGLE_PRICE_UP", "EXIT_HOLD_THROUGH", "EXIT_H1", "EXIT_H1"]})
-    picked = ev.select_top_k(day, "score")
+    _assert_refusal("experiment_1f_evaluation.select_top_k", ev.select_top_k, day, "score")
+    picked = day.iloc[ev.descending_positions(day["score"], day["ticker"], 3)]
     assert list(picked["ticker"]) == ["A", "B", "C"]
-    assert abs(ev.portfolio_return(picked, "HOLD_THROUGH") - 0.04 / 3) < 1e-15
-    assert abs(ev.portfolio_return(picked, "CASH") - 0.03 / 3) < 1e-15
-    assert abs(ev.benchmark_return(day, "HOLD_THROUGH") - 0.52 / 5) < 1e-15      # unfilled B keeps 1/5 in cash
-    assert abs(ev.benchmark_return(day, "EXCLUDED") - 0.51 / 4) < 1e-15          # diagnostic renormalises
-    assert abs(ev.daily_top3_excess(day, "score") - (0.04 / 3 - 0.52 / 5)) < 1e-15
-    assert abs(ev.portfolio_return(day.head(2), "HOLD_THROUGH") - 0.03 / 3) < 1e-15
+    _assert_refusal("experiment_1f_evaluation.portfolio_return", ev.portfolio_return, picked, "HOLD_THROUGH")
+    _assert_refusal("experiment_1f_evaluation.benchmark_return", ev.benchmark_return, day, "HOLD_THROUGH")
+    _assert_refusal("experiment_1f_evaluation.daily_top3_excess", ev.daily_top3_excess, day, "score")
+    assert abs(ev.slot_average(picked["return_hold_through"], 3) - 0.04 / 3) < 1e-15
+    assert abs(ev.slot_average(picked["return_cash"], 3) - 0.03 / 3) < 1e-15
+    assert abs(ev.slot_average(day["return_hold_through"]) - 0.52 / 5) < 1e-15
+    assert abs(ev.slot_average(day["return_excluded"], resolved_only=True) - 0.51 / 4) < 1e-15
+    assert abs(ev.slot_average(picked["return_hold_through"], 3)
+               - ev.slot_average(day["return_hold_through"]) - (0.04 / 3 - 0.52 / 5)) < 1e-15
+    assert abs(ev.slot_average(day.head(2)["return_hold_through"], 3) - 0.03 / 3) < 1e-15
     dates = [CAL[0], CAL[1]]
     large = {17: pd.Series([0.02, 0.00], index=dates), 19: pd.Series([0.04, 0.02], index=dates)}
     small = {17: pd.Series([0.01, 0.01], index=dates), 19: pd.Series([0.01, 0.01], index=dates)}
@@ -386,7 +404,8 @@ def test_rank_label_average_ties_scaling_min_names_and_missing():
     rows = [{"ticker": f"T{j:02d}", "date": CAL[0], "fwd_oo_1": v} for j, v in enumerate(values)]
     rows += [{"ticker": f"T{j:02d}", "date": CAL[1], "fwd_oo_1": 0.01 * j} for j in range(5)]
     panel = pd.DataFrame(rows)
-    label = ev.rank_label(panel, 1)
+    _assert_refusal("experiment_1f_evaluation.rank_label", ev.rank_label, panel, 1)
+    label = ev.grouped_percentile_rank(panel["fwd_oo_1"], panel["date"], ev.MIN_LABEL_NAMES)
     valid = (panel["date"] == CAL[0]) & panel["fwd_oo_1"].notna()
     expected = (panel.loc[valid, "fwd_oo_1"].rank(method="average") - 0.5) / int(valid.sum())
     assert np.allclose(label[valid], expected) and abs(label[valid].mean() - 0.5) < 1e-12
@@ -405,7 +424,8 @@ def test_daily_ic_on_raw_return_equals_ic_on_rank_label():
     frame["score"] = rng.normal(size=3 * n)
     frame.loc[frame["date"] == CAL[2], "score"] = 1.0
     frame.loc[[10, 11, 50], "score"] = np.nan
-    frame["rank_label"] = ev.rank_label(frame, 1)
+    _assert_refusal("experiment_1f_evaluation.rank_label", ev.rank_label, frame, 1)
+    frame["rank_label"] = ev.grouped_percentile_rank(frame["fwd_oo_1"], frame["date"], ev.MIN_LABEL_NAMES)
     raw = ev.daily_spearman_ic(frame, "score", "fwd_oo_1")
     ranked = ev.daily_spearman_ic(frame, "score", "rank_label")
     assert np.allclose(raw.to_numpy(), ranked.to_numpy(), atol=1e-12)
@@ -929,7 +949,10 @@ def test_fit_path_is_guarded_and_sets_every_registered_parameter():
     source = inspect.getsource(runner)
     body = inspect.getsource(runner.run_job)
     assert source.count(".fit(") == body.count(".fit(") == 1 and source.count(".predict(") == body.count(".predict(") == 1
-    assert body.split("\n")[1].strip() == "_check_authorisation(authorisation)"
+    before = dict(runner.FIT_COUNTER)
+    _assert_refusal("experiment_1f_gate_b.run_job", runner.run_job, {}, {}, None)
+    assert runner.FIT_COUNTER == before
+    assert body.index('refuse_unmigrated("experiment_1f_gate_b.run_job")') < body.index("_check_authorisation(authorisation)")
     assert body.index("_check_authorisation(authorisation)", body.index("for number")) < body.index(".fit(")
     params = runner.model_params(19)
     assert params["random_state"] == 19 and params["objective"] == "reg:squarederror" and params["eval_metric"] == "rmse"
@@ -977,13 +1000,18 @@ def _synthetic_results(rng):
 
 
 def test_graduation_and_sensitivity_assembly_on_synthetic_results_is_deterministic_and_exclusive():
-    first = runner.graduation_report(_synthetic_results(np.random.default_rng(5)))
-    second = runner.graduation_report(_synthetic_results(np.random.default_rng(5)))
+    from corporate_action_test_support import assert_unmigrated, frozen_reviewed_numeric_function
+    assert_unmigrated("experiment_1f_gate_b.graduation_report")
+    assert_unmigrated("experiment_1f_gate_b.sensitivity_report")
+    graduation = frozen_reviewed_numeric_function("experiment_1f_gate_b", "graduation_report")
+    sensitivity = frozen_reviewed_numeric_function("experiment_1f_gate_b", "sensitivity_report")
+    first = graduation(_synthetic_results(np.random.default_rng(5)))
+    second = graduation(_synthetic_results(np.random.default_rng(5)))
     assert json.dumps(first, sort_keys=True, default=str) == json.dumps(second, sort_keys=True, default=str)
     assert set(first["increments"]) == {"B-A", "C-B", "D-C"}
     allowed = {"REJECT_FOR_NOW", "GRADUATE_TOWARD_SPECTRA", "SENSITIVITY_ONLY"}
     assert all(rec["category"] in allowed for rec in first["increments"].values()) and first["A"]["category"] in allowed
-    sens = runner.sensitivity_report(_synthetic_results(np.random.default_rng(5)))
+    sens = sensitivity(_synthetic_results(np.random.default_rng(5)))
     assert len(sens) == len(runner.sensitivity_specs()) + 3
     assert all("category" not in rec for rec in sens.values())
 

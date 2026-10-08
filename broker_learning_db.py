@@ -155,6 +155,9 @@ def insert_rows(conn, table, rows):
     or NULL is also an error, because SQLite treats NULL keys as distinct and
     OR IGNORE would then insert duplicates instead of ignoring them.
     """
+    if table in TABLES and table != "runs":
+        from price_contract import refuse_unmigrated
+        refuse_unmigrated("broker_learning_db.insert_rows")
     rows = list(rows)
     if not rows:
         _check_table(table)
@@ -263,29 +266,41 @@ def _load_as_of(conn, table, as_of, order):
 
 
 def load_rule_stats(conn, as_of=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_rule_stats")
     return _load_as_of(conn, "rule_stats", as_of, "ruleset, rule_id, h")
 
 
 def load_weights(conn, as_of=None):
     """{rule_id: weight} for as_of (latest if None); {} before the first weekly run."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_weights")
     frame = _load_as_of(conn, "rule_weights", as_of, "ruleset, rule_id")
     return {r: float(w) for r, w in zip(frame["rule_id"], frame["weight"]) if w is not None}
 
 
 def load_broker_scores(conn, as_of=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_broker_scores")
     return _load_as_of(conn, "broker_scores", as_of, "broker, side, h")
 
 
 def load_profitability(conn, as_of=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_profitability")
     return _load_as_of(conn, "broker_profitability", as_of, "broker")
 
 
 def load_alpha_cases(conn, as_of=None):
     """Cases of one weekly run (latest if None), largest move first."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_alpha_cases")
     return _load_as_of(conn, "alpha_cases", as_of, "hold_60 DESC, ticker, session_date")
 
 
 def load_broker_lift(conn, as_of=None):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning_db.load_broker_lift")
     return _load_as_of(conn, "broker_lift", as_of, "broker")
 
 

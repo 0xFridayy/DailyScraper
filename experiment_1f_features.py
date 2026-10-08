@@ -427,6 +427,8 @@ def frame_value_digest(frame, columns):
 
 def daily_ic_capacity(frame, mask, panel, horizon, test_dates):
     """Dates on which a daily IC is defined for a sample (>= MIN_DAILY_IC_NAMES label-valid keys)."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("experiment_1f_features.daily_ic_capacity")
     label = panel.set_index(KEY)[f"fwd_oo_{horizon}"]
     keys = frame.loc[mask, KEY]
     valid = label.reindex(pd.MultiIndex.from_frame(keys)).notna().to_numpy()

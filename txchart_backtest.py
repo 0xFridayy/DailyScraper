@@ -109,6 +109,8 @@ def engineer(df, horizon):
 
 
 def walk_forward(panel, feats, horizon):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("txchart_backtest.walk_forward")
     dates = np.array(sorted(panel["date"].unique()))
     di = {d: i for i, d in enumerate(dates)}
     panel = panel.assign(_di=panel["date"].map(di))

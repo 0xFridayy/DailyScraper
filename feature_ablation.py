@@ -69,6 +69,8 @@ def build_multi_horizon_panel(conn, horizons=(1, 3, 5)):
 
 
 def walk_forward(panel, features, target_col, train_min=30, test_window=6):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("feature_ablation.walk_forward")
     p = panel.dropna(subset=features + [target_col]).sort_values("date").reset_index(drop=True)
     dates = sorted(p["date"].unique())
     cycles, train_end = [], train_min
@@ -98,6 +100,8 @@ def walk_forward(panel, features, target_col, train_min=30, test_window=6):
 
 
 if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("feature_ablation.__main__")
     conn = sqlite3.connect(DB_PATH)
     panel = build_multi_horizon_panel(conn)
     conn.close()

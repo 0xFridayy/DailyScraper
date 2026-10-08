@@ -357,6 +357,8 @@ def attach_excess(rows, outs, single_bucket=False):
     at h = 60. NaN where the outcome is NaN, the row is not eligible, or it
     has no bucket. Ineligible rows never enter any mean.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.attach_excess")
     missing = {"date", "ticker", "eligible", "rv20"} - set(rows.columns)
     if missing:
         raise ValueError(f"attach_excess() rows missing {sorted(missing)}")
@@ -504,6 +506,8 @@ def rule_stats(rows_x, as_of, window, ruleset="v1", rules=None):
     at its primary horizon (primary_status()); the other rows are context and
     part of the multiple-testing caveat, not a second chance to look good.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.rule_stats")
     window_start, window_end = window
     dates = rows_x["date"].astype(str)
     elig = _flag(rows_x["eligible"])
@@ -534,6 +538,8 @@ def primary_status(stats, primary_h=None):
     This is the headline a rule is judged by: R1-R5 at h = 10, R6 at h = 60.
     A rule with no row at its primary h is left out rather than guessed.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.primary_status")
     ph = _primary_h(primary_h)
     rows = stats.to_dict("records") if isinstance(stats, pd.DataFrame) else list(stats)
     out = {}
@@ -563,6 +569,8 @@ def rule_weights(rows_x, as_of, ruleset="v1", primary_h=None, rules=None):
     no scored event the weight is the neutral 1.0 and avg_excess_pct is NaN,
     not 0: nothing was measured.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.rule_weights")
     ph = _primary_h(primary_h)
     dates = rows_x["date"].astype(str)
     elig = _flag(rows_x["eligible"])
@@ -595,6 +603,8 @@ def net_trade_stats(rows_x, primary_h=None, rules=None):
     annualisation; it is not part of rule_stats, whose columns are fixed by
     the schema.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.net_trade_stats")
     ph = _primary_h(primary_h)
     dates = rows_x["date"].astype(str)
     elig = _flag(rows_x["eligible"])
@@ -627,6 +637,8 @@ def broker_scores(events_x, as_of):
     A broker code aggregates many unrelated clients; this scores the code's
     observable flow, not any entity behind it.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.broker_scores")
     need = {"date", "ticker", "broker", "side", *X_COLS}
     missing = need - set(events_x.columns)
     if missing:
@@ -786,6 +798,8 @@ def alpha_cases(rows_x, as_of, rules=None):
     The case is chosen by its FUTURE return, so this is hindsight by
     construction; it describes, and never feeds a weight or a status.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.alpha_cases")
     ids = [rule_id for rule_id, _ in _rule_defs(rules)]
     missing = [c for c in (*ALPHA_NEED, *ids) if c not in rows_x.columns]
     if missing:
@@ -857,6 +871,8 @@ def broker_lift(rows_x, cases, as_of):
     Descriptive only. A broker code is a securities firm with many clients,
     not a person, and a lift from a handful of cases is noise.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("broker_learning.broker_lift")
     cases = cases.to_dict("records") if isinstance(cases, pd.DataFrame) else list(cases)
     cases = [c for c in cases if _visible(c)]
     elig = _flag(rows_x["eligible"])

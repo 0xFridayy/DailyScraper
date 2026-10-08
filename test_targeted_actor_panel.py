@@ -25,6 +25,7 @@ import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qsl
+from unittest.mock import patch
 
 for _blocked in ("neobdm_scraper", "playwright", "playwright.sync_api"):
     sys.modules.setdefault(_blocked, None)
@@ -34,6 +35,7 @@ import broker_collect as bc              # noqa: E402
 import broker_learning_db as bldb        # noqa: E402
 import coverage_guard as cg              # noqa: E402
 import inventory_capture as ic           # noqa: E402
+from price_contract import CONTRACT_VERSION, UnsupportedPriceContract  # noqa: E402
 import targeted_actor_db as tdb          # noqa: E402
 import targeted_actor_panel as tap       # noqa: E402
 import targeted_selectors as ts          # noqa: E402
@@ -937,25 +939,21 @@ def test_targeted_data_cannot_enter_a_full_universe_metric_path():
     marked = dict(env["data"], coverage_scope=cg.TARGETED_SELECTOR_UNION)
     for payload in (marked, {"coverage_scope": cg.TARGETED_SELECTOR_UNION, "brokers": {}},
                     dict(env["data"], coverage_scope="ANYTHING_BUT_FULL")):
-        for call in (lambda p: bb.frames_from_payload(p, "AAAA"),
-                     lambda p: bb.ticker_bundle(p, "AAAA", {})):
-            try:
-                call(payload)
-            except bb.TargetedPayloadError as e:
-                assert isinstance(e, bb.PayloadError) and isinstance(e, cg.TargetedCoverageError)
-                continue
-            raise AssertionError("broker_book accepted targeted data")
+        try:
+            bb.frames_from_payload(payload, "AAAA")
+        except bb.TargetedPayloadError as e:
+            assert isinstance(e, bb.PayloadError) and isinstance(e, cg.TargetedCoverageError)
+            continue
+        raise AssertionError("broker_book accepted targeted data")
     # A bare selector union, meta and marks stripped, is refused as well: the
     # absence of a mark is not evidence of full coverage.
     bare = copy.deepcopy(env["data"])
     assert cg.targeted_reason(bare) is None and set(bare["nlot"]) == UNION_B
-    for call in (lambda p: bb.frames_from_payload(p, "AAAA"),
-                 lambda p: bb.ticker_bundle(p, "AAAA", {})):
-        try:
-            call(bare)
-        except bb.CoveragePayloadError as e:
-            assert isinstance(e, bb.PayloadError) and "14 of the 101" in str(e), e
-            continue
+    try:
+        bb.frames_from_payload(bare, "AAAA")
+    except bb.CoveragePayloadError as e:
+        assert isinstance(e, bb.PayloadError) and "14 of the 101" in str(e), e
+    else:
         raise AssertionError("broker_book accepted a bare selector union")
     # ...and so is the truncated 10-of-101 shape of the 2026-09 caches
     ten = {**bare, **{f: dict(sorted(bare[f].items())[:10]) for f in FIELDS}}
@@ -988,11 +986,12 @@ def test_targeted_data_cannot_enter_a_full_universe_metric_path():
         got = dict(bc.iter_cached(None, "daily", raw_dir=tmp, unreadable=bad))
         assert list(got) == ["CCCC"], list(got)                  # the unmarked one, as before
         assert set(bad) == {"AAAA", "BBBB"} and all("TargetedCoverageError" in r for r in bad.values())
-        import broker_learning_run as blr
-        failed = {}
-        items = blr.load_items(["AAAA", "BBBB", "CCCC"], "daily", tmp, False, {}, failed)
-        assert items == [] and set(failed) == {"AAAA", "BBBB", "CCCC"}, failed
-        assert "14 of the 101 universe brokers" in failed["CCCC"], failed["CCCC"]   # unmarked, refused
+        try:
+            bb.frames_from_payload(got["CCCC"], "CCCC")
+        except bb.CoveragePayloadError as e:
+            assert "14 of the 101 universe brokers" in str(e), e
+        else:
+            raise AssertionError("broker_book accepted the unmarked cached selector union")
 
     # (c) the databases refuse each other
     with tmpdir() as tmp:
@@ -1043,6 +1042,67 @@ def test_targeted_data_cannot_enter_a_full_universe_metric_path():
                    "top/bottom 3 by nl5", "profitability", "lift", "broker_scores", "rule_stats"):
         assert needle in text, needle
     print("  ok test_targeted_data_cannot_enter_a_full_universe_metric_path")
+
+
+def test_unmigrated_ticker_bundle_refuses_before_reading_any_coverage_shape():
+    vendor = FakeVendor({"AAAA": handbuilt_market()})
+    env = json.loads(vendor.get(ts.build_query("AAAA", ts.PLAN[1].tokens, SD, ED)).text())
+    bare = env["data"]
+    marked = dict(bare, coverage_scope=cg.TARGETED_SELECTOR_UNION)
+    full = copy.deepcopy(bare)
+    for f in FIELDS:
+        for code in cg.universe_codes():
+            full[f].setdefault(code, [0] * len(full["date"]))
+    payloads, regimes = (marked, bare, full), {"AAAA": []}
+    before = copy.deepcopy((payloads, regimes))
+    with patch.object(bb, "frames_from_payload",
+                      side_effect=AssertionError("ticker_bundle read an unmigrated payload")) as reader:
+        for payload in payloads:
+            try:
+                bb.ticker_bundle(payload, "AAAA", regimes)
+            except UnsupportedPriceContract as e:
+                assert str(e).startswith("broker_book.ticker_bundle:"), e
+                assert e.consumer == "broker_book.ticker_bundle"
+                assert e.status == "UNSUPPORTED" and e.contract_version == CONTRACT_VERSION
+                assert e.as_dict() == {"status": "UNSUPPORTED", "consumer": "broker_book.ticker_bundle",
+                                       "contract_version": CONTRACT_VERSION, "reason": str(e)}
+            else:
+                raise AssertionError("ticker_bundle accepted an unsupported price contract")
+        reader.assert_not_called()
+    assert (payloads, regimes) == before, "contract refusal changed the inputs"
+    print("  ok test_unmigrated_ticker_bundle_refuses_before_reading_any_coverage_shape")
+
+
+def test_unmigrated_learning_loader_refuses_without_cache_or_result_side_effects():
+    import broker_learning_run as blr
+    tickers, regimes = ["AAAA"], {"AAAA": []}
+    failed, empty = {"prior": "failure"}, {"prior": "empty"}
+    before = copy.deepcopy((tickers, regimes, failed, empty))
+    with tmpdir() as tmp:
+        os.makedirs(os.path.join(tmp, "daily"))
+        cache = os.path.join(tmp, "daily", "AAAA.json.gz")
+        contents = b"existing cache bytes must not be read or changed"
+        with open(cache, "wb") as fh:
+            fh.write(contents)
+        paths_before = sorted(glob.glob(os.path.join(tmp, "**", "*"), recursive=True))
+        with patch.object(bc, "iter_cached",
+                          side_effect=AssertionError("load_items read an unmigrated cache")) as reader:
+            try:
+                blr.load_items(tickers, "daily", tmp, False, regimes, failed, empty)
+            except UnsupportedPriceContract as e:
+                assert str(e).startswith("broker_learning_run.load_items:"), e
+                assert e.consumer == "broker_learning_run.load_items"
+                assert e.status == "UNSUPPORTED" and e.contract_version == CONTRACT_VERSION
+                assert e.as_dict() == {"status": "UNSUPPORTED", "consumer": "broker_learning_run.load_items",
+                                       "contract_version": CONTRACT_VERSION, "reason": str(e)}
+            else:
+                raise AssertionError("load_items accepted an unsupported price contract")
+            reader.assert_not_called()
+        assert sorted(glob.glob(os.path.join(tmp, "**", "*"), recursive=True)) == paths_before
+        with open(cache, "rb") as fh:
+            assert fh.read() == contents, "contract refusal changed the cache"
+    assert (tickers, regimes, failed, empty) == before, "contract refusal changed the inputs or results"
+    print("  ok test_unmigrated_learning_loader_refuses_without_cache_or_result_side_effects")
 
 
 # ── 8. hygiene ─────────────────────────────────────────────────────────────

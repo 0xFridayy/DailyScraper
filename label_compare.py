@@ -127,6 +127,8 @@ def add_labels(d, up, down, h):
 
 
 def section_rates(d, up, down, h):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.section_rates")
     print("\n" + "=" * 96)
     print(f"1. THE TWO LABELS over T+1..T+{h}, target +{up:.0%} / stop -{down:.0%}")
     print("=" * 96)
@@ -145,6 +147,8 @@ def section_rates(d, up, down, h):
 
 
 def section_vol(d):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.section_vol")
     print("\n" + "=" * 96)
     print("2. VOLATILITY STRATIFICATION (rv20 quintiles)")
     print("=" * 96)
@@ -166,6 +170,8 @@ def section_vol(d):
 
 
 def section_model(d, h):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.section_model")
     print("\n" + "=" * 96)
     print(f"3. WALK-FORWARD RANKING of P(target before stop within T+1..T+{h})")
     print("=" * 96)
@@ -184,6 +190,8 @@ def section_model(d, h):
 
 
 def section_trade(preds):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("label_compare.section_trade")
     print("\n" + "=" * 96)
     print("4. WOULD IT HAVE PAID -- buy the T+1 open, target or stop or T+h close")
     print("=" * 96)

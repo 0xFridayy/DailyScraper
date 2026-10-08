@@ -15,6 +15,12 @@ import os
 import pandas as pd
 import numpy as np
 import sqlite3
+from datetime import date, timedelta
+from hashlib import sha256
+from pathlib import Path
+from unittest.mock import patch
+
+import price_contract as pc
 
 import build_inventory_db as bidb
 import normalize_market_data as nm
@@ -47,7 +53,95 @@ from foreign_flow_signal_backtest import (
     date_balanced_hit_edge as foreign_date_balanced_hit_edge,
     trade_stats as foreign_trade_stats,
 )
-from regime_gated_momentum import select_threshold
+from regime_gated_momentum import select_threshold, metric_selection_index
+
+
+def _sessions(count, start="2026-01-05"):
+    """Verified IDX sessions for synthetic fixtures, including holiday gaps."""
+    sessions, day = [], date.fromisoformat(start)
+    while len(sessions) < count:
+        if pc.is_idx_session(day):
+            sessions.append(day.isoformat())
+        day += timedelta(days=1)
+    return sessions
+
+
+def _fixture_registry(px, dates, boundary=None):
+    """Reviewed coverage and optional reference belong only to these test bars."""
+    doc = json.loads(Path(__file__).with_name("corporate_actions.json").read_text())
+    event = dict(doc["events"][0]) if boundary else None
+    doc["registry_version"] = "synthetic-pipeline-fixture.v1"
+    doc["events"] = []
+    doc["reviewed_coverage"] = [{"venue": "IDX", "market_scope": ["REGULAR"],
+                                "tickers": sorted(px.ticker.unique()),
+                                "from": min(dates), "through": max(dates),
+                                "evidence_refs": ["SYNTHETIC_PIPELINE_FIXTURE_ONLY"]}]
+    doc["coverage_notes"] = "Synthetic test bars only; no production coverage claim."
+    if boundary:
+        ticker, session, reference = boundary
+        event.update(ticker=ticker, effective_session=session,
+                     event_id=f"SYNTHETIC:{ticker}:{session}", reference_price=str(reference),
+                     market_scope=["REGULAR"],
+                     source_document_id="SYNTHETIC_PIPELINE_REFERENCE_ONLY",
+                     source={"author": "Synthetic pipeline fixture", "published_on": session,
+                             "retrieval_medium": "Explicit reconstructed test fixture",
+                             "url": "https://example.invalid/synthetic-pipeline-reference"},
+                     evidence_refs={"fixture": "SYNTHETIC_PIPELINE_FIXTURE_ONLY",
+                                    "fixture_sha256": sha256(f"{ticker}:{session}:{reference}".encode()).hexdigest(),
+                                    "direct_exchange_original_sha256": None},
+                     observed_at={"date": session, "precision": "DAY", "timezone": "Asia/Jakarta"},
+                     verified_at={"date": session, "precision": "DAY", "timezone": "Asia/Jakarta"},
+                     enrolled_at={"timestamp": session + "T00:00:00+00:00", "precision": "INSTANT", "timezone": "UTC"},
+                     notes="Synthetic reset for regression testing only.")
+        doc["events"] = [event]
+    return pc.parse_registry(doc)
+
+
+def _flat_test_bars(px):
+    """Supply stated synthetic flat opens and volume for close-only fixtures."""
+    px = px.copy()
+    for column in ("open", "high", "low"):
+        if column not in px:
+            px[column] = px["close"]
+    if "volume" not in px:
+        px["volume"] = 1000
+    return px
+
+
+def _fixture_forward(px, dates, *, registry=None, **kwargs):
+    registry = registry or _fixture_registry(px, dates)
+    out = add_forward_returns(px, dates, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    out.attrs["synthetic_test_registry"] = registry
+    return out
+
+
+def _fixture_lag(px, dates, *, registry=None, **kwargs):
+    registry = registry or px.attrs.get("synthetic_test_registry") or _fixture_registry(px, dates)
+    out = add_lagged_returns(px, dates, registry=registry, representation=pc.RAW_ACTUAL, **kwargs)
+    out.attrs["synthetic_test_registry"] = registry
+    return out
+
+
+def _fixture_index(px):
+    return _index_price_history(px, registry=px.attrs["synthetic_test_registry"])
+
+
+def _fixture_trade(by_ticker, by_date, ticker, decision, hold_days, tp, sl):
+    return simulate_trade(by_ticker, by_date, ticker, decision, hold_days, tp, sl,
+                          registry=by_ticker[ticker].attrs["synthetic_test_registry"])
+
+
+def _assert_route_refusal(consumer, call):
+    try:
+        call()
+    except pc.UnsupportedPriceContract as exc:
+        assert exc.consumer == consumer
+        assert exc.status == "UNSUPPORTED" and exc.contract_version == pc.CONTRACT_VERSION
+        assert str(exc).startswith(consumer + ":")
+        assert exc.as_dict() == {"consumer": consumer, "status": "UNSUPPORTED",
+                                 "contract_version": pc.CONTRACT_VERSION, "reason": str(exc)}
+    else:
+        raise AssertionError(f"{consumer} accepted an unsupported price contract")
 
 
 def test_broker_day_aggregates_basic():
@@ -104,20 +198,21 @@ def test_price_features_no_leakage():
     does via clean_panel(open_anchored=True), rather than handing
     _price_features_and_target raw OHLC and letting it derive anything.
     """
-    import price_audit as pa
-    dates = [f"2026-01-{d:02d}" for d in range(1, 11)]
+    dates = _sessions(10)
     px = pd.DataFrame({
         "date": dates,
-        "ticker": ["AAA"] * 10,
+        "ticker": ["AAAA"] * 10,
         "open":  [100, 102, 98, 106, 97, 111, 91, 121, 81, 131],
         "high":  [101, 103, 100, 107, 99, 112, 92, 122, 82, 132],
         "low":   [99, 100, 97, 104, 96, 109, 89, 119, 79, 129],
         "close": [100, 101, 99, 105, 98, 110, 90, 120, 80, 130],
         "volume": [1000] * 10,
     })
-    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
-    out = _price_features_and_target(px)
-    row = out[out["date"] == "2026-01-02"].iloc[0]
+    px = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
+    px = _fixture_lag(px, dates, lags=(1, 5))
+    with patch("price_contract_frame.default_registry", return_value=px.attrs["synthetic_test_registry"]):
+        out = _price_features_and_target(px)
+    row = out[out["date"] == dates[1]].iloc[0]
 
     # momentum_1d on day d still uses ONLY past+current close, both known as of
     # day d's close.
@@ -137,7 +232,7 @@ def test_price_features_no_leakage():
 
     # volume_ratio must use a trailing mean that EXCLUDES today.
     defined = out.dropna(subset=["volume_ratio"])
-    assert defined["date"].min() == "2026-01-06", (
+    assert defined["date"].min() == dates[5], (
         "volume_ratio should first be defined on day 6, using days 1-5 as the "
         "trailing window (shift(1) before rolling(5) excludes day 6's own "
         "volume) — if this drifts to day 5 or earlier, today's own volume is "
@@ -152,17 +247,16 @@ def _oa_frame(rows):
 
 
 def test_open_anchored_labels_match_hand_computed_values():
-    import price_audit as pa
-    dates = [f"2026-01-{d:02d}" for d in range(1, 6)]
+    dates = _sessions(5)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 5,
+        "date": dates, "ticker": ["AAAA"] * 5,
         "open":  [100.0, 102.0, 104.0, 106.0, 108.0],
         "high":  [110.0, 112.0, 114.0, 116.0, 118.0],
         "low":   [95.0, 97.0, 99.0, 101.0, 103.0],
         "close": [101.0, 103.0, 105.0, 107.0, 109.0],
         "volume": [1000] * 5,
     })
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
     r0 = out.iloc[0]
     # decision day 1: enter open(day2)=102, exit open(day3)=104
     assert abs(r0["fwd_oo_1"] - (104 / 102 - 1)) < 1e-12
@@ -178,17 +272,16 @@ def test_open_anchored_labels_match_hand_computed_values():
 def test_multiplicative_composition_not_additive():
     """1 + fwd_1 == (1+gap_1)*(1+fwd_oc_1). The ADDITIVE form is wrong and is
     asserted wrong here so the distinction is pinned by test, not comment."""
-    import price_audit as pa
-    dates = [f"2026-01-{d:02d}" for d in range(1, 6)]
+    dates = _sessions(5)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 5,
+        "date": dates, "ticker": ["AAAA"] * 5,
         "open":  [100.0, 108.0, 104.0, 106.0, 108.0],
         "high":  [115.0, 118.0, 114.0, 116.0, 118.0],
         "low":   [95.0, 97.0, 99.0, 101.0, 103.0],
         "close": [101.0, 103.0, 105.0, 107.0, 109.0],
         "volume": [1000] * 5,
     })
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
     d = out.dropna(subset=["fwd_1", "gap_1", "fwd_oc_1"])
     assert len(d) > 0
     lhs = 1 + d["fwd_1"]
@@ -202,47 +295,42 @@ def test_multiplicative_composition_not_additive():
     print("test_multiplicative_composition_not_additive passed")
 
 
-def test_invalid_open_anchor_yields_nan_even_when_close_passes():
-    """The FAST 2025-10-14 case: prev_close 580, open 870 (+50%), close 720.
-
-    Close-to-close is +24.1%, inside the 25% band, so _step_valid PASSES — yet
-    an entry anchored on 870 is fabricated. Every target anchored on that open
-    must be NaN, while the ROW itself is kept (never deleted).
-    """
-    import price_audit as pa
-    dates = [f"2026-01-{d:02d}" for d in range(1, 5)]
+def test_out_of_band_open_withholds_the_whole_price_path():
+    """An out-of-band open rejects the complete observed bar, including its close label."""
+    dates = _sessions(4)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 4,
+        "date": dates, "ticker": ["AAAA"] * 4,
         "open":  [575.0, 870.0, 725.0, 730.0],   # day2 open is +50% on prev close
         "high":  [585.0, 880.0, 735.0, 740.0],
         "low":   [570.0, 715.0, 715.0, 720.0],
         "close": [580.0, 720.0, 730.0, 735.0],   # 580 -> 720 = +24.1%, in band
         "volume": [1000] * 4,
     })
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
     day1 = out.iloc[0]
-    assert pd.notna(day1["fwd_1"]), "close-anchored label passes the band, as measured"
+    assert pd.isna(day1["fwd_1"]), "the out-of-band bar withholds the complete price path"
+    assert day1["fwd_1_reason"] == "PRICE_PATH_UNAVAILABLE"
+    assert not out.iloc[1]["price_step_admissible"]
     assert pd.isna(day1["fwd_oo_1"]), "entry anchored on an out-of-band open must be NaN"
     assert pd.isna(day1["fwd_oc_1"])
     assert pd.isna(day1["gap_1"])
     assert len(out) == 4, "rows are kept, never deleted"
-    print("test_invalid_open_anchor_yields_nan_even_when_close_passes passed")
+    print("test_out_of_band_open_withholds_the_whole_price_path passed")
 
 
 def test_open_outside_high_low_or_nonpositive_is_invalid():
-    import price_audit as pa
-    dates = [f"2026-01-{d:02d}" for d in range(1, 4)]
+    dates = _sessions(3)
     for label, opens in [("open>high", [100.0, 130.0, 104.0]),
                           ("open<=0", [100.0, 0.0, 104.0])]:
         px = _oa_frame({
-            "date": dates, "ticker": ["AAA"] * 3,
+            "date": dates, "ticker": ["AAAA"] * 3,
             "open": opens,
             "high": [110.0, 112.0, 114.0],
             "low": [95.0, 97.0, 99.0],
             "close": [101.0, 103.0, 105.0],
             "volume": [1000] * 3,
         })
-        out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+        out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
         assert pd.isna(out.iloc[0]["fwd_oc_1"]), f"{label} must invalidate the anchor"
         assert pd.isna(out.iloc[0]["gap_1"]), f"{label} must invalidate the anchor"
     print("test_open_outside_high_low_or_nonpositive_is_invalid passed")
@@ -257,121 +345,108 @@ def test_corrupt_close_t_plus_1_invalidates_fwd_oc_1():
     +80% on close(T)=100 -- outside the ARA band -- so `_step_valid` at T is
     False and must now propagate into fwd_oc_1.
     """
-    import price_audit as pa
-    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+    dates = _sessions(3)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 3,
+        "date": dates, "ticker": ["AAAA"] * 3,
         "open":  [100.0, 101.0, 182.0],
         "high":  [101.0, 182.0, 186.0],
         "low":   [99.0, 100.0, 181.0],
         "close": [100.0, 180.0, 183.0],  # close(T+1)=180 is +80% vs close(T)=100
         "volume": [1000] * 3,
     })
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
     assert pd.isna(out.iloc[0]["fwd_oc_1"]), (
         "fwd_oc_1 must be invalidated by a corrupt close(T+1) exit price"
     )
     print("test_corrupt_close_t_plus_1_invalidates_fwd_oc_1 passed")
 
 
-def test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass():
-    """PR #36 review: a corrupt close(T+1) must invalidate fwd_oo_1 even when
-    BOTH individual opens pass their own local previous-close check.
-
-    open(T+1)=101 is fine against close(T)=100 (+1%). open(T+2)=182 is ALSO
-    individually fine against close(T+1)=180 (+1.1%) -- but 180 itself is
-    +80% off close(T)=100, which neither open-vs-immediate-prior-close check
-    can see. The old code checked close(T+1)->close(T+2) (180->183, which
-    looks locally sane) instead of close(T)->close(T+1) (100->180, which does
-    not), so this corruption slipped through undetected.
-    """
-    import price_audit as pa
-    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+def test_corrupt_bar_never_certifies_the_successor_open():
+    """A locally plausible successor open cannot use a rejected close as its reference."""
+    dates = _sessions(3)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 3,
+        "date": dates, "ticker": ["AAAA"] * 3,
         "open":  [100.0, 101.0, 182.0],
         "high":  [101.0, 182.0, 186.0],
         "low":   [99.0, 100.0, 181.0],
         "close": [100.0, 180.0, 183.0],
         "volume": [1000] * 3,
     })
-    open_valid = pa._open_anchor_valid(px, px.groupby("ticker"))
-    assert bool(open_valid.iloc[1]), "open(T+1) must pass its own local check"
-    assert bool(open_valid.iloc[2]), "open(T+2) must ALSO pass its own local check (vs the corrupt close(T+1))"
-
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
-    assert pd.isna(out.iloc[0]["fwd_oo_1"]), (
-        "fwd_oo_1 must be invalidated by corrupt close(T+1) even though both "
-        "individual opens independently pass"
-    )
-    print("test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass passed")
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
+    assert not out.iloc[1]["entry_open_admissible"], "the full corrupt bar must reject its open"
+    assert out.iloc[2]["limit_reference_status"] == "UNRESOLVED"
+    assert out.iloc[2]["limit_unresolved_reason"] == "UNTRUSTED_PREDECESSOR"
+    assert not out.iloc[2]["entry_open_admissible"], "a rejected close cannot certify its successor open"
+    assert pd.isna(out.iloc[0]["fwd_oo_1"])
+    assert out.iloc[0]["fwd_oo_1_reason"] == "PRICE_PATH_UNAVAILABLE"
+    print("test_corrupt_bar_never_certifies_the_successor_open passed")
 
 
-def test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1():
-    """PR #36 review: a corrupt close(T+2) — which occurs AFTER fwd_oo_1's
-    open(T+2) exit and is never the reference for any open in this window —
-    must NOT invalidate fwd_oo_1. Exit validity depends on open(T+2) against
-    close(T+1), never on close(T+2) itself."""
-    import price_audit as pa
-    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+def test_out_of_band_exit_bar_withholds_fwd_oo_1():
+    """The exit session must have an admitted actual bar before its open can be used."""
+    dates = _sessions(3)
     px = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 3,
+        "date": dates, "ticker": ["AAAA"] * 3,
         "open":  [100.0, 101.0, 106.0],
         "high":  [101.0, 107.0, 999.0],
         "low":   [99.0, 100.0, 106.0],
         "close": [100.0, 105.0, 999.0],  # close(T+2)=999 is wildly corrupt
         "volume": [1000] * 3,
     })
-    out = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
+    out = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
     row0 = out.iloc[0]
-    assert pd.notna(row0["fwd_oo_1"]), (
-        "a corrupt close strictly after the open(T+1+h) exit must not "
-        "invalidate fwd_oo_1"
-    )
-    expected = 106.0 / 101.0 - 1
-    assert abs(row0["fwd_oo_1"] - expected) < 1e-9
-    print("test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1 passed")
+    assert pd.isna(row0["fwd_oo_1"])
+    assert row0["fwd_oo_1_reason"] == "PRICE_PATH_UNAVAILABLE"
+    assert out.iloc[2]["limit_admission_status"] == "OUT_OF_BAND"
+    assert not out.iloc[2]["entry_open_admissible"]
+    # A rejected later close does not invalidate an otherwise admitted exit open.
+    bounded_exit = px.copy()
+    bounded_exit.loc[2, "high"] = 107.0
+    independent = _fixture_forward(bounded_exit, dates, horizons=(1,), open_anchored=True)
+    assert independent.iloc[2]["domain_violation"]
+    assert independent.iloc[2]["entry_open_admissible"]
+    assert abs(independent.iloc[0]["fwd_oo_1"] - (106.0 / 101.0 - 1)) < 1e-9
+    print("test_out_of_band_exit_bar_withholds_fwd_oo_1 passed")
 
 
-def test_close_window_validity_fix_holds_for_h_greater_than_1():
-    """PR #36 review requirement 4: the same two properties hold at h=2 —
-    corrupt close(T+1) invalidates fwd_oo_2/fwd_oc_2, but corrupt close(T+3)
-    (the exit session's own close, strictly after open(T+3)'s exit) does not.
-    """
-    import price_audit as pa
-    dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+def test_invalid_entry_and_exit_bars_withhold_multi_session_labels():
+    """Rejected entry and exit bars also withhold labels spanning multiple sessions."""
+    dates = _sessions(4)
 
     corrupt_entry_leg = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 4,
+        "date": dates, "ticker": ["AAAA"] * 4,
         "open":  [100.0, 101.0, 182.0, 186.0],
         "high":  [101.0, 182.0, 187.0, 191.0],
         "low":   [99.0, 100.0, 181.0, 184.0],
         "close": [100.0, 180.0, 185.0, 188.0],  # close(T+1)=180 is +80% vs close(T)=100
         "volume": [1000] * 4,
     })
-    out_a = pa.add_forward_returns(corrupt_entry_leg, dates, horizons=(2,), open_anchored=True)
+    out_a = _fixture_forward(corrupt_entry_leg, dates, horizons=(2,), open_anchored=True)
     row_a = out_a.iloc[0]
     assert pd.isna(row_a["fwd_oo_2"]), "corrupt close(T+1) must invalidate fwd_oo_2"
     assert pd.isna(row_a["fwd_oc_2"]), "corrupt close(T+1) must invalidate fwd_oc_2"
 
     corrupt_after_exit = _oa_frame({
-        "date": dates, "ticker": ["AAA"] * 4,
+        "date": dates, "ticker": ["AAAA"] * 4,
         "open":  [100.0, 101.0, 106.0, 111.0],
         "high":  [101.0, 107.0, 112.0, 999.0],
         "low":   [99.0, 100.0, 105.0, 111.0],
         "close": [100.0, 105.0, 110.0, 999.0],  # close(T+3)=999: the exit session's own close
         "volume": [1000] * 4,
     })
-    out_b = pa.add_forward_returns(corrupt_after_exit, dates, horizons=(2,), open_anchored=True)
+    out_b = _fixture_forward(corrupt_after_exit, dates, horizons=(2,), open_anchored=True)
     row_b = out_b.iloc[0]
-    assert pd.notna(row_b["fwd_oo_2"]), (
-        "corrupt close(T+3), the exit session's own close, must not "
-        "invalidate fwd_oo_2 (exit validity depends on open(T+3) vs "
-        "close(T+2), never on close(T+3) itself)"
-    )
-    expected = 111.0 / 101.0 - 1
-    assert abs(row_b["fwd_oo_2"] - expected) < 1e-9
-    print("test_close_window_validity_fix_holds_for_h_greater_than_1 passed")
+    assert pd.isna(row_b["fwd_oo_2"])
+    assert row_b["fwd_oo_2_reason"] == "PRICE_PATH_UNAVAILABLE"
+    assert out_b.iloc[3]["limit_admission_status"] == "OUT_OF_BAND"
+    assert not out_b.iloc[3]["entry_open_admissible"]
+    bounded_exit = corrupt_after_exit.copy()
+    bounded_exit.loc[3, "high"] = 112.0
+    independent = _fixture_forward(bounded_exit, dates, horizons=(2,), open_anchored=True)
+    assert independent.iloc[3]["domain_violation"]
+    assert independent.iloc[3]["entry_open_admissible"]
+    assert abs(independent.iloc[0]["fwd_oo_2"] - (111.0 / 101.0 - 1)) < 1e-9
+    print("test_invalid_entry_and_exit_bars_withhold_multi_session_labels passed")
 
 
 # ── Experiment #1F Gate A ─────────────────────
@@ -389,53 +464,24 @@ def _gate_ohlc_frame(ticker, dates, base):
     })
 
 
-def test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined():
-    """The detector must see the FULL harvest, not just the approved universe.
-
-    cross_ticker_dup is CROSS-SECTIONAL: it finds one stock's OHLCV copied onto
-    another. If the harvest were filtered to the approved names first, an
-    approved ticker cloned against a ticker OUTSIDE the universe would look
-    perfectly unique -- the other half of the pair having been thrown away --
-    and the contamination would sail straight into the panel.
-
-    The counter-check at the end is the point of this test: it proves the
-    subset-only path really does miss it, so this is a regression guard rather
-    than a tautology.
-    """
-    import experiment_1f_universe_gate as gate
-    import price_audit as pa
-
-    dates = ["2026-01-01", "2026-01-02", "2026-01-03"]
+def test_1f_panel_refuses_while_full_harvest_detection_sees_the_clone():
+    """Detection sees excluded names; the unmigrated economic panel refuses before work."""
+    dates = _sessions(3)
     approved = _gate_ohlc_frame("AAAA", dates, 100.0)
     excluded = _gate_ohlc_frame("ZZZZ", dates, 500.0)
-    # ZZZZ's middle row is a byte-identical clone of AAAA's middle row.
-    clone_src = approved[approved["date"] == "2026-01-02"].iloc[0]
-    target = excluded.index[excluded["date"] == "2026-01-02"][0]
-    for col in ("open", "high", "low", "close", "volume"):
-        excluded.loc[target, col] = clone_src[col]
+    excluded.loc[1, OHLCV] = approved.loc[1, OHLCV]
     full = pd.concat([approved, excluded], ignore_index=True)
-
-    panel, flagged, universe_rows = gate.build_validated_panel(
-        full, ["AAAA"], dates, horizons=(1,), lags=())
-
-    flagged_aaaa = flagged[(flagged["ticker"] == "AAAA")
-                           & (flagged["date"] == "2026-01-02")]
-    assert bool(flagged_aaaa["cross_ticker_dup"].iloc[0]), (
-        "the approved ticker's cloned row must be flagged cross_ticker_dup when "
-        "the detector sees the full cross-section")
-    assert not ((panel["ticker"] == "AAAA") & (panel["date"] == "2026-01-02")).any(), (
-        "the cloned approved row must be quarantined out of the model panel")
-    assert (panel["ticker"] == "AAAA").all(), (
-        "an out-of-universe ticker must never enter the #1F model panel")
-
-    # Counter-check: had detect() run on the approved subset alone, the clone
-    # would have been invisible. If this ever stops holding the test is no
-    # longer proving anything.
-    subset_flagged = pa.detect(approved)
-    assert not subset_flagged["cross_ticker_dup"].any(), (
-        "counter-check failed: subset-only detection was expected to miss the "
-        "cross-ticker clone")
-    print("test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined passed")
+    registry = _fixture_registry(full, dates)
+    flagged = detect(full, registry=registry, representation=pc.RAW_ACTUAL)
+    assert flagged.loc[(flagged.ticker == "AAAA") & (flagged.date == dates[1]), "cross_ticker_dup"].item()
+    assert not detect(approved, registry=registry, representation=pc.RAW_ACTUAL).cross_ticker_dup.any()
+    before = full.copy(deep=True)
+    with patch.object(gate, "detect", side_effect=AssertionError("unsupported panel read prices")) as detector:
+        _assert_route_refusal("experiment_1f_universe_gate.build_validated_panel",
+                              lambda: gate.build_validated_panel(full, ["AAAA"], dates, horizons=(1,), lags=()))
+        detector.assert_not_called()
+    pd.testing.assert_frame_equal(full, before)
+    print("test_1f_panel_refuses_while_full_harvest_detection_sees_the_clone passed")
 
 
 def test_1f_universe_validation_rejects_excel_type_coercion():
@@ -645,12 +691,8 @@ def test_1f_input_manifest_never_auto_establishes():
     print("test_1f_input_manifest_never_auto_establishes passed")
 
 
-def test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately():
-    """A broker that did not trade at all is zero-sided, not one-sided.
-
-    Also pins the consequence the audit exists to surface: those rows take
-    frozen #1E's netval/close fallback rather than the exact split path.
-    """
+def test_1f_legacy_net_lot_recovery_refuses_without_mutating_inputs():
+    """Frozen net-lot recovery refuses a new run while leaving broker observations intact."""
     import experiment_1f_universe_gate as gate
 
     broker = pd.DataFrame({
@@ -668,16 +710,12 @@ def test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately():
     })
     panel = pd.DataFrame({"date": ["2026-01-01"], "ticker": ["AAAA"], "close": [1000.0]})
 
-    report = gate.audit_net_lot_recovery(broker, panel)
-    assert report["rows_audited"] == 3
-    assert report["one_sided_rows"] == 1, (
-        f"exactly one XOR one-sided row expected, got {report['one_sided_rows']}")
-    assert report["zero_sided_rows"] == 1, (
-        f"exactly one zero-sided row expected, got {report['zero_sided_rows']}")
-    assert report["exact_split_path_rows"] == 1, (
-        "only the two-sided row has both averages defined")
-    assert report["fallback_path_rows"] == 2
-    print("test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately passed")
+    before_broker, before_panel = broker.copy(deep=True), panel.copy(deep=True)
+    _assert_route_refusal("ml_v2_experiment_1._historical_net_lots",
+                          lambda: gate.audit_net_lot_recovery(broker, panel))
+    pd.testing.assert_frame_equal(broker, before_broker)
+    pd.testing.assert_frame_equal(panel, before_panel)
+    print("test_1f_legacy_net_lot_recovery_refuses_without_mutating_inputs passed")
 
 
 def test_1f_structural_integrity_is_a_gate_not_a_report():
@@ -781,45 +819,22 @@ def test_legacy_experiment1_digest_is_frozen():
 
 
 def test_target_refuses_to_silently_use_the_close_contract():
-    """fwd_oo_1 absent must RAISE, never quietly fall back to anything else —
-    regardless of which raw OHLC columns happen to be present.
-
-    PR #36 hardening removed the raw-`open` fallback entirely: an earlier
-    version accepted a bare `open` column and reconstructed
-    open(T+1)->open(T+2) directly, unguarded by open-anchor validity, the
-    ARA/ARB band, or the quarantine/contiguity checks that
-    add_forward_returns(open_anchored=True) applies — the same silent-failure
-    class as build_experiment_panel() once forgetting open_anchored=True.
-    fwd_oo_1 is now the ONLY accepted source of `target`, so both a frame
-    missing `open` entirely AND a frame carrying full raw OHLC but no
-    fwd_oo_1 must raise identically.
-    """
-    no_open_no_fwd_oo_1 = pd.DataFrame({
-        "date": [f"2026-01-{d:02d}" for d in range(1, 6)],
-        "ticker": ["AAA"] * 5,
-        "close": [100, 101, 99, 105, 98],
-        "volume": [1000] * 5,
-    })
-    raw_ohlc_but_no_fwd_oo_1 = pd.DataFrame({
-        "date": [f"2026-01-{d:02d}" for d in range(1, 6)],
-        "ticker": ["AAA"] * 5,
-        "open":  [100, 102, 98, 106, 97],
-        "high":  [101, 103, 100, 107, 99],
-        "low":   [99, 100, 97, 104, 96],
-        "close": [100, 101, 99, 105, 98],
-        "volume": [1000] * 5,
-    })
-    for label, px in (
-        ("no open, no fwd_oo_1", no_open_no_fwd_oo_1),
-        ("full raw OHLC present, but no fwd_oo_1", raw_ohlc_but_no_fwd_oo_1),
-    ):
-        try:
-            _price_features_and_target(px)
-            assert False, f"{label}: must refuse, never derive target from raw OHLC"
-        except ValueError as e:
-            assert "fwd_oo_1" in str(e), (
-                f"{label}: error must name fwd_oo_1 as the only accepted source"
-            )
+    """Uncertified raw OHLC and a certified close-only label cannot become targets."""
+    dates = _sessions(6)
+    raw = _gate_ohlc_frame("AAAA", dates, 100.0)
+    certified_close = _fixture_lag(_fixture_forward(raw, dates, horizons=(1,)), dates, lags=(1, 5))
+    for px, expected in ((raw.drop(columns="open"), "Missing/stale corporate-action frame identity"),
+                         (raw, "Missing/stale corporate-action frame identity"),
+                         (certified_close, "Missing value-bound price/label certificate")):
+        before = px.copy(deep=True)
+        with patch("price_contract_frame.default_registry", return_value=certified_close.attrs["synthetic_test_registry"]):
+            try:
+                _price_features_and_target(px)
+            except pc.UnsupportedPriceContract as exc:
+                assert exc.consumer is None and str(exc) == expected
+            else:
+                raise AssertionError("uncertified or close-only prices became executable targets")
+        pd.testing.assert_frame_equal(px, before)
     print("test_target_refuses_to_silently_use_the_close_contract passed")
 
 
@@ -900,7 +915,7 @@ def test_ml_v2_feature_sets_keep_the_same_price_controls():
     print("test_ml_v2_feature_sets_keep_the_same_price_controls passed")
 
 
-def test_broker_identity_flows_and_observable_inventory_use_net_lots():
+def test_unmigrated_broker_identity_and_lot_recovery_refuse_without_mutation():
     dates = [f"2026-01-{day:02d}" for day in range(1, 22)]
     px = pd.DataFrame({
         "ticker": ["AAA"] * len(dates), "date": dates,
@@ -916,29 +931,13 @@ def test_broker_identity_flows_and_observable_inventory_use_net_lots():
                 "netval": lots * 100.0 * 100.0 / 1e9, "close": 100.0,
             })
     bf = pd.DataFrame(rows)
-    out, flow, inventory = build_broker_identity_features(px, bf)
-    last = out.iloc[-1]
-    assert len(flow) == 2 * len(FLOW_WINDOWS)
-    assert len(inventory) == 2
-    assert abs(last["broker_AK_flow_1d"] - 0.10) < 1e-12
-    assert abs(last["broker_AK_flow_3d"] - 0.10) < 1e-12
-    assert abs(last["broker_BK_flow_20d"] + 0.05) < 1e-12
-    assert abs(last["broker_AK_observable_inventory"] - 2.10) < 1e-12
-    assert abs(last["broker_BK_observable_inventory"] + 1.05) < 1e-12
-
-    # A clean-panel gap restarts cumulative observable inventory rather than
-    # assuming the missing interval carried zero flow.
-    gapped = px.copy()
-    gapped.loc[10, "lag_1"] = np.nan
-    reset, _, _ = build_broker_identity_features(gapped, bf)
-    assert abs(reset.iloc[-1]["broker_AK_observable_inventory"] - 1.10) < 1e-12
-
-    live = pd.DataFrame([{
-        "bval": 10 * 100 * 100 / 1e9, "sval": 2 * 100 * 100 / 1e9,
-        "bavg": 100.0, "savg": 100.0, "netval": 0.0, "close": 100.0,
-    }])
-    assert abs(_historical_net_lots(live).iloc[0]["net_lots"] - 8.0) < 1e-12
-    print("test_broker_identity_flows_and_observable_inventory_use_net_lots passed")
+    before_px, before_bf = px.copy(deep=True), bf.copy(deep=True)
+    _assert_route_refusal("ml_v2_experiment_1.build_broker_identity_features",
+                          lambda: build_broker_identity_features(px, bf))
+    _assert_route_refusal("ml_v2_experiment_1._historical_net_lots", lambda: _historical_net_lots(bf))
+    pd.testing.assert_frame_equal(px, before_px)
+    pd.testing.assert_frame_equal(bf, before_bf)
+    print("test_unmigrated_broker_identity_and_lot_recovery_refuse_without_mutation passed")
 
 
 def test_ml_v2_walk_forward_splits_are_strictly_chronological():
@@ -970,7 +969,10 @@ def test_ml_v2_robustness_pairs_predictions_within_date():
             base = {"ticker": f"T{i}", "date": date, "target": target, "cycle": 1}
             rows_b.append({**base, "prediction": float(4 - i)})
             rows_c.append({**base, "prediction": float(i)})
-    paired = paired_date_differences(pd.DataFrame(rows_b), pd.DataFrame(rows_c))
+    from corporate_action_test_support import assert_unmigrated, frozen_reviewed_numeric_function
+    assert_unmigrated("ml_v2_experiment_1_robustness.paired_date_differences")
+    legacy = frozen_reviewed_numeric_function("ml_v2_experiment_1_robustness", "paired_date_differences")
+    paired = legacy(pd.DataFrame(rows_b), pd.DataFrame(rows_c))
     assert len(paired) == 2
     assert (paired["top_hit_delta"] == 1.0).all()
     assert (paired["return_edge_delta"] > 0).all()
@@ -1090,13 +1092,22 @@ def test_regime_threshold_selection_uses_daily_edge_and_minimum_dates():
         {"thresh": 0.03, "daily_hit_edge": 0.03, "hit_edge": 0.50,
          "n_signal_days": 30},
     ])
-    winner, reliable = select_threshold(search, min_signal_days=20)
+    index, reliable = metric_selection_index(
+        search[["daily_hit_edge", "hit_edge"]].to_numpy(), search["n_signal_days"].to_numpy(), 20)
+    winner = search.iloc[index]
     assert winner["thresh"] == 0.02
     assert reliable is True
 
-    low_n_winner, reliable = select_threshold(search.iloc[[0]], min_signal_days=20)
+    sparse = search.iloc[[0]]
+    index, reliable = metric_selection_index(
+        sparse[["daily_hit_edge", "hit_edge"]].to_numpy(), sparse["n_signal_days"].to_numpy(), 20)
+    low_n_winner = sparse.iloc[index]
     assert low_n_winner["thresh"] == 0.01
     assert reliable is False
+    before = search.copy(deep=True)
+    _assert_route_refusal("regime_gated_momentum.select_threshold",
+                          lambda: select_threshold(search, min_signal_days=20))
+    pd.testing.assert_frame_equal(search, before)
     print("test_regime_threshold_selection_uses_daily_edge_and_minimum_dates passed")
 
 
@@ -1217,208 +1228,183 @@ def test_forward_returns_never_bridge_a_removed_row():
     # row" is d4 - three days and a contamination-sized jump away. A plain
     # shift(-1) would report that as a real +354% next-day return and feed it
     # in as a training label.
+    dates = _sessions(5)
     px = pd.DataFrame({
-        "ticker": ["A"] * 4,
-        "date": ["d1", "d2", "d4", "d5"],
+        "ticker": ["AAAA"] * 4,
+        "date": [dates[i] for i in (0, 1, 3, 4)],
         "close": [100.0, 110.0, 500.0, 505.0],
     })
-    out = add_forward_returns(px, ["d1", "d2", "d3", "d4", "d5"], horizons=(1,))
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[3], 500))
+    out = _fixture_forward(px, dates, horizons=(1,), registry=registry)
     by_date = out.set_index("date")["fwd_1"]
-    assert abs(by_date["d1"] - 0.10) < 1e-9, "contiguous row must still compute"
-    assert np.isnan(by_date["d2"]), "d2->d4 spans the removed d3 and must be NaN"
-    assert abs(by_date["d4"] - 0.01) < 1e-9, "contiguity resumes after the hole"
-    assert np.isnan(by_date["d5"]), "last row has no next row"
+    assert abs(by_date[dates[0]] - 0.10) < 1e-9, "contiguous row must still compute"
+    assert np.isnan(by_date[dates[1]]), "d2->d4 spans the removed d3 and must be NaN"
+    assert abs(by_date[dates[3]] - 0.01) < 1e-9, "contiguity resumes after the hole"
+    assert np.isnan(by_date[dates[4]]), "last row has no next row"
     print("test_forward_returns_never_bridge_a_removed_row passed")
 
 
 def test_lagged_returns_guarded_the_same_way():
     # Same hole, read backwards: d4's previous surviving row is d2, so a
     # momentum feature there would be fabricated too.
+    dates = _sessions(5)
     px = pd.DataFrame({
-        "ticker": ["A"] * 4,
-        "date": ["d1", "d2", "d4", "d5"],
+        "ticker": ["AAAA"] * 4,
+        "date": [dates[i] for i in (0, 1, 3, 4)],
         "close": [100.0, 110.0, 500.0, 505.0],
     })
-    out = add_lagged_returns(px, ["d1", "d2", "d3", "d4", "d5"], lags=(1,))
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[3], 500))
+    out = _fixture_lag(px, dates, lags=(1,), registry=registry)
     by_date = out.set_index("date")["lag_1"]
-    assert np.isnan(by_date["d1"]), "first row has no previous row"
-    assert abs(by_date["d2"] - 0.10) < 1e-9
-    assert np.isnan(by_date["d4"]), "d2->d4 spans the removed d3 and must be NaN"
-    assert abs(by_date["d5"] - 0.01) < 1e-9
+    assert np.isnan(by_date[dates[0]]), "first row has no previous row"
+    assert abs(by_date[dates[1]] - 0.10) < 1e-9
+    assert np.isnan(by_date[dates[3]]), "d2->d4 spans the removed d3 and must be NaN"
+    assert abs(by_date[dates[4]] - 0.01) < 1e-9
     print("test_lagged_returns_guarded_the_same_way passed")
 
 
 def test_extreme_windows_share_the_contiguity_mask():
     # max_h / mdd_h roll over the same h rows the endpoint spans, so a window
     # that bridges a hole must be dropped, not just the endpoint return.
+    dates = _sessions(5)
     px = pd.DataFrame({
-        "ticker": ["A"] * 4,
-        "date": ["d1", "d2", "d4", "d5"],
+        "ticker": ["AAAA"] * 4,
+        "date": [dates[i] for i in (0, 1, 3, 4)],
         "close": [100.0, 110.0, 500.0, 505.0],
         "high": [105.0, 115.0, 520.0, 515.0],
         "low": [95.0, 105.0, 480.0, 495.0],
     })
-    out = add_forward_returns(px, ["d1", "d2", "d3", "d4", "d5"],
-                              horizons=(1,), extremes=True)
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[3], 500))
+    out = _fixture_forward(px, dates,
+                              horizons=(1,), extremes=True, registry=registry)
     by_date = out.set_index("date")
-    assert np.isnan(by_date.loc["d2", "max_1"]), "bridged window must be NaN"
-    assert np.isnan(by_date.loc["d2", "mdd_1"]), "bridged window must be NaN"
-    assert abs(by_date.loc["d1", "max_1"] - 0.15) < 1e-9   # high 115 vs close 100
-    assert abs(by_date.loc["d1", "mdd_1"] - 0.05) < 1e-9   # low 105 vs close 100
+    assert np.isnan(by_date.loc[dates[1], "max_1"]), "bridged window must be NaN"
+    assert np.isnan(by_date.loc[dates[1], "mdd_1"]), "bridged window must be NaN"
+    assert abs(by_date.loc[dates[0], "max_1"] - 0.15) < 1e-9   # high 115 vs close 100
+    assert abs(by_date.loc[dates[0], "mdd_1"] - 0.05) < 1e-9   # low 105 vs close 100
     print("test_extreme_windows_share_the_contiguity_mask passed")
 
 
 def test_one_day_targets_mask_corporate_actions_and_other_impossible_moves():
+    dates = _sessions(3)
     px = pd.DataFrame({
-        "ticker": ["A", "A", "A"],
-        "date": ["d1", "d2", "d3"],
+        "ticker": ["AAAA", "AAAA", "AAAA"],
+        "date": dates,
         "close": [2710.0, 534.0, 562.0],
         "high": [2770.0, 550.0, 566.0],
         "low": [2700.0, 532.0, 532.0],
     })
-    out = add_forward_returns(px, ["d1", "d2", "d3"], horizons=(1,), extremes=True)
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[1], 534))
+    out = _fixture_forward(px, dates, horizons=(1,), extremes=True, registry=registry)
     by_date = out.set_index("date")
-    assert np.isnan(by_date.loc["d1", "fwd_1"]), \
+    assert np.isnan(by_date.loc[dates[0], "fwd_1"]), \
         "a stock split is not a tradeable -80% one-day model target"
-    assert np.isnan(by_date.loc["d1", "max_1"])
-    assert np.isnan(by_date.loc["d1", "mdd_1"])
-    assert abs(by_date.loc["d2", "fwd_1"] - (562 / 534 - 1)) < 1e-12
+    assert np.isnan(by_date.loc[dates[0], "max_1"])
+    assert np.isnan(by_date.loc[dates[0], "mdd_1"])
+    assert abs(by_date.loc[dates[1], "fwd_1"] - (562 / 534 - 1)) < 1e-12
     print("test_one_day_targets_mask_corporate_actions_and_other_impossible_moves passed")
 
 
 def test_one_day_features_mask_corporate_actions_too():
+    dates = _sessions(3)
     px = pd.DataFrame({
-        "ticker": ["A", "A", "A"],
-        "date": ["d1", "d2", "d3"],
+        "ticker": ["AAAA", "AAAA", "AAAA"],
+        "date": dates,
         "close": [2710.0, 534.0, 562.0],
     })
-    out = add_lagged_returns(px, ["d1", "d2", "d3"], lags=(1,))
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[1], 534))
+    out = _fixture_lag(px, dates, lags=(1,), registry=registry)
     by_date = out.set_index("date")["lag_1"]
-    assert np.isnan(by_date["d2"]), "the split must not become a -80% momentum/reward feature"
-    assert abs(by_date["d3"] - (562 / 534 - 1)) < 1e-12
+    assert np.isnan(by_date[dates[1]]), "the split must not become a -80% momentum/reward feature"
+    assert abs(by_date[dates[2]] - (562 / 534 - 1)) < 1e-12
     print("test_one_day_features_mask_corporate_actions_too passed")
 
 
 def test_multi_day_windows_cannot_cross_a_corporate_action():
+    dates = _sessions(6)
     px = pd.DataFrame({
-        "ticker": ["A"] * 6,
-        "date": [f"d{i}" for i in range(1, 7)],
+        "ticker": ["AAAA"] * 6,
+        "date": dates,
         "close": [2700.0, 2710.0, 534.0, 562.0, 570.0, 580.0],
         "high": [2710.0, 2770.0, 550.0, 566.0, 575.0, 585.0],
         "low": [2690.0, 2700.0, 532.0, 532.0, 565.0, 575.0],
     })
-    dates = px["date"].tolist()
-    fwd = add_forward_returns(px, dates, horizons=(3,), extremes=True).set_index("date")
-    lag = add_lagged_returns(px, dates, lags=(3,)).set_index("date")
-    assert np.isnan(fwd.loc["d1", "fwd_3"]), "3d target spans the d2->d3 split"
-    assert np.isnan(fwd.loc["d1", "max_3"])
-    assert np.isnan(lag.loc["d4", "lag_3"]), "3d momentum spans the d2->d3 split"
-    assert not np.isnan(fwd.loc["d3", "fwd_3"]), "windows wholly after the split stay valid"
+    px = _flat_test_bars(px)
+    registry = _fixture_registry(px, dates, boundary=("AAAA", dates[2], 534))
+    fwd = _fixture_forward(px, dates, horizons=(3,), extremes=True, registry=registry).set_index("date")
+    lag = _fixture_lag(px, dates, lags=(3,), registry=registry).set_index("date")
+    assert np.isnan(fwd.loc[dates[0], "fwd_3"]), "3d target spans the d2->d3 split"
+    assert np.isnan(fwd.loc[dates[0], "max_3"])
+    assert np.isnan(lag.loc[dates[3], "lag_3"]), "3d momentum spans the d2->d3 split"
+    assert not np.isnan(fwd.loc[dates[2], "fwd_3"]), "windows wholly after the split stay valid"
+    assert abs(fwd.loc[dates[2], "fwd_3"] - (580.0 / 534.0 - 1)) < 1e-12
     print("test_multi_day_windows_cannot_cross_a_corporate_action passed")
 
-
-def _contaminated_test_db(directory):
-    """A file-backed database plus the broker_flow evidence manifest the real
-    PR #74 generator builds for it: build_panel() reads broker flow only
-    through broker_flow_canonical, which needs both. Every broker row is
-    backfill-shaped (bval NULL, dated <= BACKFILL_END), so each date is its own
-    SOURCE_DATED_BACKFILL session."""
-    import broker_flow_regime as bfr
-    path = os.path.join(directory, "neobdm.db")
-    conn = sqlite3.connect(path)
-    conn.execute("""CREATE TABLE price_history (
-        date TEXT, ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL
-    )""")
-    conn.execute("CREATE TABLE price_quarantine (date TEXT, ticker TEXT)")
-    conn.execute("""CREATE TABLE broker_flow (
-        date TEXT NOT NULL, ticker TEXT NOT NULL, broker_code TEXT NOT NULL, bval REAL,
-        sval REAL, netval REAL, bavg REAL, savg REAL, PRIMARY KEY (date, ticker, broker_code)
-    )""")
-    dates = [f"2026-01-{d:02d}" for d in range(1, 9)]
-    closes = {"AAA": [100, 110, 1000, 500, 505, 510, 515, 520],
-              "BBB": [200, 201, 202, 203, 204, 205, 206, 207]}
-    for ticker, series in closes.items():
-        for date, close in zip(dates, series):
-            conn.execute("INSERT INTO price_history VALUES (?,?,?,?,?,?,?)",
-                         (date, ticker, close, close, close, close, 1000))
-            for code, netval in (("AK", 10.0), ("BK", -5.0), ("CC", 2.0)):
-                conn.execute("INSERT INTO broker_flow VALUES (?,?,?,NULL,NULL,?,NULL,NULL)",
-                             (date, ticker, code, netval))
-    # Removing AAA d3 makes a naive shift join d2=110 to d4=500 (+354.5%).
-    conn.execute("INSERT INTO price_quarantine VALUES (?,?)", (dates[2], "AAA"))
-    conn.commit()
-    conn.close()
-    manifest = os.path.join(directory, "broker_flow_manifest.json")
-    bfr.write_manifest(bfr.build_manifest(path), manifest)
-    return path, manifest
-
-
-def test_build_panel_cannot_recreate_impossible_target_returns():
-    import tempfile
-    from walk_forward_backtest import connect_price_db
-    with tempfile.TemporaryDirectory() as tmp:
-        db, manifest = _contaminated_test_db(tmp)
-        conn = connect_price_db(db)
-        try:
-            panel = build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=manifest)
-        finally:
-            conn.close()
-    aaa = panel[panel["ticker"] == "AAA"].set_index("date")
-    assert "2026-01-02" not in aaa.index, \
-        "the row before quarantine must lose its target, not bridge to the next clean bar"
-    assert not ((panel["target"] > 0.35) | (panel["target"] < -0.15)).any(), \
-        "an impossible ARA/ARB target reappeared in the production panel"
-    print("test_build_panel_cannot_recreate_impossible_target_returns passed")
-
-
-def test_build_panel_requires_an_explicit_broker_flow_manifest():
-    # HANDOFF Lampiran V: no default manifest, no raw fallback. Full coverage
-    # lives in test_walk_forward_canonical.py (pytest); this keeps the contract
-    # inside the suite ml-health runs.
-    import tempfile
+def test_unmigrated_build_panel_refuses_before_any_database_access():
+    """The unmigrated model panel refuses before price or broker-flow access."""
     import walk_forward_backtest as wfb
-    with tempfile.TemporaryDirectory() as tmp:
-        db, manifest = _contaminated_test_db(tmp)
-        conn = wfb.connect_price_db(db)
-        try:
-            try:
-                build_panel(conn)
-                assert False, "build_panel() must not run without broker-flow arguments"
-            except TypeError:
-                pass
-            try:
-                build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=None)
-                assert False, "a missing manifest must be refused"
-            except wfb.BrokerFlowManifestRequired as e:
-                assert "broker_flow_manifest_refresh.py" in str(e)
-        finally:
-            conn.close()
-    print("test_build_panel_requires_an_explicit_broker_flow_manifest passed")
+    conn = sqlite3.connect(":memory:")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    before = conn.total_changes
+    try:
+        with patch.object(wfb, "load_canonical_inputs",
+                          side_effect=AssertionError("unsupported panel read source inputs")) as source_reader:
+            _assert_route_refusal("walk_forward_backtest.build_panel",
+                                  lambda: build_panel(conn, broker_flow_db_path="missing-db.db", broker_flow_manifest_path="missing-manifest.json"))
+            source_reader.assert_not_called()
+        assert statements == [] and conn.total_changes == before
+    finally:
+        conn.close()
+    print("test_unmigrated_build_panel_refuses_before_any_database_access passed")
 
 
-def test_build_panel_never_reads_raw_broker_flow():
+def test_unmigrated_build_panel_refuses_missing_manifest_without_database_access():
+    """The unmigrated model panel refuses before price or broker-flow access."""
+    import walk_forward_backtest as wfb
+    conn = sqlite3.connect(":memory:")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    before = conn.total_changes
+    try:
+        with patch.object(wfb, "load_canonical_inputs",
+                          side_effect=AssertionError("unsupported panel read source inputs")) as source_reader:
+            _assert_route_refusal("walk_forward_backtest.build_panel",
+                                  lambda: build_panel(conn, broker_flow_db_path="missing-db.db", broker_flow_manifest_path="missing-manifest.json"))
+            _assert_route_refusal("walk_forward_backtest.build_panel",
+                                  lambda: build_panel(conn, broker_flow_db_path="missing-db.db", broker_flow_manifest_path=None))
+            source_reader.assert_not_called()
+        assert statements == [] and conn.total_changes == before
+    finally:
+        conn.close()
+    print("test_unmigrated_build_panel_refuses_missing_manifest_without_database_access passed")
+
+
+def test_unmigrated_build_panel_refuses_without_reading_raw_broker_flow():
+    """The unmigrated model panel refuses before price or broker-flow access."""
     import re
-    import tempfile
+    source = Path(__file__).with_name("walk_forward_backtest.py").read_text()
+    assert not re.search(r"(?i)\bfrom\s+broker_flow\b", source)
     import walk_forward_backtest as wfb
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = open(os.path.join(here, "walk_forward_backtest.py"), encoding="utf-8").read()
-    assert not re.search(r"(?i)\bfrom\s+broker_flow\b", source), \
-        "walk_forward_backtest.py reads raw broker_flow again; use broker_flow_canonical"
-    with tempfile.TemporaryDirectory() as tmp:
-        db, manifest = _contaminated_test_db(tmp)
-        conn = wfb.connect_price_db(db)
-        seen = []
-        conn.set_trace_callback(seen.append)
-        try:
-            panel = build_panel(conn, broker_flow_db_path=db, broker_flow_manifest_path=manifest)
-        finally:
-            conn.close()
-    assert any("price_history" in s for s in seen)
-    assert not [s for s in seen if "broker_flow" in s.lower()], \
-        "build_panel() queried broker_flow on the price connection"
-    prov = panel.attrs["broker_flow"]
-    assert len(prov["db_sha256"]) == 64 and len(prov["manifest_sha256"]) == 64
-    print("test_build_panel_never_reads_raw_broker_flow passed")
+    conn = sqlite3.connect(":memory:")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    before = conn.total_changes
+    try:
+        with patch.object(wfb, "load_canonical_inputs",
+                          side_effect=AssertionError("unsupported panel read source inputs")) as source_reader:
+            _assert_route_refusal("walk_forward_backtest.build_panel",
+                                  lambda: build_panel(conn, broker_flow_db_path="missing-db.db", broker_flow_manifest_path="missing-manifest.json"))
+            source_reader.assert_not_called()
+        assert statements == [] and conn.total_changes == before
+    finally:
+        conn.close()
+    print("test_unmigrated_build_panel_refuses_without_reading_raw_broker_flow passed")
 
 
 def test_ml_health_workflow_runs_the_canonical_migration_suite():
@@ -1502,7 +1488,8 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
                 patch.object(health, "check_imports"), \
                 patch.object(health, "check_known_defects"), \
                 patch.object(health, "check_panel", return_value=None), \
-                patch.object(health, "check_model_runs") as model_fit:
+                patch.object(health, "check_model_runs",
+                             side_effect=lambda *args: pc.refuse_unmigrated("check_ml_health.check_model_runs")) as model_fit:
             problems, _, stats = health.check(quick=quick)
         assert launched.count(suite) == 1, \
             "ml-health must run the trade capture behavioral suite exactly once"
@@ -1511,6 +1498,9 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
             "ml-health must count the trade suite's unittest summary"
         if quick:
             model_fit.assert_not_called()
+        else:
+            model_fit.assert_called_once()
+            assert [r["consumer"] for r in stats["unsupported_routes"]] == ["check_ml_health.check_model_runs"]
 
     def failed_trade_suite(args, **kwargs):
         if os.path.basename(args[1]) == suite:
@@ -1532,60 +1522,40 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
 
 
 def test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap():
-    # d2->d4's gap_1 is NaN for the same reason its fwd_1 is: d3 is missing,
-    # so decision-at-d2 -> (positionally-next-but-calendar-discontiguous) d4
-    # is not a valid transition. simulate_trade() now reads gap_1 (not
-    # fwd_1) for the decision->entry step, so this fixture supplies both.
-    px = pd.DataFrame({
-        "ticker": ["AAA", "AAA", "AAA"],
-        "date": ["d1", "d2", "d4"],
-        "open": [100.0, 110.0, 500.0], "high": [100.0, 110.0, 500.0],
-        "low": [100.0, 110.0, 500.0], "close": [100.0, 110.0, 500.0],
-        "fwd_1": [0.10, np.nan, np.nan],
-        "gap_1": [0.10, np.nan, np.nan],
-    })
-    by_ticker, by_date = _index_price_history(px)
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d2", 1, None, None)
-    assert ret is None, "a multi-day strategy must not treat d4 as the next bar after d2"
+    dates = _sessions(4)
+    raw = _flat_test_bars(pd.DataFrame({"ticker": ["AAAA"] * 3,
+                                      "date": [dates[i] for i in (0, 1, 3)],
+                                      "close": [100.0, 110.0, 500.0]}))
+    registry = _fixture_registry(raw, dates, boundary=("AAAA", dates[3], 500))
+    px = _fixture_forward(raw, dates, horizons=(1,), open_anchored=True, registry=registry)
+    assert pd.isna(px.iloc[1]["fwd_1"]) and pd.isna(px.iloc[1]["gap_1"])
+    assert px.iloc[1]["next_entry_open_admissible"], "the reset bar itself has a valid open"
+    by_ticker, by_date = _fixture_index(px)
+    assert _fixture_trade(by_ticker, by_date, "AAAA", dates[1], 1, None, None) is None
     print("test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap passed")
 
 
-def _off_by_one_regression_fixture():
-    """decision=d1(T), entry=d2(T+1), d3=T+2, d4=T+3.
-
-    d2's high/low (120/90) breach a 10%-TP / 5%-SL threshold off entry_price
-    105; d3's high/low (115/108) do NOT breach those same thresholds. That
-    difference is deliberate: it is what makes a regression to the old
-    off-by-one (which evaluated TP/SL against T+2 instead of T+1) fail loudly
-    instead of silently passing for an unrelated reason.
-
-    Routed through the real price_audit.add_forward_returns(open_anchored=True)
-    pipeline (not hand-set) so `gap_1` is genuinely computed and valid at d1 —
-    simulate_trade() now requires that certificate for the decision->entry
-    step. fwd_1 comes out identical to the values this fixture used to
-    hard-code (verified by inspection: every step here is comfortably inside
-    the ARA/ARB band), so none of the downstream assertions change.
-    """
-    import price_audit as pa
-    dates = ["d1", "d2", "d3", "d4"]
+def _off_by_one_regression_fixture(second_close=130.0):
+    """Certified bars for entry-session timing. A smaller second close isolates TP/SL timing."""
+    dates = _sessions(4)
     px = pd.DataFrame({
-        "ticker": ["AAA"] * 4,
+        "ticker": ["AAAA"] * 4,
         "date": dates,
         "open":  [100.0, 105.0, 110.0, 130.0],
-        "high":  [101.0, 120.0, 115.0, 140.0],
+        "high":  [101.0, 120.0, max(115.0, second_close + 1), 140.0],
         "low":   [99.0, 90.0, 108.0, 125.0],
-        "close": [100.0, 110.0, 130.0, 135.0],
+        "close": [100.0, 110.0, second_close, 135.0],
         "volume": [1000] * 4,
     })
-    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
-    return _index_price_history(px)
+    px = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
+    return _fixture_index(px)
 
 
 def test_hold_days_one_uses_entry_session_high_low_and_close():
     """Requirement 1: hold_days=1 with no TP/SL must exit at T+1's own close,
     computed off entry_price = open(T+1) = 105."""
     by_ticker, by_date = _off_by_one_regression_fixture()
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    ret = _fixture_trade(by_ticker, by_date, "AAAA", _sessions(4)[0], 1, None, None)
     expected = (110.0 - 105.0) / 105.0  # close(T+1) vs open(T+1)
     assert ret is not None and abs(ret - expected) < 1e-9, (
         f"hold_days=1 must exit at T+1's close (expected {expected:+.6f}, got {ret}); "
@@ -1602,15 +1572,15 @@ def test_tp_and_sl_hit_on_entry_session_are_detected():
     (checking T+2 instead of T+1) were reintroduced, this TP would silently
     fail to trigger and the trade would fall through to a timed exit instead.
     """
-    by_ticker, by_date = _off_by_one_regression_fixture()
-    tp_ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, 0.10, None)
+    by_ticker, by_date = _off_by_one_regression_fixture(second_close=112.0)
+    tp_ret = _fixture_trade(by_ticker, by_date, "AAAA", _sessions(4)[0], 1, 0.10, None)
     assert tp_ret == 0.10, (
         f"TP must fire off T+1's high=120 (>= 115.5 threshold), got {tp_ret}"
     )
 
     # T+1's low=90 clears a 5% SL off entry_price=105 (threshold 99.75); T+2's
     # low=108 does NOT.
-    sl_ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, 0.05)
+    sl_ret = _fixture_trade(by_ticker, by_date, "AAAA", _sessions(4)[0], 1, None, 0.05)
     assert sl_ret == -0.05, (
         f"SL must fire off T+1's low=90 (<= 99.75 threshold), got {sl_ret}"
     )
@@ -1624,7 +1594,7 @@ def test_one_day_hold_never_touches_t_plus_2():
     contamination from reading d3 instead of d2 is impossible to miss.
     """
     by_ticker, by_date = _off_by_one_regression_fixture()
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    ret = _fixture_trade(by_ticker, by_date, "AAAA", _sessions(4)[0], 1, None, None)
     t_plus_2_based = (130.0 - 105.0) / 105.0
     assert abs(ret - t_plus_2_based) > 1e-6, (
         "hold_days=1 result matches a T+2-close calculation — T+2 is being "
@@ -1639,7 +1609,7 @@ def test_hold_days_two_expires_at_close_t_plus_2():
     forced by running out of data (d4/T+3 exists precisely so the exit is a
     genuine k==hold_days-1 timed exit, not an end-of-panel fallback)."""
     by_ticker, by_date = _off_by_one_regression_fixture()
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 2, None, None)
+    ret = _fixture_trade(by_ticker, by_date, "AAAA", _sessions(4)[0], 2, None, None)
     expected = (130.0 - 105.0) / 105.0  # close(T+2) vs open(T+1)
     assert ret is not None and abs(ret - expected) < 1e-9, (
         f"hold_days=2 must exit at T+2's close (expected {expected:+.6f}, got {ret})"
@@ -1655,10 +1625,9 @@ def test_simulator_refuses_fabricated_open_even_when_close_step_passes():
     open(T+1)=870 is not a real anchor. gap_1 must be NaN and the simulator
     must refuse the trade entirely, regardless of hold_days/tp/sl.
     """
-    import price_audit as pa
-    dates = ["d1", "d2"]
+    dates = _sessions(2)
     px = pd.DataFrame({
-        "ticker": ["AAA"] * 2,
+        "ticker": ["AAAA"] * 2,
         "date": dates,
         "open":  [575.0, 870.0],
         "high":  [585.0, 880.0],
@@ -1666,9 +1635,9 @@ def test_simulator_refuses_fabricated_open_even_when_close_step_passes():
         "close": [580.0, 720.0],
         "volume": [1000] * 2,
     })
-    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
-    by_ticker, by_date = _index_price_history(px)
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    px = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
+    by_ticker, by_date = _fixture_index(px)
+    ret = _fixture_trade(by_ticker, by_date, "AAAA", dates[0], 1, None, None)
     assert ret is None, (
         "a fabricated open(T+1) must block the trade even though the "
         "close(T)->close(T+1) step alone would pass"
@@ -1681,20 +1650,19 @@ def test_simulator_trades_normally_on_a_valid_next_open():
     (580->720, +24.1%), but open(T+1)=590 is a real anchor this time. The
     simulator must trade normally, proving the guard above is about open
     validity specifically, not an overzealous rejection of this close path."""
-    import price_audit as pa
-    dates = ["d1", "d2"]
+    dates = _sessions(2)
     px = pd.DataFrame({
-        "ticker": ["AAA"] * 2,
+        "ticker": ["AAAA"] * 2,
         "date": dates,
         "open":  [575.0, 590.0],
-        "high":  [585.0, 730.0],
+        "high":  [585.0, 725.0],
         "low":   [570.0, 585.0],
         "close": [580.0, 720.0],
         "volume": [1000] * 2,
     })
-    px = pa.add_forward_returns(px, dates, horizons=(1,), open_anchored=True)
-    by_ticker, by_date = _index_price_history(px)
-    ret = simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
+    px = _fixture_forward(px, dates, horizons=(1,), open_anchored=True)
+    by_ticker, by_date = _fixture_index(px)
+    ret = _fixture_trade(by_ticker, by_date, "AAAA", dates[0], 1, None, None)
     expected = (720.0 - 590.0) / 590.0
     assert ret is not None and abs(ret - expected) < 1e-9, (
         f"a valid open(T+1) anchor must trade normally (expected {expected:+.6f}, got {ret})"
@@ -1702,25 +1670,18 @@ def test_simulator_trades_normally_on_a_valid_next_open():
     print("test_simulator_trades_normally_on_a_valid_next_open passed")
 
 
-def test_simulator_raises_when_gap_1_is_missing_entirely():
-    """PR #36 review: a price frame built WITHOUT open_anchored=True (no
-    `gap_1` column at all) must raise, never silently fall back to reading
-    the raw `open` column with no validity guard behind it."""
-    px = pd.DataFrame({
-        "ticker": ["AAA"] * 2,
-        "date": ["d1", "d2"],
-        "open":  [575.0, 870.0],
-        "high":  [585.0, 880.0],
-        "low":   [570.0, 715.0],
-        "close": [580.0, 720.0],
-    })
-    by_ticker, by_date = _index_price_history(px)
+def test_simulator_index_refuses_a_certified_close_only_frame():
+    """A certified close-only frame still lacks an executable entry certificate."""
+    dates = _sessions(3)
+    px = _fixture_forward(_gate_ohlc_frame("AAAA", dates, 100.0), dates, horizons=(1,))
+    assert "next_entry_open_admissible" not in px
     try:
-        simulate_trade(by_ticker, by_date, "AAA", "d1", 1, None, None)
-        assert False, "must refuse to silently use raw open without a gap_1 certificate"
-    except ValueError as e:
-        assert "gap_1" in str(e) and "open_anchored" in str(e)
-    print("test_simulator_raises_when_gap_1_is_missing_entirely passed")
+        _fixture_index(px)
+    except pc.UnsupportedPriceContract as exc:
+        assert exc.consumer is None and str(exc) == "Missing value-bound price/label certificate"
+    else:
+        raise AssertionError("close-only labels were indexed for executable simulation")
+    print("test_simulator_index_refuses_a_certified_close_only_frame passed")
 
 
 def test_all_tracked_model_price_consumers_use_clean_panel():
@@ -1798,25 +1759,14 @@ def _steady(ticker, start, days, price):
 
 
 def test_commit_gate_ignores_legitimate_volatility():
-    # The gate the topup workflow runs counts cross_ticker_dup ONLY. A correct
-    # scrape adds real IDX volatility — a +30% ARA day, a corporate action — that
-    # trips limit_violation (and, on a big enough jump, series_break). Those must
-    # NOT count against the gate, or every honest nightly scrape reddens it and
-    # price_history stops advancing. This is the bug that froze it at 2026-08-21.
-    base = _price_frame(_steady("AAA", 1, 6, 1000))
-    d0 = detect(base)
-
-    # Same series plus one legitimate +30% jump on a fresh day (prev close 1000 ->
-    # ara bound 25%, so this is outside the band and trips limit_violation).
-    after = _price_frame(_steady("AAA", 1, 6, 1000) + [("2026-08-07", "AAA",
-                         1300, 1300, 1300, 1300, 1000)])
-    d1 = detect(after)
-
-    assert int(d1["limit_violation"].sum()) > int(d0["limit_violation"].sum()), \
-        "a +30% day should register as a limit_violation"
-    # ...but the metric the gate actually reads did not move.
-    assert int(d1["cross_ticker_dup"].sum()) == int(d0["cross_ticker_dup"].sum()) == 0, \
-        "legitimate volatility must not raise the cross-ticker-dup gate"
+    dates = _sessions(7, start="2026-08-03")
+    after = _flat_test_bars(pd.DataFrame({"ticker": ["AAAA"] * 7, "date": dates,
+                                        "close": [1000.0] * 6 + [1300.0]}))
+    registry = _fixture_registry(after, dates)
+    d0 = detect(after.iloc[:6].copy(), registry=registry, representation=pc.RAW_ACTUAL)
+    d1 = detect(after, registry=registry, representation=pc.RAW_ACTUAL)
+    assert int(d1.limit_violation.sum()) > int(d0.limit_violation.sum())
+    assert int(d1.cross_ticker_dup.sum()) == int(d0.cross_ticker_dup.sum()) == 0
     print("test_commit_gate_ignores_legitimate_volatility passed")
 
 
@@ -1850,7 +1800,7 @@ def _inventory_payload(nlot, nval, dates=None):
 
 
 
-def test_predictions_carry_the_columns_the_scorer_reads():
+def test_unmigrated_predictions_refuse_before_splitting_inputs():
     # run_ml_reports.py died with KeyError: 'target' every night for a week
     # (2026-08-23 onward). score_all() started computing the base rate from
     # preds["target"], but get_walk_forward_predictions() returned only
@@ -1873,17 +1823,16 @@ def test_predictions_carry_the_columns_the_scorer_reads():
             rows.append(row)
     panel = pd.DataFrame(rows)
 
-    preds = get_walk_forward_predictions(panel)
-    assert len(preds), "the synthetic panel should span enough dates to produce folds"
-    for col in ("ticker", "date", "pred", "target"):
-        assert col in preds.columns, f"score_all() reads {col!r}; it must survive"
-    # The exact expression that used to raise.
-    base_rate = float((preds["target"] > 0).mean())
-    assert 0.0 <= base_rate <= 1.0
-    print("test_predictions_carry_the_columns_the_scorer_reads passed")
+    before = panel.copy(deep=True)
+    with patch("strategy_variants.make_walk_forward_splits", side_effect=AssertionError("unsupported model split inputs")) as split:
+        _assert_route_refusal("strategy_variants.get_walk_forward_predictions",
+                              lambda: get_walk_forward_predictions(panel))
+        split.assert_not_called()
+    pd.testing.assert_frame_equal(panel, before)
+    print("test_unmigrated_predictions_refuse_before_splitting_inputs passed")
 
 
-def test_strategy_report_builds_the_open_anchored_price_frame():
+def test_unmigrated_strategy_report_refuses_before_database_or_model_work():
     # run_ml_reports.py died every night from 2026-09-05: ad5650d made
     # simulate_trade() require gap_1, but run_strategy_variants_report() kept
     # calling clean_panel() without open_anchored=True. Same blind spot as the
@@ -1923,45 +1872,29 @@ def test_strategy_report_builds_the_open_anchored_price_frame():
         _sys.modules["ddqn_entry_exit"] = stub
         stubbed_ddqn = True
     fresh_import = "run_ml_reports" not in _sys.modules
-    seen = {}
     try:
         import run_ml_reports as rmr
-        original = rmr.build_panel, rmr.run_strategy_search
-
-        def capture_search(panel, px):
-            seen["px"] = px
-            return dict(winner_label="stub", winner_search_mean=0.0, winner_holdout_mean=0.0,
-                        winner_holdout_n=0, search_results=pd.DataFrame(), holdout_results=pd.DataFrame())
-
-        rmr.build_panel = lambda c, **broker_flow: pd.DataFrame()
-        rmr.run_strategy_search = capture_search
-        try:
-            rmr.run_strategy_variants_report(conn, "stubbed-broker-flow-manifest.json")
-        finally:
-            rmr.build_panel, rmr.run_strategy_search = original
-        plain = rmr.clean_panel(conn, horizons=(1,), lags=(1,))
+        statements = []
+        conn.set_trace_callback(statements.append)
+        before = conn.total_changes
+        with patch.object(rmr, "build_panel", side_effect=AssertionError("unsupported report built a model")) as model, \
+                patch.object(rmr, "run_strategy_search", side_effect=AssertionError("unsupported report searched trades")) as search, \
+                patch.object(rmr, "clean_panel", side_effect=AssertionError("unsupported report read prices")) as prices:
+            _assert_route_refusal("run_ml_reports.run_strategy_variants_report",
+                                  lambda: rmr.run_strategy_variants_report(conn, "missing-manifest.json"))
+            model.assert_not_called()
+            search.assert_not_called()
+            prices.assert_not_called()
+        assert statements == [] and conn.total_changes == before
     finally:
+        conn.close()
         for k in added_env:
             os.environ.pop(k, None)
         if stubbed_ddqn:
             _sys.modules.pop("ddqn_entry_exit", None)
         if fresh_import:
             _sys.modules.pop("run_ml_reports", None)
-
-    px = seen["px"]
-    assert "gap_1" in px.columns, (
-        "run_strategy_variants_report() must build its frame with open_anchored=True: "
-        "simulate_trade() refuses a frame without gap_1")
-    # open_anchored=True is purely additive: same rows, same existing columns and values.
-    assert set(px.columns) - set(plain.columns) == {"gap_1", "fwd_oo_1", "fwd_oc_1"}
-    key = ["ticker", "date"]
-    pd.testing.assert_frame_equal(px.sort_values(key).reset_index(drop=True)[list(plain.columns)],
-                                  plain.sort_values(key).reset_index(drop=True))
-    # And the frame satisfies the simulator it feeds, guards intact.
-    by_ticker, by_date = _index_price_history(px)
-    decision = by_ticker["AAA"].loc[by_ticker["AAA"]["gap_1"].notna(), "date"].iloc[0]
-    assert simulate_trade(by_ticker, by_date, "AAA", decision, 1, None, None) is not None
-    print("test_strategy_report_builds_the_open_anchored_price_frame passed")
+    print("test_unmigrated_strategy_report_refuses_before_database_or_model_work passed")
 
 
 def test_date_offset_only_holds_before_the_open():
@@ -1986,30 +1919,21 @@ def test_date_offset_only_holds_before_the_open():
 
 
 def test_quarantined_row_is_not_a_baseline_for_the_next_row():
-    # The 2026-08-27 false alarm: MDIA's 08-13 close was KIOS's price (95), was
-    # flagged and quarantined weeks earlier, and its real price is ~250. The next
-    # clean row then read as +171% and got reported as the scraper "writing bad
-    # rows again". A known-bad close must never be the baseline a good row is
-    # judged against.
-    rows = [(d, "AAA", 250, 250, 250, 250, 1000)
-            for d in ("2026-08-01", "2026-08-02", "2026-08-03")]
-    rows.append(("2026-08-04", "AAA", 95, 95, 95, 95, 1000))    # contaminated
-    rows.append(("2026-08-05", "AAA", 252, 252, 252, 252, 1000))  # clean
-    px = _price_frame(rows)
-
-    naive = detect(px)
-    bad = naive[naive["date"] == "2026-08-05"].iloc[0]
-    assert bool(bad["limit_violation"]), "95 -> 252 must look like a violation untrusted"
-
-    # Same data, with the contaminated row marked untrusted.
-    trusted = [d != "2026-08-04" for d in px["date"]]
-    guarded = detect(px, trusted=trusted)
-    row = guarded[guarded["date"] == "2026-08-05"].iloc[0]
-    assert not bool(row["limit_violation"]), \
-        "a clean row after a quarantined one must not be flagged"
-    # The baseline is DROPPED, not bridged to the last good close: a multi-day
-    # move cannot be judged against a one-day ARA/ARB band either.
-    assert pd.isna(row["prev_close"])
+    """Rejected observed closes remain traceable but never certify successors."""
+    dates = _sessions(5, start="2026-08-03")
+    px = _flat_test_bars(pd.DataFrame({"date": dates, "ticker": ["AAAA"] * 5,
+                                     "close": [250.0, 250.0, 250.0, 95.0, 252.0]}))
+    registry = _fixture_registry(px, dates)
+    for trusted in (None, [True, True, True, False, True]):
+        guarded = detect(px, trusted=trusted, registry=registry, representation=pc.RAW_ACTUAL)
+        assert guarded.iloc[3].limit_violation
+        row = guarded.iloc[4]
+        assert not row.limit_violation
+        assert row.limit_reference_status == "UNRESOLVED"
+        assert row.limit_unresolved_reason == "UNTRUSTED_PREDECESSOR"
+        assert pd.isna(row.limit_reference_price)
+        assert row.previous_actual_close == 95.0
+        assert not row.close_anchor_admissible
     print("test_quarantined_row_is_not_a_baseline_for_the_next_row passed")
 
 
@@ -2091,8 +2015,8 @@ def test_bagholders_sum_per_day_lots_not_last_value():
     assert [h["code"] for h in holders] == ["AK", "BK"], "must rank by cumulative net lot"
     assert holders[0]["cum"] == 310
     assert holders[1]["cum"] == 100
-    # avg = sum(nval) / (sum(nlot) * 100 shares) = 3.1e6 / 31000
-    assert abs(holders[0]["avg"] - 100.0) < 1e-9
+    assert all(h["avg"] is None and h["cost_status"] == "WITHHELD_UNKNOWN_SHARE_BASIS" for h in holders)
+    assert payload["data"]["nval"] == {"AK": [1e6, 2e6, 1e5], "BK": [5e5, 2.5e5, 2.5e5]}
     print("test_bagholders_sum_per_day_lots_not_last_value passed")
 
 
@@ -2123,7 +2047,10 @@ def test_bagholders_survive_a_malformed_payload():
     assert bagholders_from_payload(holed)[0]["cum"] == 150
     # A broker present in nlot but absent from nval must not divide by nothing.
     no_val = _inventory_payload(nlot={"AK": [100]}, nval={})
-    assert no_val and bagholders_from_payload(no_val)[0]["avg"] == 0
+    holder = bagholders_from_payload(no_val)[0]
+    assert holder["cum"] == 100 and holder["avg"] is None
+    assert holder["cost_status"] == "WITHHELD_UNKNOWN_SHARE_BASIS"
+    assert no_val["data"]["nval"] == {}
     print("test_bagholders_survive_a_malformed_payload passed")
 
 
@@ -2921,117 +2848,7 @@ def test_gate_does_not_call_a_thin_stock_deficit_a_basis_break():
 
 
 if __name__ == "__main__":
-    test_commit_gate_ignores_legitimate_volatility()
-    test_commit_gate_catches_a_recontaminated_scrape()
-    test_predictions_carry_the_columns_the_scorer_reads()
-    test_strategy_report_builds_the_open_anchored_price_frame()
-    test_date_offset_only_holds_before_the_open()
-    test_quarantined_row_is_not_a_baseline_for_the_next_row()
-    test_authoritative_panel_identifies_only_the_cloned_duplicate()
-    test_quarantine_refresh_removes_healed_rows()
-    test_trusted_mask_leaves_real_contamination_detectable()
-    test_bagholders_sum_per_day_lots_not_last_value()
-    test_bagholders_exclude_net_sellers()
-    test_bagholders_survive_a_malformed_payload()
-    test_observable_inventory_uses_three_exact_twenty_session_blocks()
-    test_old_accumulator_remains_visible_across_sixty_session_inventory()
-    test_should_fail_run_tolerates_a_few_failures()
-    test_should_fail_run_catches_a_broken_scrape()
-    test_inventory_requests_stay_inside_the_rolling_year()
-    test_short_inventory_window_is_judged_on_the_longest_series()
-    test_series_signature_distinguishes_two_stocks()
-    test_series_signature_none_when_empty()
-    test_ticker_from_title_only_asserts_when_it_can()
-    test_forward_returns_never_bridge_a_removed_row()
-    test_lagged_returns_guarded_the_same_way()
-    test_extreme_windows_share_the_contiguity_mask()
-    test_one_day_targets_mask_corporate_actions_and_other_impossible_moves()
-    test_one_day_features_mask_corporate_actions_too()
-    test_multi_day_windows_cannot_cross_a_corporate_action()
-    test_build_panel_cannot_recreate_impossible_target_returns()
-    test_build_panel_requires_an_explicit_broker_flow_manifest()
-    test_build_panel_never_reads_raw_broker_flow()
-    test_ml_health_workflow_runs_the_canonical_migration_suite()
-    test_ml_health_runs_and_counts_inventory_evidence_tests()
-    test_ml_health_runs_and_counts_bandarmolony_trade_tests()
-    test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap()
-    test_hold_days_one_uses_entry_session_high_low_and_close()
-    test_tp_and_sl_hit_on_entry_session_are_detected()
-    test_one_day_hold_never_touches_t_plus_2()
-    test_hold_days_two_expires_at_close_t_plus_2()
-    test_simulator_refuses_fabricated_open_even_when_close_step_passes()
-    test_simulator_trades_normally_on_a_valid_next_open()
-    test_simulator_raises_when_gap_1_is_missing_entirely()
-    test_all_tracked_model_price_consumers_use_clean_panel()
-    test_broker_day_aggregates_basic()
-    test_broker_correlation_first_day_is_nan()
-    test_price_features_no_leakage()
-    # These 8 were defined but never wired into this runner -- found while
-    # adding the PR #36 corrupt-close regression tests below and fixed
-    # alongside them; test_pipeline.py's "all tests pass" never actually
-    # exercised the open-anchor contract, the realization purges, the
-    # thin/infeasible fold gate, or the frozen legacy digest until now.
-    test_open_anchored_labels_match_hand_computed_values()
-    test_multiplicative_composition_not_additive()
-    test_invalid_open_anchor_yields_nan_even_when_close_passes()
-    test_open_outside_high_low_or_nonpositive_is_invalid()
-    test_corrupt_close_t_plus_1_invalidates_fwd_oc_1()
-    test_corrupt_close_t_plus_1_invalidates_fwd_oo_1_even_when_both_opens_pass()
-    test_corrupt_close_after_oo_exit_does_not_invalidate_fwd_oo_1()
-    test_close_window_validity_fix_holds_for_h_greater_than_1()
-    test_1f_cross_ticker_clone_against_excluded_ticker_is_quarantined()
-    test_1f_universe_validation_rejects_excel_type_coercion()
-    test_1f_date_validation_rejects_impossible_calendar_dates()
-    test_1f_broker_source_audit_catches_incoherent_rows()
-    test_1f_one_lot_rounding_is_tolerated_but_a_real_defect_is_not()
-    test_1f_input_manifest_never_auto_establishes()
-    test_1f_one_sided_and_zero_sided_broker_rows_are_counted_separately()
-    test_1f_structural_integrity_is_a_gate_not_a_report()
-    test_both_realization_purges_hold_on_timestamps()
-    test_thin_and_infeasible_folds_are_skipped_and_counted()
-    test_legacy_experiment1_digest_is_frozen()
-    test_target_refuses_to_silently_use_the_close_contract()
-    test_spearman_ic_direction()
-    test_signal_stats_detects_a_useless_signal()
-    test_signal_stats_reports_a_negative_edge_as_negative()
-    test_signal_stats_ranks_cross_sectionally_each_day()
-    test_ml_v2_xgboost_seed_is_locked()
-    test_ml_v2_feature_sets_keep_the_same_price_controls()
-    test_broker_identity_flows_and_observable_inventory_use_net_lots()
-    test_ml_v2_walk_forward_splits_are_strictly_chronological()
-    test_ml_v2_robustness_pairs_predictions_within_date()
-    test_ml_v2_bootstrap_is_date_level_and_deterministic()
-    test_trade_stats_has_no_annualisation()
-    test_trade_stats_edges()
-    test_signal_quality_scores_every_row_not_just_triggered()
-    test_pattern_type_stats_use_same_date_baseline_and_balance_dates()
-    test_foreign_flow_stats_use_same_date_baseline_and_balance_dates()
-    test_regime_threshold_selection_uses_daily_edge_and_minimum_dates()
-    test_sqrt_252_matcher_catches_repaired_forms()
-    test_no_sqrt_252_anywhere()
-    test_kelly_fraction_known_example()
-    test_kelly_fraction_negative_edge_returns_zero()
-    test_kelly_from_trades_matches_manual_calc()
-    test_lot_storage_keeps_values_above_the_float32_exact_range()
-    test_lot_cast_refuses_non_integral_and_non_finite_lots()
-    test_row_level_nlot_identity_is_checked_in_exact_integer_space()
-    test_uint32_volume_wrap_requires_every_guard_to_hold()
-    test_authorised_volume_repair_carries_full_provenance()
-    test_observed_basis_factor_algebra_preserves_nominal_rupiah()
-    test_basis_factor_requires_exact_piecewise_constancy()
-    test_dual_estimator_disagreement_vetoes_reconstruction()
-    test_noisy_nonconstant_factor_is_quarantined()
-    test_wrap_hidden_behind_a_basis_factor_is_never_silently_repaired()
-    test_normalization_never_bleeds_across_ticker_boundaries()
-    test_gate_refuses_to_run_without_the_normalized_artifacts()
-    test_gate_applies_only_ledger_authorised_volume_repairs()
-    test_gate_fails_on_a_volume_wrap_the_ledger_does_not_cover()
-    test_gate_harmonises_a_certified_basis_and_keeps_lots_integral()
-    test_gate_primary_mode_harmonises_nothing()
-    test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones()
-    test_gate_quarantines_only_the_affected_regime_not_the_whole_ticker()
-    test_gate_treats_lot_coverage_deficits_as_reported_not_fatal()
-    test_gate_fails_when_value_conservation_breaks()
-    test_gate_implied_price_confirms_the_basis_correction()
-    test_gate_does_not_call_a_thin_stock_deficit_a_basis_break()
-    print("\nAll tests passed.")
+    tests = [fn for name, fn in list(globals().items()) if name.startswith("test_") and callable(fn)]
+    for test in tests:
+        test()
+    print(f"\nAll {len(tests)} tests passed.")

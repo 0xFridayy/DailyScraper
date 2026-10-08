@@ -106,6 +106,8 @@ def simulate_trade(px_by_ticker, date_idx_by_ticker, ticker, entry_date):
 
 def simulate_predictions(preds_subset, px_by_ticker, date_idx_by_ticker):
     """Apply fill realism once; transaction costs are added during scoring."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.simulate_predictions")
     trades = []
     n_entry_blocked = 0
     for _, row in preds_subset.iterrows():
@@ -126,6 +128,8 @@ def simulate_predictions(preds_subset, px_by_ticker, date_idx_by_ticker):
 def evaluate(preds_subset, baseline_subset, px_by_ticker, date_idx_by_ticker,
              preset="moderate"):
     """Trade stats versus a same-date baseline, with one vote per date."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.evaluate")
     trades_df, n_entry_blocked = simulate_predictions(
         preds_subset, px_by_ticker, date_idx_by_ticker
     )
@@ -184,6 +188,24 @@ def evaluate(preds_subset, baseline_subset, px_by_ticker, date_idx_by_ticker,
     )
 
 
+def metric_selection_index(metrics, observation_counts, minimum_observations):
+    """Stable descending numeric selection, preferring rows with enough observations.
+
+    Returns the original row position and whether any row meets the minimum.
+    Callers own the eligibility and provenance of these anonymous numbers.
+    """
+    metrics = np.asarray(metrics, dtype=float)
+    observation_counts = np.asarray(observation_counts)
+    usable = np.flatnonzero(~np.isnan(metrics[:, 0]))
+    if not len(usable):
+        raise ValueError("cannot select a row without a nonmissing primary metric")
+    enough = observation_counts[usable] >= minimum_observations
+    reliable = bool(enough.any())
+    candidates = usable[enough] if reliable else usable
+    order = np.lexsort(tuple(-metrics[candidates, i] for i in reversed(range(metrics.shape[1]))))
+    return int(candidates[order[0]]), reliable
+
+
 def select_threshold(search_arm, min_signal_days=MIN_SIGNAL_DAYS_FOR_SELECTION):
     """Pick a threshold using search-period date-balanced hit edge only.
 
@@ -191,21 +213,12 @@ def select_threshold(search_arm, min_signal_days=MIN_SIGNAL_DAYS_FOR_SELECTION):
     when at least one adequately supported variant exists. Pooled hit edge is a
     deterministic tie-breaker, not the headline selection metric.
     """
-    usable = search_arm[search_arm["daily_hit_edge"].notna()].copy()
-    if usable.empty:
-        raise ValueError("cannot select a threshold without a finite daily hit edge")
-
-    eligible = usable[usable["n_signal_days"] >= min_signal_days]
-    reliable_selection = not eligible.empty
-    if eligible.empty:
-        eligible = usable
-
-    winner = eligible.sort_values(
-        ["daily_hit_edge", "hit_edge"],
-        ascending=False,
-        kind="stable",
-    ).iloc[0]
-    return winner, reliable_selection
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("regime_gated_momentum.select_threshold")
+    winner, reliable = metric_selection_index(
+        search_arm[["daily_hit_edge", "hit_edge"]].to_numpy(),
+        search_arm["n_signal_days"].to_numpy(), min_signal_days)
+    return search_arm.iloc[winner], reliable
 
 
 def main(argv=None):
