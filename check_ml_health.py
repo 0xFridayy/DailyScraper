@@ -234,6 +234,11 @@ def check_unit_tests(problems, stats):
                 executed = int(unittest_summary.group(1)) - suite_skips
             elif script_summary:
                 gated = [f"{name}: {item}" for item in (script_summary.group(3) or "").split("; ") if item]
+                reported_gates = re.findall(r"(?m)^(\S+) skipped \((.*)\)$", r.stdout)
+                summarized = {item.split(": ", 1)[0] for item in
+                              (script_summary.group(3) or "").split("; ") if item}
+                gated.extend(f"{name}: {label}: {why}" for label, why in dict(reported_gates).items()
+                             if label not in summarized)
                 executed = int(script_summary.group(1)) - len(gated)
             else:
                 executed = r.stdout.count(" passed") + r.stdout.count("  ok ")

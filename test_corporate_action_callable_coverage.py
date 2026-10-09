@@ -260,3 +260,30 @@ def test_stored_v0_rule_signals_are_not_returned_by_a_direct_reader(tmp_path):
         with pytest.raises(UnsupportedPriceContract):
             db.live_signal_frame(conn)
         assert conn.total_changes == before
+
+
+@pytest.mark.parametrize("name", ["wf", "main"])
+def test_inventory_comparison_refuses_before_source_or_model(name, monkeypatch):
+    module = importlib.import_module("test_inventory_adds")
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("panel read before contract refusal")
+
+    monkeypatch.setattr(module.pd, "read_parquet", blocked)
+    args = (UnreadableInput(), "target", [], []) if name == "wf" else ()
+    route = f"test_inventory_adds.{name}"
+    with pytest.raises(UnsupportedPriceContract, match=re.escape(route)) as caught:
+        getattr(module, name)(*args)
+    assert caught.value.consumer == route
+
+
+def test_inventory_comparison_cold_cli_refuses_without_artifacts():
+    from test_corporate_action_cold_cli import cold_run
+    from price_contract import CONTRACT_VERSION
+
+    run, created, leaked = cold_run("test_inventory_adds")
+    assert run.returncode != 0
+    assert "price_contract.UnsupportedPriceContract: test_inventory_adds.__main__" in run.stderr
+    assert CONTRACT_VERSION in run.stderr
+    assert created == []
+    assert leaked == {}

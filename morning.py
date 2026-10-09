@@ -1,28 +1,8 @@
-"""Morning entry point for daily-scrape.yml: run the scrape, then send ONE
-message with picks and follow-ups instead of the raw NeoBDM list.
+"""Scheduled scrape followed by certified picks or a nonfinancial status report.
 
-neobdm_scraper.run_all_jobs() runs as-is, but its send_telegram is swapped for
-a holder while it runs: "NeoBDM error" messages still go out immediately, the
-raw daily report is held. If the picks step fails or can't send its picks
-("send_failed"), the held raw report is sent instead.
-
-An unsupported corporate-action picks route exposes its structured refusal
-and sends no held raw substitute. Its sender is created only when a supported
-route actually sends a message. Unexpected contract refusals report an error.
-
-When the picks step finds no fresh data, its stale warning is the only
-message. The held raw report is never sent then, because it would present a
-late or failed scrape as if it were a fresh report: "stale" means the warning
-went out; "stale_send_failed" means it did not, and only that warning text is
-retried, once. A retry that is delivered is recorded like run_morning's own
-(daily_picks.record_stale_warning), so the next run stays quiet; a failed
-retry records nothing.
-
-Nothing here may stop the workflow's commit step: picks code is imported only
-after the scrape, every send is guarded, and the script always exits 0 (as
-`neobdm_scraper.py --now` did). Errors print only their type, because request
-errors can contain the bot URL. Roll back by pointing the workflow at
-`python neobdm_scraper.py --now` again.
+Unsupported analytics produce an operational report through the scraper sender.
+Held raw price reports never replace unavailable analytics. Delivery is guarded;
+only supported picks construct the credential-based daily_picks sender.
 """
 
 from datetime import datetime, timezone
@@ -54,13 +34,29 @@ def main():
         try:
             real_send(text)
         except Exception as e:
-            print(f"fallback send failed: {type(e).__name__}")
+            print(f"operational send failed: {type(e).__name__}")
 
     def hold(message):
         if str(message).startswith("NeoBDM error"):
             safe_send(message)
         else:
             held.append(message)
+
+    def report_operational(status, reason, refusal=None):
+        # Capturing a report proves neither freshness nor certified source basis.
+        # Do not inspect a database or reproduce price values to fill that gap.
+        scrape_status = "REPORT_CAPTURED" if held else "NO_REPORT_CAPTURED"
+        report = {"analytics": status, "scrape": scrape_status,
+                  "data_health": "UNVERIFIED", "reason": reason}
+        text = ("Morning operational status\n"
+                f"Scrape: {scrape_status}; data health: UNVERIFIED.\n"
+                f"Analytics: {status}.\n{reason}\n"
+                "Picks and financial returns withheld.")
+        payload = {"operational_report": report}
+        if refusal is not None:
+            payload["daily_picks"] = refusal
+        print(json.dumps(payload, sort_keys=True))
+        safe_send(text)
 
     scraper.send_telegram = hold
     try:
@@ -81,29 +77,24 @@ def main():
         run_utc = datetime.now(timezone.utc)
         status, text = daily_picks.run_morning(run_utc, send=send)
         print(f"daily picks: {status}")
-        if status == "send_failed" and held:
-            safe_send(held[-1])
+        if status == "send_failed":
+            report_operational("DELIVERY_FAILED", "Picks delivery failed; financial report withheld.")
         elif status == "stale_send_failed" and text:
             if retry_stale_warning(send, text):
-                # Guarded here: a recording error must not reach the handler
-                # below, which would send the raw report.
+                # A recording error does not change whether the warning was sent.
                 try:
                     daily_picks.record_stale_warning(run_utc, text, datetime.now(timezone.utc))
                 except Exception as e:
                     print(f"stale warning record failed: {type(e).__name__}")
     except UnsupportedPriceContract as exc:
-        # A held price-based report cannot replace unavailable certified
-        # analytics. Preserve the refusal identity without sending that report.
         result = exc.as_dict()
         if (exc.consumer != "daily_picks.run_morning" or exc.status != "UNSUPPORTED"
                 or exc.contract_version != CONTRACT_VERSION):
             result["status"] = "CONTRACT_ERROR"
-        print(json.dumps({"daily_picks": result}, sort_keys=True))
+        report_operational(result["status"],
+            "Certified source basis, holding windows and output identity are required.", result)
     except Exception as e:
-        print(f"daily picks failed: {type(e).__name__}")
-        if held:
-            safe_send(f"{held[-1]}\n\n⚠️ Picks step failed today ({type(e).__name__}); "
-                      "this is the raw NeoBDM list instead.")
+        report_operational("ANALYTICS_FAILED", f"Picks step failed ({type(e).__name__}).")
     return 0
 
 

@@ -1,5 +1,4 @@
-"""Tests for morning.py: which raw NeoBDM report, if any, goes out after the
-picks step. No network, no Playwright session, no database.
+"""Tests for morning.py: supported picks or safe operational reporting. No network, no Playwright session, no database.
 
     py -3 test_morning.py
 """
@@ -235,7 +234,7 @@ def test_real_picks_refusal_is_structured_before_any_delivery_or_record():
         env = stale_env(tmp)
         with redirect_stdout(io.StringIO()) as output:
             sent, picks_sent = run_real(env, [False, True], [run_at, retry_at])
-        assert sent == [] and picks_sent == [], (sent, picks_sent)
+        assert len(sent) == 1 and RAW not in sent[0] and picks_sent == [], (sent, picks_sent)
         refusal = json.loads(output.getvalue())["daily_picks"]
         assert refusal["status"] == "UNSUPPORTED"
         assert refusal["consumer"] == "daily_picks.run_morning"
@@ -243,18 +242,18 @@ def test_real_picks_refusal_is_structured_before_any_delivery_or_record():
         assert not os.path.exists(env["picks_db"])
 
 
-def test_unavailable_real_picks_remain_silent_on_subsequent_runs():
+def test_unavailable_real_picks_report_status_without_recording_picks():
     run_at = RUN_MYT.astimezone(timezone.utc)
     for second in (False, RuntimeError("telegram down")):
         with tempfile.TemporaryDirectory() as tmp:
             env = stale_env(tmp)
             sent, picks_sent = run_real(env, [False, second], [run_at, run_at + timedelta(minutes=1)])
-            assert sent == [], (second, sent)
+            assert len(sent) == 1 and RAW not in sent[0], (second, sent)
             assert picks_sent == [], picks_sent
             assert stale_rows(env) == [], (second, stale_rows(env))
-            # The unavailable real route remains silent on subsequent runs.
+            # Each scheduled run reports unavailable analytics, without financial fallback.
             sent2, picks_sent2 = run_real(env, [True], [run_at + timedelta(minutes=5)])
-            assert sent2 == [] and picks_sent2 == []
+            assert len(sent2) == 1 and RAW not in sent2[0] and picks_sent2 == []
             assert stale_rows(env) == []
 
 
@@ -285,7 +284,7 @@ def test_real_refusal_does_not_construct_a_credential_based_sender():
         result = json.loads(output.getvalue())["daily_picks"]
         assert result["status"] == "UNSUPPORTED"
         assert result["consumer"] == "daily_picks.run_morning"
-        assert sent == []
+        assert len(sent) == 1 and RAW not in sent[0]
     finally:
         sys.modules["daily_picks"] = saved[0]
         ns.run_all_jobs, ns.send_telegram = saved[1], saved[2]
@@ -294,7 +293,7 @@ def test_real_refusal_does_not_construct_a_credential_based_sender():
 def test_an_unexpected_contract_refusal_is_reported_as_an_error_without_raw_fallback():
     with redirect_stdout(io.StringIO()) as output:
         sent = run(raises=UnsupportedPriceContract("stale input"))
-    assert sent == []
+    assert len(sent) == 1 and RAW not in sent[0]
     assert json.loads(output.getvalue())["daily_picks"]["status"] == "CONTRACT_ERROR"
 
 
@@ -304,22 +303,25 @@ def test_delivered_stale_warning_is_not_retried():
     assert picks_sent == [STALE_WARNING]
 
 
-def test_send_failed_sends_the_held_raw_report():
-    assert run(status="send_failed") == [RAW]
+def test_send_failed_reports_operational_status():
+    sent = run(status="send_failed")
+    assert len(sent) == 1 and RAW not in sent[0]
+    assert "DELIVERY_FAILED" in sent[0]
 
 
-def test_picks_exception_sends_the_held_raw_report_with_the_failure_suffix():
+def test_picks_exception_reports_only_the_failure_type():
     sent = run(raises=ValueError("boom"))
     assert len(sent) == 1, sent
-    assert sent[0].startswith(RAW)
-    assert "⚠️ Picks step failed today (ValueError)" in sent[0]
+    assert RAW not in sent[0]
+    assert "Picks step failed (ValueError)" in sent[0]
     assert "boom" not in sent[0]                     # only the type, never the text
 
 
 def test_neobdm_error_passes_through_immediately():
     for status in ("sent", "stale", "stale_send_failed", "send_failed"):
         sent = run(status=status, scrape_messages=("NeoBDM error: RuntimeError: x",))
-        assert sent == ["NeoBDM error: RuntimeError: x"], status
+        assert sent[0] == "NeoBDM error: RuntimeError: x", status
+        assert len(sent) == (2 if status == "send_failed" else 1), status
 
 
 def _quiet(status):
@@ -332,9 +334,11 @@ def _quiet(status):
 QUIET = [_quiet(s) for s in ("weekend", "already_sent", "stale_already_warned", "sent", "no_data")]
 
 
-def test_no_held_report_means_nothing_to_fall_back_to():
-    assert run(status="send_failed", scrape_messages=()) == []
-    assert run(raises=ValueError("x"), scrape_messages=()) == []
+def test_no_held_report_still_reports_operational_failure():
+    for sent in (run(status="send_failed", scrape_messages=()),
+                 run(raises=ValueError("x"), scrape_messages=())):
+        assert len(sent) == 1 and "NO_REPORT_CAPTURED" in sent[0]
+        assert RAW not in sent[0]
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)] + QUIET

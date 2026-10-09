@@ -25,9 +25,16 @@ def test_f11_direct_ranking_refuses_valid_unversioned_candidates():
         daily_picks.rank_picks(tagged, {})
 
 
-def test_f13_recovery_does_not_hide_bad_successor():
+def test_f13_recovery_does_not_hide_bad_successor(monkeypatch):
     from test_inventory_capture import bf, price_db, price_payload
     import check_signal_integrity as integrity
+
+    class ReviewDay(integrity.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 7)
+
+    monkeypatch.setattr(integrity, "date", ReviewDay)
 
     with price_db() as conn:
         event_bars = frame().iloc[:4].drop(columns="ticker").to_dict("records")

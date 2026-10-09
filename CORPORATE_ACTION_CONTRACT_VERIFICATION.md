@@ -1,147 +1,267 @@
-# Corporate-action contract remediation verification
+# Corporate Action Contract verification — Phase 5
 
-Verified on 2026-10-08 on `feat/corporate-action-contract-pr83`. These results describe the final settled remediation source, not an intermediate subagent run.
+Scope: 0xFridayy/DailyScraper, remediation base
+`5619f0852d4bfcdb94b6397b4c216a626f9028de`, preserved previous HEAD
+`32015ebbd10678719383182250514780ffa289ad`.
+The four commits 26c382d, 084f2df, d10c727 and 32015eb remain intact.
+Phase 5 changes verification accounting, operational morning reporting and regression
+witnesses. It also closes the remaining `test_inventory_adds.wf`, `.main` and cold
+CLI refusal gaps. It does not migrate refused financial analytics or change
+production data.
 
-The previous reviewed commit is `9e32b14e7e828d7fb300bad051af491ea4c8cac2`. Its parent remains specification commit `d7889749c2a6232e33c5ec3f82468eb593b269e6`, whose parent is original PR83 base `5a2ec4181ad897e3d6455c5b7855e0d9830b1768`. Remediation commits extend this history without rewriting it. No merge or deployment was performed.
+## Trust and source semantics
 
-## Final validation
+A close becomes trusted through an admitted official action reference, an admitted
+step from a trusted immediate-session predecessor, or the final session of a clean
+10-session restart window. The first supplied row never gains positional trust.
+A missing exchange session never bridges to an older observed close. An old
+quarantine outside the required local window does not disable a current clean trade.
 
-```sh
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/tmp/ca-independent-harness:/tmp/ca-test-deps \
-  python verify_corporate_action_contract.py --test-deps /tmp/ca-test-deps
+Series-break context requires 10 preceding rows in the same supported segment.
+Restart and predecessor-consistency checks have bounded dependencies; the witnesses
+compare complete history with slices and older-history changes. Removing context
+can withhold trust, and cannot add it. Writer, cleaner, simulator and monitor use
+the same adjudication rules.
+
+An admitted official exchange reference anchors limit checks on its effective
+session. It never replaces the observed actual price for economic payoff, cost or
+netval. A theoretical TERP or the previous cum-action close cannot substitute for
+that official reference. Known and pending event boundaries withhold economic
+returns across the affected holding windows.
+
+UNKNOWN basis permits ordinary-price diagnostics and source capture only. Matching
+prices cannot establish raw-actual representation, authorize an action exception or
+certify a financial return. Event boundaries remain barriers to Option A returns.
+Cached labels and outputs require current value-bound identity. Direct unsupported
+analytical calls and cold CLIs refuse before producing persistent artifacts.
+
+The monitor rebuilds admission from stored OHLCV and quarantine evidence. It checks
+immediate sessions, full paths, quarantined anchors, extrema and numerical values;
+producer flags, blank withholding reasons and resealed forged labels do not suffice.
+
+Placeholder identities such as UNKNOWN, N/A and TBD, empty or degenerate hashes,
+and contradictory observation/verification/enrollment/publication chronology cannot
+authorize action or source evidence. Date-only evidence retains its declared
+precision. Repairing stored NULL OHLCV fields is a change and must validate both its
+own step and affected successors.
+
+Known limitation: a coherent wrong run of 10 or more sessions can regain diagnostic
+trust if no source contradiction, quarantine, domain defect or discontinuity is
+visible. Restart does not prove economic correctness or source representation.
+Resolving that limitation requires new external evidence and remains outside scope.
+
+## Operational eligibility on the preserved fixture
+
+Read-only export of Git blob `532a3cfc58779101a63327e7da4ebdeeafd99f7c`;
+SHA256 `6fc475e6db6be597a539a8cc30f6a0c44f05a5c14b263367c07a3aa417389be5`.
+The working databases were not opened. This is historical evidence, not a live
+production freshness check.
+
+- 12,346 price rows; 45 total tickers; 6,895 trusted rows in 2026.
+- Latest global session: 2026-10-05, with 44 tickers present.
+- Latest row per ticker: 45 rows; 42 diagnostically eligible; one unresolved;
+  two pending restart; zero in the exclusive refused, action-pending, quarantine,
+  source-basis or other categories.
+- Source-basis unverified: all 45 latest rows. This overlaps the diagnostic
+  categories. Certified financial analytics eligible: zero.
+- ENRG, 2026-10-05: INADMISSIBLE / UNRESOLVED_EVENT_REFERENCE;
+  reference reason UNKNOWN_REPRESENTATION.
+- SINI, 2026-10-05: RESTART_PENDING, 2 of 10 sessions;
+  reference reason UNTRUSTED_PREDECESSOR.
+- TEBE, 2026-09-30: RESTART_PENDING, 7 of 10 sessions;
+  reference reason UNTRUSTED_PREDECESSOR; absent on the latest global session.
+
+A read-only writer-validation witness proposed flat synthetic bars on 2026-10-06:
+45 accepted, zero refused. Dispositions were 42 ORDINARY_DIAGNOSTIC_ONLY,
+two SOURCE_CAPTURE_UNADJUDICATED and one RESTART_PENDING. It performed no database
+writes and makes no claim about actual October 6 observations. Historical defects
+therefore do not block all top-ups; capture acceptance does not certify analytics.
+
+## Morning reporting
+
+`.github/workflows/daily-scrape.yml` invokes `morning.py`, which runs the scraper
+and calls `daily_picks.run_morning`. The real picks route currently refuses with its
+named UNSUPPORTED contract identity. Morning emits that structured refusal plus a
+nonfinancial operational report through the existing scraper sender. It reports
+REPORT_CAPTURED or NO_REPORT_CAPTURED and data health UNVERIFIED.
+
+Unexpected contract refusals, analytical exceptions and delivery failures also
+produce operational status. Held raw financial reports never replace unavailable
+analytics. Supported stale-warning retry and recording behavior remains covered.
+The refused route never constructs the daily_picks credential-based sender or
+records a stale pick warning. All delivery tests use stubs; live Telegram delivery
+was not tested or sent.
+
+## Evidence accounting
+
+The verifier distinguishes PASS, FAIL, SKIP and UNAVAILABLE. Printed artifact gates,
+silent bare early returns and mandatory formal skips withdraw their cases from PASS.
+Returns after expected validation exceptions remain PASS; returns for missing files
+or imports remain UNAVAILABLE. Explicit optional missing-Torch skips remain SKIP.
+Zero-execution mandatory suites cannot pass. Subtests are counted separately, and
+missing mandatory subtest evidence blocks success. A failed subtest does not
+manufacture an additional failed parent.
+
+Exit 0 means completed requested evidence; exit 1 means real failure or a surviving
+semantic mutant; exit 2 means incomplete mandatory evidence. Missing fixture setup
+returns UNAVAILABLE. Mutations report every killed, surviving or unavailable mutant
+and baseline failure; import/collection errors never count as semantic kills.
+Windows child output and source interpretation use UTF-8.
+
+The ML Health checks retain their standalone accounting and expected named refusal
+probes. Informal `test_name skipped (reason)` lines are counted as UNAVAILABLE and
+deduplicated against repeated lines and explicit summary skip descriptors.
+Their optional-artifact policy is narrower than the contract verifier's mandatory
+evidence policy; an ML Health OK message alone cannot establish
+a complete contract-verification PASS.
+
+## Validation
+
+Validation recorded on 2026-10-09 with Windows/Python 3.14.6 and pytest 9.1.1.
+Counts are per group; groups overlap and must not be summed into a unique total.
+
+| Group | PASS | FAIL | SKIP | UNAVAILABLE |
+| --- | ---: | ---: | ---: | ---: |
+| Focused catching regressions | 25 | 0 | 0 | 0 |
+| Focused broker fixture/accounting cases | 5 | 0 | 0 | 0 |
+| Contract verifier: 34 suites, primary cases | 1,933 | 0 | 0 | 49 |
+| Contract verifier: subtests | 329 | 0 | 0 | 0 |
+| ML Health DEFAULT: tests | 823 | 0 | 4 | 36 |
+| ML Health QUICK: tests | 823 | 0 | 4 | 36 |
+| Full available regression: 40 suites, primary cases | 2,355 | 0 | 0 | 52 |
+| Full available regression: subtests | 329 | 0 | 0 | 0 |
+| Signal-integrity witnesses | 11 | 0 | 0 | 0 |
+| Morning pytest/stubbed operational route | 17 | 0 | 0 | 0 |
+| Morning standalone, including five QUIET outcomes | 19 | 0 | 0 | 0 |
+| Pipeline | 107 | 0 | 0 | 1 |
+| Linux accounting and POSIX witnesses | 18 | 0 | 0 | 0 |
+
+Combined semantic mutations: **54 killed / 54 total; 0 survived;
+0 baseline failures; 0 unavailable**. Exact survivor list: empty.
+There were 114 passing unchanged cases in 50 witness groups and 101 expected
+assertion failures under mutations; no import/collection failure was counted as
+a kill. The three newly added inventory-comparison mutants were also individually
+killed, with three passing baselines.
+
+The verifier exited **2: INCOMPLETE**, because mandatory evidence is unavailable.
+Both ML Health modes exited 0 under their explicit optional-artifact policy,
+imported 32 modules and recorded their expected named unsupported routes rather
+than producing analytics. Their optional UNAVAILABLE counts remain in the table.
+
+The recovered DEFAULT/QUICK runs and 11 unaffected completed full-suite groups were
+retained. The current full verifier and every unfinished/affected regression group
+ran after reconnection. The original matrix failure is preserved in
+matrix-recovered.json and the original broker-flow log, with the correct-fixture
+rerun recorded separately. No final real failure or mutant survivor remains.
+
+Unavailable primary-case accounting:
+
+- Contract verifier: 45 missing artifact checks and four Windows POSIX checks.
+  The four POSIX witnesses separately passed on Linux.
+- Full regression: the same 49, one additional pinned broker-daily Parquet check,
+  one Windows symlink-privilege check, and one zero-collection legacy utility.
+- test_inventory_adds.py has no pytest cases: its exit 5 is UNAVAILABLE, not PASS.
+  Its direct model, reader and cold CLI refusals have three passing regression
+  cases in callable coverage and three killed mutants.
+- Pipeline: one missing candidate-artifact witness; never counted as PASS.
+
+Code and available evidence are settled. Status: **READY FOR LOCAL FINAL VALIDATION**.
+Mandatory artifact/environment evidence remains incomplete, so this is not a
+complete independent delta-review claim.
+
+The Phase 5 regression additions were demonstrated failing before their fixes.
+The 25 distinct focused catching cases pass on Windows. The three additional
+inventory-comparison witnesses failed before their guards and now pass; each guard
+also has a killed mutant. Five focused broker-manifest cases pass against their
+own audited fixture. All 20 ML Health tests also pass, including the new informal-skip
+accounting regression. The duplicate-date
+witness now proves withdrawal of an otherwise admitted successor. The recovery
+monitor witness pins its fixture clock; the DDQN CLI witness requires the current
+named refusal and zero persistent artifacts. The invariant suites exercise all
+13 requested areas: restart, old quarantine, contaminated starts, slice monotonicity,
++80% audit and monitor detection, missing sessions, bounded history, provenance,
+chronology, independent label validation, NULL repair, direct refusals and cold CLIs.
+
+## Reproduction and remaining local evidence
+
+Run from the preserved worktree with Python 3.14.6 / pytest 9.1.1 on Windows.
+Set PYTHONUTF8=1, PYTHONIOENCODING=utf-8 and PYTHONDONTWRITEBYTECODE=1.
+CA_HISTORICAL_FIXTURE must name the explicitly reviewed read-only temporary export.
+Never substitute a working or production database.
+
+```powershell
+$fixtureRoot = Join-Path $env:TEMP 'ca-phase5'
+$env:CA_HISTORICAL_FIXTURE = Join-Path $fixtureRoot 'neobdm.db'
+py verify_corporate_action_contract.py --fixture-root $fixtureRoot
+py verify_corporate_action_contract.py --mutants-only
 ```
 
-The harness blocks network access. The runner uses disposable source snapshots and the explicit read-only historical fixture under `/tmp/ca-independent-review`, SHA256 `6fc475e6db6be597a539a8cc30f6a0c44f05a5c14b263367c07a3aa417389be5`. Production databases and credentials are excluded. Static workflow/ignore files and unchanged synthetic trade parsing/lock test modules are included; BandarmoloNY directories/data remain excluded.
+The recorded matrix is in the temporary ca-phase5 directory: `matrix.json`,
+`matrix-recovered.json`, `resume_matrix.py`, `resume-*.log`, the recovered ML Health
+and full-suite logs, `fixture_report.py` and `eligibility.json`.
+`py $fixtureRoot\resume_matrix.py matrix` runs the current verifier and resumes
+unfinished/affected groups in disposable source snapshots with placeholder
+credentials. It preserves recovered results for unchanged completed groups and
+sends no real Telegram.
 
-Final result: **1,822 pytest passes, 330 additional subtests, 2 optional Torch skips; all 29 suites exited 0.**
+The broker-flow manifest suite uses its own historical audited fixture from Git
+commit `1aeca5313819e4843ce5cab210d0030dd8f58a78`, blob
+`d7798904fd3293cb8105c4d1b4030caf683e426e`, file SHA256
+`fd1eef8600a1a26a9888d02481cf44fe20e791a8960d611ffd73c618f000eaa0`.
+Its 232,493 broker rows reproduce the contract's ordered hash and show no manifest
+drift. The initial full-matrix manifest assertion failed because the runner paired
+that older manifest with the separate Corporate Action fixture. The failure remains
+in the recovered log; the rerun uses the correct pinned input. This validates the
+historical manifest, without claiming that a production database still matches it.
+Three audited-refusal cases retain all their assertions and express their optional
+future-row check without a completed-test early return, so accounting counts them
+as executed evidence rather than UNAVAILABLE.
 
-| Suite | Final result |
-| --- | --- |
-| `test_price_contract.py` | 28 passed in 4.69s |
-| `test_inventory_capture.py` | 56 passed in 1.79s |
-| `test_walk_forward_canonical.py` | 56 passed in 4.68s |
-| `test_ddqn_canonical.py` | 42 passed, 2 skipped in 2.30s |
-| `test_daily_picks.py` | 60 passed in 0.32s |
-| `test_arb_veto.py` | 10 passed in 1.10s |
-| `test_broker_book.py` | 14 passed in 0.52s |
-| `test_broker_rules.py` | 16 passed in 0.35s |
-| `test_broker_learning.py` | 31 passed in 0.57s |
-| `test_broker_learning_run.py` | 4 passed in 0.41s |
-| `test_inventory_evidence.py` | 106 passed, 138 subtests passed in 5.90s |
-| `test_inventory_signal.py` | 2 passed in 1.11s |
-| `test_targeted_actor_observations.py` | 25 passed in 1.07s |
-| `test_experiment_1f_gate_b.py` | 61 passed in 4.83s |
-| `test_experiment_1f_phase2.py` | 105 passed, 5 warnings in 4.25s |
-| `test_experiment_2a0_event_study.py` | 11 passed in 0.42s |
-| `test_idx_calendar.py` | 40 passed in 0.06s |
-| `test_neobdm_source_contract.py` | 564 passed in 4.61s |
-| `test_corporate_action_findings.py` | 118 passed in 4.42s |
-| `test_corporate_action_mutation_witnesses.py` | 4 passed in 0.89s |
-| `test_corporate_action_callable_coverage.py` | 42 passed in 3.13s |
-| `test_ml_health.py` | 16 passed in 2.06s |
-| `test_pipeline.py` | 108 passed, 3 warnings in 4.57s |
-| `test_broker_dashboard.py` | 49 passed in 0.66s |
-| `test_targeted_actor_panel.py` | 35 passed in 2.57s |
-| `test_morning.py` | 14 passed in 0.47s |
-| `test_broker_collect.py` | 35 passed in 0.84s |
-| `test_bandarmolony_trade_capture.py` | 156 passed, 188 subtests passed in 15.28s |
-| `test_bandarmolony_trade_lock.py` | 14 passed, 3 warnings, 4 subtests passed in 6.56s |
+Missing inputs are `inventory_raw/`, `backtest_out/experiment_1f_candidate/`,
+`backtest_out/experiment_1f_candidate/gate_b_inputs/` and shared `ohlc.parquet` /
+`broker_daily.parquet` under the reviewed `NEOBDM_SHARED_ROOT`. Supply them from
+preserved, verified read-only evidence in an isolated checkout before repeating
+artifact-dependent checks. The verifier does not implicitly copy ignored caches
+from the live worktree. They must not be fetched from production merely to remove
+UNAVAILABLE. In an isolated checkout populated only with reviewed read-only inputs,
+run the artifact-dependent suites:
 
-The 1,822 pytest passes include 35 retained artifact-gated checks that return early because the optional inventory cache/candidate artifacts are absent in the isolated fixture. Those paths were not executed; their messages are listed below. They are not extra successful numerical validations. The formal Torch skips are the optional environment/CLI tests in `test_ddqn_canonical.py`. Five non-failing Phase2 numerical warnings, three pipeline convergence warnings and three lock-test warnings remain visible.
+```powershell
+py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_book.py test_broker_rules.py test_broker_learning_run.py test_experiment_1f_gate_b.py test_experiment_1f_phase2.py test_pipeline.py
+```
 
-ML Health DEFAULT and QUICK were rerun from scratch against the same settled source, in a separate disposable snapshot. Both exited **0**, reporting **31 module imports and 859 standalone tests passed**. DEFAULT exercises the actual named model refusal and panel refusal, validates their consumer/status/contract fields, and produces structured `UNSUPPORTED` notes. QUICK exercises the same panel refusal and intentionally skips the model smoke test. Unexpected refusals and runtime/import/DB errors remain health failures. Torch is absent, so one health module is compile-checked instead of imported.
+The additional audited broker export needs BROKER_DAILY_PARQUET set to the reviewed
+file with SHA256 `c8d1948f00d99ba96fe17376292f32a9cda2be36e2eb5ce303e680427f05cc32`.
+The Windows symlink witness needs an authorized symlink privilege or Linux. Repeat
+these exact offline witnesses once those inputs/capabilities are available:
 
-Pipeline: **108 passed**. Dashboard: **49 passed**. Actor panel: **35 passed**. Morning: **14 pytest tests plus five standalone quiet-status cases; all 19 standalone tests passed**. These are subsets/replays of the reported validation, not additional unique tests to add to 1,822.
+```powershell
+py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_flow_regime.py::test_exact_audited_baseline_reproduces_the_committed_manifest_byte_for_byte
+py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_flow_manifest_refresh.py::test_the_sidecars_of_a_symlinked_source_are_protected
+```
 
-## F01–F18 matrix
+Docker checks require a running Docker Desktop Linux engine; `docker version`
+currently reports that its named pipe is absent. The 14 accounting regressions
+passed on Linux/Python 3.12.14. The four POSIX preflight/fork checks unavailable on
+Windows also passed on Linux with PyArrow 25.0.1, using unchanged synthetic root
+modules and tests whose Git blob identities match the Windows checkout. No
+BandarmoloNY source or data tree was modified.
 
-Every original finding was reproduced on the reviewed behavior during remediation. Every row below is CLOSED, with its catching regression passing on the settled tree. All named tests are in `test_corporate_action_findings.py`; additional direct-call regressions live in `test_corporate_action_callable_coverage.py`.
+A full Linux equivalent still needs a valid Git checkout at the final Phase 5
+commit, installed `requirements.txt` plus pytest, and the same hash-verified
+read-only fixture under `/tmp/ca-phase5`. Run:
 
-| Finding | Reproduced on old behavior | Result and correction | Catching regression | Passing now |
-| --- | --- | --- | --- | --- |
-| F01 | Yes | CLOSED — Invalid registry collections fail atomically | `test_f01_invalid_collection_is_not_an_empty_registry` | Yes |
-| F02 | Yes | CLOSED — Confirmed evidence and reference text have strict identities/types | `test_f02_incomplete_provenance_cannot_authorize_reference` | Yes |
-| F03 | Yes | CLOSED — Labels cannot inherit changed trust, registry, session axis or producer ownership | `test_f03_changed_trust_cannot_reseal_existing_labels` | Yes |
-| F04 | Yes | CLOSED — Certificates bind values and reject duplicate replay | `test_f04_certificate_is_bound_to_observations_and_outputs` | Yes |
-| F05 | Yes | CLOSED — Complete OHLC and full-bar admission are required | `test_f05_extrema_require_full_bar_reference_admission` | Yes |
-| F06 | Yes | CLOSED — Writer checks all revised fields and stored successors before writes | `test_f06_predecessor_revision_revalidates_stored_successor_ohlc` | Yes |
-| F07 | Yes | CLOSED — Unresolved event bars never become predecessors | `test_f07_pending_event_cannot_back_ordinary_session_or_labels` | Yes |
-| F08 | Yes | CLOSED — UNKNOWN or contradictory source metadata cannot authorize an event | `test_f08_explicit_unknown_or_contradictory_source_metadata_refuses_event` | Yes |
-| F09 | Yes | CLOSED — Entry, every payoff bar and decision indexes require admission | `test_f09_rejected_same_session_close_cannot_be_payoff` | Yes |
-| F10 | Yes | CLOSED — Incomplete timed horizons are withheld; true earlier barriers remain supported | `test_f10_incomplete_timed_hold_is_not_shortened` | Yes |
-| F11 | Yes | CLOSED — Direct analytical APIs and cached-result presentations refuse | `test_f11_direct_call_refuses_before_accessing_unversioned_input` | Yes |
-| F12 | Yes | CLOSED — Research/weekly wrappers refuse before persistence and messages | `test_f12_weekly_inner_wrapper_does_not_commit_on_refusal` | Yes |
-| F13 | Yes | CLOSED — Cleaner/writer/monitor share quarantine trust and retain independent defects | `test_f13_independent_duplicates_cannot_be_recovered_by_the_writer` | Yes |
-| F14 | Yes | CLOSED — Independent duplicate observations cannot establish a baseline | `test_f14_direct_label_builder_does_not_chain_duplicate_identity` | Yes |
-| F15 | Yes | CLOSED — Registry boundaries segment medians even when event rows are missing | `test_f15_missing_event_row_does_not_join_median_segments` | Yes |
-| F16 | Yes | CLOSED — Integrity checks derive actual spans without trusting producer reasons | `test_f16_integrity_checks_actual_spans_with_blank_producer_reasons` | Yes |
-| F17 | Yes | CLOSED — Refusal scope covers required trade windows, not unrelated history | `test_f17_unrelated_history_does_not_disable_valid_local_trade` | Yes |
-| F18 | Yes | CLOSED — First complete extrema windows remain correctly aligned | `test_f18_first_complete_extrema_window_and_incomplete_tail` | Yes |
+```sh
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1 \
+  python3.12 verify_corporate_action_contract.py --fixture-root /tmp/ca-phase5
+python3.12 -m pytest -q -p no:cacheprovider -p corporate_action_validation \
+  test_corporate_action_validation.py \
+  test_bandarmolony_trade_capture.py::TradeCaptureTests::test_read_only_preflight_retains_same_process_writer_lock \
+  test_bandarmolony_trade_lock.py::RawRootLockTests::test_fork_while_idle_refuses_inherited_store \
+  test_bandarmolony_trade_lock.py::RawRootLockTests::test_fork_while_lock_held_refuses_inherited_store \
+  test_bandarmolony_trade_lock.py::RawRootLockTests::test_fresh_store_in_forked_child_acquires_real_coordination
+```
 
-The matrix file has **118 passing parameter cases**. Extra checks cover changed source values/certificates, duplicate replay, malformed source evidence, explicit source/session/basis contradictions, producer ownership of derived fields, stale date indexes, invalid barriers, missing event rows, and independently bad successors after quarantine recovery. The pipeline regression `test_strategy_simulator_refuses_to_hold_across_a_clean_panel_gap` verifies immediate decision-to-entry calendar adjacency.
-
-## Direct-call and refusal coverage
-
-The final independent source search inspected **90 production modules and 1,429 definitions/methods**, plus previously traced workflow entry paths. It did not use the route registry as evidence of completeness. Financial publishers were distinguished from generic numerical/statistical operators, actual-source/cash ingestion, quantity/basis diagnostics, index-only analysis, schema/run-status records and raw chart scaling.
-
-Actual module imports and entry calls produced **235 correctly named immediate function refusals, zero unexpected acceptances/errors**. The optional Torch module's exact entry definitions execute without Torch; separate tests cover `TickerEnv` reset/state/step and `QNet.forward`. All 235 function guards are the first executable action after the docstring and their pure guard import. Five CLI routes, the conditional analytical-table writer and class methods have separate coverage.
-
-The final search caught and closed `paired_date_differences`, `daily_ic_capacity`, `primary_status`, cached paired-bootstrap/graduation/sensitivity publishers, and dashboard header/rule-chip publishers. The report module now imports without Telegram credentials; credentials are accessed only by an actual send operation. Five newly discovered presentation regressions failed before their guards and now pass. The direct-call suite has **42 passing cases**.
-
-`broker_learning_db.insert_rows` refuses every analytical table before iterating rows, querying schema, connecting/writing/committing, including empty batches. `runs` keeps its separate status-only schema contract. Real disposable-DB tests verify unchanged write counters and zero `live_outcomes` rows after refusal. Weekly/research/CLI/veto and morning tests verify no output file/cache/manifest/persistence record/message before the actual named refusal. Expected unavailable morning analytics never fall back to a raw financial report or construct a credential-based sender.
-
-Generic numerical helpers retain their math tests. Explicitly pinned reviewed-code fixtures retain the daily tagging/ranking/reason/presentation assertions, primary-status horizon selection, and GateB graduation/sensitivity assertions in separate in-memory test namespaces. They never patch production modules or certify v1 output. Other refusal regressions exercise the actual named API with representative unversioned inputs rather than claiming an unsupported analytical result.
-
-## Semantic mutations
-
-**Original mutants: 9/9 killed. F01–F18 adversarial mutations: 18/18 killed. Total: 27/27.**
-
-Unchanged witnesses: **50 passing cases across 24 groups**. These replay suite tests and are not added to unique totals. Mutated executions produced **49 failing cases with genuine assertion evidence**; some parameter cases survive while the targeted mutation is killed by another case. Import/collection/syntax errors, skip-only witnesses and successful mutant executions never count as kills.
-
-The original nine reference/TERP/pending/carry-forward/OO/full-span/zero-fill/tier/netval mutations remain. F09 removes both independently redundant entry and payoff guards to expose the unsafe payoff. F14 restores arbitrary last-record deduplication to manufacture a falsely unique predecessor; removal of just one mask remains blocked independently.
-
-## Preserved semantics and scope
-
-- ENRG reconstructed observed anchors remain Oct2 C1440 and Oct5 O1080/H1085/L1000/C1030/V109977800. Oct5 reference1065 is only a limit diagnostic, approximately **−3.2863849765%**. Oct2→Oct5 economic return is NaN/WITHHELD with `CORPORATE_ACTION_BOUNDARY`. Actual prices and actual-close broker netval are unchanged; the actual-price substitution mutant is killed.
-- SINI July9 remains `PENDING_REFERENCE`, reference null. No theoretical7380 fallback or unresolved predecessor trust is admitted.
-- RAJA remains mixed-basis history, with no inferred Aug25 event and no factor-five automatic repair.
-- `Corporate_action_contract_impact_audit.md` is unchanged (SHA256 `a432d91a4477353bb779c519b57f4d3b201a9e4f62e9d74bc1f77ba80819b361`). `corporate_actions.json` is unchanged (SHA256 `fc273d921f7501d5cd99d9b571d1f90a860331e18b840aa7dbf0dc539007ddca`).
-- Diff checks and parsing of all changed/new Python sources pass. No production DB, credential/token file, BandarmoloNY file, frozen accepted artifact, or unrelated feature change is included. The read-only historical health fixture hash is identical before and after both health runs. Only task-generated Python/pytest caches were removed.
-
-## Retained artifact-gated checks not executed
-
-- SKIP strict equivalence (inventory_raw/ cache not present)
-- SKIP real-cache invariant (inventory_raw/ cache not present)
-- SKIP no look-ahead on SINI (inventory_raw/ cache not present)
-- skip unreadable cache: inventory_raw/ cache not present
-- skip mostly empty: inventory_raw/ cache not present
-- skip stale books: inventory_raw/ cache not present
-- SKIP source_manifest (candidate snapshot not built here)
-- SKIP frozen_artifacts (shared checkout not present)
-- SKIP determinism (candidate snapshot not built here)
-- SKIP validity_domains (candidate artifacts not built here)
-- SKIP real_authorization (candidate artifacts not built here)
-- SKIP sensitivity (candidate artifacts not built here)
-- SKIP mode_artifacts (validity artifacts not built here)
-- SKIP headline_counts (candidate artifacts not built here)
-- SKIP date_mask (sensitivity artifact not built here)
-- SKIP date_mask_nominal (sensitivity artifact not built here)
-- SKIP manifest_separates_execution_from_provenance (candidate snapshot not built here)
-- SKIP manifest_pins_code_identity_and_rejects_drift (candidate snapshot not built here)
-- SKIP a_dirty_working_tree_blocks_establishment (candidate snapshot not built here)
-- SKIP artifact_parentage_is_cryptographic_not_by_filename (candidate snapshot not built here)
-- SKIP auth_identity (candidate artifacts not built here)
-- SKIP the_manifest_is_not_established_by_building_it (candidate snapshot not built here)
-- SKIP pit_observability (validity artifacts not built here)
-- SKIP rename_neutral (candidate artifacts not built here)
-- SKIP ohlc_snapshot (OHLC snapshot not built here)
-- SKIP ohlc_full_market (OHLC snapshot not built here)
-- SKIP establishment_requires_semantic_code_clean_not_whole_tree (candidate snapshot not built here)
-- SKIP validity_reports_stay_derived_not_execution_inputs (candidate snapshot not built here)
-- SKIP the_manifest_establishment_target_is_the_candidate_directory (candidate snapshot not built here)
-- SKIP robustness (sensitivity artifact not built here)
-- SKIP dirty_classification_is_fail_closed_not_py_only (candidate snapshot not built here)
-- SKIP test_synthetic_manifest_matches_the_production_schema (real proposal absent)
-- SKIP test_rupiah_round_trip_stays_far_inside_the_tolerance (candidate broker table absent)
-- SKIP test_semantic_validation_does_not_depend_on_the_shared_checkout (candidate OHLC absent)
-- SKIP test_real_297_has_no_partially_present_broker (snapshot absent)
+GitHub's full Ubuntu/Python 3.12 job and live production delivery remain unverified;
+no workflow was dispatched. Repeat only offline/stubbed checks during final local
+validation; `morning.py` and the scheduled workflow are live operational entrypoints.

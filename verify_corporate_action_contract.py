@@ -5,6 +5,7 @@ Production databases, credentials and the BandarmoloNY data tree are never opene
 """
 
 import argparse
+import json
 from hashlib import sha256
 from pathlib import Path
 import os
@@ -14,7 +15,8 @@ import subprocess
 import sys
 import tempfile
 
-from corporate_action_mutations import FINDING_MUTANTS, RESTART_MUTANTS
+from corporate_action_mutations import FINDING_MUTANTS, RESTART_MUTANTS, PHASE5_MUTANTS
+from corporate_action_validation import KEYS, evidence_status, validation_counts
 
 ROOT = Path(__file__).parent
 SUITES = [
@@ -25,7 +27,8 @@ SUITES = [
     "test_experiment_1f_gate_b.py", "test_experiment_1f_phase2.py", "test_experiment_2a0_event_study.py",
     "test_idx_calendar.py", "test_neobdm_source_contract.py",
     "test_corporate_action_findings.py", "test_corporate_action_restart.py", "test_corporate_action_monitor.py",
-    "test_corporate_action_cold_cli.py",
+    "test_corporate_action_cold_cli.py", "test_corporate_action_validation.py",
+    "test_corporate_action_morning_status.py",
     "test_corporate_action_mutation_witnesses.py",
     "test_corporate_action_callable_coverage.py", "test_ml_health.py",
     "test_pipeline.py", "test_broker_dashboard.py", "test_targeted_actor_panel.py",
@@ -59,7 +62,8 @@ MUTANTS = [
 
 
 def execute(command, env, cwd=ROOT):
-    result = subprocess.run(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run(command, cwd=cwd, env=env, text=True, encoding="utf-8",
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     return result.returncode, result.stdout
 
 
@@ -104,7 +108,7 @@ def prepare_snapshot(folder, env, fixture_root=None):
         if (not fixture.is_relative_to(Path(tempfile.gettempdir()).resolve())
                 or not fixture.is_file() or fixture.is_symlink()
                 or fixture.stat().st_mode & 0o222):
-            raise RuntimeError("Full verification needs an explicit read-only historical fixture under /tmp")
+            raise RuntimeError("Full verification needs an explicit read-only historical fixture under the system temporary directory")
         if sha256(fixture.read_bytes()).hexdigest() != HISTORICAL_DB_SHA256:
             raise RuntimeError("Historical database fixture does not match the reviewed committed snapshot")
         shutil.copyfile(fixture, case / "neobdm.db")
@@ -114,7 +118,8 @@ def prepare_snapshot(folder, env, fixture_root=None):
 
 def pytest_command(target, *, show_output=False):
     return [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-            "-rs", *(["-s"] if show_output else []), target]
+            "-p", "corporate_action_validation", "-rs", target]
+
 
 
 def semantic_assertion_failure(status, output):
@@ -128,61 +133,75 @@ def semantic_assertion_failure(status, output):
 def verify_mutants(snapshot, env, selected=None):
     original = [(name, file, old, new, f"test_price_contract.py::{test}")
                 for name, file, old, new, test in MUTANTS]
-    mutations = original + FINDING_MUTANTS + RESTART_MUTANTS
+    mutations = original + FINDING_MUTANTS + RESTART_MUTANTS + PHASE5_MUTANTS
     if selected:
         mutations = [mutation for mutation in mutations if any(
             mutation[0].startswith(prefix) for prefix in selected)]
         if not mutations:
             raise RuntimeError("No semantic mutants match the requested selection")
-    checked_witnesses = set()
-    killed = 0
-    unchanged_cases = 0
-    failing_mutant_cases = 0
+    witnesses = {}
+    killed, survived, unavailable = [], [], []
+    baseline_failures = []
+    unchanged_cases = failing_mutant_cases = failing_mutant_subcases = 0
     for mutation in mutations:
         name, filename, old, new, target = mutation[:5]
         additional = mutation[5] if len(mutation) > 5 else ()
-        if target not in checked_witnesses:
+        if target not in witnesses:
             status, output = execute(pytest_command(target), env, snapshot)
-            if status:
-                print(f"UNCHANGED WITNESS FAILED: {target}\n{output}", flush=True)
-                return 1
-            baseline_summary = output.strip().splitlines()[-1] if output.strip() else ""
-            passing = re.search(r"\b(\d+) passed\b", baseline_summary)
-            if not passing:
-                print(f"UNCHANGED WITNESS DID NOT EXECUTE: {target}\n{output}", flush=True)
-                return 1
-            unchanged_cases += int(passing.group(1))
-            checked_witnesses.add(target)
+            counts = validation_counts(status, output)
+            witnesses[target] = evidence_status(counts)
+            unchanged_cases += counts["passed"]
+            if witnesses[target] != "PASS":
+                print(f"UNCHANGED WITNESS {witnesses[target]}: {target}\n{output}", flush=True)
+                if witnesses[target] == "FAIL":
+                    baseline_failures.append(target)
+        if witnesses[target] != "PASS":
+            unavailable.append(name)
+            continue
         with tempfile.TemporaryDirectory(prefix="ca-mutant-") as folder:
             case = Path(folder)
             for file in snapshot.iterdir():
                 if file.is_file() and file.suffix in {".py", ".json"}:
                     shutil.copyfile(file, case / file.name)
             path = case / filename
-            source = path.read_text()
-            finding_mutant = name.startswith(("F", "R"))  # exactly one source match
+            source = path.read_text(encoding="utf-8")
+            finding_mutant = name.startswith(("F", "R", "P5"))
             for before, after in ((old, new), *additional):
                 occurrences = source.count(before)
                 if not occurrences or finding_mutant and occurrences != 1:
-                    raise RuntimeError(f"mutant {name} requires one source match, found {occurrences}")
+                    unavailable.append(name)
+                    print(f"MUTANT UNAVAILABLE: {name}; source matches: {occurrences}", flush=True)
+                    break
                 source = source.replace(before, after, 1 if finding_mutant else occurrences)
-            path.write_text(source)
-            mutant_env = dict(env)
-            mutant_env["PYTHONPATH"] = os.pathsep.join([str(case), env["PYTHONPATH"]])
-            status, output = execute(pytest_command(target), mutant_env, case)
-            if not semantic_assertion_failure(status, output):
-                print(f"MUTANT NOT SEMANTICALLY KILLED: {name}\n{output}", flush=True)
-                return 1
-            killed += 1
-            mutant_summary = output.strip().splitlines()[-1]
-            failed = re.search(r"\b(\d+) failed\b", mutant_summary)
-            failing_mutant_cases += int(failed.group(1)) if failed else 0
-            print(f"MUTANT KILLED: {name} ({mutant_summary})", flush=True)
-    print(f"Semantic mutants killed: {killed}/{len(mutations)}; unchanged witnesses passed: "
-          f"{unchanged_cases} cases in {len(checked_witnesses)} groups; "
-          f"mutated pytest cases failed: {failing_mutant_cases}",
-          flush=True)
-    return 0
+            else:
+                path.write_text(source, encoding="utf-8")
+                mutant_env = dict(env)
+                mutant_env["PYTHONPATH"] = os.pathsep.join([str(case), env.get("PYTHONPATH", "")])
+                status, output = execute(pytest_command(target), mutant_env, case)
+                counts = validation_counts(status, output)
+                if semantic_assertion_failure(status, output):
+                    killed.append(name)
+                    failing_mutant_cases += counts["failed"]
+                    failing_mutant_subcases += counts.get("subtests", {}).get("failed", 0)
+                    print(f"MUTANT KILLED: {name}", flush=True)
+                elif evidence_status(counts) == "PASS":
+                    survived.append(name)
+                    print(f"MUTANT SURVIVED: {name}\n{output}", flush=True)
+                else:
+                    unavailable.append(name)
+                    print(f"MUTANT UNAVAILABLE: {name}\n{output}", flush=True)
+    print(f"Semantic mutants: total: {len(mutations)}; killed: {len(killed)}; "
+          f"survived: {len(survived)}; unavailable: {len(unavailable)}; "
+          f"unchanged witnesses: {unchanged_cases} cases in {len(witnesses)} groups; "
+          f"mutated cases failed: {failing_mutant_cases}; "
+          f"mutated subtests failed: {failing_mutant_subcases}", flush=True)
+    print("MUTATION_RESULTS: " + json.dumps({"total": len(mutations), "killed": killed,
+          "survived": survived, "unavailable": unavailable,
+          "baseline_failures": baseline_failures, "unchanged_cases": unchanged_cases,
+          "witness_groups": len(witnesses), "mutated_cases_failed": failing_mutant_cases,
+          "mutated_subtests_failed": failing_mutant_subcases}, sort_keys=True), flush=True)
+    return 1 if survived or baseline_failures else 2 if unavailable else 0
+
 
 
 def main():
@@ -196,28 +215,47 @@ def main():
     args = parser.parse_args()
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     with tempfile.TemporaryDirectory(prefix="ca-verification-") as folder:
-        snapshot = prepare_snapshot(folder, env, None if args.mutants_only else args.fixture_root)
+        try:
+            snapshot = prepare_snapshot(folder, env, None if args.mutants_only else args.fixture_root)
+        except RuntimeError as exc:
+            print(f"VERIFICATION UNAVAILABLE: {exc}; no PASS claim", flush=True)
+            return 2
         paths = [str(snapshot)] + ([args.test_deps] if args.test_deps else [])
         paths.extend(path for path in env.get("PYTHONPATH", "").split(os.pathsep)
                      if path and Path(path).resolve() != ROOT.resolve())
         env["PYTHONPATH"] = os.pathsep.join(paths)
         env["MPLCONFIGDIR"] = str(snapshot / "mpl-config")
+        totals = dict.fromkeys(KEYS, 0)
+        totals["subtests"] = dict.fromkeys(KEYS, 0)
+        suite_results = []
         if not args.mutants_only:
             for suite in SUITES:
-                status, output = execute(pytest_command(suite, show_output=True), env, snapshot)
-                print(f"{suite}: {output.strip().splitlines()[-1] if output.strip() else status}", flush=True)
-                # Some retained standalone suites report optional artifacts by
-                # returning early. Expose those messages instead of hiding them.
-                for line in output.splitlines():
-                    if "SKIP " in line or re.search(r"\bskip .*:", line):
-                        print(line.strip(), flush=True)
-                if status:
-                    print(output)
-                    return 1
-        if verify_mutants(snapshot, env, args.mutant):
+                status, output = execute(pytest_command(suite), env, snapshot)
+                counts = validation_counts(status, output)
+                result = evidence_status(counts)
+                suite_results.append({"suite": suite, "status": result, **counts})
+                for key in KEYS:
+                    totals[key] += counts[key]
+                    totals["subtests"][key] += counts.get("subtests", {}).get(key, 0)
+                print(f"{suite}: {result}; {json.dumps(counts, sort_keys=True)}", flush=True)
+                if result == "FAIL":
+                    print(output, flush=True)
+            print("REGRESSION_RESULTS: " + json.dumps({"counts": totals, "suites": suite_results},
+                                                     sort_keys=True), flush=True)
+        mutation_status = verify_mutants(snapshot, env, args.mutant)
+        failed = totals["failed"] or any(r["status"] == "FAIL" for r in suite_results)
+        incomplete = totals["unavailable"] or any(r["status"] == "UNAVAILABLE" for r in suite_results)
+        if failed or mutation_status == 1:
+            print("VERIFICATION FAIL; see failed evidence above.", flush=True)
             return 1
-    print("Required regressions and semantic mutations passed.", flush=True)
+        if incomplete or mutation_status == 2:
+            print("VERIFICATION INCOMPLETE: mandatory evidence UNAVAILABLE; no PASS claim.", flush=True)
+            return 2
+    print("Selected semantic mutations passed." if args.mutants_only else
+          "Required regressions and semantic mutations passed.", flush=True)
     return 0
 
 

@@ -174,6 +174,21 @@ class HealthTests(unittest.TestCase):
         self.assertIn("ML health OK", ok)
         self.assertIn("1 optional check(s) UNAVAILABLE", ok)
 
+    def test_informal_skipped_line_is_unavailable_and_counted_once(self):
+        for summary, repeats in (("All 2 tests passed.\n", 1),
+                ("All 2 tests passed. (1 skipped: test_candidate: candidate artifacts absent)\n", 1),
+                ("All 2 tests passed.\n", 2)):
+            problems, stats = [], {}
+            def gated(args, **kwargs):
+                return subprocess.CompletedProcess(args, 0,
+                    "test_candidate skipped (candidate artifacts absent)\n" * repeats + summary, "")
+            with patch.object(health.subprocess, "run", side_effect=gated):
+                health.check_unit_tests(problems, stats)
+            suites = len(stats["suite_results"])
+            self.assertEqual(problems, [])
+            self.assertEqual(stats["tests_passed"], suites)
+            self.assertEqual(len(stats["tests_unavailable"]), suites)
+
     def test_every_health_suite_uses_a_fresh_process(self):
         launched = []
         def successful(args, **kwargs):

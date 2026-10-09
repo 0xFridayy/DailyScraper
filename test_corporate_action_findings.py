@@ -183,6 +183,18 @@ def test_f14_duplicate_identity_is_not_a_predecessor():
     assert out.iloc[-1].limit_reference_status == "UNRESOLVED"
     assert not out.iloc[-1].limit_violation
 
+    # A unique official anchor supplies trust even before a restart window.
+    # Duplicating that identity must withdraw its successor reference.
+    unique = frame()
+    clean = pa.detect(unique, registry=registry(), representation=pc.RAW_ACTUAL)
+    assert clean.loc[clean.date.eq("2026-10-06"), "close_anchor_admissible"].all()
+    duplicate = unique.loc[unique.date.eq("2026-10-05")]
+    duplicated = pd.concat([unique, duplicate], ignore_index=True)
+    audited = pa.detect(duplicated, registry=registry(), representation=pc.RAW_ACTUAL)
+    successor = audited.loc[audited.date.eq("2026-10-06")].iloc[0]
+    assert successor.limit_reference_status == "UNRESOLVED"
+    assert not successor.close_anchor_admissible
+
 
 def test_f15_missing_event_row_does_not_join_median_segments():
     doc = document()
@@ -677,3 +689,15 @@ def test_n01_null_repair_still_checks_its_own_and_successor_transitions():
             bf.insert_inventory(conn, "BBBB", price_payload([price_bar("2026-07-02", 130)], "BBBB"))
         assert conn.total_changes == before
         assert conn.execute("SELECT open FROM price_history WHERE date='2026-07-02'").fetchone() == (None,)
+
+
+def test_n01_null_only_repair_cannot_bypass_ohlc_admission():
+    from test_inventory_capture import bf, price_db, price_payload, price_bar
+    with price_db() as conn:
+        null_history(conn)
+        repaired = price_bar("2026-07-02", 100)
+        repaired.update(open=140, high=140)
+        before = conn.total_changes
+        with pytest.raises(bf.InventoryError, match="limit_violation"):
+            bf.insert_inventory(conn, "BBBB", price_payload([repaired], "BBBB"))
+        assert conn.total_changes == before

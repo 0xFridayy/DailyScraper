@@ -587,12 +587,12 @@ def test_audited_snapshot_build_fails_on_any_departure_from_the_baseline(
         bfr.build_manifest(db, None, snapshot=bfr.AUDITED_SNAPSHOT)
     for reason in reasons:
         assert reason in str(e.value), (reason, str(e.value))
-    # the generic engine still classifies it, as an explicit new snapshot
-    if edit != FUTURE_ROW:
-        return
-    m = bfr.build_manifest(db, None)
-    assert m["input"]["snapshot"] is None
-    assert by_key(m)[("2026-10-01", bfr.LIVE)]["date_class"] == bfr.INFERRED_ONLY
+    # Only the future-row case has this additional generic-engine check.
+    # All cases already completed their audited-refusal assertions above.
+    if edit == FUTURE_ROW:
+        m = bfr.build_manifest(db, None)
+        assert m["input"]["snapshot"] is None
+        assert by_key(m)[("2026-10-01", bfr.LIVE)]["date_class"] == bfr.INFERRED_ONLY
 
 
 def test_refused_audited_build_writes_nothing(baseline_db, tmp_path, monkeypatch):

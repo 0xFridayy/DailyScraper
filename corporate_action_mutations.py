@@ -139,3 +139,91 @@ RESTART_MUTANTS = [
      'context = groups.cumcount().ge(SERIES_CONTEXT_ROWS)', 'context = groups.cumcount().ge(0)',
      "test_corporate_action_restart.py::test_w7_truncated_series_break_context_cannot_widen_trust"),
 ]
+
+PHASE5_MUTANTS = [
+    ("P5-mandatory-evidence-becomes-pass", "verify_corporate_action_contract.py",
+     '        incomplete = totals["unavailable"] or any(r["status"] == "UNAVAILABLE" for r in suite_results)',
+     '        incomplete = False',
+     "test_corporate_action_validation.py::test_mandatory_unavailable_blocks_success"),
+    ("P5-real-failure-downgraded", "verify_corporate_action_contract.py",
+     '        if failed or mutation_status == 1:', '        if False:',
+     "test_corporate_action_validation.py::test_real_failure_remains_failure_with_unavailable"),
+    ("P5-gated-case-counted-as-pass", "corporate_action_validation.py",
+     '        counts["passed"] = max(0, counts["passed"] - len(messages))',
+     '        counts["passed"] = counts["passed"]',
+     "test_corporate_action_validation.py::test_counts_do_not_double_count_artifact_gates"),
+    ("P5-silent-artifact-return-counted-as-pass", "corporate_action_validation.py",
+     '    if report.nodeid in _early_returns:', '    if False:',
+     "test_corporate_action_validation.py::test_pytest_plugin_counts_silent_and_printed_gates"),
+    ("P5-morning-refusal-silent", "morning.py",
+     '        safe_send(text)', '        pass',
+     "test_corporate_action_morning_status.py::test_unsupported_route_delivers_nonfinancial_operational_status"),
+    ("P5-morning-raw-financial-fallback", "morning.py",
+     '        safe_send(text)', '        safe_send(held[-1])',
+     "test_corporate_action_morning_status.py::test_unavailable_analytics_never_falls_back_to_financial_report"),
+    ("P5-N01-null-repair-grandfathered", "backfill_inventory.py",
+     '        return stored is None and proposed is None', '        return True',
+     "test_corporate_action_findings.py::test_n01_null_only_repair_cannot_bypass_ohlc_admission"),
+]
+
+PHASE5_MUTANTS += [
+    ("P5-N02-health-counts-gated-checks-as-pass", "check_ml_health.py",
+     '        passed += executed if status == "PASS" else 0',
+     '        passed += executed + len(gated) if status == "PASS" else 0',
+     "test_ml_health.py::HealthTests::test_artifact_gated_checks_are_unavailable_not_passes"),
+    ("P5-N02-health-mandatory-unavailable-passes", "check_ml_health.py",
+     '    incomplete = bool(stats.get("mandatory_unavailable"))',
+     '    incomplete = False',
+     "test_ml_health.py::HealthTests::test_mandatory_unavailable_blocks_a_complete_pass_claim"),
+]
+
+PHASE5_MUTANTS += [
+    ("P5-unavailable-subtest-becomes-pass", "corporate_action_validation.py",
+     '    if (counts["unavailable"] or counts.get("subtests", {}).get("unavailable", 0)\n'
+     '            or not counts["passed"]):',
+     '    if counts["unavailable"] or not counts["passed"]:',
+     "test_corporate_action_validation.py::test_unavailable_subtest_blocks_success"),
+    ("P5-failed-subtest-counted-twice", "corporate_action_validation.py",
+     '    if (status not in (0, 5) and not counts["failed"]\n'
+     '            and not counts.get("subtests", {}).get("failed", 0)):',
+     '    if status not in (0, 5) and not counts["failed"]:',
+     "test_corporate_action_validation.py::test_failed_subtest_does_not_invent_a_failed_parent"),
+]
+
+PHASE5_MUTANTS += [
+    ("P5-expected-validation-error-becomes-unavailable", "corporate_action_validation.py",
+     '                                  and n.lineno not in exception_returns}',
+     '                                  }',
+     "test_corporate_action_validation.py::test_expected_validation_exception_return_counts_as_pass"),
+]
+
+PHASE5_MUTANTS += [
+    ("P5-missing-fixture-exception-becomes-pass", "corporate_action_validation.py",
+     '                             and not any(getattr(t, "id", getattr(t, "attr", None)) in missing_evidence_errors\n'
+     '                                         for t in ast.walk(handler.type))',
+     '                             ',
+     "test_corporate_action_validation.py::test_missing_fixture_exception_return_is_unavailable"),
+]
+
+PHASE5_MUTANTS += [
+    ("P5-N02-informal-skip-counted-as-pass", "check_ml_health.py",
+     r'                reported_gates = re.findall(r"(?m)^(\S+) skipped \((.*)\)$", r.stdout)',
+     '                reported_gates = []',
+     "test_ml_health.py::HealthTests::test_informal_skipped_line_is_unavailable_and_counted_once"),
+]
+
+
+PHASE5_MUTANTS += [
+    ("P5-F11-inventory-comparison-model-bypass", "test_inventory_adds.py",
+     '    refuse_unmigrated("test_inventory_adds.wf")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_inventory_comparison_refuses_before_source_or_model[wf]"),
+    ("P5-F11-inventory-comparison-reader-bypass", "test_inventory_adds.py",
+     '    refuse_unmigrated("test_inventory_adds.main")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_inventory_comparison_refuses_before_source_or_model[main]"),
+    ("P5-F12-inventory-comparison-cold-cli-bypass", "test_inventory_adds.py",
+     '    refuse_unmigrated("test_inventory_adds.__main__")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_inventory_comparison_cold_cli_refuses_without_artifacts"),
+]

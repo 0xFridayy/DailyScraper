@@ -326,6 +326,10 @@
       "build_panel",
       "run_walk_forward"
     ],
+    "test_inventory_adds": [
+      "wf",
+      "main"
+    ],
     "test_inventory_signal": [
       "load",
       "main"
@@ -340,6 +344,7 @@
     ]
   },
   "cli_routes": {
+    "test_inventory_adds": "__main__",
     "ara_arb_simulation": "__main__",
     "ddqn_entry_exit": "__main__",
     "experiment_1f_features": "__main__",

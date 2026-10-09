@@ -405,13 +405,16 @@ def test_ddqn_entry_exit_reexports_the_frame_and_refuses_uncertified_envs():
         dee.TickerEnv(None, None, None, None)
 
 
-@needs_torch
 def test_ddqn_cli_refuses_without_a_manifest(tmp_path):
     out = subprocess.run([sys.executable, DDQN_SOURCE, "--db", str(tmp_path / "x.db")], cwd=HERE,
                          capture_output=True, text=True, timeout=300)
-    assert out.returncode == 2
-    assert "--broker-flow-manifest is required" in out.stderr
-    assert "broker_flow_manifest_refresh.py" in out.stderr
+    from price_contract import CONTRACT_VERSION
+    assert out.returncode == 1
+    assert "UnsupportedPriceContract" in out.stderr
+    assert "ddqn_entry_exit.__main__" in out.stderr
+    assert CONTRACT_VERSION in out.stderr
+    assert not (tmp_path / "x.db").exists()
+    assert not list(tmp_path.iterdir())
 
 
 # --------------------------------------------------------------------------

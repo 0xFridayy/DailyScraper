@@ -5,6 +5,11 @@ Runs the same walk-forward twice per target -- price-only vs price+inventory --
 keeps both prediction vectors on the identical rows, and bootstraps the paired
 difference in average precision, resampling whole trading days.
 """
+
+if __name__ == "__main__":
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("test_inventory_adds.__main__")
+
 import os
 import sys
 
@@ -21,6 +26,8 @@ rng = np.random.default_rng(23)
 
 
 def wf(data, tgt, feats, dates, min_train=140, step=20, embargo=2):
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("test_inventory_adds.wf")
     keys, ps = [], []
     X = data[feats].replace([np.inf, -np.inf], np.nan)
     for i in range(min_train, len(dates), step):
@@ -55,6 +62,8 @@ def paired_boot(df, n=2000):
 
 
 def main():
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("test_inventory_adds.main")
     d = pd.read_parquet(os.path.join(HERE, "panel.parquet"))
     d["date"] = pd.to_datetime(d["date"])
     d = d[(d.turn20 >= 0.5) & (d.volume > 0)].copy()
