@@ -1158,10 +1158,34 @@ def test_the_legacy_root_basis_artifact_is_left_untouched():
 # manifest v3
 # --------------------------------------------------------------------------
 
+
+def _metadata_snapshot_present():
+    return _candidate_snapshot_present() and os.path.exists(
+        os.path.join(cand.CANDIDATE_DIR, "PROPOSED_manifest_schema_v3.json"))
+
+
+def _metadata_proposal():
+    """Pinned legacy schema plus current, independently computed metadata.
+
+    This is an inert test fixture, never a current financial execution proposal.
+    No guard is removed or patched. Hash/parentage helpers operate on the reviewed
+    artifacts; code identity comes from the controlled committed fixture repo.
+    """
+    path = os.path.join(cand.CANDIDATE_DIR, "PROPOSED_manifest_schema_v3.json")
+    with open(path, "rb") as fh:
+        frozen = fh.read()
+    assert hashlib.sha256(frozen).hexdigest() == "75e8d0c50203e51231c1f2ba21d50bbfabee3f96a308c885a92e6e1a5e91acf8"
+    proposal = json.loads(frozen)
+    proposal["A_execution_inputs"] = manifest.execution_inputs_section(cand.CANDIDATE_DIR)
+    proposal["H_parentage"] = manifest.parentage(cand.CANDIDATE_DIR)
+    repo, _head, _payload = _pinned_code_repo()
+    proposal["E_code_identity"] = manifest.code_identity(root=repo)
+    return proposal
+
 def test_manifest_separates_execution_from_provenance():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("manifest_separates_execution_from_provenance", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     assert proposal["established_utc"] is None, "the proposal is not established"
     assert "_status" in proposal and "NOT ESTABLISHED" in proposal["_status"]
     execution = proposal["A_execution_inputs"]
@@ -1185,9 +1209,9 @@ def test_manifest_separates_execution_from_provenance():
 
 
 def test_manifest_pins_code_identity_and_rejects_drift():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("manifest_pins_code_identity_and_rejects_drift", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     code = proposal["E_code_identity"]
     pinned = {e["path"] for e in code["files"]}
     for required in ("experiment_1f_universe_gate.py", "price_audit.py",
@@ -1262,9 +1286,9 @@ def test_a_dirty_working_tree_blocks_establishment():
     establishment; otherwise writing the established manifest would violate its
     own precondition.
     """
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("a_dirty_working_tree_blocks_establishment", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     dirty = json.loads(json.dumps(proposal))
     dirty["E_code_identity"]["semantic_code_tree_clean"] = False
     dirty["E_code_identity"]["dirty_semantic_code"] = ["experiment_1f_validity.py"]
@@ -1280,9 +1304,9 @@ def test_a_dirty_working_tree_blocks_establishment():
 
 
 def test_artifact_parentage_is_cryptographic_not_by_filename():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("artifact_parentage_is_cryptographic_not_by_filename", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     chain = proposal["H_parentage"]
     assert chain["all_bindings_ok"] is True
     links = {link["child"]: link for link in chain["chain"]}
@@ -1322,15 +1346,21 @@ def test_authorization_parent_identity_is_still_exact():
 
 
 def test_the_manifest_is_not_established_by_building_it():
-    if not _candidate_snapshot_present():
-        return _skip("the_manifest_is_not_established_by_building_it", "candidate snapshot not built here")
-    before = os.path.exists(gate.INPUT_MANIFEST_JSON)
-    manifest.build(cand.CANDIDATE_DIR)
-    assert os.path.exists(gate.INPUT_MANIFEST_JSON) == before, \
-        "building the proposal must never establish a manifest"
-    assert not os.path.exists(gate.INPUT_MANIFEST_JSON), \
-        "no input manifest may exist in this worktree"
-    print("  ok building the proposal establishes nothing")
+    from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
+    from unittest.mock import patch
+    targets = (gate.INPUT_MANIFEST_JSON, gate.REVIEWED_MANIFEST_V3_JSON)
+    before = {path: open(path, "rb").read() if os.path.exists(path) else None for path in targets}
+    with patch("builtins.open", side_effect=AssertionError("proposal refusal must precede IO")):
+        try:
+            manifest.build(cand.CANDIDATE_DIR)
+        except UnsupportedPriceContract as exc:
+            assert exc.consumer == "experiment_1f_manifest.build"
+            assert exc.status == "UNSUPPORTED" and exc.contract_version == CONTRACT_VERSION
+        else:
+            raise AssertionError("an unsupported proposal or fallback was returned")
+    after = {path: open(path, "rb").read() if os.path.exists(path) else None for path in targets}
+    assert after == before, "refused proposal must never establish or modify a manifest"
+    assert not os.path.exists(gate.INPUT_MANIFEST_JSON), "no legacy root input manifest may be created"
 
 
 # ==========================================================================
@@ -1490,9 +1520,9 @@ def test_semantic_code_and_generated_artifacts_are_classified_apart():
 
 
 def test_establishment_requires_semantic_code_clean_not_whole_tree():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("establishment_requires_semantic_code_clean_not_whole_tree", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     dirty = json.loads(json.dumps(proposal))
     dirty["E_code_identity"]["semantic_code_tree_clean"] = False
     dirty["E_code_identity"]["dirty_semantic_code"] = ["experiment_1f_validity.py"]
@@ -1694,9 +1724,9 @@ def test_changing_the_verifier_bytes_invalidates_code_identity():
 
 
 def test_validity_reports_stay_derived_not_execution_inputs():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("validity_reports_stay_derived_not_execution_inputs", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     execution = proposal["A_execution_inputs"]
     for name in execution:
         assert "validity_impact" not in name, \
@@ -1708,9 +1738,9 @@ def test_validity_reports_stay_derived_not_execution_inputs():
 
 
 def test_the_manifest_establishment_target_is_the_candidate_directory():
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("the_manifest_establishment_target_is_the_candidate_directory", "candidate snapshot not built here")
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     est = proposal["_establishment"]
     assert est["established"] is False
     assert est["target_path"].startswith("backtest_out/experiment_1f_candidate/")
@@ -1763,7 +1793,7 @@ def test_dirty_classification_is_fail_closed_not_py_only():
     have been pinned at its dirty value with semantic_code_tree_clean still
     true. neobdm.db and broker_codes.json had the same hole.
     """
-    if not _candidate_snapshot_present():
+    if not _metadata_snapshot_present():
         return _skip("dirty_classification_is_fail_closed_not_py_only", "candidate snapshot not built here")
     entries = manifest.parse_porcelain("\n".join([
         " M experiment_1f_universe.json",
@@ -1781,7 +1811,7 @@ def test_dirty_classification_is_fail_closed_not_py_only():
     assert len(generated) == 1
 
     # and the gate actually refuses on it
-    proposal = manifest.build(cand.CANDIDATE_DIR)
+    proposal = _metadata_proposal()
     dirty = json.loads(json.dumps(proposal))
     dirty["E_code_identity"]["semantic_code_tree_clean"] = False
     dirty["E_code_identity"]["dirty_semantic_code"] = ["experiment_1f_universe.json"]

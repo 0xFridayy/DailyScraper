@@ -598,96 +598,101 @@ def test_retail_codes_match_frozen_definition():
 _REAL = {}
 
 
+def _export_present():
+    """Availability never loads prices or initializes financial features."""
+    return os.path.exists(os.path.join(f.EXPORT_DIR, "export_manifest.json"))
+
+
 def _real():
-    if not os.path.exists(os.path.join(f.EXPORT_DIR, "export_manifest.json")):
+    """Only immutable raw inputs and structural broker observations are cached."""
+    if not _export_present():
         return None
     if not _REAL:
         inputs = f.load_inputs()
         daily = f.broker_daily(inputs["axis"], inputs["broker"], inputs["calendar"])
-        _REAL.update(inputs=inputs, daily=daily,
-                     lag0=f.build_features(inputs, "lag0", daily=daily),
-                     lag1=f.build_features(inputs, "lag1", daily=daily))
+        _REAL.update(inputs=inputs, daily=daily)
     return _REAL
 
 
+def _assert_real_refusal(real):
+    from unittest.mock import patch
+    def no_financial_work(*args, **kwargs):
+        raise AssertionError("feature refusal must precede price computation/file IO")
+    with patch.object(f, "price_features", no_financial_work), \
+            patch("builtins.open", no_financial_work):
+        for arm in f.TIMING_ARMS:
+            _assert_refusal("experiment_1f_features.build_features", f.build_features,
+                            real["inputs"], arm, daily=real["daily"])
+    assert set(real) == {"inputs", "daily"}, "no financial feature cache or fallback"
+
+
 def test_real_export_reproduces_gate_a_identities():
-    if _real() is None:
+    if not _export_present():
         return
-    assert contract.verify_inputs(recompute_logical=True) == []
+    from unittest.mock import patch
+    with patch.object(f, "build_features", side_effect=AssertionError("identity verification must not build features")):
+        assert contract.verify_inputs(recompute_logical=True, recompute_ledgers=False) == []
 
 
 def test_real_preparation_ledgers_match_pins_and_are_deterministic():
     real = _real()
     if real is None:
         return
-    first = f.preparation_ledgers(real["inputs"])
-    assert first == contract.load_pins()
-    assert f.preparation_ledgers(real["inputs"])["arms"]["lag1"]["feature_value_digest"] == first["arms"]["lag1"]["feature_value_digest"]
+    _assert_real_refusal(real)
+    _assert_refusal("experiment_1f_features.build_features", f.preparation_ledgers, real["inputs"])
+    # The schema/identity ledger is structural; feature-value regeneration is not.
+    pins = contract.load_pins()
+    ledger = f.feature_ledger(real["daily"]["codes"])
+    assert f.sha256_json(ledger) == pins["feature_ledger_digest"]
+    assert {name: len(cols) for name, cols in f.family_columns(ledger).items()} == pins["family_counts"]
+    assert contract.load_pins() == pins
+    assert f.sha256_json(f.feature_ledger(real["daily"]["codes"])) == f.sha256_json(ledger)
 
 
 def test_real_exact_nlot_windows_equal_source_sums():
     real = _real()
     if real is None:
         return
+    _assert_real_refusal(real)
     inputs, daily = real["inputs"], real["daily"]
-    frame = real["lag0"][0]
+    ok, num, den = f.window_state(daily, 20)
+    code = daily["codes"].index("KZ")
     by_ticker = {t: g.set_index(["date", "broker_code"]) for t, g in inputs["broker"].groupby("ticker")}
-    rid = daily["axis"].reset_index().set_index(f.KEY)["index"]
     rng = np.random.default_rng(17)
-    col = f.flow_column("KZ", 20)
-    candidates = np.flatnonzero(frame[col].notna().to_numpy())
-    for r in rng.choice(candidates, size=150, replace=False):
-        t, d = frame.at[r, "ticker"], frame.at[r, "date"]
-        p = daily["pos"][rid[(t, d)]]
+    for r in rng.choice(np.flatnonzero(ok), size=150, replace=False):
+        t = daily["axis"].at[r, "ticker"]
+        p = daily["pos"][r]
         dates = daily["calendar"][p - 19:p + 1]
         g = by_ticker[t]
         window = g[g.index.get_level_values("date").isin(dates)]
-        num = int(window.xs("KZ", level="broker_code")["nlot"].sum()) if "KZ" in window.index.get_level_values(1) else 0
-        den = int(window["blot"].sum())
-        assert frame.at[r, col] == num / den, (t, d)
+        expected = int(window.xs("KZ", level="broker_code")["nlot"].sum()) if "KZ" in window.index.get_level_values(1) else 0
+        assert num[r, code] == expected, (t, dates[-1])
+        assert den[r] == int(window["blot"].sum())
 
 
 def test_real_no_broker_feature_consumes_an_invalid_observation():
     real = _real()
     if real is None:
         return
-    inputs, daily = real["inputs"], real["daily"]
-    axis = inputs["axis"]
-    invalid = set(zip(axis.loc[~axis["broker_basis_valid"], "ticker"], axis.loc[~axis["broker_basis_valid"], "date"]))
-    present = set(zip(axis["ticker"], axis["date"]))
-    counts = {}
-    for arm in ("lag0", "lag1"):
-        frame, info = real[arm]
-        on_invalid = np.array([(t, d) in invalid for t, d in zip(frame["ticker"], frame["date"])])
-        broker_cols = list(f.B_ADDED) + [f.flow_column(c, 1) for c in daily["codes"]]
-        counts[arm] = int(frame.loc[on_invalid, broker_cols].notna().any(axis=1).sum())
-        prov = info["provenance"]
-        rng = np.random.default_rng(3)
-        d_col = f.accum_column("KZ")
-        rows = np.flatnonzero(frame[d_col].notna().to_numpy())
-        calpos = {d: i for i, d in enumerate(daily["calendar"])}
+    _assert_real_refusal(real)
+    daily = real["daily"]
+    rng = np.random.default_rng(3)
+    for window in f.FLOW_WINDOWS + (f.ACCUM_WINDOW,):
+        ok, _, den = f.window_state(daily, window)
+        rows = np.flatnonzero(ok)
+        assert len(rows) >= 200
         for r in rng.choice(rows, size=200, replace=False):
-            t = frame.at[r, "ticker"]
-            q = calpos[prov.at[r, "broker_anchor_date"]]
-            assert q <= calpos[frame.at[r, "date"]] - f.TIMING_ARMS[arm]
-            for s in daily["calendar"][q - 59:q + 1]:
-                assert (t, s) in present and (t, s) not in invalid, (arm, t, s)
-    assert counts == {"lag0": 0, "lag1": 7}, counts
-    frame, info = real["lag1"]
-    calpos = {d: i for i, d in enumerate(daily["calendar"])}
-    on_invalid = np.array([(t, d) in invalid for t, d in zip(frame["ticker"], frame["date"])])
-    rows = np.flatnonzero(on_invalid & frame[list(f.B_ADDED) + [f.flow_column(c, 1) for c in daily["codes"]]]
-                          .notna().any(axis=1).to_numpy())
-    assert len(rows) == 7
-    for r in rows:
-        t, anchor = frame.at[r, "ticker"], info["provenance"].at[r, "broker_anchor_date"]
-        q = calpos[anchor]
-        assert q == calpos[frame.at[r, "date"]] - 1
-        for w in f.FLOW_WINDOWS + (f.ACCUM_WINDOW,):
-            col = f.flow_column("KZ", w) if w != f.ACCUM_WINDOW else f.accum_column("KZ")
-            if not np.isnan(frame.at[r, col]):
-                for s in daily["calendar"][q - w + 1:q + 1]:
-                    assert (t, s) in present and (t, s) not in invalid, (t, w, s)
+            q = daily["pos"][r]
+            indices = daily["lookup"][daily["tid"][r], q - window + 1:q + 1]
+            assert len(indices) == window and (indices >= 0).all()
+            assert daily["valid"][indices].all()
+            assert den[r] > 0
+    # Raw anchor selection still uses the previous market session, not row position.
+    for arm, lag in f.TIMING_ARMS.items():
+        anchors = f.anchors(daily, real["inputs"]["panel"], lag)
+        present = anchors >= 0
+        positions = real["inputs"]["panel"]["date"].map(dict(zip(daily["calendar"], range(len(daily["calendar"]))))).to_numpy()
+        assert np.array_equal(daily["pos"][anchors[present]], positions[present] - lag), arm
 
 
 def test_real_b_aggregates_match_frozen_definitions():
@@ -696,7 +701,11 @@ def test_real_b_aggregates_match_frozen_definitions():
         return
     from walk_forward_backtest import _broker_correlation_1d, _broker_day_aggregates
     inputs = real["inputs"]
-    frame = real["lag0"][0].set_index(f.KEY)
+    _assert_real_refusal(real)
+    daily = real["daily"]
+    raw = pd.DataFrame(f._day_aggregates(daily))
+    raw["broker_correlation_1d"] = f._correlation_1d(daily, np.arange(len(daily["axis"])))
+    frame = pd.concat([daily["axis"][f.KEY], raw], axis=1).set_index(f.KEY)
     tickers = ["BBCA", "BUMI", "TINS"]
     bf = inputs["broker"][inputs["broker"]["ticker"].isin(tickers)]
     frozen = _broker_day_aggregates(bf).set_index(f.KEY)
@@ -716,61 +725,37 @@ def test_real_price_features_follow_their_definitions():
     real = _real()
     if real is None:
         return
-    panel = real["inputs"]["panel"]
-    frame = real["lag0"][0]
-    g = panel.groupby("ticker", sort=False)
-    rng = np.random.default_rng(11)
-    for r in rng.choice(np.flatnonzero(frame["log_adv20"].notna().to_numpy()), size=100, replace=False):
-        t, d = frame.at[r, "ticker"], frame.at[r, "date"]
-        hist = g.get_group(t).reset_index(drop=True)
-        i = int(np.flatnonzero(hist["date"].to_numpy() == d)[0])
-        assert abs(frame.at[r, "log_adv20"] - np.log(hist["volume"].iloc[i - 19:i + 1].mean())) < 1e-12
-        if not np.isnan(frame.at[r, "volume_ratio"]):
-            assert abs(frame.at[r, "volume_ratio"] - hist["volume"].iloc[i] / hist["volume"].iloc[i - 5:i].mean()) < 1e-12
+    _assert_real_refusal(real)
+    _assert_refusal("experiment_1f_features.price_features", f.price_features, real["inputs"]["panel"])
 
 
 def test_real_execution_diagnostics_match_contract():
     real = _real()
     if real is None:
         return
-    inputs = real["inputs"]
-    out = ev.slot_outcomes(inputs["panel"], inputs["calendar"])
-    diag = ev.execution_diagnostics(out, inputs["calendar"])
+    _assert_real_refusal(real)
+    _assert_refusal("experiment_1f_evaluation.slot_outcomes", ev.slot_outcomes,
+                    real["inputs"]["panel"], real["inputs"]["calendar"])
+    # Frozen diagnostics remain evidence of the old contract, not fresh returns.
     pinned = contract.EXECUTABLE["counts_h1_evaluable"]
-    assert diag["rows"] == pinned["rows"]
-    assert diag["status"] == {k: pinned[k] for k in ev.STATUSES}, diag["status"]
-    assert diag["hold_through_delay_reason"] == pinned["hold_through_delay_reason"]
-    assert diag["unresolved_reason"] == pinned["unresolved_reason"]
-    for key in ("blocked_single_price_down_exit_attempts", "positions_with_a_blocked_exit_attempt",
-                "unusable_open_exit_attempts"):
-        assert diag[key] == pinned[key], key
-    assert diag["ohlc_optimistic_status"] == pinned["ohlc_optimistic"]
-    held, pinned_held = diag["holding_sessions_hold_through"], contract.EXECUTABLE["holding_sessions_hold_through"]
-    assert held["distribution"] == pinned_held["distribution"] and held["n"] == pinned_held["n"]
-    assert all(abs(held[k] - pinned_held[k]) < 1e-9 for k in ("p50", "p90", "p99", "max"))
-    prox = contract.EXECUTABLE["diagnostics_price_level_proximity_only"]["entry_single_price_up"]
-    got = diag["diagnostics_price_level_proximity_only"]
-    assert got["entry_single_price_up"] == sum(prox.values()) == pinned["UNFILLED_SINGLE_PRICE_UP"]
-    assert (got["entry_single_price_up_near_10pct_level"], got["entry_single_price_up_near_ara_level"]) == (
-        prox["near_10pct_level"], prox["near_ara_level"])
-    assert (out["status"] == "EXIT_HOLD_THROUGH").sum() >= pinned["EXIT_HOLD_THROUGH"]
+    assert sum(pinned[status] for status in ev.STATUSES) == pinned["rows"]
 
 
 def test_real_timing_intersection_and_label_ledgers():
     real = _real()
     if real is None:
         return
-    pins = contract.load_pins()
-    ledger = real["lag0"][1]["ledger"]
-    m0 = f.sample_masks(real["lag0"][0], ledger)
-    m1 = f.sample_masks(real["lag1"][0], ledger)
-    both = f.timing_intersection_masks(m0, m1, real["lag0"][0], real["lag1"][0])
+    _assert_real_refusal(real)
+    for horizon in f.HORIZONS:
+        _assert_refusal("experiment_1f_evaluation.rank_label", ev.rank_label, real["inputs"]["panel"], horizon)
+    # Intersection is a supported Boolean operation on anonymous sample masks.
+    keys = real["inputs"]["panel"][f.KEY].iloc[:8].reset_index(drop=True)
+    m0 = {name: np.array([True, True, False, True, False, True, False, True]) for name in f.TIMING_INTERSECTION_SAMPLES}
+    m1 = {name: np.array([True, False, True, True, False, False, True, True]) for name in f.TIMING_INTERSECTION_SAMPLES}
+    both = f.timing_intersection_masks(m0, m1, keys, keys)
     for name, mask in both.items():
+        assert np.array_equal(mask, m0[name] & m1[name])
         assert not (mask & ~m0[name]).any() and not (mask & ~m1[name]).any()
-        assert int(mask.sum()) == pins["timing_intersection"][name]["keys"]
-    for arm in ("lag0", "lag1"):
-        assert pins["arms"][arm]["all_variant_intersection_equals_CD"] is True
-    assert all(pins["rank_labels"][f"h{h}"]["evaluable_dates_below_min_names"] == 0 for h in f.HORIZONS)
 
 
 # ── Stage-1 runner and pre-fit execution manifest (no model is fitted) ─────
@@ -903,8 +888,14 @@ def test_manifest_rejects_changed_contract_pins_and_export():
     files["gate_a_panel.parquet"]["sha256"] = "f" * 64
     with _patched(contract, "EXPORT", dict(contract.EXPORT, files=files)):
         assert "export_raw_sha256 differs from the manifest" in runner.verify_data_identity(manifest)
-        if _real() is not None:
-            assert "sha256 mismatch gate_a_panel.parquet" in contract.verify_inputs(recompute_logical=False)
+        if _export_present():
+            # Neither an empty nor populated RAW cache may affect pin rejection.
+            for cache in ({}, {"inputs": object(), "daily": object()}):
+                with _patched(sys.modules[__name__], "_REAL", cache):
+                    assert "sha256 mismatch gate_a_panel.parquet" in contract.verify_file_pins(
+                        {name: spec["sha256"] for name, spec in contract.EXPORT["files"].items()}, f.EXPORT_DIR)
+                    for logical in (False, True):
+                        assert "sha256 mismatch gate_a_panel.parquet" in contract.verify_inputs(recompute_logical=logical)
 
 
 def test_missing_manifest_and_unverified_tokens_refuse_every_fit():
@@ -1017,30 +1008,19 @@ def test_graduation_and_sensitivity_assembly_on_synthetic_results_is_determinist
 
 
 def test_dry_run_resolves_the_full_plan_with_zero_fits_and_predictions():
-    if _real() is None:
+    real = _real()
+    if real is None:
         return
-    calls = []
-
-    def verified(**kwargs):              # ledger recomputation is covered by the real-ledger test and the CLI dry run
-        calls.append(kwargs)
-        return []
-
+    _assert_real_refusal(real)
     before = dict(runner.FIT_COUNTER)
-    with _xgboost_forbidden(), _patched(contract, "verify_inputs", verified):
-        report = runner.dry_run()
-    assert calls == [{"recompute_logical": True, "recompute_ledgers": True}]
-    assert report["plan_digest"] == contract.STAGE1_PLAN["digest"]
-    assert (report["jobs_resolved"], report["total_models"], report["total_fits"]) == (435, 435, 11810)
-    assert (report["models_constructed"], report["fits"], report["predictions"]) == (0, 0, 0)
+    with _xgboost_forbidden():
+        _assert_refusal("experiment_1f_features.build_features", runner.dry_run)
     assert runner.FIT_COUNTER == before
-    assert report["feature_columns_per_variant"] == contract.FAMILIES["counts"]
-    assert {k: v["draws"] for k, v in report["placebo_schedule"].items()} == {"B_alignment": 50, "C_identity": 50,
-                                                                            "D_state": 50}
-    assert report["row_signatures_checked"] == len(report["row_counts"]) and report["row_signatures_checked"] > 0
-    assert all(min(c["fit_rows"], c["eval_rows"], c["test_rows"]) > 0 for c in report["row_counts"].values())
-    diag = report["execution_diagnostics"]
-    assert diag["status"] == {k: contract.EXECUTABLE["counts_h1_evaluable"][k] for k in ev.STATUSES}
-    assert report["prediction_ledger_schema"] == list(runner.PREDICTION_COLUMNS)
+    # Static planning remains supported without constructing financial context.
+    plan = runner.stage1_plan()
+    assert plan["digest"] == contract.STAGE1_PLAN["digest"]
+    assert len(plan["jobs"]) == plan["total_models"] == 435
+    assert plan["total_fits"] == 11810
 
 
 def main():

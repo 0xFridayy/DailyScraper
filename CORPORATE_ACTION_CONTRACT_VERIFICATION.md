@@ -117,72 +117,100 @@ a complete contract-verification PASS.
 
 ## Validation
 
-Validation recorded on 2026-10-09 with Windows/Python 3.14.6 and pytest 9.1.1.
+Final test/harness validation recorded on 2026-10-09 with Windows/Python 3.14.6
+and pytest 9.1.1, based on candidate HEAD
+`e92b340823b61465630d5a95a527d5a5c789170b`.
+The follow-up changes only five test files and this verification record.
+Production source, capability ledger, refusal guards, certification requirements,
+trust/restart rules and morning financial behavior remain unchanged.
+
+All 24 formerly failing cases now pass: 13 stale financial expectations,
+10 oversized metadata setups and one pin-drift/cache dependency. Financial tests
+assert the named UnsupportedPriceContract before financial work or persistent
+writes, while retaining narrower raw/structural assertions. Metadata tests use
+supported control-plane helpers and an inert, hash-pinned legacy proposal fixture;
+they do not create a current financial execution proposal. Gate-B caches only raw
+inputs/daily rows. Bad-pin verification is independent of feature initialization,
+test order and an empty or populated raw cache. No original test case was deleted.
+
 Counts are per group; groups overlap and must not be summed into a unique total.
 
-| Group | PASS | FAIL | SKIP | UNAVAILABLE |
-| --- | ---: | ---: | ---: | ---: |
-| Focused catching regressions | 25 | 0 | 0 | 0 |
-| Focused broker fixture/accounting cases | 5 | 0 | 0 | 0 |
-| Contract verifier: 34 suites, primary cases | 1,933 | 0 | 0 | 49 |
-| Contract verifier: subtests | 329 | 0 | 0 | 0 |
-| ML Health DEFAULT: tests | 823 | 0 | 4 | 36 |
-| ML Health QUICK: tests | 823 | 0 | 4 | 36 |
-| Full available regression: 40 suites, primary cases | 2,355 | 0 | 0 | 52 |
-| Full available regression: subtests | 329 | 0 | 0 | 0 |
-| Signal-integrity witnesses | 11 | 0 | 0 | 0 |
-| Morning pytest/stubbed operational route | 17 | 0 | 0 | 0 |
-| Morning standalone, including five QUIET outcomes | 19 | 0 | 0 | 0 |
-| Pipeline | 107 | 0 | 0 | 1 |
-| Linux accounting and POSIX witnesses | 18 | 0 | 0 | 0 |
+| Group | PASS | FAIL | SKIP | UNAVAILABLE | Exit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Former 24 failures, run first | 24 | 0 | 0 | 0 | 0 |
+| Contract verifier: 34 suites, primary cases | 1,978 | 0 | 0 | 4 | 2: INCOMPLETE |
+| Contract verifier: subtests | 329 | 0 | 0 | 0 | included above |
+| Full semantic mutation catalogue | 54 killed | 0 | 0 | 0 | included above |
+| ML Health DEFAULT | 859 | 0 | 4 | 0 | 0 |
+| ML Health QUICK | 859 | 0 | 4 | 0 | 0 |
+| Full regression: 40 modules, primary cases | 2,401 | 0 | 0 | 6 | incomplete environment coverage |
+| Full regression: subtests | 329 | 0 | 0 | 0 | included above |
+| Pipeline | 108 | 0 | 0 | 0 | 0 |
+| Signal-integrity witnesses | 11 | 0 | 0 | 0 | 0 |
+| Morning pytest/stubbed operational route | 17 | 0 | 0 | 0 | 0 |
+| Corporate-action callable coverage | 47 | 0 | 0 | 0 | 0 |
+| Cold CLI | 38 | 0 | 0 | 0 | 0 |
+| DDQN/canonical | 44 | 0 | 0 | 0 | 0 |
 
-Combined semantic mutations: **54 killed / 54 total; 0 survived;
-0 baseline failures; 0 unavailable**. Exact survivor list: empty.
-There were 114 passing unchanged cases in 50 witness groups and 101 expected
-assertion failures under mutations; no import/collection failure was counted as
-a kill. The three newly added inventory-comparison mutants were also individually
-killed, with three passing baselines.
+The full verifier executed all 54 mutations: **54 killed / 54 total; 0 survived;
+0 baseline failures; 0 unavailable**. There were 114 passing unchanged cases in
+50 witness groups and 101 expected assertion failures under mutation. No
+import/collection failure was counted as a kill. The 40-module regression records
+reuse the 34 exact suite executions from this current verifier and execute all
+six remaining modules; they do not reuse results from the prior candidate run.
 
-The verifier exited **2: INCOMPLETE**, because mandatory evidence is unavailable.
-Both ML Health modes exited 0 under their explicit optional-artifact policy,
-imported 32 modules and recorded their expected named unsupported routes rather
-than producing analytics. Their optional UNAVAILABLE counts remain in the table.
+Both ML Health modes have no problems or failed suites. Counts above come from
+their native returned accounting, including four explicit skips; a generic pytest
+log parser is not used to reclassify those skips. The optional-artifact policy does
+not override the contract verifier's incomplete mandatory evidence.
 
-The recovered DEFAULT/QUICK runs and 11 unaffected completed full-suite groups were
-retained. The current full verifier and every unfinished/affected regression group
-ran after reconnection. The original matrix failure is preserved in
-matrix-recovered.json and the original broker-flow log, with the correct-fixture
-rerun recorded separately. No final real failure or mutant survivor remains.
+All authoritative artifact gates are now available and pass, including raw caches,
+candidate/Gate-B snapshots, historical databases, pipeline and pinned broker
+Parquet. All 1,363 original artifact file hashes and both pinned historical
+database hashes remained unchanged. The 153 root Python/JSON source/configuration
+files match the validated disposable source snapshot; the 148 files outside the
+five edited tests also match the previous validation snapshot byte for byte.
+Production-semantic diff excluding the five tests and this record is empty.
+Morning checks retain typed nonfinancial refusal/status, no uncertified picks,
+no stale or fake-zero fallback, and stubbed delivery only. No live Telegram send,
+production database access or BandarmoloNY data change was performed.
 
-Unavailable primary-case accounting:
+Remaining UNAVAILABLE checks are recorded honestly:
 
-- Contract verifier: 45 missing artifact checks and four Windows POSIX checks.
-  The four POSIX witnesses separately passed on Linux.
-- Full regression: the same 49, one additional pinned broker-daily Parquet check,
-  one Windows symlink-privilege check, and one zero-collection legacy utility.
-- test_inventory_adds.py has no pytest cases: its exit 5 is UNAVAILABLE, not PASS.
-  Its direct model, reader and cold CLI refusals have three passing regression
-  cases in callable coverage and three killed mutants.
-- Pipeline: one missing candidate-artifact witness; never counted as PASS.
+- Verifier: one POSIX close/connection-lock witness in test_bandarmolony_trade_capture.py
+  and three real os.fork ownership witnesses in test_bandarmolony_trade_lock.py.
+  These cannot execute on Windows. The verifier therefore remains **INCOMPLETE,
+  exit 2** despite zero failures.
+- Full regression additionally includes the symlink-sidecar witness in
+  test_broker_flow_manifest_refresh.py (Windows privilege error 1314), and
+  test_inventory_adds.py (no pytest cases, exit 5). Zero collection is UNAVAILABLE,
+  never PASS; direct inventory model/reader/cold-CLI refusals remain covered
+  elsewhere by passing tests and killed mutants.
+- Prior Linux witnesses are historical evidence, not reruns of this remediation.
+  A full Linux workflow and live delivery remain unverified.
 
-Code and available evidence are settled. Status: **READY FOR LOCAL FINAL VALIDATION**.
-Mandatory artifact/environment evidence remains incomplete, so this is not a
-complete independent delta-review claim.
-
-The Phase 5 regression additions were demonstrated failing before their fixes.
-The 25 distinct focused catching cases pass on Windows. The three additional
-inventory-comparison witnesses failed before their guards and now pass; each guard
-also has a killed mutant. Five focused broker-manifest cases pass against their
-own audited fixture. All 20 ML Health tests also pass, including the new informal-skip
-accounting regression. The duplicate-date
-witness now proves withdrawal of an otherwise admitted successor. The recovery
-monitor witness pins its fixture clock; the DDQN CLI witness requires the current
-named refusal and zero persistent artifacts. The invariant suites exercise all
-13 requested areas: restart, old quarantine, contaminated starts, slice monotonicity,
-+80% audit and monitor detection, missing sessions, bounded history, provenance,
-chronology, independent label validation, NULL repair, direct refusals and cold CLIs.
+Current result and log roots are `%TEMP%\\ca-harness-final-e92b3408` and
+`%TEMP%\\ca-harness-health-e92b3408`. Each contains results.json; the first also
+contains focused-24.log, verifier.log, per-module regression logs and integrity.json.
+The second retains both native health accounting JSON files and logs.
+All locally available gates are green. Status: **READY FOR INDEPENDENT DELTA REVIEW**.
 
 ## Reproduction and remaining local evidence
+
+The final harness drivers retain the exact commands, pinned source locations and
+disposable snapshot setup. From the preserved validation environment, the primary
+driver modes are `focused`, `verifier` and `regression`; health uses the separate
+snapshot and native-accounting observer. The full mutation gate is included in the
+ordinary verifier command, so a duplicate mutation run is unnecessary.
+
+```powershell
+$harnessRoot = Join-Path $env:TEMP 'ca-harness-final-e92b3408'
+$healthRoot = Join-Path $env:TEMP 'ca-harness-health-e92b3408'
+py "$harnessRoot\\validate.py" focused
+py "$harnessRoot\\validate.py" verifier
+py "$harnessRoot\\validate.py" regression
+py "$healthRoot\\validate.py" health
+```
 
 Run from the preserved worktree with Python 3.14.6 / pytest 9.1.1 on Windows.
 Set PYTHONUTF8=1, PYTHONIOENCODING=utf-8 and PYTHONDONTWRITEBYTECODE=1.
@@ -196,7 +224,7 @@ py verify_corporate_action_contract.py --fixture-root $fixtureRoot
 py verify_corporate_action_contract.py --mutants-only
 ```
 
-The recorded matrix is in the temporary ca-phase5 directory: `matrix.json`,
+Historical Phase-5 results are in the temporary ca-phase5 directory: `matrix.json`,
 `matrix-recovered.json`, `resume_matrix.py`, `resume-*.log`, the recovered ML Health
 and full-suite logs, `fixture_report.py` and `eligibility.json`.
 `py $fixtureRoot\resume_matrix.py matrix` runs the current verifier and resumes
@@ -217,14 +245,14 @@ Three audited-refusal cases retain all their assertions and express their option
 future-row check without a completed-test early return, so accounting counts them
 as executed evidence rather than UNAVAILABLE.
 
-Missing inputs are `inventory_raw/`, `backtest_out/experiment_1f_candidate/`,
+These inputs were available for the final harness validation:
+`inventory_raw/`, `backtest_out/experiment_1f_candidate/`,
 `backtest_out/experiment_1f_candidate/gate_b_inputs/` and shared `ohlc.parquet` /
-`broker_daily.parquet` under the reviewed `NEOBDM_SHARED_ROOT`. Supply them from
-preserved, verified read-only evidence in an isolated checkout before repeating
-artifact-dependent checks. The verifier does not implicitly copy ignored caches
-from the live worktree. They must not be fetched from production merely to remove
-UNAVAILABLE. In an isolated checkout populated only with reviewed read-only inputs,
-run the artifact-dependent suites:
+`broker_daily.parquet` under the reviewed `NEOBDM_SHARED_ROOT`.
+Hash-verified copies populated disposable source checkouts. Original artifacts
+were preserved; no production input was fetched to remove UNAVAILABLE.
+The verifier does not implicitly copy ignored caches from the live worktree.
+In an isolated checkout populated only with these reviewed inputs, run:
 
 ```powershell
 py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_book.py test_broker_rules.py test_broker_learning_run.py test_experiment_1f_gate_b.py test_experiment_1f_phase2.py test_pipeline.py
@@ -232,8 +260,8 @@ py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_b
 
 The additional audited broker export needs BROKER_DAILY_PARQUET set to the reviewed
 file with SHA256 `c8d1948f00d99ba96fe17376292f32a9cda2be36e2eb5ce303e680427f05cc32`.
-The Windows symlink witness needs an authorized symlink privilege or Linux. Repeat
-these exact offline witnesses once those inputs/capabilities are available:
+The Windows symlink witness needs an authorized symlink privilege or Linux. The pinned Parquet witness passed; the symlink witness remains unavailable.
+These are the exact offline witnesses:
 
 ```powershell
 py -m pytest -q -p no:cacheprovider -p corporate_action_validation test_broker_flow_regime.py::test_exact_audited_baseline_reproduces_the_committed_manifest_byte_for_byte

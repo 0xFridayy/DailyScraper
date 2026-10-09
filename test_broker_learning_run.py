@@ -63,23 +63,26 @@ def _write(folder, ticker, data=None, raw=None):
 
 
 def _weekly(raw_dir, tmp):
-    """weekly --no-fetch over every file in raw_dir; (exit code, runs row, note)."""
+    """The financial CLI refuses before cache access, dispatch or persistence."""
+    from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
+    from unittest.mock import patch
     db = os.path.join(tmp, "bl.db")
-    argv = ["weekly", "--no-fetch", "--legacy-cache", "--raw-dir", raw_dir, "--db", db,
-            "--history-dir", os.path.join(tmp, "hist")]
-    logging.disable(logging.CRITICAL)
-    try:
-        code = run.main(argv)
-    finally:
-        logging.disable(logging.NOTSET)
-    conn = sqlite3.connect(db)
-    try:
-        row = conn.execute("SELECT status, tickers_ok, tickers_fail, note FROM runs "
-                           "WHERE kind = 'weekly'").fetchone()
-        n_prof = conn.execute("SELECT COUNT(*) FROM broker_profitability").fetchone()[0]
-    finally:
-        conn.close()
-    return code, row, json.loads(row[3]), n_prof
+    history = os.path.join(tmp, "hist")
+    argv = ["weekly", "--no-fetch", "--legacy-cache", "--raw-dir", raw_dir,
+            "--db", db, "--history-dir", history]
+    before = sorted(os.listdir(raw_dir))
+    with patch.object(run, "parse_args", side_effect=AssertionError("refusal must precede dispatch")), \
+            patch("builtins.open", side_effect=AssertionError("refusal must precede file IO")):
+        try:
+            run.main(argv)
+        except UnsupportedPriceContract as exc:
+            assert exc.consumer == "broker_learning_run.main"
+            assert exc.status == "UNSUPPORTED" and exc.contract_version == CONTRACT_VERSION
+        else:
+            raise AssertionError("uncertified weekly output or zero/stale fallback returned")
+    assert sorted(os.listdir(raw_dir)) == before
+    assert not os.path.exists(db) and not os.path.exists(history)
+    assert sorted(os.listdir(tmp)) == ["raw"]
 
 
 def test_daily_no_fetch_needs_dry_run_or_db():
@@ -111,10 +114,14 @@ def test_weekly_counts_unreadable_cache_files_as_failed():
         _write(raw, "RAJA", raja)
         _write(raw, "AAAA", raw=b"not gzip at all")
         _write(raw, "BBBB", raw=gzip.compress(b"{truncated json"))
-        code, row, note, _ = _weekly(raw, tmp)
-    assert code == 1 and row[:3] == ("failed", 2, 2), row[:3]
-    assert sorted(note["failed"]) == ["AAAA", "BBBB"], note
-    assert all(v.startswith("unreadable cache") for v in note["failed"].values()), note
+        _weekly(raw, tmp)
+        unreadable = {}
+        cached = dict(run.bc.iter_cached(None, run.bc.MODE_MARKET, raw_dir=raw,
+                                         legacy=True, unreadable=unreadable))
+        assert sorted(cached) == ["RAJA", "SINI"]
+        assert sorted(unreadable) == ["AAAA", "BBBB"]
+        assert all(v.startswith("unreadable cache") for v in unreadable.values())
+        assert run.should_fail_run(len(unreadable), len(cached) + len(unreadable))
 
 
 def test_weekly_fails_when_mostly_empty():
@@ -129,9 +136,15 @@ def test_weekly_fails_when_mostly_empty():
         _write(raw, "SINI", sini)
         for t in ("DEDA", "DEDB", "DEDC"):
             _write(raw, t, {"date": [], "ohlc": []})
-        code, row, note, n_prof = _weekly(raw, tmp)
-    assert code == 1 and row[0] == "failed" and n_prof == 0, (code, row[:3])
-    assert "over the empty limit" in note["reason"] and note["n_empty"] == 3, note
+        _weekly(raw, tmp)
+        empty, nonempty = {}, []
+        cached = list(run.bc.iter_cached(None, run.bc.MODE_MARKET, raw_dir=raw, legacy=True))
+        for ticker, payload in cached:
+            if not run._empty_payload(ticker, payload, empty):
+                nonempty.append(ticker)
+        assert nonempty == ["SINI"]
+        assert sorted(empty) == ["DEDA", "DEDB", "DEDC"]
+        assert len(empty) == 3 and run.bc.too_many_empty(len(empty), len(cached))
 
 
 def test_profitability_leaves_out_books_that_end_before_as_of():
@@ -147,16 +160,16 @@ def test_profitability_leaves_out_books_that_end_before_as_of():
         os.makedirs(raw)
         _write(raw, "SINI", sini)
         _write(raw, "BREN", _truncate(bren, 10))     # eligible at its own last row
-        code, row, note, n_prof = _weekly(raw, tmp)
-        conn = sqlite3.connect(os.path.join(tmp, "bl.db"))
-        top = conn.execute("SELECT MAX(n_tickers) FROM broker_profitability").fetchone()[0]
-        conn.close()
-    assert code == 0 and row[0] == "ok", row[:3]
-    assert (note["n_books"], note["n_books_stale"]) == (1, 1), note
-    assert n_prof > 0 and top == 1, "only SINI's book is in the table"
-    net = note["net_trade_stats"]
-    assert sorted(net) == ["R1", "R4", "R5", "R6"], "dir = +1 rules only"
-    assert all("n_trades" in v and "base_rate" in v for v in net.values())
+        _weekly(raw, tmp)
+        # Test the supported date filter with opaque book identities, not P/L.
+        acc = run._Weekly()
+        fresh, stale = object(), object()
+        acc.books = {"SINI": (sini["date"][-1], fresh),
+                     "BREN": (_truncate(bren, 10)["date"][-1], stale)}
+        as_of = max(last for last, _ in acc.books.values())
+        assert acc.fresh_books(as_of) == {"SINI": fresh}
+        assert len(acc.books) - len(acc.fresh_books(as_of)) == 1
+        assert acc.fresh_books("2099-01-01") == {}, "no stale book fallback"
 
 
 ALL = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]

@@ -326,21 +326,29 @@ def test_book_invariant_on_random_sequences():
 
 
 def test_book_invariant_on_real_cache():
+    """Raw lots/cash retain their identities; uncertified books are refused."""
+    from unittest.mock import patch
     present = [t for t in REAL if _real(t) is not None]
     if not present:
         return _skip("real-cache invariant", "inventory_raw/ cache not present")
     regs = bb.load_basis_regimes()
-    checked = 0
-    for t in present:
-        b = bb.ticker_bundle(_real(t), t, regs)
-        if b["anchor"] is None:
-            continue
-        book, worst = _check_invariant(b["brokers"], b["ohlc"], b["anchor"])
-        assert list(book.columns) == bb.BOOK_COLS
-        pos = book["position_lots"].tolist()
-        assert pos == sorted(pos, reverse=True)
-        checked += len(book)
-    print(f"  ok invariant holds for {checked} real broker books ({', '.join(present)})")
+    for ticker in present:
+        data = _real(ticker)
+        brokers, ohlc = bb.frames_from_payload(data, ticker)
+        assert (brokers["nlot"] == brokers["blot"] - brokers["slot"]).all()
+        assert set(brokers["date"]) <= set(ohlc["date"])
+        assert {"date", "ticker", "broker", "nlot", "blot", "slot", "nval", "bval", "sval"} <= set(brokers.columns)
+        before = json.dumps(data, sort_keys=True)
+        with patch.object(bb, "frames_from_payload", side_effect=AssertionError("book refusal must precede input access")), \
+                patch("builtins.open", side_effect=AssertionError("book refusal must precede file IO")):
+            try:
+                bb.ticker_bundle(data, ticker, regs)
+            except UnsupportedPriceContract as exc:
+                assert exc.consumer == "broker_book.ticker_bundle"
+                assert exc.status == "UNSUPPORTED" and exc.contract_version == CONTRACT_VERSION
+            else:
+                raise AssertionError("uncertified book or zero/stale fallback returned")
+        assert json.dumps(data, sort_keys=True) == before
 
 
 def test_cumulative_curves():

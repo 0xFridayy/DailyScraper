@@ -319,24 +319,43 @@ def _rows_events(data, ticker, regimes):
 
 
 def test_no_look_ahead_real_sini():
+    """Raw prefixes remain unchanged; no legacy rule/event output is returned."""
+    from price_contract import CONTRACT_VERSION, UnsupportedPriceContract
+    from unittest.mock import patch
     path = os.path.join(RAW, "SINI.json.gz")
     if not os.path.exists(path):
         return _skip("no look-ahead on SINI", "inventory_raw/ cache not present")
     with gzip.open(path, "rt", encoding="utf-8") as fh:
         data = json.load(fh)
     regs = bb.load_basis_regimes()
-    full_rows, full_ev = _rows_events(data, "SINI", regs)
-    fired_seen = 0
+    full_brokers, full_ohlc = bb.frames_from_payload(data, "SINI")
+    variants = [data]
     for cut in (100, 150, 180, len(data["date"]) - 1):
-        rows, ev = _rows_events(_truncate(data, cut), "SINI", regs)
-        assert rows["eligible"].any()
-        fired_seen += int(rows[br.RULE_IDS].to_numpy().sum())
-        _assert_prefix_equal(rows, full_rows, ev, full_ev, f"SINI cut {cut}")
-    ext_rows, ext_ev = _rows_events(_extend(data, 40, seed=5), "SINI", regs)
-    _assert_prefix_equal(full_rows, ext_rows, full_ev, ext_ev, "SINI + 40 synthetic sessions")
-    assert fired_seen > 0 and len(full_ev) > 0
-    print(f"  ok SINI rows/events for T <= cut identical to the full fetch and to a 40-session "
-          f"extension ({fired_seen} fired rule-rows compared)")
+        short = _truncate(data, cut)
+        brokers, ohlc = bb.frames_from_payload(short, "SINI")
+        pd.testing.assert_frame_equal(ohlc, full_ohlc.iloc[:cut].reset_index(drop=True))
+        head = full_brokers[full_brokers["date"] <= short["date"][-1]].reset_index(drop=True)
+        pd.testing.assert_frame_equal(brokers, head)
+        variants.append(short)
+    extended = _extend(data, 40, seed=5)
+    assert extended["date"][:len(data["date"])] == data["date"]
+    assert extended["ohlc"][:len(data["ohlc"])] == data["ohlc"]
+    for field in FIELDS:
+        for code, values in data[field].items():
+            assert extended[field][code][:len(values)] == values
+    variants.append(extended)
+    for payload in variants:
+        before = json.dumps(payload, sort_keys=True)
+        with patch.object(bb, "frames_from_payload", side_effect=AssertionError("rule pipeline must refuse before reading input")), \
+                patch("builtins.open", side_effect=AssertionError("rule pipeline must refuse before file IO")):
+            try:
+                _rows_events(payload, "SINI", regs)
+            except UnsupportedPriceContract as exc:
+                assert exc.consumer == "broker_book.ticker_bundle"
+                assert exc.status == "UNSUPPORTED" and exc.contract_version == CONTRACT_VERSION
+            else:
+                raise AssertionError("uncertified rule/events or zero/stale fallback returned")
+        assert json.dumps(payload, sort_keys=True) == before
 
 
 def test_no_look_ahead_synthetic():
