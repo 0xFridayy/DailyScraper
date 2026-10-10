@@ -246,25 +246,57 @@ _PROVENANCE_LABELS = frozenset({
     "URL", "HASH", "SHA256", "PUBLICATION", "DATE", "NUMBER", "PUBLISHER",
 })
 
+# A finite vocabulary and inflection rule describe structure, not authenticity.
+_PROVENANCE_FUNCTION_WORDS = frozenset({
+    "AND", "OR", "YET", "BUT", "NOR", "SO", "FOR", "AS", "AT", "BY",
+    "IN", "OF", "ON", "TO", "WITH", "THE", "A", "AN",
+})
+_PLACEHOLDER_NAMES = tuple(sorted({
+    re.sub(r"[\W_]+", "", token) for token in PLACEHOLDER_TOKENS
+    if re.sub(r"[\W_]+", "", token)
+}, key=lambda token: (-len(token), token)))
+_SEPARATED_PLACEHOLDER_WORD = re.compile(
+    r"(?<![^\W_])(?:" + "|".join(r"[\W_]*".join(token) for token in _PLACEHOLDER_NAMES)
+    + r")(?![^\W_])"
+)
+_KEY_VALUE_PLACEHOLDER = re.compile(
+    r"[:=][\W_]*(?:(?:" + "|".join(_PLACEHOLDER_NAMES)
+    + r")(?![^\W_])|[-?](?![^\W_])|$)"
+)
+
+
+def _provenance_label(part):
+    """Recognize a generic label stem and its regular plural inflections."""
+    return (part in _PROVENANCE_LABELS
+            or (part.endswith("IES") and part[:-3] + "Y" in _PROVENANCE_LABELS)
+            or (part.endswith("ES") and part[:-2] in _PROVENANCE_LABELS)
+            or (part.endswith("S") and part[:-1] in _PROVENANCE_LABELS))
+
+
 
 def _compound_placeholder_text(value):
     """A placeholder-bearing claim needs a substantive identity beyond labels.
 
-    NFKC and Unicode separators canonicalize repeated/mixed placeholder tokens.
+    NFKC and Unicode separators canonicalize the finite placeholder vocabulary.
+    A placeholder value after ':' or '=' refuses regardless of the key or suffix.
+    Regular label plurals and finite function words cannot substantiate identity.
     Separated N-A may be part of a real name (N-A Securities Research); explicit
     N/A remains forbidden by meaningful_identity's existing notation rule.
     A substantive token has at least three characters including a letter, or
-    at least four nonrepeating digits. Labels and placeholders never qualify.
+    at least four digits with distinct values. This does not authenticate a source.
     Single tokens retain the whole-field policy in placeholder_text below.
     """
     canonical = normalize("NFKC", value).upper()
-    canonical = re.sub(r"(?<![A-Z0-9])N[\W_]+A(?![A-Z0-9])", "NA", canonical)
+    canonical = _SEPARATED_PLACEHOLDER_WORD.sub(lambda match: re.sub(r"[\W_]+", "", match[0]), canonical)
+    if _KEY_VALUE_PLACEHOLDER.search(canonical):
+        return True
     parts = re.findall(r"[^\W_]+", canonical)
     if len(parts) <= 1:
         return False
     has_placeholder = any(part in PLACEHOLDER_TOKENS for part in parts)
     substantive = any(
-        part not in PLACEHOLDER_TOKENS and part not in _PROVENANCE_LABELS
+        part not in PLACEHOLDER_TOKENS and not _provenance_label(part)
+        and part not in _PROVENANCE_FUNCTION_WORDS
         and ((len(part) >= 3 and any(char.isalpha() for char in part))
              or (part.isdigit() and len(part) >= 4 and len(set(part)) > 1))
         for part in parts

@@ -922,3 +922,73 @@ def test_g1_substantive_source_identity_controls(identity):
 @pytest.mark.parametrize("digest", ["0" * 64, "f" * 64, EMPTY_CONTENT_SHA256, "ab" * 32])
 def test_g1_substantive_source_names_do_not_override_degenerate_hashes(digest):
     test_ca_r01_degenerate_hashes_never_authorize_registry_or_adapter(digest)
+
+
+# J1/J2: structural placeholder policy must govern every authorization route.
+J1_CONTEXTS = G1_CONTEXTS + ["registry-notes"]
+
+
+def j1_assert_provenance_refused(identity, context):
+    if context == "registry-notes":
+        doc = document()
+        doc["events"][0]["notes"] = identity
+        with pytest.raises(pc.PriceContractError):
+            pc.parse_registry(doc)
+    else:
+        g1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", J1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "SOURCES: N-A", "Sumber: N-A", "retrieval_medium: N-A",
+    "event_id: NA", "notes: NA", "SOURCE: N-A (IDX)",
+    "arbitrary_unlisted_key=NA", "sUmBeR\uFF1A n\u2013a (IDX)",
+    "\u6765\u6E90\uFF1D N\u00A0-\u00A0A", "random_key = (N.A.)",
+    "unlisted: T.B.D. (IDX)", "unlisted: - (IDX)",
+])
+def test_j1_key_value_placeholder_claims_refuse(identity, context):
+    j1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", J1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "N-A author", "N-A authors", "NA document", "NA documents",
+    "NA source", "NA sources", "NA identity", "NA identities",
+    "NA hash", "NA hashes", "NA status", "NA statuses",
+    "n\u2011a\u202fAUTHORS",
+])
+def test_j1_label_inflections_do_not_supply_identity(identity, context):
+    j1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", J1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "N-A and N-A", "nan and nan", "NA or NA", "N-A yet",
+    "MISSING and PENDING", "N-A with NA",
+    "n\u2013a\u00A0AnD\u00A0n\u2011a", "N-A; or | NAN",
+])
+def test_j1_placeholder_conjunctions_refuse(identity, context):
+    j1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("identity", [
+    "N-A Securities Research", "NA-EXCHANGE-2026", "Citibank, N.A.",
+    "JPMorgan Chase Bank, N.A.", "Nan Ya Plastics",
+])
+def test_j1_substantive_organization_identity_controls(identity):
+    test_ca_r01_genuine_longer_identifiers_remain_accepted_in_all_five_contexts(identity)
+
+
+@pytest.mark.parametrize("context", J1_CONTEXTS)
+@pytest.mark.parametrize("identity", ["T.B.D.", "U-N-K-N-O-W-N", "TO-DO", "N - A", "N.A."])
+def test_j2_whole_field_placeholder_folds_refuse(identity, context):
+    j1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", J1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "M-I-S-S-I-N-G or P-E-N-D-I-N-G", "T.B.D. or TO-DO",
+    "MISSING PENDING",
+])
+def test_j2_compounds_require_all_placeholder_tokens(identity, context):
+    j1_assert_provenance_refused(identity, context)

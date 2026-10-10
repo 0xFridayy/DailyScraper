@@ -1,11 +1,199 @@
 # Corporate Action Contract verification
 
+## J1 / J2 structural provenance policy
+
+Recorded 2026-10-10 (UTC) against required base
+`b74660af78543bd766050ebc13a7bd99bef6e38f` on
+`feat/corporate-action-contract-pr83`. This section is the current evidence;
+the G1/G2/G3, CA-R01/CA-R02 and Phase-5 records below are historical.
+
+### Finite policy and its boundary
+
+The shared validator checks whether a provenance field is structurally meaningful.
+**Provenance format does NOT establish real-world source authenticity.**
+Acceptance does not prove an organization, publication, source, or retrieved
+document exists or is authentic. This is a bounded lexical policy, not an
+attempt to identify every fabricated name.
+
+The finite placeholder words are UNKNOWN, UNVERIFIED, NONE, NULL, N/A, NA,
+TBD, TBA, TODO, PLACEHOLDER, MISSING, PENDING, NAN and XXX. Empty text and
+the markers -, -- and ? are also absence. Identity fields additionally retain
+the existing explicit-word refusal for UNKNOWN, UNVERIFIED, TBD, TBA, TODO,
+PLACEHOLDER, N/A, NULL and NONE, even in a longer claim.
+
+- Whole-field absence remains prohibited: empty/non-text values, the finite
+  placeholder tokens, separated spellings of those tokens, and punctuation/zero
+  bodies. NFKC, case folding and Unicode punctuation/spacing normalize examples
+  such as `T.B.D.`, `U-N-K-N-O-W-N`, `TO-DO`, `N - A` and `N.A.`.
+- A placeholder value immediately following `:` or `=` refuses independently
+  of the key's name, vocabulary or language. Punctuation wrapping and a trailing
+  substantive decoration do not authorize it: `SOURCES: N-A`,
+  `Sumber: N-A`, `retrieval_medium: N-A`, `event_id: NA`, `notes: NA`
+  and `SOURCE: N-A (IDX)` all refuse. NFKC includes fullwidth colon/equals.
+  Punctuation absence markers `-` and `?` and an empty value also refuse.
+- Generic provenance labels use the existing finite stem vocabulary and regular
+  `S`, `ES` and `IES -> Y` plural inflections. No growing plural blacklist
+  is used. Both `N-A author/authors` and `NA document/documents` refuse;
+  `identity/identities`, `hash/hashes` and `status/statuses` are covered.
+- Placeholder-bearing compounds must contain a substantive token beyond
+  placeholders, labels and this finite function-word set:
+  `AND OR YET BUT NOR SO FOR AS AT BY IN OF ON TO WITH THE A AN`.
+  Thus `N-A and N-A`, `nan and nan`, `NA or NA` and `N-A yet` refuse.
+  Punctuation/separators alone add no content. All finite placeholder names
+  participate, including separated `MISSING/PENDING` and `TBD/TODO` forms.
+- A remaining substantive token keeps the existing threshold: at least three
+  characters with a letter, or at least four digits that are not all identical.
+  Genuine names containing NA/N-A/NAN are preserved when they have that content
+  and no prohibited key-value placeholder claim. This threshold does not
+  authenticate the name. The existing explicit N/A notation rule is unchanged.
+
+Positive authorization controls pass for `N-A Securities Research`,
+`NA-EXCHANGE-2026`, `Citibank, N.A.`, `JPMorgan Chase Bank, N.A.` and
+`Nan Ya Plastics`. They retain reference 1065, VERIFIED session, RAW
+representation and a trusted event anchor in the registry/adapter/frame controls.
+
+### Independent RED and mutation sensitivity
+
+Seven original J1 samples reproduced on untouched b74660a production: each
+authorized ENRG reference 1065, VERIFIED/RAW adapter claims and a trusted anchor.
+New J1 witnesses recorded **312 FAIL / 122 PASS**, then **434 PASS / 0 FAIL**.
+The J2 selection recorded **26 FAIL / 78 PASS**, then **104 PASS / 0 FAIL**.
+There were zero SKIP or UNAVAILABLE in those selections. Authorization outcomes
+are checked across thirteen entry points, including registry notes, rather than
+only predicate return values. The five whole-field spelling cases already passed
+on base production; the new compound spellings exposed the additional RED cases.
+
+Both independently reported whole-field weakenings (NA-only and fields of at
+most three characters) survived all **668 committed base findings cases**:
+2 survived, 0 killed, 0 baseline failures and 0 unavailable. After adding the new
+witnesses both are killed. Five other new semantic mutants remove key-value
+refusal, plural handling, function-word exclusion, all-token compound handling
+or separated compound folding. The focused gate kills **7/7** from **533 passing
+baseline cases in five witness groups**, with 468 mutated assertion failures.
+Syntax, import or collection failures are not counted as semantic kills.
+
+All existing **71 definitions remain unchanged and killed**. The complete
+catalogue is **78 total / 78 killed / 0 survived / 0 baseline failures /
+0 unavailable**. The strengthened CA-R02 financial-computation-before-refusal
+tests still pass, including the existing cost/arithmetic mutants. Their four
+production guards and their test file are unchanged.
+
+G3 remains explicit: historical selected RED was **CA-R01 22 / CA-R02 12**;
+historical full-suite RED was **CA-R01 66 / CA-R02 16**. Those expected historical
+failures are distinct from this candidate's GREEN validation.
+
+### Actual final offline accounting
+
+Groups overlap; do not add them as unique cases.
+
+| Gate | PASS | FAIL | SKIP | UNAVAILABLE | Exit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| J1 focused | 434 | 0 | 0 | 0 | 0 |
+| J2 focused | 104 | 0 | 0 | 0 | 0 |
+| Existing G1 / CA-R01 | 490 | 0 | 0 | 0 | 0 |
+| Existing F02/F08/F11 | 96 | 0 | 0 | 0 | 0 |
+| CA-R01 / chronology / source evidence | 346 | 0 | 0 | 0 | 0 |
+| Callable / CA-R02 direct calls | 68 | 0 | 0 | 0 | 0 |
+| Cold CLI | 38 | 0 | 0 | 0 | 0 |
+| Price contract / trust restart | 52 | 0 | 0 | 0 | 0 |
+| F16 monitor | 10 | 0 | 0 | 0 | 0 |
+| Full verifier, 34 suites (primary cases) | 3027 | 0 | 0 | 4 | 2: INCOMPLETE |
+| Verifier subtests | 329 | 0 | 0 | 0 | same gate |
+| Full semantic catalogue | 78 killed | 0 | 0 | 0 | included verifier execution |
+| ML Health DEFAULT | 859 | 0 | 4 | 0 | 0 |
+| ML Health QUICK | 859 | 0 | 4 | 0 | 0 |
+| Full regression, 40 modules (primary cases) | 3450 | 0 | 0 | 6 | incomplete environment coverage |
+| Regression subtests | 329 | 0 | 0 | 0 | same gate |
+| Pipeline | 108 | 0 | 0 | 0 | included verifier execution |
+| Signal integrity | 11 | 0 | 0 | 0 | 0 |
+| Morning / sender stubs | 17 | 0 | 0 | 0 | 0 |
+
+Every verifier suite and both ML Health modes were freshly executed against
+this exact source snapshot. The 40-module matrix reuses the 34 suite executions
+from this run's verifier and executes the six remaining modules. Pipeline is
+that current verifier execution; signal integrity and morning are additional
+reruns. No earlier candidate's GREEN result is reused. ML Health totals come
+from its native accounting, retaining the four optional SKIP results.
+
+Remaining environment evidence is UNAVAILABLE, never PASS:
+
+- Verifier: one POSIX close/connection-lock witness and three real os.fork
+  ownership witnesses cannot execute on Windows. The verifier remains
+  **INCOMPLETE, exit 2**, despite zero actual failures.
+- Regression also records Windows symlink privilege error 1314 and
+  test_inventory_adds.py zero collection / exit 5. Its inventory callable
+  and cold-CLI refusals pass through the separate catching witnesses.
+- No current full Linux workflow or production delivery is claimed.
+
+### Residual LOW findings
+
+**J3 remains residual LOW:** slash-notation spacing consistency has not been
+independently established. The pre-existing explicit N/A refusal is retained.
+
+**J4 remains residual LOW:** the conservative substantive-token threshold can
+refuse certain legitimate short names. Neither finding is marked CLOSED.
+Lexical acceptance is structural evidence only and establishes no real-world
+authenticity; further fake-name blacklists are outside this bounded policy.
+
+### Scope, pinned inputs and reproducibility
+
+Only price_contract.py, test_corporate_action_findings.py,
+corporate_action_mutations.py and this record differ from b74660a.
+Production changes only the shared provenance policy. CA-R02 guards, trust
+restart, F16/F17, NULL repair, morning, historical prices, Source Self-Healing,
+ML lineage, Market Intelligence, SPECTRA, Sentinel and BandarmoloNY are unchanged.
+ENRG official reference 1065, SINI PENDING_REFERENCE and RAJA unresolved
+mixed-basis history remain intact in the passing evidence controls.
+Morning retains no uncertified picks, no fake zero signal, no stale financial
+fallback and structured nonfinancial refusal/status delivered with sender stubs.
+No production database access, live scraping or real Telegram send occurred.
+
+All 1,363 original artifact hashes and both read-only pinned database hashes
+remain unchanged. Both disposable snapshots match all 153 permitted root
+Python/JSON files byte for byte. The unchanged snapshot policy excludes .mcp.json
+and test_bandarmolony_trade_mutations.py; their base Git blobs remain unchanged.
+The separate BandarmoloNY mutation runner is not claimed as executed.
+
+The pinned Corporate Action fixture is `%TEMP%\ca-phase5\neobdm.db`,
+SHA-256 `6fc475e6db6be597a539a8cc30f6a0c44f05a5c14b263367c07a3aa417389be5`.
+The distinct audited broker fixture is
+`%TEMP%\ca-phase5\broker-audited\neobdm.db`,
+SHA-256 `fd1eef8600a1a26a9888d02481cf44fe20e791a8960d611ffd73c618f000eaa0`.
+The reviewed Parquet/raw inventory artifacts come from
+`C:\Users\jason\Desktop\VsCode\Claude` and the pinned candidate artifacts
+from `C:\Users\jason\Desktop\VsCode\Claude-1f-phase2\backtest_out\experiment_1f_candidate`.
+Drivers verify committed artifact hashes and run copies, not replacements.
+
+Logs, RED/GREEN JSON, mutation baselines, final integrity and native health
+accounting are preserved under `%TEMP%\ca-provenance-j1-j2-b74660a`.
+`backup.json` identifies the durable Documents backup and final binary patch.
+
+The external offline drivers are pinned to base b74660a plus these preserved
+edits. Before committing, reproduce the documented final commands using:
+
+```powershell
+$reviewRoot = Join-Path $env:TEMP 'ca-provenance-j1-j2-b74660a'
+py "$reviewRoot\validation\validate.py" new-mutants
+py "$reviewRoot\validation\validate.py" foundation
+py "$reviewRoot\validation\validate.py" r01-evidence
+py "$reviewRoot\validation\validate.py" verifier
+py "$reviewRoot\validation\validate.py" regression
+py "$reviewRoot\health\validate.py" health
+py "$reviewRoot\integrity.py"
+```
+
+Verifier mode runs `py verify_corporate_action_contract.py --fixture-root`
+with reviewed `%TEMP%\ca-phase5`, including the full mutation catalogue.
+Health runs `py check_ml_health.py` and `py check_ml_health.py --quick`.
+All available mandatory gates pass. Environment gaps remain explicitly incomplete.
+Status: **READY FOR INDEPENDENT DELTA REVIEW**.
+
 ## G1 / G2 / G3 provenance follow-up
 
 Recorded on 2026-10-10 (Asia/Jakarta), against required base
 `0289cca7b7b1c0b3f36b2f66bd88e181154a592f`, branch
-`feat/corporate-action-contract-pr83`. This is the current validation record;
-the CA-R01 / CA-R02 and Phase-5 sections below are historical.
+`feat/corporate-action-contract-pr83`. This is a historical validation record;
+the CA-R01 / CA-R02 and Phase-5 sections below are also historical.
 
 G1 uses one shared provenance predicate for registry identities, adapter session
 and representation evidence, and dataframe source/anchor evidence. Unicode NFKC

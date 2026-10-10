@@ -288,3 +288,57 @@ for module, name, route_id in (
         (f"G2-{route_id}-arithmetic-before-refusal", module + ".py", guard,
          arithmetic + guard, witness + f"[cached-{route_id}]"),
     ]
+
+
+# J1/J2: finite structural placeholder rules and independent whole-field sensitivity.
+FINDING_MUTANTS += [
+    (
+        'J2-whole-field-fold-only-na',
+        'price_contract.py',
+        '            or re.sub(r"[\\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS\n',
+        '            or re.sub(r"[\\W_]+", "", normalize("NFKC", value)).upper() in {"NA"}\n',
+        'test_corporate_action_findings.py::test_j2_whole_field_placeholder_folds_refuse',
+    ),
+    (
+        'J2-whole-field-fold-only-three-characters',
+        'price_contract.py',
+        '            or re.sub(r"[\\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS\n',
+        '            or (len(value) <= 3 and re.sub(r"[\\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS)\n',
+        'test_corporate_action_findings.py::test_j2_whole_field_placeholder_folds_refuse',
+    ),
+    (
+        'J1-key-value-placeholder-guard-removed',
+        'price_contract.py',
+        '    if _KEY_VALUE_PLACEHOLDER.search(canonical):\n',
+        '    if False:\n',
+        'test_corporate_action_findings.py::test_j1_key_value_placeholder_claims_refuse',
+    ),
+    (
+        'J1-label-inflection-removed',
+        'price_contract.py',
+        '        part not in PLACEHOLDER_TOKENS and not _provenance_label(part)\n',
+        '        part not in PLACEHOLDER_TOKENS and part not in _PROVENANCE_LABELS\n',
+        'test_corporate_action_findings.py::test_j1_label_inflections_do_not_supply_identity',
+    ),
+    (
+        'J1-function-words-counted-substantive',
+        'price_contract.py',
+        '        and part not in _PROVENANCE_FUNCTION_WORDS\n',
+        '',
+        'test_corporate_action_findings.py::test_j1_placeholder_conjunctions_refuse',
+    ),
+    (
+        'J2-compound-placeholders-only-na-nan',
+        'price_contract.py',
+        '    has_placeholder = any(part in PLACEHOLDER_TOKENS for part in parts)',
+        '    has_placeholder = any(part in {"NA", "NAN"} for part in parts)',
+        'test_corporate_action_findings.py::test_j2_compounds_require_all_placeholder_tokens',
+    ),
+    (
+        'J2-separated-compound-fold-only-na',
+        'price_contract.py',
+        '    canonical = _SEPARATED_PLACEHOLDER_WORD.sub(lambda match: re.sub(r"[\\W_]+", "", match[0]), canonical)\n',
+        '    canonical = re.sub(r"(?<![A-Z0-9])N[\\W_]+A(?![A-Z0-9])", "NA", canonical)\n',
+        'test_corporate_action_findings.py::test_j2_compounds_require_all_placeholder_tokens',
+    ),
+]
