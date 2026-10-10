@@ -823,3 +823,102 @@ def test_ca_r01_degenerate_hashes_never_authorize_registry_or_adapter(digest):
                                representation=pc.RAW_ACTUAL, session_evidence=evidence,
                                representation_evidence=evidence)
     assert out["session_status"] == "UNKNOWN" and out["input_representation"] == "UNKNOWN"
+
+
+# G1: compound placeholders and metadata labels cannot supply provenance.
+G1_CONTEXTS = [
+    "registry-author", "registry-document", "registry-evidence",
+    "registry-retrieval", "registry-evidence-key", "registry-event",
+    "registry-version", "adapter-session", "adapter-representation",
+    "frame-source", "frame-source_identity", "frame-source_document_id",
+]
+
+
+def g1_assert_provenance_refused(identity, context):
+    if context.startswith("registry-"):
+        doc = document()
+        event = doc["events"][0]
+        field = context.removeprefix("registry-")
+        if field == "author":
+            event["source"]["author"] = identity
+        elif field == "document":
+            event["source_document_id"] = identity
+        elif field == "evidence":
+            event["evidence_refs"]["investigation_report"] = identity
+        elif field == "retrieval":
+            event["source"]["retrieval_medium"] = identity
+        elif field == "evidence-key":
+            event["evidence_refs"][identity] = event["evidence_refs"].pop("investigation_report")
+        elif field == "event":
+            event["event_id"] = identity
+        else:
+            doc["registry_version"] = identity
+        with pytest.raises(pc.PriceContractError):
+            pc.parse_registry(doc)
+    elif context.startswith("adapter-"):
+        from neobdm_source_contract import price_source_context
+        claim = context.removeprefix("adapter-")
+        evidence = dict(session_evidence=ca_r01_evidence(), representation_evidence=ca_r01_evidence())
+        evidence[claim + "_evidence"] = ca_r01_evidence(identity)
+        out = price_source_context("2026-10-06", source_session="2026-10-05",
+                                   representation=pc.RAW_ACTUAL, **evidence)
+        assert out["session_status"] == ("UNKNOWN" if claim == "session" else "VERIFIED")
+        assert out["source_session"] == (None if claim == "session" else "2026-10-05")
+        assert out["input_representation"] == ("UNKNOWN" if claim == "representation" else pc.RAW_ACTUAL)
+    else:
+        px = frame()
+        px[context.removeprefix("frame-")] = identity
+        before = px.copy(deep=True)
+        row = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL).loc[
+            lambda p: p.date.eq("2026-10-05")].iloc[0]
+        assert row.limit_reference_status != "RESOLVED"
+        assert row.anchor_trust_status == "INADMISSIBLE"
+        assert not row.close_anchor_admissible and not row.price_step_admissible
+        assert not row.entry_open_admissible
+        pd.testing.assert_frame_equal(px, before)
+
+
+@pytest.mark.parametrize("context", G1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "N-A N-A", "NA NA", "nan_nan", "N-A_N/A", "Na / NAN / n_a",
+    "\uff2e\uff0d\uff21\u3000\uff2e\uff21", "n\u2013a\u00a0nan", "N.A|N_A",
+])
+def test_g1_repeated_placeholder_provenance_is_rejected(identity, context):
+    g1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", G1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "N-A author", "SOURCE: N-A", "DOCUMENT: NA", "N-A evidence",
+    "nA, source AUTHOR", "AUTHOR\u2014n\u2013a", "document_id=(n_a)",
+    "SESSION: nan", "Representation=n.a", "SOURCE:\uff2e\uff21",
+])
+def test_g1_labelled_placeholder_provenance_is_rejected(identity, context):
+    g1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", G1_CONTEXTS)
+@pytest.mark.parametrize("identity", [
+    "N-A a", "NA 0", "N-A 0000", "NA\tNA", "NA\u202fN\u2011A",
+])
+def test_g1_ambiguous_placeholder_provenance_fails_closed(identity, context):
+    g1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("context", G1_CONTEXTS)
+@pytest.mark.parametrize("identity", ["N/A Securities Research", "N/A IDX Bulletin 2026"])
+def test_g1_slash_placeholder_notation_retains_existing_refusal(identity, context):
+    g1_assert_provenance_refused(identity, context)
+
+
+@pytest.mark.parametrize("identity", [
+    "N-A Securities Research", "Bursa Efek Indonesia ENRG Bulletin 2026-10-05",
+    "IDX-CA-ENRG-20261005", "NANOBDM_EXCHANGE_REPORT_2026",
+])
+def test_g1_substantive_source_identity_controls(identity):
+    test_ca_r01_genuine_longer_identifiers_remain_accepted_in_all_five_contexts(identity)
+
+
+@pytest.mark.parametrize("digest", ["0" * 64, "f" * 64, EMPTY_CONTENT_SHA256, "ab" * 32])
+def test_g1_substantive_source_names_do_not_override_degenerate_hashes(digest):
+    test_ca_r01_degenerate_hashes_never_authorize_registry_or_adapter(digest)

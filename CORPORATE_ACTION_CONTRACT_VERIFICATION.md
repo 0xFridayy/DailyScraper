@@ -1,5 +1,138 @@
 # Corporate Action Contract verification
 
+## G1 / G2 / G3 provenance follow-up
+
+Recorded on 2026-10-10 (Asia/Jakarta), against required base
+`0289cca7b7b1c0b3f36b2f66bd88e181154a592f`, branch
+`feat/corporate-action-contract-pr83`. This is the current validation record;
+the CA-R01 / CA-R02 and Phase-5 sections below are historical.
+
+G1 uses one shared provenance predicate for registry identities, adapter session
+and representation evidence, and dataframe source/anchor evidence. Unicode NFKC
+and separators canonicalize repeated/mixed placeholders. A placeholder-bearing
+claim needs identity beyond generic metadata labels: at least three characters
+including a letter, or at least four digits that are not all identical.
+Labels and placeholders cannot supply that substantive token. Whole-field absence
+checks and the existing explicit N/A refusal remain intact.
+`N-A Securities Research` stays accepted; `N/A Securities Research` stays refused.
+Names containing NA as part of a substantive identifier are preserved.
+
+All four independent witnesses reproduced on the required base across registry,
+adapter and frame contexts. Before changing the validator, the new regressions
+recorded **264 FAIL / 44 PASS** on unchanged 0289cca production. After the fix:
+**308 PASS / 0 FAIL**. They cover twelve provenance entry points, mixed case,
+Unicode separators, labels, ambiguous short/zero bodies, explicit slash notation,
+real identities and degenerate hashes.
+
+G2 tests nonempty cached, empty, malformed and unreadable inputs for all four
+CA-R02 APIs. Every input blocks cost/statistics helpers and NumPy computation.
+Cached economic values carry arithmetic probes, so arithmetic before refusal
+fails the witness. All sixteen direct refusals, four ledger checks and the
+anonymous numerical control pass. The four production guards are unchanged.
+
+G3 distinguishes the original selected RED witnesses (22 CA-R01, 12 CA-R02)
+from the complete committed-test totals. The frozen 0289cca tests rerun against
+00d56cf production and its ledger recorded CA-R01 **66 FAIL / 116 PASS** and
+CA-R02 **16 FAIL / 1 PASS**, exit 1 each, with zero SKIP or UNAVAILABLE.
+Four ledger omissions explain the additional CA-R02 failures. This historical
+rerun excludes the new G1/G2 cases. Original selected logs and the independent
+full-suite RED logs remain preserved; these are expected historical failures.
+
+Counts overlap between groups and must not be summed as unique cases.
+
+| Gate | PASS | FAIL | SKIP | UNAVAILABLE | Exit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| G1 focused | 308 | 0 | 0 | 0 | 0 |
+| CA-R02 focused | 21 | 0 | 0 | 0 | 0 |
+| Existing F02/F08/F11 | 96 | 0 | 0 | 0 | 0 |
+| CA-R01 / chronology / source evidence | 264 | 0 | 0 | 0 | 0 |
+| Callable coverage | 68 | 0 | 0 | 0 | 0 |
+| Cold CLI | 38 | 0 | 0 | 0 | 0 |
+| Price contract / trust restart | 52 | 0 | 0 | 0 | 0 |
+| F16 monitor | 10 | 0 | 0 | 0 | 0 |
+| Full verifier, 34 suites (primary cases) | 2489 | 0 | 0 | 4 | 2: INCOMPLETE |
+| Verifier subtests | 329 | 0 | 0 | 0 | same gate, separate subtests |
+| Semantic mutations | 71 killed | 0 | 0 | 0 | included verifier execution |
+| ML Health DEFAULT | 859 | 0 | 4 | 0 | 0 |
+| ML Health QUICK | 859 | 0 | 4 | 0 | 0 |
+| Full regression, 40 modules (primary cases) | 2912 | 0 | 0 | 6 | incomplete environment coverage |
+| Regression subtests | 329 | 0 | 0 | 0 | same gate, separate subtests |
+| Pipeline | 108 | 0 | 0 | 0 | included verifier execution |
+| Signal integrity | 11 | 0 | 0 | 0 | 0 |
+| Morning / sender stubs | 17 | 0 | 0 | 0 | 0 |
+| Final integrity | 1 | 0 | 0 | 0 | 0 |
+
+The full catalogue killed **71/71**, with zero survivors, baseline failures or
+unavailable mutants. All previous 59 definitions remain unchanged and killed.
+Twelve new mutants were killed before broader validation: four provenance
+weakenings, four cost-before-refusal and four arithmetic-before-refusal mutants.
+
+Every verifier suite and both ML Health modes were freshly rerun. The full
+40-module matrix reuses the 34 exact suite executions from this follow-up's
+verifier and executes the six remaining modules. Pipeline is that current
+verifier execution; signal integrity and morning are additional fresh reruns.
+No previous candidate's GREEN evidence is reused. ML Health uses native returned
+accounting; four optional skips remain SKIP, with no failed suites or problems.
+
+ENRG's official reference remains 1065, SINI remains pending and RAJA remains
+mixed-basis unresolved in the passing evidence controls. Morning retains typed
+nonfinancial refusal/status, no uncertified picks, no stale financial fallback
+and no fake-zero signal. Delivery uses sender stubs. No real Telegram send,
+live scraping or production database access was performed.
+
+All 1,363 original artifact hashes and both pinned read-only database hashes
+remain unchanged. The 153 permitted root Python/JSON files match both validated
+disposable snapshots byte for byte. The unchanged snapshot policy excludes
+.mcp.json and test_bandarmolony_trade_mutations.py; both retain their base Git
+blob identities. The separate BandarmoloNY mutation runner is not claimed as
+executed. No BandarmoloNY source/data or historical prices were changed.
+
+Remaining unavailable evidence is not counted as PASS:
+
+- Verifier: one POSIX close/connection-lock witness and three real os.fork
+  ownership witnesses cannot execute on Windows. It remains **INCOMPLETE, exit 2**.
+- Regression additionally records Windows symlink privilege error 1314 and
+  test_inventory_adds.py zero collection / exit 5. Inventory direct-call and
+  cold-CLI refusals pass in their separate witnesses.
+- No current full Linux workflow or live production delivery is claimed.
+
+Only price_contract.py, test_corporate_action_findings.py,
+test_corporate_action_callable_coverage.py, corporate_action_mutations.py and
+this record differ from 0289cca. Production changes only the shared provenance
+predicate. Restart, F16/F17, source self-healing, ML lineage, NULL repair and
+all other frozen subsystems are unchanged. git diff --check passes, and the
+diff outside these five files is empty.
+
+Evidence is under `%TEMP%\ca-provenance-g1-g3-0289cca`: RED/GREEN logs,
+historical-red-results.json, validation/results.json and verifier.log,
+health/results.json and native health JSON, artifact-copies.json, integrity.json
+and backup.json. The latter records the durable backup location and patch hash.
+Historical RED uses a disposable copy with production/ledger from 00d56cf;
+the implementation worktree was never reset.
+
+Preserved offline drivers retain exact artifact locations and distinct pinned
+Corporate Action and audited-broker fixtures. Before committing, with base HEAD
+still 0289cca, reproduce using:
+
+```powershell
+$reviewRoot = Join-Path $env:TEMP 'ca-provenance-g1-g3-0289cca'
+py "$reviewRoot\validation\validate.py" new-mutants
+py "$reviewRoot\validation\validate.py" foundation
+py "$reviewRoot\validation\validate.py" r01-evidence
+py "$reviewRoot\validation\validate.py" verifier
+py "$reviewRoot\validation\validate.py" regression
+py "$reviewRoot\health\validate.py" health
+py "$reviewRoot\integrity.py"
+```
+
+Verifier mode runs `py verify_corporate_action_contract.py --fixture-root`
+with reviewed `%TEMP%\ca-phase5`. Health runs both
+`py check_ml_health.py` and `py check_ml_health.py --quick`.
+All tests use disposable copies and placeholder credentials.
+
+All mandatory locally available gates are green.
+Status: **READY FOR INDEPENDENT DELTA REVIEW**.
+
 ## CA-R01 / CA-R02 final local validation
 
 Recorded on 2026-10-10 (Asia/Jakarta), against required base
@@ -25,9 +158,14 @@ computation. All four routes are in the capability ledger. Tests block database
 and file access, verify unchanged cached inputs, and independently detect ledger
 omissions. Anonymous numerical utilities remain available.
 
-The RED witnesses ran on the exact required base before production edits:
-22 CA-R01 failures and 12 CA-R02 failures. The latter cover each of the four APIs
-with cached, empty and unreadable inputs. The cached ENRG witness spans
+The original selected RED witnesses ran on the exact required base before
+production edits: 22 CA-R01 failures and 12 CA-R02 failures. These were narrower
+selections, not whole-suite RED totals. The latter cover each of the four APIs
+with cached, empty and unreadable inputs. An independent later rerun of every
+committed 0289cca CA-R01 / CA-R02 case against 00d56cf production and its
+capability ledger recorded 66 FAIL / 116 PASS and 16 FAIL / 1 PASS respectively;
+both exited 1 with no SKIP or UNAVAILABLE. The CA-R02 total includes four failing
+ledger checks in addition to the twelve direct refusals. The cached ENRG witness spans
 2026-10-02 to 2026-10-05 with gross return 1030 / 1440 - 1.
 GREEN results are 182 CA-R01 cases and 17 CA-R02 cases: 12 direct refusals,
 four ledger checks and one anonymous numerical control.

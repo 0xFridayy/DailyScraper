@@ -238,12 +238,46 @@ _PLACEHOLDER_WORD = re.compile(r"(?<![A-Z0-9])(?:UNKNOWN|UNVERIFIED|TBD|TBA|TODO
 EMPTY_CONTENT_SHA256 = sha256(b"").hexdigest()
 
 
+# Metadata labels name a claim; they cannot substantiate a placeholder identity.
+_PROVENANCE_LABELS = frozenset({
+    "AUTHOR", "SOURCE", "DOCUMENT", "DOC", "EVIDENCE", "ID", "IDENTITY", "NAME",
+    "PROVENANCE", "REPORT", "SESSION", "REPRESENTATION", "REFERENCE", "REF",
+    "STATUS", "METADATA", "LABEL", "FIELD", "OWNER", "BY", "TITLE", "ORIGIN",
+    "URL", "HASH", "SHA256", "PUBLICATION", "DATE", "NUMBER", "PUBLISHER",
+})
+
+
+def _compound_placeholder_text(value):
+    """A placeholder-bearing claim needs a substantive identity beyond labels.
+
+    NFKC and Unicode separators canonicalize repeated/mixed placeholder tokens.
+    Separated N-A may be part of a real name (N-A Securities Research); explicit
+    N/A remains forbidden by meaningful_identity's existing notation rule.
+    A substantive token has at least three characters including a letter, or
+    at least four nonrepeating digits. Labels and placeholders never qualify.
+    Single tokens retain the whole-field policy in placeholder_text below.
+    """
+    canonical = normalize("NFKC", value).upper()
+    canonical = re.sub(r"(?<![A-Z0-9])N[\W_]+A(?![A-Z0-9])", "NA", canonical)
+    parts = re.findall(r"[^\W_]+", canonical)
+    if len(parts) <= 1:
+        return False
+    has_placeholder = any(part in PLACEHOLDER_TOKENS for part in parts)
+    substantive = any(
+        part not in PLACEHOLDER_TOKENS and part not in _PROVENANCE_LABELS
+        and ((len(part) >= 3 and any(char.isalpha() for char in part))
+             or (part.isdigit() and len(part) >= 4 and len(set(part)) > 1))
+        for part in parts
+    )
+    return has_placeholder and not substantive
+
+
 def placeholder_text(value):
     """True for anything that is not meaningful single-line evidence text."""
-    # Normalize only the whole field: separators do not make N/A evidence,
-    # while longer identifiers such as N-A Securities remain meaningful.
+    # Whole-field absence and compound claims share one provenance policy.
     return (not _text(value) or value.upper() in PLACEHOLDER_TOKENS
             or re.sub(r"[\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS
+            or _compound_placeholder_text(value)
             or re.fullmatch(r"[\W_0]*", value) is not None)
 
 

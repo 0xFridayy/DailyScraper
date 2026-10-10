@@ -250,3 +250,41 @@ FINDING_MUTANTS += [
      '    pass',
      "test_corporate_action_callable_coverage.py::test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output[cached-pattern-date]"),
 ]
+
+# G1/G2: independent compound-provenance and refusal-order sensitivity.
+FINDING_MUTANTS += [
+    ("G1-compound-placeholder-check-removed", "price_contract.py",
+     '            or _compound_placeholder_text(value)\n', '',
+     "test_corporate_action_findings.py::test_g1_repeated_placeholder_provenance_is_rejected"),
+    ("G1-labelled-placeholders-accepted", "price_contract.py",
+     '    return has_placeholder and not substantive',
+     '    return has_placeholder and not substantive and not any(part in _PROVENANCE_LABELS for part in parts)',
+     "test_corporate_action_findings.py::test_g1_labelled_placeholder_provenance_is_rejected"),
+    ("G1-only-simple-na-normalized", "price_contract.py",
+     '    has_placeholder = any(part in PLACEHOLDER_TOKENS for part in parts)',
+     '    has_placeholder = any(part == "NA" for part in parts)',
+     "test_corporate_action_findings.py::test_g1_repeated_placeholder_provenance_is_rejected"),
+    ("G1-only-three-character-identities-checked", "price_contract.py",
+     '            or _compound_placeholder_text(value)\n',
+     '            or (len(value) <= 3 and _compound_placeholder_text(value))\n',
+     "test_corporate_action_findings.py::test_g1_ambiguous_placeholder_provenance_fails_closed"),
+]
+
+for module, name, route_id in (
+    ("foreign_flow_signal_backtest", "trade_stats", "foreign-trade"),
+    ("foreign_flow_signal_backtest", "date_balanced_hit_edge", "foreign-date"),
+    ("pattern_type_backtest", "trade_level_stats", "pattern-trade"),
+    ("pattern_type_backtest", "date_balanced_hit_edge", "pattern-date"),
+):
+    guard = f'    refuse_unmigrated("{module}.{name}")'
+    witness = ("test_corporate_action_callable_coverage.py::"
+               "test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output")
+    arithmetic = ('    if trades:\n        _ = trades[0]["gross_return"] + 0\n'
+                  if route_id.startswith("foreign") else
+                  '    if not trades.empty:\n        _ = trades.iloc[0]["gross_ret"] + 0\n')
+    FINDING_MUTANTS += [
+        (f"G2-{route_id}-cost-before-refusal", module + ".py", guard,
+         '    apply_costs_to_returns([])\n' + guard, witness + f"[empty-{route_id}]"),
+        (f"G2-{route_id}-arithmetic-before-refusal", module + ".py", guard,
+         arithmetic + guard, witness + f"[cached-{route_id}]"),
+    ]

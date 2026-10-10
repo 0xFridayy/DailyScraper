@@ -288,6 +288,29 @@ def test_inventory_comparison_cold_cli_refuses_without_artifacts():
     assert created == []
     assert leaked == {}
 
+class RefusalArithmeticProbe:
+    """Keep the cached economic value while detecting premature arithmetic."""
+    def __init__(self, value):
+        self.value = value
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __eq__(self, other):
+        return isinstance(other, RefusalArithmeticProbe) and self.value == other.value
+
+    def _computed(self, *args, **kwargs):
+        raise AssertionError("financial arithmetic before contract refusal")
+
+    __float__ = __int__ = __index__ = _computed
+    __add__ = __radd__ = __sub__ = __rsub__ = _computed
+    __mul__ = __rmul__ = __truediv__ = __rtruediv__ = _computed
+    __floordiv__ = __rfloordiv__ = __pow__ = __rpow__ = _computed
+    __neg__ = __pos__ = __abs__ = _computed
+    __lt__ = __le__ = __gt__ = __ge__ = _computed
+    __array_ufunc__ = _computed
+
+
 CA_R02_ROUTES = [
     ("foreign_flow_signal_backtest", "trade_stats"),
     ("foreign_flow_signal_backtest", "date_balanced_hit_edge"),
@@ -299,7 +322,7 @@ CA_R02_ROUTES = [
 @pytest.mark.parametrize("module,name", CA_R02_ROUTES, ids=[
     "foreign-trade", "foreign-date", "pattern-trade", "pattern-date",
 ])
-@pytest.mark.parametrize("kind", ["cached", "empty", "unreadable"])
+@pytest.mark.parametrize("kind", ["cached", "empty", "malformed", "unreadable"])
 def test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output(module, name, kind, monkeypatch, tmp_path):
     import builtins
     import copy
@@ -310,12 +333,16 @@ def test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output(module,
         trades = universe = UnreadableInput()
     elif kind == "empty":
         trades = universe = [] if foreign else pd.DataFrame()
+    elif kind == "malformed":
+        row = {"ticker": "ENRG", "gross_return": "malformed", "gross_ret": "malformed"}
+        trades = [row] if foreign else pd.DataFrame([row], dtype=object)
+        universe = copy.deepcopy(trades)
     else:
         # Actual audited ENRG closes across the unresolved action holding window.
         row = {"ticker": "ENRG", "entry_date": "2026-10-02", "exit_date": "2026-10-05",
-               "signal_date": "2026-10-02", "gross_return": 1030 / 1440 - 1,
-               "gross_ret": 1030 / 1440 - 1}
-        trades = [row] if foreign else pd.DataFrame([row])
+               "signal_date": "2026-10-02", "gross_return": RefusalArithmeticProbe(1030 / 1440 - 1),
+               "gross_ret": RefusalArithmeticProbe(1030 / 1440 - 1)}
+        trades = [row] if foreign else pd.DataFrame([row], dtype=object)
         universe = copy.deepcopy(trades)
     before = None if kind == "unreadable" else copy.deepcopy(trades)
     existing = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
@@ -329,9 +356,10 @@ def test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output(module,
         guard.setattr(sqlite3, "connect", blocked)
         guard.setattr(builtins, "open", blocked)
         guard.setattr(Path, "open", blocked)
-        if kind == "unreadable":
-            guard.setattr(owner, "apply_costs_to_returns", blocked)
-            guard.setattr(owner, "net_return_stats", blocked)
+        guard.setattr(owner, "apply_costs_to_returns", blocked)
+        guard.setattr(owner, "net_return_stats", blocked)
+        for operation in ("array", "asarray", "mean", "median", "std", "sqrt", "sum", "nanmean"):
+            guard.setattr(owner.np, operation, blocked)
         route = module + "." + name
         with pytest.raises(UnsupportedPriceContract, match=re.escape(route)) as caught:
             getattr(owner, name)(trades, universe)
