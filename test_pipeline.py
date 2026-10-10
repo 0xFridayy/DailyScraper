@@ -1052,6 +1052,24 @@ def test_signal_quality_scores_every_row_not_just_triggered():
     print("test_signal_quality_scores_every_row_not_just_triggered passed")
 
 
+def _anonymous_cost_summary(returns, groups, universe_returns, universe_groups):
+    """Retain pooled/group-balanced numerical coverage without cached trade APIs."""
+    from transaction_cost_model import apply_costs_to_returns, net_return_stats
+    from signal_metrics import date_balanced_hit_edge as anonymous_hit_edge
+    signal_net = apply_costs_to_returns(returns, preset="moderate")
+    universe_net = apply_costs_to_returns(universe_returns, preset="moderate")
+    groups, universe_groups = np.asarray(groups), np.asarray(universe_groups)
+    pooled = net_return_stats(returns, preset="moderate",
+                             base_rate=float((universe_net > 0).mean()))
+    balanced = anonymous_hit_edge(signal_net, groups, universe_net, universe_groups)
+    edges = [anonymous_hit_edge(signal_net[groups == group], groups[groups == group],
+                                universe_net[universe_groups == group],
+                                universe_groups[universe_groups == group])["daily_hit_edge"]
+             for group in sorted(set(groups))]
+    balanced["positive_edge_days"] = float((np.asarray(edges) > 0).mean())
+    return pooled, balanced
+
+
 def test_pattern_type_stats_use_same_date_baseline_and_balance_dates():
     # d1 has two signals while d2 has one. The headline date-balanced edge must
     # give the two dates equal weight rather than letting d1 vote twice.
@@ -1065,14 +1083,20 @@ def test_pattern_type_stats_use_same_date_baseline_and_balance_dates():
         "gross_ret": [0.10, 0.08, -0.08],
     })
 
-    pooled = trade_level_stats(signals, universe, preset="moderate")
-    balanced = date_balanced_hit_edge(signals, universe, preset="moderate")
+    _assert_route_refusal("pattern_type_backtest.trade_level_stats",
+                          lambda: trade_level_stats(signals, universe, preset="moderate"))
+    _assert_route_refusal("pattern_type_backtest.date_balanced_hit_edge",
+                          lambda: date_balanced_hit_edge(signals, universe, preset="moderate"))
+    # d1/d2 are anonymous group labels, not ticker/session-certified outcomes.
+    pooled, balanced = _anonymous_cost_summary(
+        signals["gross_ret"].to_numpy(), signals["signal_date"].to_numpy(),
+        universe["gross_ret"].to_numpy(), universe["signal_date"].to_numpy())
 
     # Pooled: signal 2/3 versus universe 3/8.
     assert abs(pooled["base_rate"] - 0.375) < 1e-12
-    assert abs(pooled["hit_edge"] - round((2 / 3) - (3 / 8), 4)) < 1e-12
-    # Per date: d1 edge 1 - 1/2 = +1/2; d2 edge 0 - 1/4 = -1/4.
-    assert balanced["n_signal_days"] == 2
+    assert abs(pooled["hit_edge"] - ((2 / 3) - (3 / 8))) < 1e-12
+    # Per group: d1 edge 1 - 1/2 = +1/2; d2 edge 0 - 1/4 = -1/4.
+    assert balanced["n_dates"] == 2
     assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
     assert balanced["positive_edge_days"] == 0.5
     print("test_pattern_type_stats_use_same_date_baseline_and_balance_dates passed")
@@ -1092,12 +1116,17 @@ def test_foreign_flow_stats_use_same_date_baseline_and_balance_dates():
         {"entry_date": "d2", "gross_return": -0.08},
     ]
 
-    pooled = foreign_trade_stats(signals, universe, preset="moderate")
-    balanced = foreign_date_balanced_hit_edge(signals, universe, preset="moderate")
+    _assert_route_refusal("foreign_flow_signal_backtest.trade_stats",
+                          lambda: foreign_trade_stats(signals, universe, preset="moderate"))
+    _assert_route_refusal("foreign_flow_signal_backtest.date_balanced_hit_edge",
+                          lambda: foreign_date_balanced_hit_edge(signals, universe, preset="moderate"))
+    pooled, balanced = _anonymous_cost_summary(
+        [r["gross_return"] for r in signals], [r["entry_date"] for r in signals],
+        [r["gross_return"] for r in universe], [r["entry_date"] for r in universe])
 
     assert abs(pooled["base_rate"] - 0.375) < 1e-12
     assert abs(pooled["hit_edge"] - ((2 / 3) - (3 / 8))) < 1e-12
-    assert balanced["n_signal_days"] == 2
+    assert balanced["n_dates"] == 2
     assert abs(balanced["daily_hit_edge"] - 0.125) < 1e-12
     assert balanced["positive_edge_days"] == 0.5
     print("test_foreign_flow_stats_use_same_date_baseline_and_balance_dates passed")

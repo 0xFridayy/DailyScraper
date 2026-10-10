@@ -227,3 +227,26 @@ PHASE5_MUTANTS += [
      '    pass',
      "test_corporate_action_callable_coverage.py::test_inventory_comparison_cold_cli_refuses_without_artifacts"),
 ]
+# Independent HIGH findings: whole-field provenance and direct cached outcomes.
+FINDING_MUTANTS += [
+    ("R01-separated-placeholder-provenance-accepted", "price_contract.py",
+     '            or re.sub(r"[\\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS\n',
+     '',
+     "test_corporate_action_findings.py::test_ca_r01_registry_placeholder_variants_cannot_authorize_reference"),
+    ("R02-foreign-trade-outcome-guard-removed", "foreign_flow_signal_backtest.py",
+     '    refuse_unmigrated("foreign_flow_signal_backtest.trade_stats")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output[cached-foreign-trade]"),
+    ("R02-foreign-date-outcome-guard-removed", "foreign_flow_signal_backtest.py",
+     '    refuse_unmigrated("foreign_flow_signal_backtest.date_balanced_hit_edge")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output[cached-foreign-date]"),
+    ("R02-pattern-trade-outcome-guard-removed", "pattern_type_backtest.py",
+     '    refuse_unmigrated("pattern_type_backtest.trade_level_stats")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output[cached-pattern-trade]"),
+    ("R02-pattern-date-outcome-guard-removed", "pattern_type_backtest.py",
+     '    refuse_unmigrated("pattern_type_backtest.date_balanced_hit_edge")',
+     '    pass',
+     "test_corporate_action_callable_coverage.py::test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output[cached-pattern-date]"),
+]

@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 import math
 import re
+from unicodedata import normalize
 from zoneinfo import ZoneInfo
 
 from idx_calendar import (CALENDAR_VERSION, is_idx_session, latest_idx_session_before,
@@ -239,7 +240,10 @@ EMPTY_CONTENT_SHA256 = sha256(b"").hexdigest()
 
 def placeholder_text(value):
     """True for anything that is not meaningful single-line evidence text."""
+    # Normalize only the whole field: separators do not make N/A evidence,
+    # while longer identifiers such as N-A Securities remain meaningful.
     return (not _text(value) or value.upper() in PLACEHOLDER_TOKENS
+            or re.sub(r"[\W_]+", "", normalize("NFKC", value)).upper() in PLACEHOLDER_TOKENS
             or re.fullmatch(r"[\W_0]*", value) is not None)
 
 

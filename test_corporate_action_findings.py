@@ -701,3 +701,125 @@ def test_n01_null_only_repair_cannot_bypass_ohlc_admission():
         with pytest.raises(bf.InventoryError, match="limit_violation"):
             bf.insert_inventory(conn, "BBBB", price_payload([repaired], "BBBB"))
         assert conn.total_changes == before
+
+# CA-R01: all five provenance contexts share whole-field placeholder semantics.
+CA_R01_PLACEHOLDERS = [
+    "N-A", "N/A", "NA", "N_A", "N A", "N–A", "UNKNOWN", "TBD",
+    "PLACEHOLDER", "NULL", "NONE", "", " ", "n-a", "Ｎ－Ａ",
+]
+CA_R01_GENUINE_IDENTITIES = [
+    "N-A Securities Research", "N_A_RESEARCH_2026", "N A Research Desk",
+    "N–A Research Bulletin", "NA-EXCHANGE-2026", "BANANA_SECURITIES",
+    "NATIONAL_EXCHANGE", "NONEQUITY_REPORT", "UNKNOWNLEDGER_2026",
+    "TBDATA_2026", "PLACEHOLDERLESS_CERTIFICATE",
+]
+
+
+def ca_r01_evidence(identity="REVIEWED_OFFLINE_SOURCE_DOCUMENT"):
+    from hashlib import sha256
+    return {"source_document_id": identity,
+            "sha256": sha256(b"reviewed offline session and source evidence").hexdigest()}
+
+
+@pytest.mark.parametrize("token", CA_R01_PLACEHOLDERS)
+@pytest.mark.parametrize("context", ["author", "document", "evidence"])
+def test_ca_r01_registry_placeholder_variants_cannot_authorize_reference(context, token):
+    doc = document()
+    event = doc["events"][0]
+    if context == "author":
+        event["source"]["author"] = token
+    elif context == "document":
+        event["source_document_id"] = token
+    else:
+        event["evidence_refs"]["investigation_report"] = token
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("token", CA_R01_PLACEHOLDERS)
+@pytest.mark.parametrize("field", ["retrieval_medium", "evidence_key", "event_id"])
+def test_ca_r01_other_registry_identity_fields_use_shared_validation(field, token):
+    doc = document()
+    event = doc["events"][0]
+    if field == "retrieval_medium":
+        event["source"][field] = token
+    elif field == "event_id":
+        event[field] = token
+    else:
+        event["evidence_refs"][token] = event["evidence_refs"].pop("investigation_report")
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+
+
+@pytest.mark.parametrize("token", CA_R01_PLACEHOLDERS)
+@pytest.mark.parametrize("claim", ["session", "representation"])
+def test_ca_r01_adapter_placeholder_claims_are_independently_unverified(claim, token):
+    from neobdm_source_contract import price_source_context
+    kwargs = {"session_evidence": ca_r01_evidence(),
+              "representation_evidence": ca_r01_evidence()}
+    kwargs[claim + "_evidence"] = ca_r01_evidence(token)
+    out = price_source_context("2026-10-06", source_session="2026-10-05",
+                               representation=pc.RAW_ACTUAL, **kwargs)
+    assert out["session_status"] == ("UNKNOWN" if claim == "session" else "VERIFIED")
+    assert out["source_session"] == (None if claim == "session" else "2026-10-05")
+    assert out["input_representation"] == ("UNKNOWN" if claim == "representation" else pc.RAW_ACTUAL)
+
+
+@pytest.mark.parametrize("token", CA_R01_PLACEHOLDERS)
+@pytest.mark.parametrize("field", ["source", "source_identity", "source_document_id"])
+def test_ca_r01_frame_placeholder_identity_cannot_gain_event_anchor(field, token):
+    px = frame()
+    px[field] = token
+    before = px.copy(deep=True)
+    out = annotate_prices(px, registry=registry(), representation=pc.RAW_ACTUAL)
+    event = out.loc[out.date.eq("2026-10-05")].iloc[0]
+    assert event.limit_reference_status != "RESOLVED"
+    assert event.anchor_trust_status == "INADMISSIBLE"
+    assert not event.close_anchor_admissible and not event.price_step_admissible
+    assert not event.entry_open_admissible
+    pd.testing.assert_frame_equal(px, before)
+
+
+@pytest.mark.parametrize("identity", CA_R01_GENUINE_IDENTITIES)
+def test_ca_r01_genuine_longer_identifiers_remain_accepted_in_all_five_contexts(identity):
+    from neobdm_source_contract import price_source_context
+    assert pc.meaningful_identity(identity)
+    doc = document()
+    doc["events"][0]["source"]["author"] = identity
+    doc["events"][0]["source_document_id"] = identity
+    doc["events"][0]["evidence_refs"]["investigation_report"] = identity
+    valid_registry = pc.parse_registry(doc)
+    ref = pc.resolve_limit_reference("ENRG", "2026-10-05", "REGULAR", None, valid_registry,
+                                     input_representation=pc.RAW_ACTUAL)
+    assert ref.status == "RESOLVED" and ref.price == 1065
+    evidence = ca_r01_evidence(identity)
+    out = price_source_context("2026-10-06", source_session="2026-10-05",
+                               representation=pc.RAW_ACTUAL, session_evidence=evidence,
+                               representation_evidence=evidence)
+    assert out["session_status"] == "VERIFIED" and out["input_representation"] == pc.RAW_ACTUAL
+    px = frame()
+    for field in ("source", "source_identity", "source_document_id"):
+        px[field] = identity
+    event = annotate_prices(px, registry=valid_registry, representation=pc.RAW_ACTUAL).loc[
+        lambda p: p.date.eq("2026-10-05")].iloc[0]
+    assert event.limit_reference_status == "RESOLVED"
+    assert event.anchor_trust_status == "TRUSTED_EVENT_ANCHOR"
+    assert event.close_anchor_admissible and event.price_step_admissible
+
+
+@pytest.mark.parametrize("digest", [
+    "0" * 64, "f" * 64, "1" * 64, EMPTY_CONTENT_SHA256,
+    "ab" * 32, "0123456789abcdef" * 4,
+])
+def test_ca_r01_degenerate_hashes_never_authorize_registry_or_adapter(digest):
+    from neobdm_source_contract import price_source_context
+    assert not pc.meaningful_sha256(digest)
+    doc = document()
+    doc["events"][0]["evidence_refs"]["report_content_sha256"] = digest
+    with pytest.raises(pc.PriceContractError):
+        pc.parse_registry(doc)
+    evidence = dict(ca_r01_evidence(), sha256=digest)
+    out = price_source_context("2026-10-06", source_session="2026-10-05",
+                               representation=pc.RAW_ACTUAL, session_evidence=evidence,
+                               representation_evidence=evidence)
+    assert out["session_status"] == "UNKNOWN" and out["input_representation"] == "UNKNOWN"

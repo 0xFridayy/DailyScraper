@@ -227,7 +227,9 @@
     ],
     "foreign_flow_signal_backtest": [
       "generate_trades",
-      "main"
+      "main",
+      "trade_stats",
+      "date_balanced_hit_edge"
     ],
     "horizon_scan": [
       "build",
@@ -280,7 +282,9 @@
     "pattern_type_backtest": [
       "prep_price_panels",
       "build_trades",
-      "main"
+      "main",
+      "trade_level_stats",
+      "date_balanced_hit_edge"
     ],
     "regime_gated_momentum": [
       "load_neobdm",

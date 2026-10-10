@@ -287,3 +287,80 @@ def test_inventory_comparison_cold_cli_refuses_without_artifacts():
     assert CONTRACT_VERSION in run.stderr
     assert created == []
     assert leaked == {}
+
+CA_R02_ROUTES = [
+    ("foreign_flow_signal_backtest", "trade_stats"),
+    ("foreign_flow_signal_backtest", "date_balanced_hit_edge"),
+    ("pattern_type_backtest", "trade_level_stats"),
+    ("pattern_type_backtest", "date_balanced_hit_edge"),
+]
+
+
+@pytest.mark.parametrize("module,name", CA_R02_ROUTES, ids=[
+    "foreign-trade", "foreign-date", "pattern-trade", "pattern-date",
+])
+@pytest.mark.parametrize("kind", ["cached", "empty", "unreadable"])
+def test_ca_r02_direct_cached_outcome_apis_refuse_before_input_or_output(module, name, kind, monkeypatch, tmp_path):
+    import builtins
+    import copy
+    from price_contract import CONTRACT_VERSION
+    owner = importlib.import_module(module)
+    foreign = module == "foreign_flow_signal_backtest"
+    if kind == "unreadable":
+        trades = universe = UnreadableInput()
+    elif kind == "empty":
+        trades = universe = [] if foreign else pd.DataFrame()
+    else:
+        # Actual audited ENRG closes across the unresolved action holding window.
+        row = {"ticker": "ENRG", "entry_date": "2026-10-02", "exit_date": "2026-10-05",
+               "signal_date": "2026-10-02", "gross_return": 1030 / 1440 - 1,
+               "gross_ret": 1030 / 1440 - 1}
+        trades = [row] if foreign else pd.DataFrame([row])
+        universe = copy.deepcopy(trades)
+    before = None if kind == "unreadable" else copy.deepcopy(trades)
+    existing = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+    monkeypatch.chdir(tmp_path)
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("persistent access before contract refusal")
+
+    # Import first; direct calls must refuse without opening any database or file.
+    with monkeypatch.context() as guard:
+        guard.setattr(sqlite3, "connect", blocked)
+        guard.setattr(builtins, "open", blocked)
+        guard.setattr(Path, "open", blocked)
+        if kind == "unreadable":
+            guard.setattr(owner, "apply_costs_to_returns", blocked)
+            guard.setattr(owner, "net_return_stats", blocked)
+        route = module + "." + name
+        with pytest.raises(UnsupportedPriceContract, match=re.escape(route)) as caught:
+            getattr(owner, name)(trades, universe)
+        assert caught.value.consumer == route
+        assert caught.value.status == "UNSUPPORTED"
+        assert caught.value.contract_version == CONTRACT_VERSION
+    assert sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*")) == existing
+    if kind != "unreadable":
+        if foreign:
+            assert trades == before and universe == before
+        else:
+            pd.testing.assert_frame_equal(trades, before)
+            pd.testing.assert_frame_equal(universe, before)
+
+
+@pytest.mark.parametrize("module,name", CA_R02_ROUTES)
+def test_ca_r02_capability_ledger_cannot_omit_direct_outcome_api(module, name):
+    import json
+    ledger = json.loads(Path(__file__).with_name("corporate_action_consumer_routes.json").read_text())
+    assert name in ledger["routes"].get(module, []), module + "." + name
+
+
+def test_ca_r02_anonymous_cost_statistics_remain_available():
+    from transaction_cost_model import apply_costs_to_returns, net_return_stats
+    numbers = np.array([0.05, -0.02, 0.03])
+    net = apply_costs_to_returns(numbers, preset="ideal")
+    stats = net_return_stats(numbers, preset="ideal")
+    assert np.all(net < numbers)
+    assert np.allclose(numbers, [0.05, -0.02, 0.03])
+    assert stats["n_trades"] == 3
+    assert stats["hit_rate"] == pytest.approx(2 / 3)
+    assert stats["mean_ret"] == pytest.approx(net.mean())

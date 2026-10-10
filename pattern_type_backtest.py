@@ -122,6 +122,8 @@ def build_trades(pats, by_ticker, idx_by_ticker, hold):
 
 def trade_level_stats(trades, universe_trades, preset="moderate"):
     """Cost-adjusted signal stats against the same-date always-long universe."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_type_backtest.trade_level_stats")
     if trades.empty:
         return dict(n=0, hit_rate=np.nan, mean_net=np.nan, median_net=np.nan,
                     ret_per_risk=np.nan, base_rate=np.nan, hit_edge=np.nan)
@@ -155,6 +157,8 @@ def date_balanced_hit_edge(trades, universe_trades, preset="moderate"):
     signals. This statistic first computes the signal and always-long hit rate
     on each signal date, subtracts them, and only then averages across dates.
     """
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("pattern_type_backtest.date_balanced_hit_edge")
     if trades.empty:
         return dict(n_signal_days=0, daily_hit_edge=np.nan,
                     daily_hit_edge_median=np.nan, positive_edge_days=np.nan)

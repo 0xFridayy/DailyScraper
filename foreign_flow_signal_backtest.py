@@ -144,6 +144,8 @@ def generate_trades(signals_df, H, px_by_ticker, date_idx_by_ticker):
 
 def trade_stats(trades, universe_trades, preset="moderate"):
     """Cost-adjusted signal stats against the same-date always-long universe."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("foreign_flow_signal_backtest.trade_stats")
     if not trades:
         return dict(n_trades=0, hit_rate=np.nan, mean_net_return=np.nan,
                     median_net_return=np.nan, ret_per_risk=np.nan,
@@ -176,6 +178,8 @@ def trade_stats(trades, universe_trades, preset="moderate"):
 
 def date_balanced_hit_edge(trades, universe_trades, preset="moderate"):
     """Mean within-entry-date hit edge, so each calendar date votes once."""
+    from price_contract import refuse_unmigrated
+    refuse_unmigrated("foreign_flow_signal_backtest.date_balanced_hit_edge")
     if not trades:
         return dict(n_signal_days=0, daily_hit_edge=np.nan,
                     daily_hit_edge_median=np.nan, positive_edge_days=np.nan)

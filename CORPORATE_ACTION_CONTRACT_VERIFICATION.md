@@ -1,5 +1,129 @@
-# Corporate Action Contract verification — Phase 5
+# Corporate Action Contract verification
 
+## CA-R01 / CA-R02 final local validation
+
+Recorded on 2026-10-10 (Asia/Jakarta), against required base
+`00d56cfa1445ae44f2a6ea452257763b28a84eb8` on
+`feat/corporate-action-contract-pr83`. This record supersedes the historical
+validation totals below. The existing eight remediation edits were preserved
+through the Desktop Commander interruption; implementation was not restarted.
+
+CA-R01 normalizes Unicode NFKC and separator spelling in the shared whole-field
+placeholder predicate. N-A, N/A, NA, N_A, N A, N–A, empty text and the other tested
+placeholder spellings cannot authorize registry, adapter or frame provenance.
+Eleven meaningful longer identifiers remain accepted across all five provenance
+contexts. Degenerate hashes remain rejected, and the existing chronology,
+date-only precision, ENRG official-reference, SINI pending-reference and RAJA
+mixed-basis controls pass. The adapter and frame consumers already use the shared
+predicate; no duplicate validation or historical price change was needed.
+
+CA-R02 adds named UnsupportedPriceContract guards to exactly four unmigrated APIs:
+foreign_flow_signal_backtest.trade_stats and .date_balanced_hit_edge, plus
+pattern_type_backtest.trade_level_stats and .date_balanced_hit_edge. Each refuses
+before input inspection, empty-input branches, cost adjustment or financial
+computation. All four routes are in the capability ledger. Tests block database
+and file access, verify unchanged cached inputs, and independently detect ledger
+omissions. Anonymous numerical utilities remain available.
+
+The RED witnesses ran on the exact required base before production edits:
+22 CA-R01 failures and 12 CA-R02 failures. The latter cover each of the four APIs
+with cached, empty and unreadable inputs. The cached ENRG witness spans
+2026-10-02 to 2026-10-05 with gross return 1030 / 1440 - 1.
+GREEN results are 182 CA-R01 cases and 17 CA-R02 cases: 12 direct refusals,
+four ledger checks and one anonymous numerical control.
+
+Two existing pipeline tests were updated to assert these named refusals while
+retaining their pooled and group-balanced numerical assertions through supported
+anonymous helpers. No original case was deleted. The production diff is limited
+to the shared predicate, four API entry guards and four ledger routes; the other
+changes are focused tests, five semantic mutants and this record. Trust restart,
+source self-healing, ML lineage and the other frozen subsystems were not changed.
+
+Counts overlap between groups and must not be summed as unique test cases.
+
+| Gate | PASS | FAIL | SKIP | UNAVAILABLE | Exit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| CA-R01 focused | 182 | 0 | 0 | 0 | 0 |
+| CA-R02 focused | 17 | 0 | 0 | 0 | 0 |
+| Existing F02/F08/F11 | 96 | 0 | 0 | 0 | 0 |
+| Callable coverage | 64 | 0 | 0 | 0 | 0 |
+| Cold CLI | 38 | 0 | 0 | 0 | 0 |
+| Price contract / trust restart | 52 | 0 | 0 | 0 | 0 |
+| F16 monitor | 10 | 0 | 0 | 0 | 0 |
+| Full verifier, 34 suites | 2177 | 0 | 0 | 4 | 2: INCOMPLETE |
+| Verifier subtests | 329 | 0 | 0 | 0 | included above |
+| Full semantic mutation catalogue | 59 killed | 0 | 0 | 0 | included above |
+| ML Health DEFAULT | 859 | 0 | 4 | 0 | 0 |
+| ML Health QUICK | 859 | 0 | 4 | 0 | 0 |
+| Full prepared regression, 40 modules | 2600 | 0 | 0 | 6 | incomplete environment coverage |
+| Regression subtests | 329 | 0 | 0 | 0 | included above |
+| Pipeline | 108 | 0 | 0 | 0 | included verifier execution |
+| Signal-integrity rerun | 11 | 0 | 0 | 0 | 0 |
+| Morning / sender-stub rerun | 17 | 0 | 0 | 0 | 0 |
+| DDQN/canonical | 44 | 0 | 0 | 0 | included verifier execution |
+| Final integrity | 1 | 0 | 0 | 0 | 0 |
+
+The combined mutation gate killed **59/59**, including all previous
+54 mutants, one placeholder-normalization mutant and four individual guard-removal
+mutants. Survivors, baseline failures and unavailable mutants are all zero.
+The five new mutants were killed individually before broader validation.
+
+Saved results confirm the interrupted run completed all 40 permitted regression
+modules, signal integrity and morning. Finalization collected those results
+without repeating completed tests. The 40-module matrix reuses the 34 exact suite
+executions from this candidate's verifier and executes the six remaining modules.
+Original PID 14800 and its Desktop Commander session no longer exist; the parent
+shell exit code was not recoverable. Individual gate exit codes, native result
+records and completed logs supply the accounting above.
+
+Both ML Health modes return no problems and no failed suites. Their four explicit
+optional skips remain SKIP under native accounting. Morning retains structured
+nonfinancial refusal/status, no uncertified picks, no stale financial fallback
+and no fake-zero signal. Delivery tests use stubs. No live scraping, real Telegram
+send or production database access was performed.
+
+The earlier broader run exposed two stale pipeline expectations and two temporary
+directory collection errors. The corrected tests and external fixed pytest root
+resolved them; those initial failed results remain archived. A later Windows
+path-option collection error is also archived. No accounting production code was
+changed. During finalization, the external integrity reader needed BOM-aware log
+decoding and explicit handling of the verifier's existing snapshot exclusions.
+Original logs and both earlier reader versions are preserved; repository source
+and snapshot policy were unchanged.
+
+All 1363 original artifact hashes and both pinned read-only historical
+database hashes remain unchanged. All 153 permitted root Python/JSON files
+match both disposable validated snapshots byte for byte. The existing snapshot
+policy excludes .mcp.json and test_bandarmolony_trade_mutations.py; both retain
+their required-base Git identities. The separate BandarmoloNY mutation runner
+is not claimed as executed by this Corporate Action gate.
+
+Remaining unavailable checks are not counted as PASS:
+
+- Verifier: one POSIX close/connection-lock witness and three os.fork ownership
+  witnesses cannot run on Windows. The verifier remains INCOMPLETE, exit 2.
+- Regression additionally records the symlink-sidecar witness's Windows
+  privilege error 1314, and test_inventory_adds.py zero collection / exit 5.
+  Inventory direct-call and cold-CLI refusals remain covered elsewhere.
+- No current full Linux run, GitHub workflow or live production delivery is claimed.
+
+The eight-file binary-capable patch was verified outside Windows Temp:
+`C:\Users\jason\Documents\CodexBackups\CorporateActionContract\20261010T200840+0700\ca-r01-r02-00d56cf.patch`.
+SHA256: `0e9babf6dc9bb1fbdca036c68127763824bb497cfad7770e4550d0e27f38a5ea`. Its reverse-apply check passes without applying
+anything, and backup creation left the worktree unchanged.
+
+Current evidence is under `%TEMP%\ca-high-remediation-00d56cf`:
+base-witness.json, r01/r02 RED and GREEN logs, new-mutants.log,
+validation/results.json and verifier.log, health/results.json and both native
+health JSON files, and integrity.json. Prepared drivers retain the exact offline
+commands and distinct pinned Corporate Action and audited-broker fixtures.
+Original artifacts and the frozen prior worktree are preserved.
+
+git diff --check passes. The diff outside the eight remediation files and this
+verification record is empty. All mandatory locally available gates are green.
+Status: **READY FOR INDEPENDENT DELTA REVIEW**.
+
+## Historical Phase-5 context
 Scope: 0xFridayy/DailyScraper, remediation base
 `5619f0852d4bfcdb94b6397b4c216a626f9028de`, preserved previous HEAD
 `32015ebbd10678719383182250514780ffa289ad`.
@@ -115,7 +239,7 @@ Their optional-artifact policy is narrower than the contract verifier's mandator
 evidence policy; an ML Health OK message alone cannot establish
 a complete contract-verification PASS.
 
-## Validation
+## Historical 2026-10-09 harness validation
 
 Final test/harness validation recorded on 2026-10-09 with Windows/Python 3.14.6
 and pytest 9.1.1, based on candidate HEAD
@@ -195,7 +319,7 @@ contains focused-24.log, verifier.log, per-module regression logs and integrity.
 The second retains both native health accounting JSON files and logs.
 All locally available gates are green. Status: **READY FOR INDEPENDENT DELTA REVIEW**.
 
-## Reproduction and remaining local evidence
+## Historical reproduction and remaining local evidence
 
 The final harness drivers retain the exact commands, pinned source locations and
 disposable snapshot setup. From the preserved validation environment, the primary
