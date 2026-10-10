@@ -55,6 +55,7 @@ def test_mutant_baseline_with_no_assertions_is_unavailable(monkeypatch, tmp_path
     monkeypatch.setattr(verifier, "FINDING_MUTANTS", [])
     monkeypatch.setattr(verifier, "RESTART_MUTANTS", [])
     monkeypatch.setattr(verifier, "PHASE5_MUTANTS", [])
+    monkeypatch.setattr(verifier, "PRICE_REVISION_MUTANTS", [])
     monkeypatch.setattr(verifier, "execute", lambda *a: (0, "1 skipped in 0.1s\n"))
     assert verifier.verify_mutants(tmp_path, {"PYTHONPATH": ""}) == 2
     assert "unavailable: 1" in capsys.readouterr().out.lower()

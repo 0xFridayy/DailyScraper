@@ -49,7 +49,10 @@ FINDING_MUTANTS = [
     ("F06-writer-preserves-close-only-revisions", "backfill_inventory.py",
      '                          for field in ("open", "high", "low", "close", "volume"))}',
      '                          for field in ("close",))}',
-     "test_corporate_action_findings.py::test_f06_unchanged_close_does_not_grandfather_changed_fields"),
+     "test_corporate_action_findings.py::test_f06_unchanged_close_does_not_grandfather_changed_fields",
+     (('if (changes := revision_changes(stored_bars[bar["date"]], bar))]',
+       'if not _same_value(stored_bars[bar["date"]]["close"], bar["close"]) '
+       'and (changes := revision_changes(stored_bars[bar["date"]], bar))]'),)),
     ("F07-unresolved-event-becomes-trusted-predecessor", "price_contract.py",
      '            if ref.status != "RESOLVED":\n'
      '                reason = "UNRESOLVED_EVENT_REFERENCE"\n'
@@ -161,9 +164,35 @@ PHASE5_MUTANTS = [
     ("P5-morning-raw-financial-fallback", "morning.py",
      '        safe_send(text)', '        safe_send(held[-1])',
      "test_corporate_action_morning_status.py::test_unavailable_analytics_never_falls_back_to_financial_report"),
-    ("P5-N01-null-repair-grandfathered", "backfill_inventory.py",
+    ("P5-N01-null-repair-grandfathered", "price_history_revision.py",
      '        return stored is None and proposed is None', '        return True',
      "test_corporate_action_findings.py::test_n01_null_only_repair_cannot_bypass_ohlc_admission"),
+]
+
+# P0 barriers must be tested even without private historical artifacts. These
+# mutants run against the actual writer and disposable SQLite fixtures.
+PRICE_REVISION_MUTANTS = [
+    ("P0-revision-refusal-disabled", "backfill_inventory.py",
+     '    if revisions:\n        evidence =', '    if False:\n        evidence =',
+     "test_price_history_revision_barrier.py::test_vktr_historical_rewrites_are_refused_before_mutation"),
+    ("P0-nonnull-observations-unprotected", "price_history_revision.py",
+     'if stored[field] is not None and not same_value', 'if False and not same_value',
+     "test_price_history_revision_barrier.py::test_each_nonnull_field_is_protected_including_null_repair"),
+    ("P0-partial-writes-not-rolled-back", "backfill_inventory.py",
+     '        conn.execute("ROLLBACK TO inventory_ticker")', '        pass',
+     "test_price_history_revision_barrier.py::test_price_failure_preserves_unrelated_pending_transaction"),
+    ("P0-identical-prices-replaced", "backfill_inventory.py",
+     'for o in ohlc if o["date"] in close_by_date.changed', 'for o in ohlc',
+     "test_price_history_revision_barrier.py::test_identical_repeat_preserves_rowids_and_does_not_fire_price_triggers"),
+    ("P0-delta-gate-accepts-revisions", "price_history_revision.py",
+     'WHERE a.date IS NULL OR {reasons}', 'WHERE a.date IS NULL',
+     "test_price_history_revision_barrier.py::test_precommit_delta_gate"),
+    ("P0-refusal-snapshot-exposes-response", "backfill_inventory.py",
+     'raw = json.dumps(e.evidence, sort_keys=True)', 'raw = response_raw',
+     "test_price_history_revision_barrier.py::test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth"),
+    ("P0-revision-failure-rate-tolerated", "backfill_inventory.py",
+     '    if refused_revisions:', '    if False:',
+     "test_price_history_revision_barrier.py::test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth"),
 ]
 
 PHASE5_MUTANTS += [

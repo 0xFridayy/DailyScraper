@@ -87,6 +87,7 @@ from price_audit import (series_signature, should_fail_run, inventory_window,
 from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before
 from price_contract import RAW_ACTUAL, positive_real, actual_bar_reason, adjudicate_series
 from price_contract_frame import default_registry, quarantine_withholds
+from price_history_revision import revision_changes, same_value as _same_value
 
 
 class ValidatedPriceValues(dict):
@@ -95,6 +96,7 @@ class ValidatedPriceValues(dict):
     def __init__(self):
         super().__init__()
         self.dispositions = []
+        self.changed = set()
 
 
 # Priming this page first sets the csrftoken/sessionid cookies for the inventory
@@ -137,6 +139,27 @@ class InventoryError(RuntimeError):
     def __init__(self, msg, raw=None):
         super().__init__(msg)
         self.raw = raw
+
+
+class HistoricalRevisionError(InventoryError):
+    """A source response tried to revise stored non-NULL observations."""
+
+    def __init__(self, evidence):
+        self.evidence = evidence
+        first = evidence["refusals"][0]
+        super().__init__(f"{evidence['ticker']} {first['session']}: historical_revision refused; "
+                         f"no verified correction authorization; fields={','.join(first['changes'])}; "
+                         f"{evidence.get('admission_refusal', '')}")
+
+
+def _refuse_revisions(ticker, representation, revisions, admission_refusal=None):
+    if revisions:
+        evidence = {"reason": "UNAUTHORIZED_HISTORICAL_REVISION", "ticker": ticker,
+                    "input_representation": representation, "refusals": revisions}
+        if admission_refusal:
+            evidence["admission_refusal"] = admission_refusal
+        print(json.dumps({"historical_revision_refusal": evidence}, sort_keys=True))
+        raise HistoricalRevisionError(evidence)
 
 
 def _json_or_none(resp):
@@ -202,16 +225,6 @@ def _real_close(close, ticker, day):
     return normalized
 
 
-def _same_value(stored, proposed):
-    """None-safe field equality. A stored NULL repaired to a value is a change."""
-    if stored is None or proposed is None:
-        return stored is None and proposed is None
-    try:
-        return float(stored) == float(proposed)
-    except (OverflowError, TypeError, ValueError):
-        return False
-
-
 def _refusal(ticker, day, record, close):
     reason = record["anchor_trust_reason"]
     if reason == "LIMIT_VIOLATION":
@@ -231,7 +244,7 @@ def _refusal(ticker, day, record, close):
 
 
 def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representation="UNKNOWN", market="REGULAR"):
-    """Refuse new limit violations before either table receives any writes.
+    """Refuse unauthorized revisions and invalid repairs before any writes.
 
     Judge the proposed series, including stored neighbours outside the response,
     with the same adjudication core as the audit (price_contract.adjudicate_series).
@@ -263,6 +276,9 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
     fields = ("date", "open", "high", "low", "close", "volume")
     stored_bars = {row[0]: dict(zip(fields, row)) for row in conn.execute(
         "SELECT date, open, high, low, close, volume FROM price_history WHERE ticker=? ORDER BY date", (ticker,))}
+    revisions = [{"session": bar["date"], "changes": changes}
+                 for bar in ohlc if bar["date"] in stored_bars
+                 if (changes := revision_changes(stored_bars[bar["date"]], bar))]
     proposed_bars = stored_bars | {bar["date"]: bar for bar in ohlc}
     changed = {bar["date"] for bar in ohlc if bar["date"] not in stored_bars
                or not all(_same_value(stored_bars[bar["date"]].get(field), bar.get(field))
@@ -317,7 +333,9 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
             # A stored successor is re-judged only on its transition from the
             # revised predecessor; its other historical findings stay with the audit.
             if day in changed or record["anchor_trust_reason"] == "LIMIT_VIOLATION":
-                raise InventoryError(_refusal(ticker, day, record, proposed_bars[day]["close"]))
+                refusal = _refusal(ticker, day, record, proposed_bars[day]["close"])
+                _refuse_revisions(ticker, representation, revisions, refusal)
+                raise InventoryError(refusal)
             continue
         if day not in incoming:
             continue
@@ -340,10 +358,46 @@ def validate_inventory_prices(conn, ticker, ohlc, *, registry=None, representati
                                       "event_id": record["corporate_action_event_id"],
                                       "registry_sha256": registry.content_sha256})
 
+    # Admission answers whether a proposed bar is plausible. It never grants
+    # permission to replace an observation. Keep the existing domain/transition
+    # refusals, then independently refuse every non-NULL historical revision.
+    _refuse_revisions(ticker, representation, revisions)
+    incoming.changed = changed
     return incoming
 
 
 def insert_inventory(conn, ticker, payload, *, registry=None, representation="UNKNOWN", market="REGULAR"):
+    """Validate and write one ticker atomically, leaving commit to the caller.
+
+    A savepoint protects callers that catch failures, including autocommit
+    connections. An outer transaction prevents releasing the savepoint from
+    committing before run_backfill records its persistence intent. Acquire the
+    write lock before reading stored observations when we own the transaction.
+    """
+    owned_transaction = not conn.in_transaction
+    if owned_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("SAVEPOINT inventory_ticker")
+        result = _insert_inventory(conn, ticker, payload, registry=registry,
+                                   representation=representation, market=market)
+        conn.execute("RELEASE inventory_ticker")
+    except BaseException:
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK TO inventory_ticker")
+                conn.execute("RELEASE inventory_ticker")
+        except sqlite3.Error:
+            # A lost savepoint cannot leave partial financial writes pending.
+            conn.rollback()
+        finally:
+            if owned_transaction:
+                conn.rollback()
+        raise
+    return result
+
+
+def _insert_inventory(conn, ticker, payload, *, registry=None, representation="UNKNOWN", market="REGULAR"):
     """Store price_history (all days) + broker_flow (days <= BACKFILL_END).
 
     Returns (broker_rows, price_rows, returned_broker_codes, signature).
@@ -374,11 +428,17 @@ def insert_inventory(conn, ticker, payload, *, registry=None, representation="UN
     price_rows = [
         (o["date"], ticker, positive_real(o["open"]), positive_real(o["high"]),
          positive_real(o["low"]), close_by_date[o["date"]], float(o["volume"]))
-        for o in ohlc
+        for o in ohlc if o["date"] in close_by_date.changed
     ]
     conn.executemany(
-        """INSERT OR REPLACE INTO price_history
-           (date, ticker, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)""",
+        """INSERT INTO price_history
+           (date, ticker, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(date,ticker) DO UPDATE SET
+             open=COALESCE(price_history.open,excluded.open),
+             high=COALESCE(price_history.high,excluded.high),
+             low=COALESCE(price_history.low,excluded.low),
+             close=COALESCE(price_history.close,excluded.close),
+             volume=COALESCE(price_history.volume,excluded.volume)""",
         price_rows,
     )
 
@@ -401,15 +461,22 @@ def insert_inventory(conn, ticker, payload, *, registry=None, representation="UN
             broker_rows.append((d, ticker, code, None, None, netval, None, None))
 
     conn.executemany(
-        """INSERT OR REPLACE INTO broker_flow
+        """INSERT INTO broker_flow
            (date, ticker, broker_code, bval, sval, netval, bavg, savg)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(date,ticker,broker_code) DO UPDATE SET
+             bval=excluded.bval, sval=excluded.sval, netval=excluded.netval,
+             bavg=excluded.bavg, savg=excluded.savg
+           WHERE broker_flow.bval IS NOT excluded.bval OR broker_flow.sval IS NOT excluded.sval
+              OR broker_flow.netval IS NOT excluded.netval OR broker_flow.bavg IS NOT excluded.bavg
+              OR broker_flow.savg IS NOT excluded.savg""",
         broker_rows,
     )
 
     sig = series_signature(
         {"x": [o["date"] for o in ohlc], "close": [close_by_date[o["date"]] for o in ohlc]})
-    return len(broker_rows), len(price_rows), returned, sig
+    # Counts retain the public response coverage contract, including repeats.
+    return len(broker_rows), len(ohlc), returned, sig
 
 
 def run_backfill(tickers):
@@ -436,6 +503,7 @@ def run_backfill(tickers):
 
     print("price_contract=" + json.dumps(run_registry.identity, sort_keys=True))
     failed = []
+    refused_revisions = []
     sessions = []   # sessions each stored ticker actually got back
     captures = ic.CaptureLog(ic.NO_CACHE_ROOT, "backfill_inventory", writes_cache=False,
                              broker_list_source="backfill_inventory.INVENTORY_BROKERS")
@@ -510,21 +578,24 @@ def run_backfill(tickers):
                 print(f"  {broker_n} broker_flow rows, {price_n} price_history rows ({rng})")
                 print(f"  brokers returned={returned} kept(in BROKER_FLOW_CODES)={kept}")
             except Exception as e:
-                # Drop whatever this ticker wrote before it failed. insert_inventory
-                # writes before the stale-series check can reject it, and without
-                # this the next ticker's commit() stored the rejected rows after
-                # all. Every earlier ticker is already committed or rolled back,
-                # so only this ticker's writes are pending here.
+                # insert_inventory rolls back its own failures. The outer
+                # transaction also covers post-writer checks and the capture
+                # persistence record. Earlier tickers are already committed.
                 conn.rollback()
                 # A failure fetch_inventory already recorded has no cap here.
                 if cap is not None:
                     cap.finish(ic.REJECTED if isinstance(e, InventoryError) else ic.ERROR, e)
                 print(f"  FAILED: {e}")
                 raw = getattr(e, "raw", None)
-                if isinstance(e, InventoryError) and response_raw is not None:
+                if isinstance(e, HistoricalRevisionError):
+                    refused_revisions.append(ticker)
+                    # Preserve only the financial diff, never an authenticated
+                    # response's extra fields, cookies or headers.
+                    raw = json.dumps(e.evidence, sort_keys=True)
+                elif isinstance(e, InventoryError) and response_raw is not None:
                     raw = response_raw
                 if not failed and raw is not None:
-                    # First failure only: one raw response is enough to diagnose,
+                    # First failure only: one diagnostic is enough to diagnose,
                     # and 45 dumps would be noise. This replaces the old page
                     # screenshot — there is no page to snapshot now, the response
                     # body IS the diagnostic.
@@ -541,6 +612,10 @@ def run_backfill(tickers):
 
     conn.close()
     print(f"\nFailed tickers: {failed}")
+
+    if refused_revisions:
+        sys.exit(f"ABORT: unauthorized historical revisions refused for {refused_revisions}; "
+                 "do not commit this run, regardless of the ticker failure rate")
 
     # A warning, not an exit: the short fallback still ends at the latest
     # session, so price_history WAS topped up. Failing here would have blocked

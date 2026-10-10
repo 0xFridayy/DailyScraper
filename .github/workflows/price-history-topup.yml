@@ -5,8 +5,8 @@ name: NeoBDM price_history Top-up
 # one-time historical backfill (see that script's docstring). Nothing kept
 # it current after that, so it silently stopped moving once the backfill
 # ceiling was reached. backfill_inventory.py is already safe to rerun
-# repeatedly: it writes price_history unconditionally with INSERT OR REPLACE
-# (idempotent), and skips broker_flow rows past BACKFILL_END so it never
+# repeatedly: it preserves identical stored observations, refuses changes to
+# non-NULL OHLCV, and skips broker_flow rows past BACKFILL_END so it never
 # overwrites the live-scraped broker_flow data from the other workflow. This
 # just reruns that same already-validated script on its own schedule,
 # offset well clear of the main daily-scrape.yml run so both workflows never
@@ -83,11 +83,21 @@ jobs:
       - name: Record contamination baseline
         run: echo "CONTAM_BEFORE=$(python price_audit.py count cross_ticker_dup)" >> "$GITHUB_ENV"
 
+      # Duplicate counts do not detect plausible vendor-adjusted history.
+      # Preserve the exact committed SQLite state, including WAL contents, for
+      # a second independent gate before any database commit or push.
+      - name: Record historical observation baseline
+        run: >-
+          python price_history_revision.py snapshot --database neobdm.db
+          --baseline "$RUNNER_TEMP/price-history-before.sqlite"
+
       - name: Top up price_history
+        id: topup
         run: python backfill_inventory.py ${{ inputs.tickers }}
 
-      # backfill_inventory.py dumps the raw JSON of its FIRST failed response
-      # (topup-failure.json). With the API there is no page to screenshot — the
+      # backfill_inventory.py records its FIRST failure in topup-failure.json.
+      # Historical revisions retain only financial diffs; other failures retain
+      # the original response. With the API there is no page to screenshot — the
       # response body IS the diagnostic. Without this upload an API break leaves
       # only stdout, and diagnosing it costs another day.
       - name: Upload failure snapshot for debugging
@@ -100,6 +110,7 @@ jobs:
           retention-days: 7
 
       - name: Fail if the scrape introduced new cross-ticker contamination
+        id: contamination_gate
         run: |
           AFTER=$(python price_audit.py count cross_ticker_dup)
           echo "cross-ticker contaminated rows: $CONTAM_BEFORE -> $AFTER"
@@ -108,7 +119,14 @@ jobs:
             exit 1
           fi
 
+      - name: Refuse unauthorized historical revisions before committing
+        id: revision_gate
+        run: >-
+          python price_history_revision.py verify --database neobdm.db
+          --baseline "$RUNNER_TEMP/price-history-before.sqlite"
+
       - name: Commit updated neobdm.db
+        if: ${{ success() && steps.topup.outcome == 'success' && steps.contamination_gate.outcome == 'success' && steps.revision_gate.outcome == 'success' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
