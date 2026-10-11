@@ -1,0 +1,1003 @@
+{
+  "additional_broker_regressions": [
+    {
+      "failed": 0,
+      "passed": 145,
+      "skipped": 0,
+      "status": "PASS",
+      "subtests": {
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "unavailable": 0
+      },
+      "suite": "test_broker_flow_canonical.py",
+      "unavailable": 0,
+      "unavailable_checks": []
+    },
+    {
+      "failed": 0,
+      "passed": 77,
+      "skipped": 0,
+      "status": "UNAVAILABLE",
+      "subtests": {
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "unavailable": 0
+      },
+      "suite": "test_broker_flow_regime.py",
+      "unavailable": 1,
+      "unavailable_checks": [
+        "test_broker_flow_regime.py::test_exact_audited_baseline_reproduces_the_committed_manifest_byte_for_byte: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\m2-broker-readers-hm9ol_b1\\\\test_broker_flow_regime.py', 435, 'Skipped: broker_daily.parquet not supplied (set BROKER_DAILY_PARQUET)')"
+      ]
+    },
+    {
+      "failed": 0,
+      "passed": 118,
+      "skipped": 0,
+      "status": "UNAVAILABLE",
+      "subtests": {
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "unavailable": 0
+      },
+      "suite": "test_broker_flow_manifest_refresh.py",
+      "unavailable": 1,
+      "unavailable_checks": [
+        "test_broker_flow_manifest_refresh.py::test_the_sidecars_of_a_symlinked_source_are_protected: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\m2-broker-readers-hm9ol_b1\\\\test_broker_flow_manifest_refresh.py', 498, \"Skipped: symlinks unavailable: [WinError 1314] A required privilege is not held by the client: 'C:\\\\\\\\Users\\\\\\\\jason\\\\\\\\Desktop\\\\\\\\VsCode\\\\\\\\DailyScraper-broker-flow-revision-barrier\\\\\\\\scratchpad\\\\\\\\broker-revision\\\\\\\\temp\\\\\\\\pytest-of-jason\\\\\\\\pytest-14\\\\\\\\test_the_sidecars_of_a_symlink0\\\\\\\\current.db' -> 'C:\\\\\\\\Users\\\\\\\\jason\\\\\\\\Desktop\\\\\\\\VsCode\\\\\\\\DailyScraper-broker-flow-revision-barrier\\\\\\\\scratchpad\\\\\\\\broker-revision\\\\\\\\temp\\\\\\\\pytest-of-jason\\\\\\\\pytest-14\\\\\\\\test_the_sidecars_of_a_symlink0\\\\\\\\link.db'\")"
+      ]
+    }
+  ],
+  "base": "cf8daf5fa4551f6788e0d7b76766338b710ef8bb",
+  "branch": "feat/broker-flow-revision-barrier",
+  "date": "2026-10-11",
+  "focused_m2_mutations": {
+    "baseline_failures": [],
+    "killed": [
+      "M2-broker-comparison-disabled",
+      "M2-broker-erasure-allowed",
+      "M2-broker-null-repair-allowed",
+      "M2-missing-broker-manufactured-as-zero",
+      "M2-identical-price-bypasses-broker-comparison",
+      "M2-broker-delta-gate-removed",
+      "M2-broker-gate-failure-suppressed",
+      "M2-broker-delta-ignores-null-repair",
+      "M2-broker-delta-ignores-erasure",
+      "M2-broker-delta-ignores-deletion",
+      "M2-baseline-receipt-not-bound-to-candidate",
+      "M2-partial-writes-committed-after-refusal",
+      "M2-writer-ignores-bval",
+      "M2-delta-ignores-bval",
+      "M2-writer-ignores-sval",
+      "M2-delta-ignores-sval",
+      "M2-writer-ignores-netval",
+      "M2-delta-ignores-netval",
+      "M2-writer-ignores-bavg",
+      "M2-delta-ignores-bavg",
+      "M2-writer-ignores-savg",
+      "M2-delta-ignores-savg"
+    ],
+    "mutated_cases_failed": 62,
+    "mutated_subtests_failed": 0,
+    "survived": [],
+    "total": 22,
+    "unavailable": [],
+    "unchanged_cases": 39,
+    "witness_groups": 9
+  },
+  "full_verifier": {
+    "counts": {
+      "failed": 0,
+      "passed": 3104,
+      "skipped": 0,
+      "subtests": {
+        "failed": 0,
+        "passed": 329,
+        "skipped": 0,
+        "unavailable": 0
+      },
+      "unavailable": 48
+    },
+    "exit": 2,
+    "status": "UNAVAILABLE",
+    "suites": [
+      {
+        "failed": 0,
+        "passed": 85,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_flow_revision_barrier.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 36,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_price_history_revision_barrier.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 29,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_price_contract.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 56,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_inventory_capture.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 56,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_walk_forward_canonical.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 44,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_ddqn_canonical.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 60,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_daily_picks.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 10,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_arb_veto.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 12,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_book.py",
+        "unavailable": 2,
+        "unavailable_checks": [
+          "test_broker_book.py::test_frames_match_strict_ticker_frame_on_real_cache: SKIP strict equivalence (inventory_raw/ cache not present)",
+          "test_broker_book.py::test_book_invariant_on_real_cache: SKIP real-cache invariant (inventory_raw/ cache not present)"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 15,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_rules.py",
+        "unavailable": 1,
+        "unavailable_checks": [
+          "test_broker_rules.py::test_no_look_ahead_real_sini: SKIP no look-ahead on SINI (inventory_raw/ cache not present)"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 31,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_learning.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 1,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_learning_run.py",
+        "unavailable": 3,
+        "unavailable_checks": [
+          "test_broker_learning_run.py::test_weekly_counts_unreadable_cache_files_as_failed: skip unreadable cache: inventory_raw/ cache not present",
+          "test_broker_learning_run.py::test_weekly_fails_when_mostly_empty: skip mostly empty: inventory_raw/ cache not present",
+          "test_broker_learning_run.py::test_profitability_leaves_out_books_that_end_before_as_of: skip stale books: inventory_raw/ cache not present"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 106,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 138,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_inventory_evidence.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 2,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_inventory_signal.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 25,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_targeted_actor_observations.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 52,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_experiment_1f_gate_b.py",
+        "unavailable": 9,
+        "unavailable_checks": [
+          "test_experiment_1f_gate_b.py::test_real_export_reproduces_gate_a_identities: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_preparation_ledgers_match_pins_and_are_deterministic: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_exact_nlot_windows_equal_source_sums: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_no_broker_feature_consumes_an_invalid_observation: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_b_aggregates_match_frozen_definitions: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_price_features_follow_their_definitions: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_execution_diagnostics_match_contract: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_real_timing_intersection_and_label_ledgers: Test returned before completing its evidence checks",
+          "test_experiment_1f_gate_b.py::test_dry_run_resolves_the_full_plan_with_zero_fits_and_predictions: Test returned before completing its evidence checks"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 77,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_experiment_1f_phase2.py",
+        "unavailable": 28,
+        "unavailable_checks": [
+          "test_experiment_1f_phase2.py::test_source_manifest_holds_exactly_297_with_full_hashes: SKIP source_manifest (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_frozen_artifacts_are_unchanged: SKIP frozen_artifacts (shared checkout not present)",
+          "test_experiment_1f_phase2.py::test_candidate_artifacts_are_semantically_deterministic: SKIP determinism (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_broker_quarantine_does_not_erase_price_validity: SKIP validity_domains (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_the_real_five_key_authorization_is_bound_to_its_artifact: SKIP real_authorization (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_nominal_sensitivity_reproduces_production_segmentation: SKIP sensitivity (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_primary_and_secondary_cannot_be_confused: SKIP mode_artifacts (validity artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_primary_headline_counts_recompute_from_the_contract: SKIP headline_counts (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_sensitivity_compares_exact_invalid_date_keys: SKIP date_mask (sensitivity artifact not built here)",
+          "test_experiment_1f_phase2.py::test_nominal_sensitivity_reproduces_the_production_invalid_keys_exactly: SKIP date_mask_nominal (sensitivity artifact not built here)",
+          "test_experiment_1f_phase2.py::test_manifest_separates_execution_from_provenance: SKIP manifest_separates_execution_from_provenance (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_manifest_pins_code_identity_and_rejects_drift: SKIP manifest_pins_code_identity_and_rejects_drift (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_a_dirty_working_tree_blocks_establishment: SKIP a_dirty_working_tree_blocks_establishment (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_artifact_parentage_is_cryptographic_not_by_filename: SKIP artifact_parentage_is_cryptographic_not_by_filename (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_authorization_parent_identity_is_still_exact: SKIP auth_identity (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_primary_report_records_pit_observability_unestablished: SKIP pit_observability (validity artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_renaming_the_mode_did_not_change_eligibility: SKIP rename_neutral (candidate artifacts not built here)",
+          "test_experiment_1f_phase2.py::test_candidate_full_market_ohlc_matches_the_frozen_source_exactly: SKIP ohlc_snapshot (OHLC snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_candidate_ohlc_is_not_narrowed_to_the_297: SKIP ohlc_full_market (OHLC snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_establishment_requires_semantic_code_clean_not_whole_tree: SKIP establishment_requires_semantic_code_clean_not_whole_tree (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_validity_reports_stay_derived_not_execution_inputs: SKIP validity_reports_stay_derived_not_execution_inputs (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_the_manifest_establishment_target_is_the_candidate_directory: SKIP the_manifest_establishment_target_is_the_candidate_directory (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_the_robustness_result_is_preserved_without_overselling: SKIP robustness (sensitivity artifact not built here)",
+          "test_experiment_1f_phase2.py::test_dirty_classification_is_fail_closed_not_py_only: SKIP dirty_classification_is_fail_closed_not_py_only (candidate snapshot not built here)",
+          "test_experiment_1f_phase2.py::test_synthetic_manifest_matches_the_production_schema: SKIP test_synthetic_manifest_matches_the_production_schema (real proposal absent); Test returned before completing its evidence checks",
+          "test_experiment_1f_phase2.py::test_rupiah_round_trip_stays_far_inside_the_tolerance: SKIP test_rupiah_round_trip_stays_far_inside_the_tolerance (candidate broker table absent); Test returned before completing its evidence checks",
+          "test_experiment_1f_phase2.py::test_semantic_validation_does_not_depend_on_the_shared_checkout: SKIP test_semantic_validation_does_not_depend_on_the_shared_checkout (candidate OHLC absent); Test returned before completing its evidence checks",
+          "test_experiment_1f_phase2.py::test_real_297_has_no_partially_present_broker: SKIP test_real_297_has_no_partially_present_broker (snapshot absent); Test returned before completing its evidence checks"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 11,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_experiment_2a0_event_study.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 40,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_idx_calendar.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 564,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_neobdm_source_contract.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 1206,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_findings.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 23,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_restart.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 10,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_monitor.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 38,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_cold_cli.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 14,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_validation.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 3,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_morning_status.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 4,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_mutation_witnesses.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 68,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_corporate_action_callable_coverage.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 20,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_ml_health.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 107,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_pipeline.py",
+        "unavailable": 1,
+        "unavailable_checks": [
+          "test_pipeline.py::test_gate_reads_only_candidate_artifacts_not_the_legacy_root_ones: Test returned before completing its evidence checks"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 49,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_dashboard.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 35,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_targeted_actor_panel.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 14,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_morning.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 35,
+        "skipped": 0,
+        "status": "PASS",
+        "subtests": {
+          "failed": 0,
+          "passed": 0,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_broker_collect.py",
+        "unavailable": 0,
+        "unavailable_checks": []
+      },
+      {
+        "failed": 0,
+        "passed": 155,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 187,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_bandarmolony_trade_capture.py",
+        "unavailable": 1,
+        "unavailable_checks": [
+          "test_bandarmolony_trade_capture.py::TradeCaptureTests::test_read_only_preflight_retains_same_process_writer_lock: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\ca-verification-ozs64esl\\\\test_bandarmolony_trade_capture.py', 2364, \"Skipped: POSIX closes can release another connection's locks\")"
+        ]
+      },
+      {
+        "failed": 0,
+        "passed": 11,
+        "skipped": 0,
+        "status": "UNAVAILABLE",
+        "subtests": {
+          "failed": 0,
+          "passed": 4,
+          "skipped": 0,
+          "unavailable": 0
+        },
+        "suite": "test_bandarmolony_trade_lock.py",
+        "unavailable": 3,
+        "unavailable_checks": [
+          "test_bandarmolony_trade_lock.py::RawRootLockTests::test_fork_while_idle_refuses_inherited_store: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\ca-verification-ozs64esl\\\\test_bandarmolony_trade_lock.py', 629, 'Skipped: real os.fork() ownership checks need POSIX')",
+          "test_bandarmolony_trade_lock.py::RawRootLockTests::test_fork_while_lock_held_refuses_inherited_store: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\ca-verification-ozs64esl\\\\test_bandarmolony_trade_lock.py', 591, 'Skipped: real os.fork() ownership checks need POSIX')",
+          "test_bandarmolony_trade_lock.py::RawRootLockTests::test_fresh_store_in_forked_child_acquires_real_coordination: ('C:\\\\Users\\\\jason\\\\Desktop\\\\VsCode\\\\DailyScraper-broker-flow-revision-barrier\\\\scratchpad\\\\broker-revision\\\\temp\\\\ca-verification-ozs64esl\\\\test_bandarmolony_trade_lock.py', 661, 'Skipped: real os.fork() ownership checks need POSIX')"
+        ]
+      }
+    ]
+  },
+  "live_requests": false,
+  "log_sha256": {
+    "broker-readers.log": "4e1a17e94750b30d27661c6ccce29f3ab35c3619f18984557770ed07cf73498c",
+    "focused-expanded.log": "0c83a280e939f5f2fbe74bbe5ec8edb35e15c7bac46d1023966a251151080752",
+    "focused.log": "f6bf5e415cf376cffdecad861635f0ab01a22d904f1b0f241853a1c3e61eb51f",
+    "m2-mutants.log": "e2895baaa5582b0433aed58ae350085ee47ad3d34798b540f41a5e4af2a1bef3",
+    "red.log": "7c56b5151be8ebf57521d076d5a45e5ec5ccb87a2c9646df392dbee6433ec6ab",
+    "verifier.log": "7f09cc6cbf81634a117434c393a6c58ab5f9dad200360be08915d4edad739e8b"
+  },
+  "mutations": {
+    "baseline_failures": [],
+    "killed": [
+      "official-reference-replaced-with-cum-close",
+      "theoretical-terp-substituted",
+      "pending-falls-through",
+      "reference-carried-to-next-day",
+      "oo-exit-boundary-mask-removed",
+      "intermediate-boundary-ignored",
+      "withheld-return-replaced-with-zero",
+      "tier-selected-from-cum-close",
+      "actual-close-replaced-in-netval",
+      "F01-invalid-registry-becomes-empty",
+      "F02-malformed-evidence-authorizes-reference",
+      "F02-placeholder-provenance-accepted",
+      "F02-degenerate-evidence-hash-accepted",
+      "F02-contradictory-chronology-accepted",
+      "F08-placeholder-session-evidence-verifies",
+      "F03-stale-labels-recertified-by-annotation",
+      "F04-edited-values-retain-certificate",
+      "F05-incomplete-bars-get-manufactured-extrema-anchors",
+      "F06-writer-preserves-close-only-revisions",
+      "F07-unresolved-event-becomes-trusted-predecessor",
+      "F08-unknown-source-gets-event-exception",
+      "F09-rejected-payoff-endpoint-used",
+      "F10-truncated-horizon-is-shortened",
+      "F11-direct-ranking-bypasses-contract",
+      "F12-wrapper-writes-before-refusing",
+      "F13-recovery-hides-invalid-successor",
+      "F14-duplicate-identity-becomes-baseline",
+      "F15-removed-event-row-merges-regimes",
+      "F16-integrity-trusts-producer-frame",
+      "F16-monitor-skips-path-admission",
+      "F17-ancient-unresolved-row-blocks-local-trade",
+      "F18-first-complete-extrema-window-shifted-away",
+      "R01-separated-placeholder-provenance-accepted",
+      "R02-foreign-trade-outcome-guard-removed",
+      "R02-foreign-date-outcome-guard-removed",
+      "R02-pattern-trade-outcome-guard-removed",
+      "R02-pattern-date-outcome-guard-removed",
+      "G1-compound-placeholder-check-removed",
+      "G1-labelled-placeholders-accepted",
+      "G1-only-simple-na-normalized",
+      "G1-only-three-character-identities-checked",
+      "G2-foreign-trade-cost-before-refusal",
+      "G2-foreign-trade-arithmetic-before-refusal",
+      "G2-foreign-date-cost-before-refusal",
+      "G2-foreign-date-arithmetic-before-refusal",
+      "G2-pattern-trade-cost-before-refusal",
+      "G2-pattern-trade-arithmetic-before-refusal",
+      "G2-pattern-date-cost-before-refusal",
+      "G2-pattern-date-arithmetic-before-refusal",
+      "J2-whole-field-fold-only-na",
+      "J2-whole-field-fold-only-three-characters",
+      "J1-key-value-placeholder-guard-removed",
+      "J1-label-inflection-removed",
+      "J1-function-words-counted-substantive",
+      "J2-compound-placeholders-only-na-nan",
+      "J2-separated-compound-fold-only-na",
+      "R1-once-invalid-always-invalid",
+      "R2-trust-first-row-of-supplied-slice",
+      "R3-two-good-looking-bars-restart",
+      "R4-unbounded-recursive-admissibility",
+      "R5-truncated-series-context-enters-restart",
+      "P5-mandatory-evidence-becomes-pass",
+      "P5-real-failure-downgraded",
+      "P5-gated-case-counted-as-pass",
+      "P5-silent-artifact-return-counted-as-pass",
+      "P5-morning-refusal-silent",
+      "P5-morning-raw-financial-fallback",
+      "P5-N01-null-repair-grandfathered",
+      "P5-N02-health-counts-gated-checks-as-pass",
+      "P5-N02-health-mandatory-unavailable-passes",
+      "P5-unavailable-subtest-becomes-pass",
+      "P5-failed-subtest-counted-twice",
+      "P5-expected-validation-error-becomes-unavailable",
+      "P5-missing-fixture-exception-becomes-pass",
+      "P5-N02-informal-skip-counted-as-pass",
+      "P5-F11-inventory-comparison-model-bypass",
+      "P5-F11-inventory-comparison-reader-bypass",
+      "P5-F12-inventory-comparison-cold-cli-bypass",
+      "P0-revision-refusal-disabled",
+      "P0-nonnull-observations-unprotected",
+      "P0-partial-writes-not-rolled-back",
+      "P0-identical-prices-replaced",
+      "P0-delta-gate-accepts-revisions",
+      "P0-refusal-snapshot-exposes-response",
+      "P0-revision-failure-rate-tolerated",
+      "M2-broker-comparison-disabled",
+      "M2-broker-erasure-allowed",
+      "M2-broker-null-repair-allowed",
+      "M2-missing-broker-manufactured-as-zero",
+      "M2-identical-price-bypasses-broker-comparison",
+      "M2-broker-delta-gate-removed",
+      "M2-broker-gate-failure-suppressed",
+      "M2-broker-delta-ignores-null-repair",
+      "M2-broker-delta-ignores-erasure",
+      "M2-broker-delta-ignores-deletion",
+      "M2-baseline-receipt-not-bound-to-candidate",
+      "M2-partial-writes-committed-after-refusal",
+      "M2-writer-ignores-bval",
+      "M2-delta-ignores-bval",
+      "M2-writer-ignores-sval",
+      "M2-delta-ignores-sval",
+      "M2-writer-ignores-netval",
+      "M2-delta-ignores-netval",
+      "M2-writer-ignores-bavg",
+      "M2-delta-ignores-bavg",
+      "M2-writer-ignores-savg",
+      "M2-delta-ignores-savg"
+    ],
+    "mutated_cases_failed": 902,
+    "mutated_subtests_failed": 0,
+    "survived": [],
+    "total": 107,
+    "unavailable": [],
+    "unchanged_cases": 1033,
+    "witness_groups": 82
+  },
+  "pinned_green": {
+    "accepted": false,
+    "after": {
+      "broker_flow": "856ea4fb1549502a52a6d604051542ee48ae5edcbc97451663b82e9b7d62a3e9",
+      "price_history": "dbeb897954552888955a0df712184299af7f352d3f7d1a2752b08d34bb9737ee"
+    },
+    "before": {
+      "broker_flow": "856ea4fb1549502a52a6d604051542ee48ae5edcbc97451663b82e9b7d62a3e9",
+      "price_history": "dbeb897954552888955a0df712184299af7f352d3f7d1a2752b08d34bb9737ee"
+    },
+    "close": 980.0,
+    "delta_gate_refusals": [],
+    "financial_snapshot_unchanged": true,
+    "fixture_sha256": "6fc475e6db6be597a539a8cc30f6a0c44f05a5c14b263367c07a3aa417389be5",
+    "key": [
+      "2026-04-23",
+      "VKTR",
+      "AI"
+    ],
+    "mode": "green",
+    "persisted_netval": -0.15582,
+    "proposed_lots": -3180.0,
+    "proposed_netval": -0.31164,
+    "refusal": "VKTR 2026-04-23: broker_flow historical_revision refused; UNAUTHORIZED_HISTORICAL_REVISION; no verified correction authorization; fields=netval; ",
+    "source": "reconstructed from pinned stored observations; raw API response unavailable",
+    "stored_lots": -1590.0,
+    "stored_netval": -0.15582,
+    "total_changes_delta": 0,
+    "writer_bypass_gate_refusals": [
+      {
+        "broker_code": "AI",
+        "changes": {
+          "netval": {
+            "proposed": -0.31164,
+            "stored": -0.15582
+          }
+        },
+        "reason": "UNAUTHORIZED_HISTORICAL_REVISION",
+        "session": "2026-04-23",
+        "table": "broker_flow",
+        "ticker": "VKTR"
+      }
+    ]
+  },
+  "pinned_red": {
+    "accepted": true,
+    "after": {
+      "broker_flow": "2cfa630b85a9989e014a015dec926e016402cc0cc5a8d6dc7c3a1e4e93906ee8",
+      "price_history": "dbeb897954552888955a0df712184299af7f352d3f7d1a2752b08d34bb9737ee"
+    },
+    "before": {
+      "broker_flow": "856ea4fb1549502a52a6d604051542ee48ae5edcbc97451663b82e9b7d62a3e9",
+      "price_history": "dbeb897954552888955a0df712184299af7f352d3f7d1a2752b08d34bb9737ee"
+    },
+    "close": 980.0,
+    "delta_gate_refusals": [],
+    "financial_snapshot_unchanged": false,
+    "fixture_sha256": "6fc475e6db6be597a539a8cc30f6a0c44f05a5c14b263367c07a3aa417389be5",
+    "key": [
+      "2026-04-23",
+      "VKTR",
+      "AI"
+    ],
+    "mode": "base",
+    "persisted_netval": -0.31164,
+    "proposed_lots": -3180.0,
+    "proposed_netval": -0.31164,
+    "refusal": null,
+    "source": "reconstructed from pinned stored observations; raw API response unavailable",
+    "stored_lots": -1590.0,
+    "stored_netval": -0.15582,
+    "total_changes_delta": 1
+  },
+  "pinned_unchanged_database_gate": {
+    "broker_rows": 235716,
+    "gate": "PASS",
+    "price_rows": 12346,
+    "vktr_broker": [
+      "2026-04-23",
+      "VKTR",
+      "AI",
+      null,
+      null,
+      -0.15582,
+      null,
+      null
+    ],
+    "vktr_price": [
+      "2026-04-23",
+      990.0,
+      1010.0,
+      950.0,
+      980.0,
+      78782400.0
+    ]
+  },
+  "production_data_accessed": false,
+  "real_telegram": false,
+  "red_before_production_changes": {
+    "failed": 41,
+    "passed": 10,
+    "skipped": 0,
+    "unavailable": 0
+  },
+  "remote_branch_changed": false,
+  "residual_release_gates": {
+    "L1": "Malformed/empty ticker responses can leave the aggregate run green.",
+    "M1": "One refused ticker prevents the aggregate scheduled commit."
+  },
+  "source_git_blobs": {
+    ".github/workflows/price-history-topup.yml": "fa3dcd7db3386719b54a604baf36cf0fe6272715",
+    "backfill_inventory.py": "b4bbbc336558d3ece66477dbbb13ec5f04d3b823",
+    "corporate_action_mutations.py": "b2e70a87106645f4344fb5904ecd0527cb0d950a",
+    "price_history_revision.py": "d8bf677e2bcc20db00c53c291c09650924a5efb5",
+    "test_broker_flow_revision_barrier.py": "70fcf949b349c3b30d3fca8cbaf4578202ca02bf",
+    "test_corporate_action_validation.py": "0376c88c5b64d72715c71adb49885354e24ecb01",
+    "test_price_history_revision_barrier.py": "455d883445ce772e93c0f88642d51403cd4b290c",
+    "verify_corporate_action_contract.py": "cfdee95f46a7c8e2da4b565862d3a0332764b9e4"
+  },
+  "source_sha256": {
+    ".github/workflows/price-history-topup.yml": "330784ed7d927c98e34b9512fb60081c6e761b51c0731a7603b2504dbcce510d",
+    "backfill_inventory.py": "b82a679a114b5c0a1069d0bee0cbfd7310e8e6dd30a194050301be060b59749d",
+    "corporate_action_mutations.py": "3a89a3f309370b18e6b490d0b238ea9b789b7051c4cb9f013c5328ae9db4cdfd",
+    "price_history_revision.py": "c9e3de3d4dcaf79758b1412c99458b4857c93274012d3264d17e6e72fa4a148c",
+    "test_broker_flow_revision_barrier.py": "d43d35d814e05e220894b5f3d2a0f92da4f9d027ecc19e70402efa60bc339208",
+    "test_corporate_action_validation.py": "0fd74aae972104ec123d6f7c15b9725ecdeef11a60d7dba0572a6308e1cce333",
+    "test_price_history_revision_barrier.py": "43323b5b39ac3d9869491f51e1e9d57e081e78ee58add6a2a3592807cde048ae",
+    "verify_corporate_action_contract.py": "e723f3f2d1cdd69aeec34e18212384abf396f5e9e39355b13857ca7c9bf5f87d"
+  },
+  "synthetic_green": {
+    "accepted": false,
+    "delta_gate_refusals": [],
+    "financial_snapshot_unchanged": true,
+    "key": [
+      "2026-04-23",
+      "VKTR",
+      "AI"
+    ],
+    "persisted_netval": -0.15582,
+    "prices_unchanged": true,
+    "proposed_netval": -0.31164,
+    "refusal": "VKTR 2026-04-23: broker_flow historical_revision refused; UNAUTHORIZED_HISTORICAL_REVISION; no verified correction authorization; fields=netval; ",
+    "stored_netval": -0.15582,
+    "total_changes_delta": 0
+  },
+  "synthetic_red": {
+    "accepted": true,
+    "delta_gate_refusals": [],
+    "financial_snapshot_unchanged": false,
+    "key": [
+      "2026-04-23",
+      "VKTR",
+      "AI"
+    ],
+    "persisted_netval": -0.31164,
+    "prices_unchanged": true,
+    "proposed_netval": -0.31164,
+    "refusal": null,
+    "stored_netval": -0.15582,
+    "total_changes_delta": 1
+  },
+  "timezone": "Asia/Jakarta",
+  "unavailable_authoritative_evidence": [
+    "original successful inventory API response",
+    "private inventory_raw caches",
+    "private experiment 1f candidate and gate_b artifacts",
+    "the broker manifest's matching broker_daily.parquet",
+    "POSIX witnesses on Windows and missing symlink privilege"
+  ],
+  "verdict": "READY FOR INDEPENDENT DELTA REVIEW",
+  "workflow_dispatched_or_enabled": false
+}

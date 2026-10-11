@@ -62,11 +62,13 @@ def seed(conn, body):
     conn.commit()
 
 
-def vktr_witness(factor):
+def vktr_witness(factor, include_brokers=True):
     """Run unchanged on base and fix; report actual persisted writer effects."""
     body = observations()
     # The 1.10 case deliberately keeps actual and adjusted bars in one ticker.
     proposal = adjusted(body, factor, 8 if factor == 1.10 else None)
+    if not include_brokers:
+        proposal["data"]["nlot"] = {}
     with tempfile.TemporaryDirectory(prefix="vktr-revision-") as folder:
         path = str(Path(folder) / "synthetic.sqlite")
         # Transaction contexts do not close SQLite connections; close before cleanup.
@@ -104,8 +106,9 @@ def vktr_witness(factor):
 
 
 @pytest.mark.parametrize("factor", [1.10, 1.24])
-def test_vktr_historical_rewrites_are_refused_before_mutation(factor):
-    result = vktr_witness(factor)
+@pytest.mark.parametrize("include_brokers", [True, False])
+def test_vktr_historical_rewrites_are_refused_before_mutation(factor, include_brokers):
+    result = vktr_witness(factor, include_brokers)
     assert not result["accepted"], result
     assert result["financial_snapshot_unchanged"], result
     assert result["total_changes_delta"] == 0, result
@@ -299,7 +302,9 @@ def test_failed_null_repair_and_netval_refresh_are_rolled_back(tmp_path):
         before = financial_snapshot(conn)
         proposal = copy.deepcopy(body)
         proposal["data"]["nlot"] = {"AK": [150] * 30, "BK": [-100] * 30}
-        with pytest.raises(sqlite3.IntegrityError, match="refresh failed"):
+        # M2 refuses the changed broker observations before the price NULL
+        # repair or broker UPDATE trigger can run.
+        with pytest.raises(bf.HistoricalRevisionError, match="broker_flow"):
             bf.insert_inventory(conn, "VKTR", proposal, representation=RAW_ACTUAL)
         conn.commit()
         assert financial_snapshot(conn) == before

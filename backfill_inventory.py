@@ -51,9 +51,9 @@ deliberate on two counts:
      and silently zeroed billion-Rupiah days — see walk_forward_backtest.py.) The
      JSON `nval` here is actually full-precision and would be usable, but see (2).
 
-  2. It matches the unit of the rows already stored by the old backfill, so a
-     recent-window re-fetch heals existing rows in place rather than mixing two
-     conventions. Contamination older than the endpoint's rolling year is
+  2. It matches the unit of the rows already stored by the old backfill.
+     Existing observations are preserved; revisions require verified correction
+     authority, which this writer does not have. Contamination older than the endpoint's rolling year is
      reconciled from the archived full-market parquet instead.
      bval/sval/bavg/savg are left NULL for the same reason — the live path
      (neobdm_scraper.save_broker_flow) stores those in a different, page-derived
@@ -87,7 +87,8 @@ from price_audit import (series_signature, should_fail_run, inventory_window,
 from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before
 from price_contract import RAW_ACTUAL, positive_real, actual_bar_reason, adjudicate_series
 from price_contract_frame import default_registry, quarantine_withholds
-from price_history_revision import revision_changes, same_value as _same_value
+from price_history_revision import (BROKER_FIELDS, broker_revision_changes,
+                                    revision_changes, same_value as _same_value)
 
 
 class ValidatedPriceValues(dict):
@@ -142,12 +143,14 @@ class InventoryError(RuntimeError):
 
 
 class HistoricalRevisionError(InventoryError):
-    """A source response tried to revise stored non-NULL observations."""
+    """A source response tried to revise stored financial observations."""
 
     def __init__(self, evidence):
         self.evidence = evidence
         first = evidence["refusals"][0]
-        super().__init__(f"{evidence['ticker']} {first['session']}: historical_revision refused; "
+        table = evidence.get("table", "price_history")
+        super().__init__(f"{evidence['ticker']} {first['session']}: {table} historical_revision refused; "
+                         f"{first.get('reason', evidence['reason'])}; "
                          f"no verified correction authorization; fields={','.join(first['changes'])}; "
                          f"{evidence.get('admission_refusal', '')}")
 
@@ -160,6 +163,37 @@ def _refuse_revisions(ticker, representation, revisions, admission_refusal=None)
             evidence["admission_refusal"] = admission_refusal
         print(json.dumps({"historical_revision_refusal": evidence}, sort_keys=True))
         raise HistoricalRevisionError(evidence)
+
+
+def validate_inventory_brokers(conn, ticker, broker_rows):
+    """Return new observations only; an accepted price grants no broker authority.
+
+    No verified broker correction or NULL-repair contract exists in this path.
+    Missing brokers/sessions produce no proposal and never manufacture zeros.
+    Compare all five fields before either financial table is mutated.
+    """
+    stored = {row[:3]: dict(zip(BROKER_FIELDS, row[3:])) for row in conn.execute(
+        "SELECT date,ticker,broker_code,bval,sval,netval,bavg,savg FROM broker_flow WHERE ticker=?",
+        (ticker,))}
+    new_rows, refusals = [], []
+    for row in broker_rows:
+        key, proposed = row[:3], dict(zip(BROKER_FIELDS, row[3:]))
+        if key not in stored:
+            new_rows.append(row)
+            continue
+        changes = broker_revision_changes(stored[key], proposed)
+        if changes:
+            reason = ("UNVERIFIED_BROKER_NULL_REPAIR" if all(
+                value["stored"] is None for value in changes.values())
+                else "UNAUTHORIZED_HISTORICAL_REVISION")
+            refusals.append({"session": key[0], "broker_code": key[2],
+                             "reason": reason, "changes": changes})
+    if refusals:
+        evidence = {"reason": "UNAUTHORIZED_HISTORICAL_REVISION", "table": "broker_flow",
+                    "ticker": ticker, "refusals": refusals}
+        print(json.dumps({"historical_revision_refusal": evidence}, sort_keys=True))
+        raise HistoricalRevisionError(evidence)
+    return new_rows
 
 
 def _json_or_none(resp):
@@ -430,18 +464,6 @@ def _insert_inventory(conn, ticker, payload, *, registry=None, representation="U
          positive_real(o["low"]), close_by_date[o["date"]], float(o["volume"]))
         for o in ohlc if o["date"] in close_by_date.changed
     ]
-    conn.executemany(
-        """INSERT INTO price_history
-           (date, ticker, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)
-           ON CONFLICT(date,ticker) DO UPDATE SET
-             open=COALESCE(price_history.open,excluded.open),
-             high=COALESCE(price_history.high,excluded.high),
-             low=COALESCE(price_history.low,excluded.low),
-             close=COALESCE(price_history.close,excluded.close),
-             volume=COALESCE(price_history.volume,excluded.volume)""",
-        price_rows,
-    )
-
     dates = data.get("date") or []          # parallel to every nlot[...] series
     nlot = data.get("nlot") or {}
     returned = sorted(nlot.keys())
@@ -458,19 +480,27 @@ def _insert_inventory(conn, ticker, payload, *, registry=None, representation="U
             if close is None or i >= len(series) or series[i] is None:
                 continue
             netval = (series[i] * 100 * close) / 1e9   # lot-derived, billions
+            if not math.isfinite(netval):
+                raise InventoryError(f"{ticker} {d}: broker_flow INVALID_FINANCIAL_VALUE")
             broker_rows.append((d, ticker, code, None, None, netval, None, None))
 
+    new_broker_rows = validate_inventory_brokers(conn, ticker, broker_rows)
+    conn.executemany(
+        """INSERT INTO price_history
+           (date, ticker, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(date,ticker) DO UPDATE SET
+             open=COALESCE(price_history.open,excluded.open),
+             high=COALESCE(price_history.high,excluded.high),
+             low=COALESCE(price_history.low,excluded.low),
+             close=COALESCE(price_history.close,excluded.close),
+             volume=COALESCE(price_history.volume,excluded.volume)""",
+        price_rows,
+    )
     conn.executemany(
         """INSERT INTO broker_flow
            (date, ticker, broker_code, bval, sval, netval, bavg, savg)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(date,ticker,broker_code) DO UPDATE SET
-             bval=excluded.bval, sval=excluded.sval, netval=excluded.netval,
-             bavg=excluded.bavg, savg=excluded.savg
-           WHERE broker_flow.bval IS NOT excluded.bval OR broker_flow.sval IS NOT excluded.sval
-              OR broker_flow.netval IS NOT excluded.netval OR broker_flow.bavg IS NOT excluded.bavg
-              OR broker_flow.savg IS NOT excluded.savg""",
-        broker_rows,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        new_broker_rows,
     )
 
     sig = series_signature(

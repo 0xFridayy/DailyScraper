@@ -15,11 +15,13 @@ import subprocess
 import sys
 import tempfile
 
-from corporate_action_mutations import FINDING_MUTANTS, RESTART_MUTANTS, PHASE5_MUTANTS, PRICE_REVISION_MUTANTS
+from corporate_action_mutations import (FINDING_MUTANTS, RESTART_MUTANTS, PHASE5_MUTANTS,
+                                        PRICE_REVISION_MUTANTS, BROKER_REVISION_MUTANTS)
 from corporate_action_validation import KEYS, evidence_status, validation_counts
 
 ROOT = Path(__file__).parent
 SUITES = [
+    "test_broker_flow_revision_barrier.py",
     "test_price_history_revision_barrier.py",
     "test_price_contract.py", "test_inventory_capture.py", "test_walk_forward_canonical.py",
     "test_ddqn_canonical.py", "test_daily_picks.py", "test_arb_veto.py", "test_broker_book.py",
@@ -134,7 +136,8 @@ def semantic_assertion_failure(status, output):
 def verify_mutants(snapshot, env, selected=None):
     original = [(name, file, old, new, f"test_price_contract.py::{test}")
                 for name, file, old, new, test in MUTANTS]
-    mutations = original + FINDING_MUTANTS + RESTART_MUTANTS + PHASE5_MUTANTS + PRICE_REVISION_MUTANTS
+    mutations = (original + FINDING_MUTANTS + RESTART_MUTANTS + PHASE5_MUTANTS
+                 + PRICE_REVISION_MUTANTS + BROKER_REVISION_MUTANTS)
     if selected:
         mutations = [mutation for mutation in mutations if any(
             mutation[0].startswith(prefix) for prefix in selected)]

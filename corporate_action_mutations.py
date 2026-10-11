@@ -195,6 +195,68 @@ PRICE_REVISION_MUTANTS = [
      "test_price_history_revision_barrier.py::test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth"),
 ]
 
+
+# M2: each witness must fail for a financial assertion, never a broken import.
+BROKER_REVISION_MUTANTS = [
+    ("M2-broker-comparison-disabled", "backfill_inventory.py",
+     '        if changes:\n            reason =', '        if False and changes:\n            reason =',
+     "test_broker_flow_revision_barrier.py::test_vktr_identical_price_changed_lots_refused"),
+    ("M2-broker-erasure-allowed", "price_history_revision.py",
+     'if not same_value(stored[field], proposed.get(field))}',
+     'if proposed.get(field) is not None and not same_value(stored[field], proposed.get(field))}',
+     "test_broker_flow_revision_barrier.py::test_writer_protects_every_stored_financial_field"),
+    ("M2-broker-null-repair-allowed", "price_history_revision.py",
+     'if not same_value(stored[field], proposed.get(field))}',
+     'if stored[field] is not None and not same_value(stored[field], proposed.get(field))}',
+     "test_broker_flow_revision_barrier.py::test_broker_null_repair_requires_existing_authority"),
+    ("M2-missing-broker-manufactured-as-zero", "backfill_inventory.py",
+     '    returned = sorted(nlot.keys())',
+     '    returned = sorted(set(nlot) | {r[0] for r in conn.execute(\n'
+     '        "SELECT DISTINCT broker_code FROM broker_flow WHERE ticker=?", (ticker,))})',
+     "test_broker_flow_revision_barrier.py::test_absent_observation_is_preserved_never_zero",
+     (('        series = nlot.get(code) or []',
+       '        series = nlot.get(code) or [0] * len(dates)'),)),
+    ("M2-identical-price-bypasses-broker-comparison", "backfill_inventory.py",
+     '    new_broker_rows = validate_inventory_brokers(conn, ticker, broker_rows)',
+     '    new_broker_rows = (validate_inventory_brokers(conn, ticker, broker_rows)\n'
+     '                       if close_by_date.changed else [])',
+     "test_broker_flow_revision_barrier.py::test_vktr_identical_price_changed_lots_refused"),
+    ("M2-broker-delta-gate-removed", "price_history_revision.py",
+     '        for row in broker_rows:', '        for row in []:',
+     "test_broker_flow_revision_barrier.py::test_broker_gate_catches_all_five_fields_without_price_changes"),
+    ("M2-broker-gate-failure-suppressed", "price_history_revision.py",
+     '        return refusals', '        return [r for r in refusals if r.get("table") != "broker_flow"]',
+     "test_broker_flow_revision_barrier.py::test_independent_gate_blocks_commit_after_successful_writer"),
+    ("M2-broker-delta-ignores-null-repair", "price_history_revision.py",
+     'f"b.{field} IS NOT a.{field}"',
+     'f"(b.{field} IS NOT NULL AND b.{field} IS NOT a.{field})"',
+     "test_broker_flow_revision_barrier.py::test_broker_gate_catches_all_five_fields_without_price_changes"),
+    ("M2-broker-delta-ignores-erasure", "price_history_revision.py",
+     'f"b.{field} IS NOT a.{field}"',
+     'f"(a.{field} IS NOT NULL AND b.{field} IS NOT a.{field})"',
+     "test_broker_flow_revision_barrier.py::test_broker_gate_catches_all_five_fields_without_price_changes"),
+    ("M2-broker-delta-ignores-deletion", "price_history_revision.py",
+     'WHERE a.date IS NULL OR {broker_reasons}', 'WHERE a.date IS NOT NULL AND ({broker_reasons})',
+     "test_broker_flow_revision_barrier.py::test_broker_gate_catches_deleted_row_and_allows_new_and_identical"),
+    ("M2-baseline-receipt-not-bound-to-candidate", "price_history_revision.py",
+     '            or receipt.get("database") != str(Path(database).resolve())', '',
+     "test_broker_flow_revision_barrier.py::test_wrong_or_missing_broker_baseline_cannot_pass"),
+    ("M2-partial-writes-committed-after-refusal", "backfill_inventory.py",
+     '                conn.execute("ROLLBACK TO inventory_ticker")', '                pass',
+     "test_broker_flow_revision_barrier.py::test_failure_after_partial_mutation_caller_catches_and_commits"),
+]
+
+for field in ("bval", "sval", "netval", "bavg", "savg"):
+    BROKER_REVISION_MUTANTS += [
+        (f"M2-writer-ignores-{field}", "price_history_revision.py",
+         'if not same_value(stored[field], proposed.get(field))}',
+         f'if field != "{field}" and not same_value(stored[field], proposed.get(field))}}',
+         "test_broker_flow_revision_barrier.py::test_writer_protects_every_stored_financial_field"),
+        (f"M2-delta-ignores-{field}", "price_history_revision.py",
+         'for field in BROKER_FIELDS)', f'for field in BROKER_FIELDS if field != "{field}")',
+         "test_broker_flow_revision_barrier.py::test_broker_gate_catches_all_five_fields_without_price_changes"),
+    ]
+
 PHASE5_MUTANTS += [
     ("P5-N02-health-counts-gated-checks-as-pass", "check_ml_health.py",
      '        passed += executed if status == "PASS" else 0',
