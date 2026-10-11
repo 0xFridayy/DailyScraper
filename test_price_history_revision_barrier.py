@@ -69,7 +69,12 @@ def vktr_witness(factor):
     proposal = adjusted(body, factor, 8 if factor == 1.10 else None)
     with tempfile.TemporaryDirectory(prefix="vktr-revision-") as folder:
         path = str(Path(folder) / "synthetic.sqlite")
-        with price_db(path) as conn, contextlib.redirect_stdout(io.StringIO()):
+        # Transaction contexts do not close SQLite connections; close before cleanup.
+        with (
+            contextlib.closing(price_db(path)) as conn,
+            conn,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             seed(conn, body)
             before, dup_before = financial_snapshot(conn), duplicate_count(conn)
             changes_before = conn.total_changes
@@ -81,7 +86,7 @@ def vktr_witness(factor):
             conn.commit()
             after, dup_after = financial_snapshot(conn), duplicate_count(conn)
             changes = conn.total_changes - changes_before
-        with sqlite3.connect(path) as persisted:
+        with contextlib.closing(sqlite3.connect(path)) as persisted, persisted:
             assert financial_snapshot(persisted) == after
         return {"factor": factor, "first_session": body["data"]["date"][0],
                 "accepted": refusal is None, "refusal": refusal,
@@ -109,7 +114,7 @@ def test_vktr_historical_rewrites_are_refused_before_mutation(factor):
 
 @pytest.mark.parametrize("representation", [RAW_ACTUAL, "UNKNOWN", "ADJUSTED", "MIXED"])
 def test_plausible_partial_mass_revision_cannot_authorize_itself(representation):
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         before, changes = financial_snapshot(conn), conn.total_changes
@@ -125,7 +130,7 @@ def test_plausible_partial_mass_revision_cannot_authorize_itself(representation)
 
 @pytest.mark.parametrize("field", ["open", "high", "low", "close", "volume"])
 def test_each_nonnull_field_is_protected_including_null_repair(field):
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         bar = copy.deepcopy(body["data"]["ohlc"][5])
@@ -145,7 +150,7 @@ def test_each_nonnull_field_is_protected_including_null_repair(field):
 
 
 def test_identical_repeat_preserves_rowids_and_does_not_fire_price_triggers():
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         before, changes = financial_snapshot(conn), conn.total_changes
@@ -164,7 +169,7 @@ def test_identical_repeat_preserves_rowids_and_does_not_fire_price_triggers():
 
 
 def test_new_session_and_unrelated_ticker_still_insert():
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         old_prices = financial_snapshot(conn)["price_history"]
@@ -182,7 +187,7 @@ def test_new_session_and_unrelated_ticker_still_insert():
 @pytest.mark.parametrize("fields", [("open",), ("high", "low"), ("volume",), ("close",),
                                    ("open", "high", "low", "close", "volume")])
 def test_legitimate_null_repair_preserves_nonnull_observations(fields):
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         bar = body["data"]["ohlc"][5]
@@ -200,7 +205,7 @@ def test_legitimate_null_repair_preserves_nonnull_observations(fields):
 @pytest.mark.parametrize("autocommit", [False, True])
 def test_broker_failure_rolls_back_prices_and_earlier_broker_writes(tmp_path, autocommit):
     path = str(tmp_path / "atomic.sqlite")
-    with price_db(path) as conn:
+    with contextlib.closing(price_db(path)) as conn, conn:
         conn.execute("CREATE TRIGGER fail_second_broker BEFORE INSERT ON broker_flow "
                      "WHEN NEW.broker_code='BK' BEGIN SELECT RAISE(ABORT,'injected broker failure'); END")
         conn.commit()
@@ -212,12 +217,12 @@ def test_broker_failure_rolls_back_prices_and_earlier_broker_writes(tmp_path, au
         assert financial_snapshot(conn) == before
         # A caller that catches the error and commits must not leak partial writes.
         conn.commit()
-    with sqlite3.connect(path) as persisted:
+    with contextlib.closing(sqlite3.connect(path)) as persisted, persisted:
         assert financial_snapshot(persisted) == before
 
 
 def test_price_failure_preserves_unrelated_pending_transaction():
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         other = price_bar("2026-01-02", 200)
         conn.execute("INSERT INTO price_history VALUES(?,?,?,?,?,?,?)",
                      (other["date"], "BBBB", 200, 200, 200, 200, 9999))
@@ -234,10 +239,10 @@ def test_price_failure_preserves_unrelated_pending_transaction():
 
 def test_successful_ticker_waits_for_caller_commit(tmp_path):
     path = str(tmp_path / "pending.sqlite")
-    with price_db(path) as conn:
+    with contextlib.closing(price_db(path)) as conn, conn:
         bf.insert_inventory(conn, "VKTR", observations(), representation=RAW_ACTUAL)
         assert conn.in_transaction
-        with sqlite3.connect(path) as reader:
+        with contextlib.closing(sqlite3.connect(path)) as reader, reader:
             assert reader.execute("SELECT count(*) FROM price_history").fetchone() == (0,)
             assert reader.execute("SELECT count(*) FROM broker_flow").fetchone() == (0,)
         conn.rollback()
@@ -245,7 +250,7 @@ def test_successful_ticker_waits_for_caller_commit(tmp_path):
 
 
 def test_revision_refuses_new_session_and_null_repair_in_the_same_payload():
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         body = observations()
         seed(conn, body)
         conn.execute("UPDATE price_history SET open=NULL WHERE date='2026-01-05'")
@@ -274,7 +279,7 @@ def test_savepoint_release_failure_cannot_leak_financial_writes():
                 raise sqlite3.OperationalError("injected release failure")
             return self.conn.execute(sql, *args)
 
-    with price_db() as conn:
+    with contextlib.closing(price_db()) as conn, conn:
         before = financial_snapshot(conn)
         with pytest.raises(sqlite3.OperationalError, match="injected release failure"):
             bf.insert_inventory(FailRelease(conn), "VKTR", observations(), representation=RAW_ACTUAL)
@@ -284,7 +289,7 @@ def test_savepoint_release_failure_cannot_leak_financial_writes():
 
 def test_failed_null_repair_and_netval_refresh_are_rolled_back(tmp_path):
     path = str(tmp_path / "repair-failure.sqlite")
-    with price_db(path) as conn:
+    with contextlib.closing(price_db(path)) as conn, conn:
         body = observations()
         seed(conn, body)
         conn.execute("UPDATE price_history SET open=NULL WHERE date='2026-01-05'")
@@ -304,7 +309,7 @@ def test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth(t
     from test_inventory_capture import run_backfill, Resp, ic, only_manifest
     body = observations()
     path = str(tmp_path / "neobdm.db")
-    with price_db(path) as conn:
+    with contextlib.closing(price_db(path)) as conn, conn:
         seed(conn, body)
         before = financial_snapshot(conn)
     proposal = adjusted(body, 1.10, 8)
@@ -326,7 +331,7 @@ def test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth(t
     captures = ic.read_captures(only_manifest(str(tmp_path)))
     assert captures[0]["status"] == ic.REJECTED
     assert all(c["status"] == ic.OK for c in captures[1:])
-    with sqlite3.connect(path) as conn:
+    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
         for table in before:
             assert conn.execute(f"SELECT rowid,* FROM {table} WHERE ticker='VKTR' ORDER BY rowid").fetchall() == before[table]
 
@@ -334,7 +339,7 @@ def test_run_refusal_is_fatal_below_failure_threshold_and_evidence_has_no_auth(t
 @pytest.mark.parametrize("change", ["revision", "delete", "erase", "new", "identical", "null_repair"])
 def test_precommit_delta_gate(tmp_path, change, capsys):
     path, baseline = tmp_path / "candidate.sqlite", tmp_path / "before.sqlite"
-    with price_db(str(path)) as conn:
+    with contextlib.closing(price_db(str(path))) as conn, conn:
         body = observations()
         seed(conn, body)
         if change == "null_repair":
@@ -361,7 +366,7 @@ def test_precommit_delta_gate(tmp_path, change, capsys):
 
 def test_missing_invalid_or_reused_baseline_fails_closed(tmp_path):
     path = tmp_path / "candidate.sqlite"
-    with price_db(str(path)) as conn:
+    with contextlib.closing(price_db(str(path))) as conn, conn:
         seed(conn, observations())
     for baseline in (tmp_path / "missing.sqlite", path):
         assert revision.main(["verify", "--database", str(path), "--baseline", str(baseline)]) == 1
