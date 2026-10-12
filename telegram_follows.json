@@ -26,7 +26,16 @@
    "reason": "di pompom waterfront",
    "ticker": "VKTR",
    "update_id": 353954004
+  },
+  {
+   "action": "yes",
+   "at": "2026-10-12T01:53:39+00:00",
+   "days": 15,
+   "new": true,
+   "reason": "below most broker average cost",
+   "ticker": "PTRO",
+   "update_id": 353954005
   }
  ],
- "last_update_id": 353954004
+ "last_update_id": 353954005
 }
