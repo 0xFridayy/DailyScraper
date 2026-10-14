@@ -1,6 +1,6 @@
 # DailyScraper
 
-Pipeline riset trading IDX: scrape data broker/harga saban hari dari NeoBDM, simpan ke SQLite, lalu diuji lewat serangkaian eksperimen fitur, model, dan strategi.
+Pipeline riset trading IDX: data broker/harga historical, simpan ke SQLite, lalu diuji lewat serangkaian eksperimen fitur, model, dan strategi.
 
 > **⚠️ Baca [`HANDOFF.md`](HANDOFF.md) sebelum menjalankan backtest apa pun.**
 >
