@@ -72,16 +72,17 @@ Usage: py backfill_inventory.py TICKER1 TICKER2 ...
 
 import sys
 import json
+import math
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
 import inventory_capture as ic
 from neobdm_scraper import login, API_BASE, BROKER_FLOW_CODES, TRACKED_TICKERS, DB_PATH
 from price_audit import (series_signature, should_fail_run, inventory_window,
-                         inventory_window_is_short)
+                         inventory_window_is_short, ara_bound, ARB_BOUND, TOL)
 
 # Priming this page first sets the csrftoken/sessionid cookies for the inventory
 # path. The data GET is authenticated by the sessionid cookie alone (no CSRF).
@@ -138,9 +139,10 @@ def _date_window(window_days=WINDOW_DAYS):
 
 
 def fetch_inventory(req, ticker, start_date, end_date, captures):
-    """Authenticated GET of the inventory endpoint; (payload, the Capture that
-    records it). Raises InventoryError with the raw response text attached, so
-    the first failure can be snapshotted.
+    """Authenticated GET; returns (payload, Capture, original response text).
+    Raises InventoryError with the raw response text attached, so the first
+    failure can be snapshotted. The caller keeps the original text for content
+    rejections after a successful fetch.
 
     The request goes into `captures` (inventory_capture.CaptureLog) before it
     is sent, and a failure found here is recorded before it is raised. What
@@ -171,7 +173,65 @@ def fetch_inventory(req, ticker, start_date, end_date, captures):
     except Exception as e:
         cap.finish(ic.ERROR, e)          # only if nothing above recorded it
         raise
-    return payload, cap
+    return payload, cap, raw
+
+
+def _real_close(close, ticker, day):
+    """Normalize supported numeric closes to SQLite REAL before validation."""
+    if isinstance(close, bool) or not isinstance(close, (int, float)):
+        raise InventoryError(f"{ticker} {day}: ambiguous close {close!r}")
+    try:
+        normalized = float(close)
+    except (OverflowError, TypeError, ValueError) as e:
+        raise InventoryError(f"{ticker} {day}: close cannot be represented as REAL") from e
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise InventoryError(f"{ticker} {day}: ambiguous close {close!r}")
+    return normalized
+
+
+def validate_inventory_prices(conn, ticker, ohlc):
+    """Refuse new limit violations before either table receives any writes.
+
+    Judge the proposed series, including stored neighbours outside the response.
+    A revised predecessor can invalidate an unchanged successor. Unchanged
+    historical violations remain visible to the audit without blocking every
+    future top-up of the rolling year. No corporate-action exception is inferred.
+    """
+    incoming = {}
+    for bar in ohlc:
+        day, close = bar.get("date"), bar.get("close")
+        try:
+            canonical = date.fromisoformat(day).isoformat()
+        except (TypeError, ValueError):
+            canonical = None
+        if canonical is None or canonical != day:
+            raise InventoryError(f"{ticker}: ambiguous price date {day!r}")
+        if day in incoming:
+            raise InventoryError(f"{ticker}: duplicate date {day} in ohlc")
+        incoming[day] = _real_close(close, ticker, day)
+
+    stored = dict(conn.execute(
+        "SELECT date, close FROM price_history WHERE ticker=? ORDER BY date", (ticker,)))
+    changed = {d for d, close in incoming.items() if d not in stored or close != stored[d]}
+    proposed = stored | incoming
+    days = sorted(proposed)
+    for previous_day, day in zip(days, days[1:]):
+        if day not in changed and previous_day not in changed:
+            continue
+        try:
+            previous = _real_close(proposed[previous_day], ticker, previous_day)
+            close = _real_close(proposed[day], ticker, day)
+        except InventoryError as e:
+            raise InventoryError(
+                f"{ticker} {day}: ambiguous close baseline on {previous_day}") from e
+        change = close / previous - 1
+        lower, upper = ARB_BOUND - TOL, ara_bound(previous) + TOL
+        if change < lower or change > upper:
+            raise InventoryError(
+                f"{ticker} {day}: limit_violation, close {previous:g} on {previous_day} "
+                f"-> {close:g} ({change:+.2%}), allowed {lower:+.2%}..{upper:+.2%} "
+                f"— refusing to store")
+    return incoming
 
 
 def insert_inventory(conn, ticker, payload):
@@ -185,7 +245,9 @@ def insert_inventory(conn, ticker, payload):
     # Hard gate: the API is symbol-keyed, but never store a payload whose meta
     # disagrees with what we asked for.
     shown = str(meta.get("symbol") or "").upper()
-    if shown and shown != ticker.upper():
+    if not shown:
+        raise InventoryError(f"API omitted symbol for requested {ticker} — refusing to store")
+    if shown != ticker.upper():
         raise InventoryError(
             f"API returned symbol {shown} for requested {ticker} — refusing to store")
 
@@ -193,9 +255,11 @@ def insert_inventory(conn, ticker, payload):
     if not ohlc:
         return 0, 0, [], None
 
+    close_by_date = validate_inventory_prices(conn, ticker, ohlc)
+
     price_rows = [
         (o["date"], ticker, o.get("open"), o.get("high"),
-         o.get("low"), o.get("close"), o.get("volume"))
+         o.get("low"), close_by_date[o["date"]], o.get("volume"))
         for o in ohlc
     ]
     conn.executemany(
@@ -204,7 +268,6 @@ def insert_inventory(conn, ticker, payload):
         price_rows,
     )
 
-    close_by_date = {o["date"]: o.get("close") for o in ohlc}
     dates = data.get("date") or []          # parallel to every nlot[...] series
     nlot = data.get("nlot") or {}
     returned = sorted(nlot.keys())
@@ -231,7 +294,7 @@ def insert_inventory(conn, ticker, payload):
     )
 
     sig = series_signature(
-        {"x": [o["date"] for o in ohlc], "close": [o.get("close") for o in ohlc]})
+        {"x": [o["date"] for o in ohlc], "close": [close_by_date[o["date"]] for o in ohlc]})
     return len(broker_rows), len(price_rows), returned, sig
 
 
@@ -282,8 +345,10 @@ def run_backfill(tickers):
         for ticker in tickers:
             print(f"=== {ticker} ===")
             cap = None      # this ticker's capture, once fetch_inventory returns it
+            response_raw = None
             try:
-                payload, cap = fetch_inventory(req, ticker, start_date, end_date, captures)
+                payload, cap, response_raw = fetch_inventory(
+                    req, ticker, start_date, end_date, captures)
                 broker_n, price_n, returned, signature = insert_inventory(
                     conn, ticker, payload)
 
@@ -335,13 +400,15 @@ def run_backfill(tickers):
                     cap.finish(ic.REJECTED if isinstance(e, InventoryError) else ic.ERROR, e)
                 print(f"  FAILED: {e}")
                 raw = getattr(e, "raw", None)
+                if isinstance(e, InventoryError) and response_raw is not None:
+                    raw = response_raw
                 if not failed and raw is not None:
                     # First failure only: one raw response is enough to diagnose,
                     # and 45 dumps would be noise. This replaces the old page
                     # screenshot — there is no page to snapshot now, the response
                     # body IS the diagnostic.
                     try:
-                        with open(FAILURE_SNAPSHOT, "w", encoding="utf-8") as fh:
+                        with open(FAILURE_SNAPSHOT, "w", encoding="utf-8", newline="") as fh:
                             fh.write(raw)
                         print(f"  saved {FAILURE_SNAPSHOT} for diagnosis")
                     except Exception as snap_err:
