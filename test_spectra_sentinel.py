@@ -29,7 +29,7 @@ class FakeGitHub:
             when = (NOW - timedelta(hours=self.age_hours.get(name, 4))).isoformat()
             return {"workflow_runs": [{
                 "created_at": when, "status": "completed",
-                "conclusion": self.conclusions.get(name, "success"),
+                "event": "schedule", "conclusion": self.conclusions.get(name, "success"),
                 "html_url": "https://github.com/0xFridayy/DailyScraper/actions/runs/1"}]}
         raise AssertionError("Unexpected call")
 
