@@ -4,6 +4,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import sqlite3
 import unittest
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+from ticker_registry import registry_from_tickers
+from sentinel_evidence import expected_sessions, file_sha256
+REGISTRY = registry_from_tickers(["BRMS"])
+
+def admit(conn, **kwargs):
+    return {"admitted": True, "snapshot_sha256": file_sha256(conn.execute("PRAGMA database_list").fetchone()[2])}
+
+GATES = {"signal_integrity_health": SimpleNamespace(report_admission=admit),
+         "sig1_coverage_contract": SimpleNamespace(UniverseContract=lambda *args: args)}
 
 import spectra_sentinel as s
 
@@ -36,8 +48,10 @@ class FakeGitHub:
 def database(p, dt="2026-10-21", table=True):
     d = sqlite3.connect(p)
     if table:
-        d.execute("CREATE TABLE price_history(ticker TEXT, date TEXT, close REAL)")
-        d.execute("INSERT INTO price_history VALUES('BRMS', ?, 400)", (dt,))
+        d.execute("CREATE TABLE price_history(ticker TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
+        d.execute("CREATE TABLE price_quarantine(ticker TEXT,date TEXT)")
+        for day in [dt, (date.fromisoformat(dt) - timedelta(days=1)).isoformat()]:
+            d.execute("INSERT INTO price_history VALUES('BRMS', ?, 390, 410, 380, 400, 500)", (day,))
     else:
         d.execute("CREATE TABLE unrelated(x TEXT)")
     d.commit()
@@ -48,12 +62,13 @@ class SentinelTests(unittest.TestCase):
         with TemporaryDirectory() as td:
             p = Path(td) / "neobdm.db"
             database(p, date_str)
-            return s.audit(FakeGitHub(state, conclusions, age_hours),
-                           "0xFridayy/DailyScraper", NOW, p)
+            with patch.dict(sys.modules, GATES):
+                return s.audit(FakeGitHub(state, conclusions, age_hours),
+                               "0xFridayy/DailyScraper", NOW, p, registry=REGISTRY)
 
     def test_all_scheduled_success_does_not_claim_vendor_access(self):
         r = self.run_audit()
-        self.assertEqual(r["overall"], "GREEN_MONITORED_ONLY")
+        self.assertEqual(r["overall"], "DEGRADED")
         self.assertEqual(r["external_not_certified"]["stockbit_broker_distribution"],
                          "WAITING_AUTHORIZED_CAPTURE_METHOD")
 
@@ -83,7 +98,7 @@ class SentinelTests(unittest.TestCase):
 
     def test_source_stale_even_with_green_workflows(self):
         r = self.run_audit(date_str="2026-10-09")
-        self.assertTrue(any("price_history: STALE" in x for x in r["critical"]))
+        self.assertTrue(any("price_history: INCOMPLETE_COVERAGE" in x for x in r["critical"]))
 
     def test_source_missing_table(self):
         with TemporaryDirectory() as td:
@@ -102,7 +117,7 @@ class SentinelTests(unittest.TestCase):
             self.assertEqual(s.check_price_history(p, NOW.date())["status"], "FUTURE_SOURCE_DATE")
 
     def test_weekend_gap(self):
-        self.assertEqual(s.weekdays_since(date(2026, 10, 16), date(2026, 10, 19)), 1)
+        self.assertEqual(expected_sessions(date(2026, 8, 18))[0], date(2026, 8, 14))
 
     def test_missing_run_history_is_red(self):
         def get(url):

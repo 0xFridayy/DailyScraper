@@ -6,6 +6,11 @@ on:
     # UTC 03:15/15:15 = Asia/Jakarta 10:15/22:15.
     - cron: '15 3,15 * * *'
   workflow_dispatch:
+    inputs:
+      notify:
+        description: Send the existing Telegram alert on RED
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      SENTINEL_NOTIFY_RED: ${{ github.event_name == 'schedule' || inputs.notify }}
       GITHUB_TOKEN: ${{ github.token }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -30,12 +36,12 @@ jobs:
           python-version: '3.12'
 
       - name: Offline test (no vendor requests)
-        run: python -m unittest -q test_spectra_sentinel.py
+        run: python -m unittest -q test_spectra_sentinel.py test_sentinel_evidence.py
 
       - name: Inspect GitHub collector fleet and data freshness
         id: audit
         continue-on-error: true
-        run: python -B spectra_sentinel.py --notify-red
+        run: python -B spectra_sentinel.py
 
       - name: Save audit report (NO proprietary source data)
         if: always()
