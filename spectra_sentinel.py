@@ -137,8 +137,9 @@ def check_workflow(get, base, name, policy, meta, now):
         result["status"] = "REQUIRED_WORKFLOW_DISABLED"
         return result
     try:
-        data = get(f"{base}/actions/workflows/{int(meta['id'])}/runs?event=schedule&per_page=5")
-        runs = data.get("workflow_runs", [])
+        data = get(f"{base}/actions/workflows/{int(meta['id'])}/runs?per_page=40")
+        all_runs = data.get("workflow_runs", [])
+        runs = [r for r in all_runs if r.get("event") == "schedule"]
         if not isinstance(runs, list):
             raise SentinelError("INVALID_RUNS_SCHEMA")
     except (SentinelError, ValueError, KeyError, TypeError):
