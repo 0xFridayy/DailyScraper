@@ -1,0 +1,55 @@
+name: SPECTRA Sentinel — Collector Fleet Health
+
+# Monitor all registered workflows and source freshness. NO acquisition.
+on:
+  schedule:
+    # UTC 03:15/15:15 = Asia/Jakarta 10:15/22:15.
+    - cron: '15 3,15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: spectra-sentinel
+  cancel-in-progress: false
+
+jobs:
+  fleet-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Offline test (no vendor requests)
+        run: python -m unittest -q test_spectra_sentinel.py
+
+      - name: Inspect GitHub collector fleet and data freshness
+        id: audit
+        continue-on-error: true
+        run: python -B spectra_sentinel.py --notify-red
+
+      - name: Save audit report (NO proprietary source data)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: spectra-sentinel-${{ github.run_id }}
+          path: |
+            sentinel_status.json
+            sentinel_summary.md
+          if-no-files-found: warn
+          retention-days: 21
+
+      - name: Mark GitHub run red on collector failure
+        if: steps.audit.outcome != 'success'
+        run: |
+          echo "::error::Sentinel found disabled/failing/stale collectors, or self-audit failed. See job summary and JSON artifact."
+          exit 1
