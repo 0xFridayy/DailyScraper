@@ -265,7 +265,9 @@ def audit_archive(root,registry,subset,expected,checkpoint=None):
         coverage_summary(receipt,registry.tickers)
         receipt["processing_status"]="COMPLETE"
         receipt["archive_audit"]=dict(source_receipt_sha256=digest(original),changes=changed,
-            audited_at=stamp(),provider_requests=0,original_bytes_modified=False)
+            audited_at=stamp(),provider_requests=0,original_bytes_modified=False,
+            prior_request_budget=receipt.get("request_budget"))
+        receipt["request_budget"]=dict(allowed=0,performed=0,retry_limit_per_ticker=0)
         publish_receipt(root,run_dir,receipt)
         if checkpoint:
             checkpoint(root,run_dir,receipt)
@@ -392,7 +394,10 @@ def authenticated_get():
         raise RuntimeError("Existing NeoBDM username/password secrets are required")
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser=p.chromium.launch(headless=True)
+        channel=os.environ.get("BROKER_BROWSER_CHANNEL") or None
+        if channel not in (None,"chrome"):
+            raise ValueError("Unsupported broker browser channel")
+        browser=p.chromium.launch(headless=True,channel=channel)
         try:
             context=browser.new_context(viewport={"width":1400,"height":900})
             page=context.new_page()

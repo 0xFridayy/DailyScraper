@@ -125,6 +125,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(audited["per_ticker"]["BRMS"]["state"],"SOURCE_STALE")
         self.assertEqual(audited["per_ticker"]["BRMS"]["last_session"],"2026-10-20")
         self.assertEqual(audited["archive_audit"]["provider_requests"],0)
+        self.assertEqual(audited["request_budget"]["performed"],0)
+        self.assertEqual(audited["archive_audit"]["prior_request_budget"]["performed"],2)
         self.assertEqual(self.queries,before)
         self.assertEqual(capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)["counts"],r["counts"])
 
