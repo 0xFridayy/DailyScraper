@@ -76,6 +76,17 @@ class Tests(unittest.TestCase):
         self.assertEqual(second["counts"],{"COMPLETE":2})
         self.assertEqual(len(self.queries),2)
         self.assertGreaterEqual(len(list(self.root.glob("runs/*/receipt_versions/*.json"))),3)
+
+    def test_mid_run_checkpoint_counts_match_durable_ticker_outcomes(self):
+        seen=[]
+        def checkpoint(root,run,receipt):
+            stored=json.loads((Path(root)/capture.RECEIPT_NAME).read_text())
+            self.assertEqual(stored['counts'],{'COMPLETE':1,'MISSING':1})
+            self.assertFalse(stored['eligible_scope_complete'])
+            self.assertEqual(sum(stored['counts'].values()),len(self.registry.tickers))
+            seen.append(stored['counts'])
+        self.run_capture(max_requests=1,checkpoint=checkpoint,checkpoint_every=1)
+        self.assertGreaterEqual(len(seen),1)
     def test_tampered_successful_object_cannot_be_resumed_as_complete(self):
         r=self.run_capture(max_requests=1)
         artifact=self.root/r["per_ticker"]["BMRI"]["artifacts"][0]["path"]
@@ -128,7 +139,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(audited["request_budget"]["performed"],0)
         self.assertEqual(audited["archive_audit"]["prior_request_budget"]["performed"],2)
         self.assertEqual(self.queries,before)
-        self.assertEqual(capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)["counts"],r["counts"])
+        self.assertEqual(capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)["counts"],audited["counts"])
 
     def test_source_ahead_is_distinct_and_never_current(self):
         data=payload("BMRI")["data"]

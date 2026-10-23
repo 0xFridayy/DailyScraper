@@ -274,6 +274,7 @@ def audit_archive(root,registry,subset,expected,checkpoint=None):
         return receipt
 
 def publish_receipt(root,run_dir,receipt):
+    coverage_summary(receipt,tuple(receipt["per_ticker"]))
     raw=encoded(receipt)
     immutable(Path(run_dir)/"receipt_versions"/(digest(raw)+".json"),raw)
     atomic(Path(run_dir)/RECEIPT_NAME,raw)
