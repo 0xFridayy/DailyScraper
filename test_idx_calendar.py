@@ -116,6 +116,32 @@ def test_latest_session_refuses_to_walk_past_the_lookback_limit(monkeypatch):
         cal.latest_idx_session_before(date(2026, 7, 1))
 
 
+@pytest.mark.parametrize("as_of, closed, expected", [
+    (date(2026, 10, 23), None, date(2026, 10, 22)),                 # default: strictly before
+    (date(2026, 10, 23), date(2026, 10, 22), date(2026, 10, 22)),   # caller: before the close
+    (date(2026, 10, 23), date(2026, 10, 23), date(2026, 10, 23)),   # caller: after the close
+    (date(2026, 10, 24), date(2026, 10, 23), date(2026, 10, 23)),   # Saturday: Friday either way
+])
+def test_expected_closed_session(as_of, closed, expected):
+    assert cal.expected_closed_session(as_of, closed) == expected
+
+
+@pytest.mark.parametrize("as_of, closed", [
+    (date(2026, 10, 24), date(2026, 10, 24)),   # a weekend never closes a session
+    (date(2026, 8, 17), date(2026, 8, 17)),     # nor does a holiday
+    (date(2026, 10, 23), date(2026, 10, 21)),   # an older session would hide staleness
+    (date(2026, 10, 23), date(2026, 10, 26)),   # a later one is the future
+])
+def test_expected_closed_session_refuses_any_other_session(as_of, closed):
+    with pytest.raises(ValueError, match="^closed session"):
+        cal.expected_closed_session(as_of, closed)
+
+
+def test_expected_closed_session_accepts_only_calendar_dates():
+    with pytest.raises(TypeError):
+        cal.expected_closed_session(date(2026, 10, 23), datetime(2026, 10, 23, 18))
+
+
 def test_price_history_sessions_agree_with_the_calendar_secondary_check():
     """SECONDARY consistency only: price_history bars must fall exactly on the
     calendar's sessions over the dates both cover. It never defines the calendar."""

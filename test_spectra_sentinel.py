@@ -58,13 +58,13 @@ def database(p, dt="2026-10-21", table=True):
     d.close()
 
 class SentinelTests(unittest.TestCase):
-    def run_audit(self, *, date_str="2026-10-21", state=None, conclusions=None, age_hours=None):
+    def run_audit(self, *, date_str="2026-10-21", state=None, conclusions=None, age_hours=None, **kwargs):
         with TemporaryDirectory() as td:
             p = Path(td) / "neobdm.db"
             database(p, date_str)
             with patch.dict(sys.modules, GATES):
                 return s.audit(FakeGitHub(state, conclusions, age_hours),
-                               "0xFridayy/DailyScraper", NOW, p, registry=REGISTRY)
+                               "0xFridayy/DailyScraper", NOW, p, registry=REGISTRY, **kwargs)
 
     def test_all_scheduled_success_does_not_claim_vendor_access(self):
         r = self.run_audit()
@@ -115,6 +115,14 @@ class SentinelTests(unittest.TestCase):
             p = Path(td) / "data.db"
             database(p, "2026-11-01")
             self.assertEqual(s.check_price_history(p, NOW.date())["status"], "FUTURE_SOURCE_DATE")
+
+    def test_closed_same_day_price_session_only_when_the_caller_says_so(self):
+        # NOW is 22:30 WIB on session 2026-10-22; only an after-close producer's
+        # caller may declare that session closed.
+        r = self.run_audit(date_str="2026-10-22")
+        self.assertIn("neobdm.db/price_history: FUTURE_SOURCE_DATE", r["critical"])
+        r = self.run_audit(date_str="2026-10-22", price_closed_session=date(2026, 10, 22))
+        self.assertEqual(r["source_checks"][0]["status"], "CURRENT_REQUIRED_COVERAGE")
 
     def test_weekend_gap(self):
         self.assertEqual(expected_sessions(date(2026, 8, 18))[0], date(2026, 8, 14))

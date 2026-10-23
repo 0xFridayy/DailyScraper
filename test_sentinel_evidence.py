@@ -43,7 +43,7 @@ class FixedRegistryTests(unittest.TestCase):
         self.assertEqual(r.metadata()["listing_lifecycle_certification"],"UNVERIFIED")
 
 class PriceEvidenceTests(unittest.TestCase):
-    def run_case(self, mutate=None, members=("BMRI","BRMS"), gates=GATES):
+    def run_case(self, mutate=None, members=("BMRI","BRMS"), gates=GATES, **kwargs):
         with TemporaryDirectory() as td:
             p=Path(td)/"prices.db"
             c=price_db(p,members)
@@ -52,7 +52,7 @@ class PriceEvidenceTests(unittest.TestCase):
             c.close()
             before=file_sha256(p)
             with patch.dict(sys.modules,gates):
-                result=check_price_evidence(p,TODAY,REGISTRY)
+                result=check_price_evidence(p,TODAY,REGISTRY,**kwargs)
             self.assertEqual(file_sha256(p),before)
             return result
 
@@ -99,6 +99,34 @@ class PriceEvidenceTests(unittest.TestCase):
     def test_missing_quarantine_is_not_admission(self):
         r=self.run_case(lambda c:c.execute("DROP TABLE price_quarantine"))
         self.assertEqual(r["status"],"QUARANTINE_NOT_CERTIFIED")
+
+    # An after-close producer stores TODAY's session the same evening; only the
+    # caller knows that producer's cutoff, so the default stays strictly-before.
+    def same_day(self, members=("BMRI","BRMS")):
+        return lambda c:c.executemany("INSERT INTO price_history VALUES('2026-10-22',?,100,110,90,101,1000)",
+                                      [(t,) for t in members])
+
+    def test_same_day_bar_stays_future_without_a_closed_session(self):
+        self.assertEqual(self.run_case(self.same_day())["status"],"FUTURE_SOURCE_DATE")
+
+    def test_closed_same_day_session_is_required_not_future(self):
+        r=self.run_case(self.same_day(),closed_session=TODAY)
+        self.assertEqual(r["required_sessions"],["2026-10-22","2026-10-21"])
+        self.assertEqual(r["status"],"CURRENT_REQUIRED_COVERAGE")
+
+    def test_closed_session_reports_evening_coverage_instead_of_hiding_it(self):
+        r=self.run_case(self.same_day(("BMRI",)),closed_session=TODAY)
+        self.assertEqual(r["status"],"INCOMPLETE_COVERAGE")
+        self.assertEqual(r["coverage"]["2026-10-22"]["missing"],["BRMS"])
+
+    def test_closed_session_reaches_the_same_snapshot_admission(self):
+        seen={}
+        def admit(conn,**kw):
+            seen.update(kw)
+            return GATES["signal_integrity_health"].report_admission(conn,**kw)
+        gates=dict(GATES,signal_integrity_health=SimpleNamespace(report_admission=admit))
+        self.run_case(self.same_day(),gates=gates,closed_session=TODAY)
+        self.assertEqual(seen["closed_session"],TODAY)
 
 class ReceiptEvidenceTests(unittest.TestCase):
     def fixture(self,root):

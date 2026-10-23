@@ -134,13 +134,14 @@ def _finding(stats, category, detail, severity="degraded", **evidence):
 
 
 def check_freshness(conn, problems, notes=None, stats=None, as_of=None, producer_states=None,
-                    universe=EXPECTED_UNIVERSE):
+                    universe=EXPECTED_UNIVERSE, closed_session=None):
     notes = notes if notes is not None else []
     stats = stats if stats is not None else {}
     stats["freshness"] = {}
     for table in PRODUCERS:
         try:
-            health = table_freshness(conn, table, as_of, producer_states, MAX_STALE_SESSIONS, universe)
+            health = table_freshness(conn, table, as_of, producer_states, MAX_STALE_SESSIONS, universe,
+                                     closed_session=closed_session)
         except IdxCalendarUnavailable as exc:
             detail = f"{table} freshness UNVERIFIED: {exc}"
             notes.append(detail)
@@ -699,9 +700,10 @@ def check_value_sanity(conn, problems, notes=None, stats=None):
 
 # ── reporting ─────────────────────────────────
 
-def check_report_inputs(conn, problems, notes, stats, as_of, universe):
+def check_report_inputs(conn, problems, notes, stats, as_of, universe, closed_session=None):
     try:
-        stats["report_admission"] = report_admission(conn, as_of, universe=universe)
+        stats["report_admission"] = report_admission(conn, as_of, universe=universe,
+                                                     closed_session=closed_session)
     except AdmissionRefused as exc:
         stats["report_admission"] = exc.evidence
         for reason in exc.evidence["rejection_reasons"]:
@@ -710,12 +712,16 @@ def check_report_inputs(conn, problems, notes, stats, as_of, universe):
             _finding(stats, "REPORT_INPUT_REFUSED", detail, "fail")
 
 
-def check(conn, as_of=None, producer_states=None, price_baseline=None, universe=EXPECTED_UNIVERSE):
+def check(conn, as_of=None, producer_states=None, price_baseline=None, universe=EXPECTED_UNIVERSE,
+          closed_session=None):
+    # closed_session: see idx_calendar.expected_closed_session. The CLI never
+    # passes it; only a caller that owns an after-close price producer may.
     problems, notes, stats = [], [], {}
     stats["as_of"] = (as_of or jakarta_today()).isoformat()
-    check_freshness(conn, problems, notes, stats, as_of, producer_states, universe)
+    check_freshness(conn, problems, notes, stats, as_of, producer_states, universe, closed_session)
     checks = [
-        (check_report_inputs, "REPORT_INPUT_REFUSED", (conn, problems, notes, stats, as_of, universe)),
+        (check_report_inputs, "REPORT_INPUT_REFUSED",
+         (conn, problems, notes, stats, as_of, universe, closed_session)),
         (check_schema_and_coverage, "SOURCE_CONTRACT_FAILURE", (conn, problems, notes, stats)),
         (check_capture_contract, "SOURCE_CONTRACT_FAILURE", (conn, problems, notes, stats)),
         (check_value_sanity, "STRUCTURAL_DEFECT", (conn, problems, notes, stats)),

@@ -6,7 +6,8 @@ import math
 from pathlib import Path
 import sqlite3
 
-from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before, CALENDAR_VERSION
+from idx_calendar import (IdxCalendarUnavailable, latest_idx_session_before, expected_closed_session,
+                          CALENDAR_VERSION)
 from ticker_registry import load_registry
 
 OHLCV = ("open", "high", "low", "close", "volume")
@@ -20,8 +21,8 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def expected_sessions(today, count=2):
-    current = latest_idx_session_before(today)
+def expected_sessions(today, count=2, closed_session=None):
+    current = expected_closed_session(today, closed_session)
     result = [current]
     for _ in range(count - 1):
         current = latest_idx_session_before(current)
@@ -29,7 +30,9 @@ def expected_sessions(today, count=2):
     return result
 
 
-def check_price_evidence(db_path, today, registry=None):
+def check_price_evidence(db_path, today, registry=None, closed_session=None):
+    # closed_session: see idx_calendar.expected_closed_session; only the caller
+    # knows whether this snapshot's producer stores a session the evening it closes.
     registry = registry or load_registry()
     item = dict(name="neobdm.db/price_history", severity="CRITICAL",
                 status="UNKNOWN", asof=None, registry=registry.metadata(),
@@ -42,7 +45,7 @@ def check_price_evidence(db_path, today, registry=None):
     if wal.exists() and wal.stat().st_size:
         return dict(item, status="UNFROZEN_WAL_DATABASE")
     try:
-        required = expected_sessions(today)
+        required = expected_sessions(today, closed_session=closed_session)
     except IdxCalendarUnavailable:
         return dict(item, status="CALENDAR_UNSUPPORTED")
     item["required_sessions"] = [d.isoformat() for d in required]
@@ -121,7 +124,7 @@ def check_price_evidence(db_path, today, registry=None):
             except ImportError:
                 return dict(item, status="REPORT_ADMISSION_NOT_INTEGRATED")
             universe = UniverseContract(registry.version, registry.source, registry.tickers)
-            admission = report_admission(db, as_of=today, universe=universe)
+            admission = report_admission(db, as_of=today, universe=universe, closed_session=closed_session)
             item["report_admission"] = {
                 "admitted": admission.get("admitted", False),
                 "rejection_reasons": admission.get("rejection_reasons", []),

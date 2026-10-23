@@ -9,7 +9,8 @@ import math
 
 import pandas as pd
 
-from idx_calendar import CALENDAR_VERSION, IdxCalendarUnavailable, is_idx_session, latest_idx_session_before
+from idx_calendar import (CALENDAR_VERSION, IdxCalendarUnavailable, is_idx_session, latest_idx_session_before,
+                          expected_closed_session)
 from price_audit import load, load_clean, OHLCV
 from sig1_coverage_contract import EXPECTED_UNIVERSE, REQUIRED_SESSION_COUNT
 
@@ -207,12 +208,16 @@ def price_snapshot_health(conn, expected, universe=EXPECTED_UNIVERSE, max_lag=2)
 
 
 def table_freshness(conn, table, as_of=None, producer_states=None, max_lag=2,
-                    universe=EXPECTED_UNIVERSE):
-    """A workflow's state explains availability; it never proves source freshness."""
+                    universe=EXPECTED_UNIVERSE, closed_session=None):
+    """A workflow's state explains availability; it never proves source freshness.
+
+    closed_session applies only to session-dated tables; see
+    idx_calendar.expected_closed_session. Capture-dated tables ignore it."""
     as_of = as_of or jakarta_today()
     producer = PRODUCERS[table]
     state = (producer_states or {}).get(producer["workflow"], "unknown")
-    expected = latest_idx_session_before(as_of) if producer["date_basis"] == "session" else as_of
+    expected = (expected_closed_session(as_of, closed_session) if producer["date_basis"] == "session"
+                else as_of)
     columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
     latest = conn.execute(f"SELECT MAX(date) FROM {table}").fetchone()[0] if "date" in columns else None
     result = dict(producer, table=table, producer_state=state, latest=latest, expected=str(expected))
@@ -254,10 +259,11 @@ class AdmissionRefused(RuntimeError):
         self.evidence = evidence
 
 
-def require_current_prices(conn, as_of=None, universe=EXPECTED_UNIVERSE):
+def require_current_prices(conn, as_of=None, universe=EXPECTED_UNIVERSE, closed_session=None):
     """Admit only complete, numeric, valid, quarantine-filtered current prices."""
     try:
-        health = table_freshness(conn, "price_history", as_of=as_of, max_lag=0, universe=universe)
+        health = table_freshness(conn, "price_history", as_of=as_of, max_lag=0, universe=universe,
+                                 closed_session=closed_session)
     except (IdxCalendarUnavailable, sqlite3.Error, ValueError, TypeError) as exc:
         raise RuntimeError(f"Current ML report refused: admission evidence unavailable: {exc}") from exc
     if health["freshness"] != "CURRENT":
@@ -281,7 +287,7 @@ REPORT_COMPONENTS = {
 KONGLO_SOURCES = ("top_akum_bandar", "dashboard_Bandarmologi", "dashboard_Foreign", "dashboard_NonRetail", "broker_stalker")
 
 
-def report_admission(conn, as_of=None, components=None, universe=EXPECTED_UNIVERSE):
+def report_admission(conn, as_of=None, components=None, universe=EXPECTED_UNIVERSE, closed_session=None):
     """Admit all enabled components against this same frozen connection."""
     import neobdm_source_contract as nsc
     as_of = as_of or jakarta_today()
@@ -294,7 +300,8 @@ def report_admission(conn, as_of=None, components=None, universe=EXPECTED_UNIVER
     for table in datasets:
         if table in PRODUCERS:
             try:
-                item = table_freshness(conn, table, as_of, max_lag=0, universe=universe)
+                item = table_freshness(conn, table, as_of, max_lag=0, universe=universe,
+                                       closed_session=closed_session)
             except (IdxCalendarUnavailable, sqlite3.Error, ValueError, TypeError) as exc:
                 item = dict(table=table, freshness="UNAVAILABLE", latest=None, expected=str(as_of), detail=str(exc), **PRODUCERS[table])
         else:

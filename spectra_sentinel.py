@@ -71,8 +71,8 @@ def timestamp(s: str) -> datetime:
         raise SentinelError("UNZONED_ACTION_TIMESTAMP")
     return dt
 
-def check_price_history(db_path: Path, today: date, registry=None) -> dict:
-    return check_price_evidence(db_path, today, registry=registry)
+def check_price_history(db_path: Path, today: date, registry=None, closed_session=None) -> dict:
+    return check_price_evidence(db_path, today, registry=registry, closed_session=closed_session)
 
 def check_workflow(get, base, name, policy, meta, now):
     role, expected, max_age = policy
@@ -127,7 +127,9 @@ def check_workflow(get, base, name, policy, meta, now):
     return result
 
 def audit(get, repo: str, now: datetime, db_path: Path, *, registry=None,
-          receipts_dir=None, artifact_root=None) -> dict:
+          receipts_dir=None, artifact_root=None, price_closed_session=None) -> dict:
+    # price_closed_session: for a db_path written by an after-close price producer
+    # (idx_calendar.expected_closed_session). This repo's own main() never passes it.
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise SentinelError("INVALID_REPOSITORY")
     base = "https://api.github.com/repos/" + repo
@@ -144,7 +146,7 @@ def audit(get, repo: str, now: datetime, db_path: Path, *, registry=None,
                              severity="WARNING", status="UNCLASSIFIED_WORKFLOW"))
     registry = registry or load_registry()
     today = now.astimezone(WIB).date()
-    data = check_price_history(db_path, today, registry=registry)
+    data = check_price_history(db_path, today, registry=registry, closed_session=price_closed_session)
     source_checks = [data]
     if receipts_dir is not None:
         from idx_calendar import latest_idx_session_before
