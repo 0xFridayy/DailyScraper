@@ -55,8 +55,27 @@ jobs:
       # morning.py runs the unchanged scrape (neobdm_scraper.run_all_jobs),
       # then sends ONE message with picks + follow-ups instead of the raw list.
       # To roll back, change this line back to: python neobdm_scraper.py --now
+      - name: Record exact capture run boundary
+        run: echo "DAILY_CAPTURE_NOT_BEFORE=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" >> "$GITHUB_ENV"
+
       - name: Run scraper + morning picks (one-shot)
         run: python morning.py
+
+      - name: Write sanitized daily capture receipt
+        if: always()
+        run: >-
+          python daily_capture_receipt.py
+          --not-before "$DAILY_CAPTURE_NOT_BEFORE"
+          --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}"
+
+      - name: Upload sanitized daily capture receipt
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: daily-capture-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/daily-capture-receipt.json
+          if-no-files-found: error
+          retention-days: 30
 
       # market_summary/dashboard scrapes have been silently failing
       # (selector timeouts, likely a NeoBDM site update) without failing the
@@ -100,3 +119,12 @@ jobs:
           done
           echo "::error::push failed 3 times - today's data is NOT saved"
           exit 1
+
+
+      # Keep successful source persistence/report behavior, then fail partial runs.
+      - name: Require complete current-run daily capture
+        if: always()
+        run: >-
+          python daily_capture_receipt.py --check
+          --not-before "$DAILY_CAPTURE_NOT_BEFORE"
+          --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}"
