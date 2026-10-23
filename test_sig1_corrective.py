@@ -233,10 +233,9 @@ def test_missing_signal_close_threshold_has_an_isolated_witness():
     assert len(problems) == 1 and "past the 30% limit" in problems[0]
 
 
-def test_fixed_real_universe_matches_the_pinned_producer_without_importing_secrets():
+def test_fixed_real_universe_matches_the_checked_out_producer_without_importing_secrets():
     import ast
-    import subprocess
-    source = subprocess.check_output(["git", "show", "f73f24bda4a66f9470ee348c306cb0bb0baf3c48:neobdm_scraper.py"])
+    source = (Path(__file__).resolve().parent / "neobdm_scraper.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     stock_owner = next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
                        and any(isinstance(t, ast.Name) and t.id == "STOCK_OWNER" for t in node.targets))
