@@ -208,7 +208,7 @@ def main(argv=None, checkpoint=None):
     totals = {}
     t_start = time.time()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, channel=os.environ.get("OWNERSHIP_BROWSER_CHANNEL") or None)
         ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
         page = ctx.new_page()
         login(page)
