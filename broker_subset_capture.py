@@ -311,6 +311,9 @@ def capture(root,registry,subset,expected_session,request_get,*,max_requests=100
                 source_scope=dict(investor_type="A",board_scope="UNKNOWN"),
                 acquisition_status="PARTIAL",per_ticker={t:dict(state="MISSING",reason="NOT_ATTEMPTED") for t in members},
                 history_certification="NOT_CERTIFIED_BY_SPAN_OR_ROW_COUNT")
+        previous_halt=receipt.pop("halt_reason",None)
+        if previous_halt:
+            receipt["previous_halt"]=dict(reason=previous_halt,captured_at=receipt.get("captured_at"))
         transport=EvidenceTransport(request_get,root,max_requests,sleep)
         receipt["source_certification"]="VERIFIED_REQUESTED_SCOPE" if live else "OFFLINE_TEST_ONLY"
         receipt["persistence"]=dict(status="LOCAL_ONLY",retrieval_status="NOT_TESTED")
