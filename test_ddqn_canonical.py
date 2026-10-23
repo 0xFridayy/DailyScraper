@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 from collections import Counter
 
 import numpy as np
@@ -646,15 +647,16 @@ def _stub_training(rmr, monkeypatch, seen):
     def split(panel):
         seen["panel"] = panel
         return panel.copy(), panel.copy()
-    monkeypatch.setattr(rmr, "FEATURES", wfb.FEATURES)
-    monkeypatch.setattr(rmr, "STATE_EXTRA", ["position", "days_in_position", "unrealized_return"])
-    monkeypatch.setattr(rmr, "split_search_holdout", split)
-    monkeypatch.setattr(rmr, "fit_normalizer", lambda df: (None, None))
-    monkeypatch.setattr(rmr, "normalize_features", lambda df, mean, std: df[wfb.FEATURES])
-    monkeypatch.setattr(rmr, "make_envs", lambda df: [])
-    monkeypatch.setattr(rmr, "train_ddqn", lambda envs, state_dim, n_epochs: "net")
-    monkeypatch.setattr(rmr, "evaluate_policy_with_trade_log", lambda net, envs: pd.DataFrame())
-    monkeypatch.setattr(rmr, "evaluate_policy", lambda net, envs: dict(daily=trades, trades=trades))
+    from types import SimpleNamespace
+    ddqn = SimpleNamespace(
+        FEATURES=wfb.FEATURES, STATE_EXTRA=["position", "days_in_position", "unrealized_return"],
+        split_search_holdout=split, fit_normalizer=lambda df: (None, None),
+        normalize_features=lambda df, mean, std: df[wfb.FEATURES], make_envs=lambda df: [],
+        train_ddqn=lambda envs, state_dim, n_epochs: "net",
+        evaluate_policy_with_trade_log=lambda net, envs: pd.DataFrame(),
+        evaluate_policy=lambda net, envs: dict(daily=trades, trades=trades),
+    )
+    monkeypatch.setattr(rmr, "_ddqn_module", lambda: ddqn)
 
 
 def test_run_ddqn_report_builds_the_canonical_frame_under_the_given_manifest(reports, synth,
@@ -686,12 +688,17 @@ def test_run_ddqn_report_builds_the_canonical_frame_under_the_given_manifest(rep
                                          (["--broker-flow-manifest=given.json"], "given.json"),
                                          (["--broker-flow-manifest="], "")])
 def test_the_report_refreshes_at_most_once_and_every_model_gets_that_manifest(
-        reports, synth, monkeypatch, argv, given):
+        reports, synth, monkeypatch, argv, given, tmp_path):
     rmr = reports
     prov = panel_of(synth.db, synth.mpath).attrs["broker_flow"]
     xgb, strat, ddqn, konglo = report_inputs(prov)
     calls = []
-    monkeypatch.setattr(rmr, "DB_PATH", synth.db)
+    from test_sig1_corrective import AS_OF, production_scope_fixture, save_fixture
+    import signal_integrity_health as health
+    report_db = tmp_path / "current-synthetic.db"
+    save_fixture(production_scope_fixture(), report_db)
+    monkeypatch.setattr(rmr, "DB_PATH", str(report_db))
+    monkeypatch.setattr(health, "jakarta_today", lambda: AS_OF)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
     def refresh(db_path):
@@ -700,9 +707,12 @@ def test_the_report_refreshes_at_most_once_and_every_model_gets_that_manifest(
 
     def model(name, result):
         def run(conn, broker_flow_manifest_path, db_path=None):
+            seen_paths.append(db_path)
+            assert Path(conn.execute("PRAGMA database_list").fetchone()[2]) == Path(db_path)
             calls.append((name, broker_flow_manifest_path))
             return result
         return run
+    seen_paths = []
     monkeypatch.setattr(rmr, "refresh_broker_flow_manifest", refresh)
     monkeypatch.setattr(rmr, "run_xgboost_report", model("xgboost", xgb))
     monkeypatch.setattr(rmr, "run_strategy_variants_report", model("strategy", strat))
@@ -711,7 +721,8 @@ def test_the_report_refreshes_at_most_once_and_every_model_gets_that_manifest(
     monkeypatch.setattr(rmr, "send_telegram", lambda message: calls.append(("telegram", message)))
     rmr.main(argv)
     manifest = "refreshed.json" if given is None else given
-    assert [c for c in calls if c[0] == "refresh"] == ([("refresh", synth.db)] if given is None else [])
+    assert len(set(seen_paths)) == 1 and seen_paths[0] != str(report_db)
+    assert [c for c in calls if c[0] == "refresh"] == ([("refresh", seen_paths[0])] if given is None else [])
     assert [c for c in calls if c[0] in ("xgboost", "strategy", "ddqn")] == \
         [("xgboost", manifest), ("strategy", manifest), ("ddqn", manifest)]
     (message,) = [c[1] for c in calls if c[0] == "telegram"]
