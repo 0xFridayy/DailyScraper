@@ -192,7 +192,7 @@ def test_workflow_stages_only_the_database_and_the_raw_fragment_store():
                                            encoding="utf-8").read().splitlines()
                      if not line.lstrip().startswith("#"))
     adds = re.findall(r"^\s*(?:if .*then\s+)?git add (.+?)\s*(?:;|$)", text, flags=re.M)
-    assert [a.strip() for a in adds] == ["neobdm.db", "market_summary_raw_fragments/"]
+    assert [a.strip() for a in adds] == ["neobdm.db", "market_summary_raw_fragments/", "daily_picks.db"]
     assert not re.search(r"git add (-A|--all|\.(\s|$)|-u)", text) and "git commit -a" not in text
 
 
@@ -2557,13 +2557,22 @@ def test_retired_field_populated_again_fails():
     assert any("RETIRED" in p and "populated again" in p for p in problems)
 
 
-def test_active_field_absence_type_change_constant_collapse_and_cardinality_fail():
+def test_active_field_absence_fails():
     missing = make_panel(DAYS, lambda i, c, k: None if c == "m_dn_0" and i == 9 else default_fill(i, c, k))
     assert any("m_dn_0" in p for p in run_schema(missing)[0])
+
+
+def test_active_field_type_change_fails():
     typed = make_panel(DAYS, lambda i, c, k: "x" if c == "tval" and i == 9 else default_fill(i, c, k))
     assert any("type change" in p and "tval" in p for p in run_schema(typed)[0])
+
+
+def test_active_field_constant_collapse_fails():
     flat = make_panel(DAYS, lambda i, c, k: 7.0 if c == "pct_5" and i == 9 else default_fill(i, c, k))
     assert any("collapse" in p and "pct_5" in p for p in run_schema(flat)[0])
+
+
+def test_active_panel_cardinality_change_fails():
     conn = make_panel(DAYS[:9], default_fill)
     for k in range(10):
         vals = [DAYS[9], f"T{k:03d}"] + [default_fill(9, c, k) for c in ACTIVE + ["is_unusual_volume"]]

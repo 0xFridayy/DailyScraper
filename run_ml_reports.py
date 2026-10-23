@@ -32,6 +32,12 @@ login credentials, neither of which this report needs.
 import argparse
 import os
 import sqlite3
+from contextlib import contextmanager
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import tempfile
 
 import pandas as pd
 import requests
@@ -42,13 +48,9 @@ from strategy_variants import run_strategy_search
 # The episode frame comes from the torch-free module (ddqn_entry_exit re-exports
 # the same function), so the DDQN input wiring is testable without torch.
 from ddqn_episode_data import build_episode_frame
-from ddqn_entry_exit import (
-    split_search_holdout, fit_normalizer,
-    normalize_features, make_envs, train_ddqn, evaluate_policy,
-    evaluate_policy_with_trade_log, FEATURES, STATE_EXTRA,
-)
 from signal_metrics import trade_stats, format_trade_stats
 from price_audit import clean_panel
+from signal_integrity_health import open_readonly, report_admission, AdmissionRefused
 import neobdm_source_contract as nsc
 
 RECENT_TRADES_SHOWN = 15
@@ -96,6 +98,39 @@ def refresh_broker_flow_manifest(db_path=DB_PATH, out=BROKER_FLOW_MANIFEST_OUT):
     return out
 
 
+@contextmanager
+def reporting_snapshot(db_path):
+    """Freeze one read-only SQLite image for admission and every report reader.
+
+    Preserve file bytes so an explicit canonical manifest still describes the
+    snapshot. A WAL image not represented by the main file is refused, rather
+    than calculating on a copy that lost committed rows. No source is written.
+    """
+    source = open_readonly(db_path)
+    scratch = Path(BROKER_FLOW_MANIFEST_OUT).parent
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        source.execute("BEGIN")
+        source.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        with tempfile.TemporaryDirectory(prefix="sig1-", dir=scratch) as directory:
+            frozen_path = Path(directory) / Path(db_path).name
+            shutil.copyfile(db_path, frozen_path)
+            frozen = open_readonly(frozen_path)
+            try:
+                if hashlib.sha256(source.serialize()).digest() != hashlib.sha256(frozen.serialize()).digest():
+                    raise RuntimeError("Current ML report refused: frozen database is not the source SQLite snapshot")
+                wal = Path(str(db_path) + "-wal")
+                if (wal.exists() and wal.stat().st_size) or hashlib.sha256(Path(db_path).read_bytes()).digest() != hashlib.sha256(frozen_path.read_bytes()).digest():
+                    raise RuntimeError("Current ML report refused: source changed while freezing the SQLite snapshot")
+                source.execute("ROLLBACK")
+                frozen.execute("PRAGMA query_only=ON")
+                yield frozen, str(frozen_path)
+            finally:
+                frozen.close()
+    finally:
+        source.close()
+
+
 def run_xgboost_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
     panel = build_panel(conn, broker_flow_db_path=db_path,
                         broker_flow_manifest_path=broker_flow_manifest_path)
@@ -123,32 +158,39 @@ def run_strategy_variants_report(conn, broker_flow_manifest_path, db_path=DB_PAT
     )
 
 
+def _ddqn_module():
+    # Admission and its CI tests do not need Torch. Actual DDQN execution does.
+    import ddqn_entry_exit
+    return ddqn_entry_exit
+
+
 def run_ddqn_report(conn, broker_flow_manifest_path, db_path=DB_PATH):
     """DDQN on the canonical episode frame, under the SAME manifest and
     database the XGBoost/strategy panels were built from; never refreshes."""
+    ddqn = _ddqn_module()
     panel = build_episode_frame(conn, broker_flow_db_path=db_path,
                                 broker_flow_manifest_path=broker_flow_manifest_path)
-    search_df, holdout_df = split_search_holdout(panel)
-    mean, std = fit_normalizer(search_df)
+    search_df, holdout_df = ddqn.split_search_holdout(panel)
+    mean, std = ddqn.fit_normalizer(search_df)
     search_df, holdout_df = search_df.copy(), holdout_df.copy()
-    search_df[FEATURES] = normalize_features(search_df, mean, std)
-    holdout_df[FEATURES] = normalize_features(holdout_df, mean, std)
+    search_df[ddqn.FEATURES] = ddqn.normalize_features(search_df, mean, std)
+    holdout_df[ddqn.FEATURES] = ddqn.normalize_features(holdout_df, mean, std)
 
-    train_envs = make_envs(search_df)
-    holdout_envs = make_envs(holdout_df)
-    net = train_ddqn(train_envs, state_dim=len(FEATURES) + len(STATE_EXTRA), n_epochs=40)
+    train_envs = ddqn.make_envs(search_df)
+    holdout_envs = ddqn.make_envs(holdout_df)
+    net = ddqn.train_ddqn(train_envs, state_dim=len(ddqn.FEATURES) + len(ddqn.STATE_EXTRA), n_epochs=40)
 
-    # evaluate_policy() gives the aggregate stats (unchanged, cheap inference);
-    # evaluate_policy_with_trade_log() reruns the same greedy holdout rollout
+    # ddqn.evaluate_policy() gives the aggregate stats (unchanged, cheap inference);
+    # ddqn.evaluate_policy_with_trade_log() reruns the same greedy holdout rollout
     # to also capture per-trade Q-value margins - same trades, same numbers,
     # just also recorded for the "why" detail.
-    holdout_trade_log = evaluate_policy_with_trade_log(net, holdout_envs)
+    holdout_trade_log = ddqn.evaluate_policy_with_trade_log(net, holdout_envs)
     recent = holdout_trade_log.tail(RECENT_TRADES_SHOWN).to_dict("records")
 
     return dict(
         n_dates=panel["date"].nunique(), n_tickers=panel["ticker"].nunique(),
         date_min=panel["date"].min(), date_max=panel["date"].max(),
-        search=evaluate_policy(net, train_envs), holdout=evaluate_policy(net, holdout_envs),
+        search=ddqn.evaluate_policy(net, train_envs), holdout=ddqn.evaluate_policy(net, holdout_envs),
         recent_holdout_trades=recent, broker_flow=panel.attrs["broker_flow"],
     )
 
@@ -447,19 +489,27 @@ def main(argv=None):
     # The one manifest of this report: refreshed at most once, here, then given
     # to XGBoost, the strategy search and DDQN alike. An explicit (even empty)
     # --broker-flow-manifest is used as given, never replaced by a refresh.
-    manifest = (refresh_broker_flow_manifest(DB_PATH) if args.broker_flow_manifest is None
-                else args.broker_flow_manifest)
-
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        xgb_result = run_xgboost_report(conn, manifest)
+    with reporting_snapshot(DB_PATH) as (conn, snapshot_path):
+        # A current report cannot silently reuse the last available historical
+        # panel while signals and broker captures continue on newer dates.
+        try:
+            admission = report_admission(conn)
+        except AdmissionRefused as exc:
+            print("Current report input admission: " + json.dumps(exc.evidence, sort_keys=True))
+            raise
+        health = admission["datasets"]["price_history"]
+        print(f"Current report price basis: {health['usable_latest']} (required {health['expected']})")
+        print("Current report input admission: " + json.dumps(admission, sort_keys=True))
+        manifest = (refresh_broker_flow_manifest(snapshot_path) if args.broker_flow_manifest is None
+                    else args.broker_flow_manifest)
+        xgb_result = run_xgboost_report(conn, manifest, db_path=snapshot_path)
         print(format_broker_flow_provenance(xgb_result["broker_flow"]))
-        strat_result = run_strategy_variants_report(conn, manifest)
-        ddqn_result = run_ddqn_report(conn, manifest)
+        strat_result = run_strategy_variants_report(conn, manifest, db_path=snapshot_path)
+        ddqn_result = run_ddqn_report(conn, manifest, db_path=snapshot_path)
         print(ddqn_snapshot_note(xgb_result, ddqn_result))
         konglo_result = run_konglo_watch_report(conn)
-    finally:
-        conn.close()
+        if hashlib.sha256(conn.serialize()).hexdigest() != admission["snapshot_sha256"]:
+            raise RuntimeError("Current ML report refused: admitted snapshot changed during consumption")
 
     message = format_telegram_message(xgb_result, strat_result, ddqn_result, konglo_result)
     print(message)

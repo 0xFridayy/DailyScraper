@@ -1,55 +1,30 @@
 """
-Post-scrape correctness gate: is the data we just captured actually RIGHT?
+Read-only integrity gate for independent producers and their signal consumers.
 
-check_capture_health.py already answers "did rows arrive, and are the columns
-populated". That is a different question from "are the values correct", and the
-gap between the two is exactly where this project has already been burned: the
-cross-ticker contamination in price_history passed every shape check for months
-because the rows were present, the columns were full, and the numbers looked
-like plausible prices. They were just the wrong stock's prices.
+Daily Scrape writes capture-dated screener/broker tables and signal status.
+Price History Top-up writes session-dated inventory prices independently.
+The screener's pre-open capture is compared with the previous IDX session,
+including weekends and exchange holidays. Recent overlap is reported explicitly.
 
-NeoBDM is a third-party site that changes without notice - daily-scrape.yml
-already carries a note about market_summary/dashboard scrapes silently failing
-after a suspected site update. So the checks here are deliberately built to
-catch a scrape that SUCCEEDS but returns something different from what it
-returned yesterday.
+Heuristic price-limit/series findings remain unresolved until verified. They
+cannot establish new ticker-selection damage. Cross-ticker OHLCV collisions
+and structural impossibilities still fail; a prior price snapshot establishes
+whether a collision is new, including historical-date rewrites.
 
-The strongest check available is cross-source agreement. market_summary_daily
-(screener API) and price_history (inventory Plotly chart) are two independent
-scrape paths that both carry close/high/low/volume for overlapping tickers. If
-one path breaks or starts returning another ticker's series, the two disagree.
-Nothing else in this repo compares them.
-
-That comparison needs one correction first, discovered by building it:
-
-  market_summary_daily.date is the SCRAPE date, not the data date.
-
-The scrape runs 23:00 UTC = 07:00 Asia/Kuala_Lumpur, before the market opens,
-so the freshest screener data is the PREVIOUS session's close. Aligning
-market_summary_daily.date - 1 day against price_history.date matches 34 of 37
-overlapping pairs exactly (median deviation 0.00%); aligning them directly
-matches 4 of 36. All three residual mismatches are known-contaminated tickers
-(COIN, ELTY), so the offset is the alignment and the leftovers are the real
-defects. The `last_date` column, which presumably should carry the data date,
-is NULL for every row.
-
-Nothing currently joins the two tables, so this is not an active bug - it is a
-landmine for HANDOFF.md stage 5, which puts daily-signal tickers into
-TRACKED_TICKERS and would then join signals to price_history by date. The
-offset is asserted below so that a change in NeoBDM's publish timing (or in
-when the workflow runs) fails loudly instead of silently shifting every label
-by one day.
-
-Run:  py check_signal_integrity.py            -> print status
-      py check_signal_integrity.py --telegram -> also send it
-Exit code is non-zero when something is wrong, so the workflow goes red too:
-1 = failed, 2 = SOURCE_CONTRACT_BREAK_ACKNOWLEDGED (see check_schema_and_coverage).
+Run: python check_signal_integrity.py
+     python check_signal_integrity.py --as-of 2026-10-14 --producer-states states.json
+     python check_signal_integrity.py --price-baseline prior.db
+     python check_signal_integrity.py --telegram
+Exit: 1 = hard failure; 2 = degraded/acknowledged, still unhealthy; 0 = healthy.
 """
 
 import json
+import math
+import argparse
 import os
 import sqlite3
 import sys
+from pathlib import Path
 from datetime import date, datetime, timedelta
 from statistics import median
 
@@ -57,17 +32,22 @@ import pandas as pd
 import requests
 
 import neobdm_source_contract as nsc
-from price_audit import detect, load
+from price_audit import detect, load, OHLCV
+from idx_calendar import IdxCalendarUnavailable, latest_idx_session_before
+from idx_price_rules_sig1 import assess_limit
+from signal_integrity_health import (PRODUCERS, jakarta_today, open_readonly, table_freshness,
+                                     inspect_price_rows, price_collisions, report_admission, AdmissionRefused)
+from sig1_coverage_contract import EXPECTED_UNIVERSE, NUMERIC_SOURCE_FIELDS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "neobdm.db")
 
-WINDOW_DAYS = 10          # only recent scrapes; older rows are quarantine's job
-MAX_STALE_WEEKDAYS = 2    # allows one public holiday before alerting
+WINDOW_DAYS = 10          # recent capture comparison; unresolved prices remain visible
+MAX_STALE_SESSIONS = 2    # IDX closures do not count as missed sessions
 
 # Cross-source agreement. Both paths quote the same exchange, so a real match is
 # exact; the tolerance only absorbs float round-tripping.
-EXPECTED_DATE_OFFSET = 1  # market_summary_daily.date - 1 == price_history.date
+EXPECTED_DATE_OFFSET = 1  # candidate 1 means the previous IDX session
 CLOSE_TOLERANCE = 0.001   # 0.1%
 MIN_AGREEMENT = 0.85      # below this, one of the two scrape paths has drifted
 MIN_PAIRS_TO_JUDGE = 15   # under this the sample is too thin to fail a build on
@@ -126,11 +106,6 @@ def _load_dotenv():
                     os.environ.setdefault(k.strip(), v.strip())
 
 
-def weekdays_between(d1, d2):
-    return sum(1 for i in range((d2 - d1).days)
-               if (d1 + timedelta(days=i + 1)).weekday() < 5)
-
-
 def _recent_dates(conn, table, n):
     return [r[0] for r in conn.execute(
         f"SELECT DISTINCT date FROM {table} ORDER BY date DESC LIMIT ?", (n,))]
@@ -141,38 +116,91 @@ def _shift(datestr, days):
             - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _source_date(capture_date, offset):
+    # The previous closing session is not necessarily the previous calendar
+    # day. Weekend/holiday captures must not manufacture a timing defect.
+    if offset == EXPECTED_DATE_OFFSET:
+        return latest_idx_session_before(date.fromisoformat(capture_date)).isoformat()
+    return _shift(capture_date, offset)
+
+
 # ── individual checks ─────────────────────────
 
-def check_freshness(conn, problems):
-    today = date.today()
-    for table in ("market_summary_daily", "price_history", "broker_flow"):
-        row = conn.execute(f"SELECT MAX(date) FROM {table}").fetchone()[0]
-        if not row:
-            problems.append(f"{table} is EMPTY")
-            continue
+def _finding(stats, category, detail, severity="degraded", **evidence):
+    stats.setdefault("findings", []).append(dict(category=category, severity=severity,
+                                                detail=detail, **evidence))
+    if severity == "degraded":
+        stats["degraded"] = True
+
+
+def check_freshness(conn, problems, notes=None, stats=None, as_of=None, producer_states=None,
+                    universe=EXPECTED_UNIVERSE):
+    notes = notes if notes is not None else []
+    stats = stats if stats is not None else {}
+    stats["freshness"] = {}
+    for table in PRODUCERS:
         try:
-            latest = datetime.strptime(row, "%Y-%m-%d").date()
-        except ValueError:
-            problems.append(f"{table} has unparseable date {row!r}")
+            health = table_freshness(conn, table, as_of, producer_states, MAX_STALE_SESSIONS, universe)
+        except IdxCalendarUnavailable as exc:
+            detail = f"{table} freshness UNVERIFIED: {exc}"
+            notes.append(detail)
+            _finding(stats, "FRESHNESS_UNVERIFIED", detail, table=table)
             continue
-        stale = weekdays_between(latest, today)
-        if stale > MAX_STALE_WEEKDAYS:
-            problems.append(f"{table} STALE — newest {row} ({stale} weekdays ago)")
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            detail = f"{table} STRUCTURAL_DEFECT: {exc}"
+            problems.append(detail)
+            _finding(stats, "STRUCTURAL_DEFECT", detail, "fail", table=table)
+            continue
+        stats["freshness"][table] = health
+        lag_description = (f"{health['lag']} session(s) behind" if health['lag'] is not None else "session lag UNKNOWN/unavailable")
+        detail = (f"{table} {health['status']}: writer {health['writer']}, workflow {health['workflow']} "
+                  f"({health['producer_state']}); newest {health['latest']}, expected {health['expected']} "
+                  f"by {health['date_basis']} date; source {health['freshness']} ({lag_description})")
+        if health.get("structural_faults"):
+            problems.extend(health["structural_faults"])
+            for fault in health["structural_faults"]:
+                _finding(stats, "STRUCTURAL_DEFECT", fault, "fail", table=table)
+        if health.get("unsupported_dates") or health["freshness"] == "CALENDAR_UNSUPPORTED":
+            detail += f"; historical calendar UNKNOWN/UNSUPPORTED: {health.get('unsupported_dates', [])[:5]}"
+            notes.append(detail)
+            _finding(stats, "CALENDAR_UNSUPPORTED", detail, table=table)
+        if health.get("ahead_of_cutoff_dates"):
+            ahead = f"{table} AHEAD_OF_CUTOFF: {health['ahead_of_cutoff_dates']}; required {health['expected']}"
+            problems.append(ahead)
+            _finding(stats, "AHEAD_OF_CUTOFF", ahead, "fail", table=table)
+        if health.get("missing_coverage"):
+            summary = {
+                session: {"missing_count": len(missing), "sample": missing[:8],
+                          "required": health["coverage"][session]["required"],
+                          "present": health["coverage"][session]["present"]}
+                for session, missing in health["missing_coverage"].items()
+            }
+            coverage_detail = (f"{table} INCOMPLETE_COVERAGE after quarantine under "
+                               f"{health['universe_version']}: {summary}; "
+                               "complete membership remains in JSON evidence")
+            problems.append(coverage_detail)
+            _finding(stats, "INCOMPLETE_COVERAGE", coverage_detail, "fail", table=table)
+        if health["freshness"] in {"EMPTY", "INVALID_DATE", "UNAVAILABLE", "AHEAD_OF_CUTOFF"}:
+            problems.append(detail)
+            _finding(stats, health["freshness"], detail, "fail", table=table)
+        if health["status"] == "PRODUCER_PAUSED":
+            notes.append(detail + "; separate owner approval required for recovery")
+            _finding(stats, "PRODUCER_PAUSED", detail, table=table)
+        if health["freshness"] == "SOURCE_STALE":
+            # The data remains unhealthy even when a paused producer explains it.
+            problems.append(detail)
+            _finding(stats, "SOURCE_STALE", detail, "fail", table=table)
+        elif health["freshness"] == "LAGGING":
+            notes.append(detail)
+            _finding(stats, "SOURCE_LAGGING", detail, table=table)
 
 
-def check_new_contamination(conn, problems, notes, stats):
-    """Unquarantined suspect rows in the recent window.
+def check_new_contamination(conn, problems, notes, stats, price_baseline=None):
+    """Separate heuristic suspects from proven collisions and proven new writes.
 
-    "Unquarantined" is not the same as "newly written", and conflating the two
-    made this alert blame the wrong thing. On 2026-08-23 it reported rows dated
-    08-06 through 08-13 as the scraper "writing bad rows again" while
-    price_history had in fact been frozen at 08-20 for two days because the
-    topup was failing — the scraper had written nothing at all. An alert that
-    misattributes the cause every morning is one people learn to skip.
-
-    So the row age is interpreted against whether the scrape is actually
-    advancing, and the absence of a quarantine baseline is called out as its own
-    condition rather than silently inflating the count.
+    Neither an advancing nor a frozen MAX(date) establishes write activity:
+    inventory top-up can rewrite old dates. No heuristic-only finding can
+    establish a new ticker-selection defect.
     """
     window = set(_recent_dates(conn, "price_history", WINDOW_DAYS))
     if not window:
@@ -183,8 +211,15 @@ def check_new_contamination(conn, problems, notes, stats):
     ).fetchone()[0]
     known = set()
     if has_q:
-        known = set(map(tuple, conn.execute(
-            "SELECT date, ticker FROM price_quarantine").fetchall()))
+        # A quarantine acknowledges a particular bar, not every future rewrite
+        # of its key. A changed quarantined bar must be examined again.
+        qcols = {r[1] for r in conn.execute("PRAGMA table_info(price_quarantine)")}
+        if set(OHLCV) <= qcols:
+            known = set(map(tuple, conn.execute(
+                "SELECT p.date, p.ticker FROM price_history p JOIN price_quarantine q "
+                "USING(date,ticker) WHERE " + " AND ".join(f"p.{c} IS q.{c}" for c in OHLCV))))
+        else:
+            notes.append("price_quarantine lacks OHLCV evidence; key-only entries cannot acknowledge current bars")
 
     # Quarantined rows must not serve as the baseline the NEXT row's daily move
     # is measured against, or old damage keeps manufacturing fresh alarms: on
@@ -192,53 +227,74 @@ def check_new_contamination(conn, problems, notes, stats):
     # "writing bad rows again", purely because the close before it was KIOS's
     # price, flagged and quarantined two weeks earlier. See price_audit.detect.
     raw = load(conn)
+    # Structural validation reports malformed values separately. Coercion only
+    # in this diagnostic frame lets unaffected ticker collisions still run.
+    raw[OHLCV] = raw[OHLCV].apply(pd.to_numeric, errors="coerce")
     trusted = [(d, t) not in known for d, t in zip(raw["date"], raw["ticker"])]
     px = detect(raw, trusted=trusted)
+    px["cross_ticker_dup"] &= px.groupby(["date"] + OHLCV, dropna=False)["ticker"].transform("nunique").gt(1)
+    px["suspect"] = px[["limit_violation", "cross_ticker_dup", "series_break"]].any(axis=1)
     recent = px[px["date"].isin(window)]
+    # Neither a rolling window nor producer recovery resolves an old suspect.
+    # Keep backlog visible; old-date rewrites can introduce new collisions too.
+    examined = px[px["suspect"]]
 
-    flagged = recent[recent["suspect"] & ~pd.Series(
-        [(d, t) in known for d, t in zip(recent["date"], recent["ticker"])],
-        index=recent.index)]
+    flagged = examined[examined["cross_ticker_dup"] | (examined["suspect"] & ~pd.Series(
+        [(d, t) in known for d, t in zip(examined["date"], examined["ticker"])],
+        index=examined.index, dtype=bool))]
 
     stats["window_rows"] = len(recent)
-    stats["fresh_suspects"] = len(flagged)
+    stats["unresolved_suspects"] = len(flagged)
+    stats["recent_unresolved_suspects"] = int(flagged["date"].isin(window).sum())
+    stats["new_contamination"] = 0
     if not len(flagged):
         return
 
     by_reason = {r: int(flagged[r].sum()) for r in
                  ("limit_violation", "cross_ticker_dup", "series_break")
                  if flagged[r].any()}
-    sample = ", ".join(f"{r.date} {r.ticker}" for r in flagged.head(4).itertuples())
-
-    # Is the scrape actually writing? If price_history has not advanced, nothing
-    # in it can be a fresh write, whatever the quarantine table does or does not
-    # contain.
-    latest = conn.execute("SELECT MAX(date) FROM price_history").fetchone()[0]
-    try:
-        stale_days = weekdays_between(
-            datetime.strptime(latest, "%Y-%m-%d").date(), date.today())
-    except (TypeError, ValueError):
-        stale_days = 0
-
-    if not has_q:
-        notes.append(
-            f"{len(flagged)} suspect row(s) in the last {WINDOW_DAYS} scrape days "
-            f"({by_reason}) — e.g. {sample}. No price_quarantine table exists, so "
-            f"the whole backlog counts as unresolved. Run `py price_audit.py "
-            f"quarantine` once to set the baseline; after that this only fires on "
-            f"rows the scrape adds.")
-    elif stale_days > MAX_STALE_WEEKDAYS:
-        notes.append(
-            f"{len(flagged)} unquarantined suspect row(s) ({by_reason}) — e.g. "
-            f"{sample}. These are BACKLOG, not new damage: price_history has not "
-            f"advanced past {latest} in {stale_days} weekdays, so the scraper has "
-            f"written nothing. The staleness itself is the problem to chase.")
-    else:
-        problems.append(
-            f"{len(flagged)} NEW contaminated price_history row(s) in the last "
-            f"{WINDOW_DAYS} scrape days ({by_reason}) — e.g. {sample}. The scrape "
-            f"IS advancing (newest {latest}), so the ticker-selection defect is "
-            f"writing bad rows again.")
+    # Event dates and table MAX(date) cannot establish insert/update time. A
+    # supplied prior snapshot can prove a new collision, including an old-date
+    # rewrite. Without it, a proven defect still fails but its newness is unknown.
+    baseline_rows = None
+    baseline_dups = set()
+    if price_baseline is not None:
+        baseline_rows = {(r.date, r.ticker): tuple(getattr(r, c) for c in OHLCV)
+                         for r in price_baseline.itertuples()}
+        before = detect(price_baseline)
+        baseline_dups = set(zip(before.loc[before.cross_ticker_dup, "date"],
+                                before.loc[before.cross_ticker_dup, "ticker"]))
+    collision_evidence = {(c["date"], t): c for c in price_collisions(conn) for t in c["tickers"]}
+    for row in flagged.itertuples():
+        key = (row.date, row.ticker)
+        fingerprint = tuple(getattr(row, c) for c in OHLCV)
+        if row.cross_ticker_dup:
+            evidence = collision_evidence[key]
+            if evidence["classification"] == "REVIEW_REQUIRED":
+                detail = f"REVIEW_REQUIRED: {row.date} {row.ticker} identical OHLCV; independent clone evidence unavailable"
+                notes.append(detail)
+                _finding(stats, "REVIEW_REQUIRED", detail, table="price_history", evidence=evidence)
+                continue
+            changed = baseline_rows is not None and (
+                baseline_rows.get(key) != fingerprint or key not in baseline_dups)
+            category = "NEW_CONTAMINATION" if changed else "CORRUPTION_PRESENT"
+            detail = (f"{category}: {row.date} {row.ticker} identical OHLCV across tickers; "
+                      + ("new/changed collision versus supplied price snapshot" if changed else
+                         "insert/update time unverified; no claim of a new ticker-selection defect"))
+            problems.append(detail)
+            _finding(stats, category, detail, "fail", table="price_history", date=row.date, ticker=row.ticker, evidence=evidence)
+            stats["new_contamination"] += int(changed)
+        else:
+            evidence = assess_limit(row) if row.limit_violation else {"classification": "UNKNOWN"}
+            detail = (f"BACKLOG_SUSPECT: {row.date} {row.ticker}, "
+                      f"limit_violation={row.limit_violation}, series_break={row.series_break}; "
+                      f"classification {evidence['classification']}; "
+                      f"{evidence.get('detail', 'corporate action, rule regime and source bar require verification')}. "
+                      "Unresolved price finding; row date and table freshness do not prove a new write.")
+            notes.append(detail)
+            _finding(stats, "BACKLOG_SUSPECT", detail, table="price_history", date=row.date,
+                     ticker=row.ticker, evidence=evidence)
+    stats["suspect_reasons"] = by_reason
 
 
 def check_cross_source(conn, problems, notes, stats):
@@ -250,16 +306,39 @@ def check_cross_source(conn, problems, notes, stats):
     """
     ms = pd.read_sql(
         "SELECT date, ticker, close FROM market_summary_daily WHERE close IS NOT NULL", conn)
-    ph = pd.read_sql(
-        "SELECT date, ticker, close FROM price_history WHERE close IS NOT NULL", conn)
+    # Compare usable rows, the same quarantine-filtered base as report readers.
+    from price_audit import load_clean
+    ph = load_clean(conn)[["date", "ticker", "close"]].copy()
+    for panel in (ms, ph):
+        panel["close"] = pd.to_numeric(panel["close"], errors="coerce")
+        panel.drop(panel.index[~panel.close.abs().lt(float("inf")) | panel.close.le(0)], inplace=True)
     if ms.empty or ph.empty:
-        notes.append("cross-source check skipped — one of the tables is empty")
+        detail = "cross-source UNKNOWN: no usable comparison evidence"
+        notes.append(detail)
+        _finding(stats, "CROSS_SOURCE_UNVERIFIED", detail)
         return
+    # Full-history agreement diluted recent mismatches and looked current
+    # even after the independent price producer stopped. Judge recent captures
+    # and expose the actual overlap endpoint alongside the agreement score.
+    dates = _recent_dates(conn, "market_summary_daily", WINDOW_DAYS)
+    ms = ms[ms["date"].isin(dates)]
+    stats["cross_source_price_latest"] = ph["date"].max()
+    stats["cross_source_capture_latest"] = ms["date"].max()
+    latest_capture = ms[ms.date == ms.date.max()].copy()
+    latest_capture["date"] = latest_capture.date.map(lambda d: _source_date(d, EXPECTED_DATE_OFFSET))
+    current_overlap = latest_capture.merge(ph, on=["date", "ticker"])
+    if len(current_overlap) < MIN_PAIRS_TO_JUDGE:
+        detail = (f"cross-source UNKNOWN: latest capture has {len(current_overlap)} usable pairs, "
+                  f"requires {MIN_PAIRS_TO_JUDGE}; historical overlap cannot certify the latest capture")
+        notes.append(detail)
+        _finding(stats, "CROSS_SOURCE_UNVERIFIED", detail)
 
     best, scores = None, {}
-    for offset in (0, 1, 2):
+    # Prefer the expected alignment on equal scores. Constant closes cannot
+    # establish that publish timing changed.
+    for offset in (EXPECTED_DATE_OFFSET, 0, 2):
         m = ms.copy()
-        m["date"] = m["date"].map(lambda d: _shift(d, offset))
+        m["date"] = m["date"].map(lambda d: _source_date(d, offset))
         j = m.merge(ph, on=["date", "ticker"], suffixes=("_ms", "_ph"))
         j = j[(j["close_ms"] > 0) & (j["close_ph"] > 0)]
         if len(j) < MIN_PAIRS_TO_JUDGE:
@@ -272,25 +351,32 @@ def check_cross_source(conn, problems, notes, stats):
 
     stats["offset_scores"] = {k: (n, round(a, 3)) for k, (n, a) in scores.items()}
     if best is None:
-        notes.append(f"cross-source check skipped — fewer than {MIN_PAIRS_TO_JUDGE} "
-                     f"overlapping (date,ticker) pairs at any offset")
+        detail = (f"cross-source UNKNOWN: fewer than {MIN_PAIRS_TO_JUDGE} "
+                  "overlapping (date,ticker) pairs at any offset")
+        notes.append(detail)
+        _finding(stats, "CROSS_SOURCE_UNVERIFIED", detail)
         return
 
     n_best, agree_best = scores[best]
-    stats["cross_source"] = f"offset={best}d n={n_best} agree={agree_best:.0%}"
+    alignment = "previous IDX session" if best == EXPECTED_DATE_OFFSET else f"offset={best}d"
+    stats["cross_source"] = f"{alignment} n={n_best} agree={agree_best:.0%}"
+    aligned = ms.copy()
+    aligned["date"] = aligned["date"].map(lambda d: _source_date(d, best))
+    overlap = aligned.merge(ph, on=["date", "ticker"], suffixes=("_ms", "_ph"))
+    stats["cross_source_overlap_latest"] = overlap["date"].max()
+    stats["cross_source"] += f" through {stats['cross_source_overlap_latest']} (recent captures only)"
 
-    if best != EXPECTED_DATE_OFFSET:
+    if best != EXPECTED_DATE_OFFSET and agree_best >= MIN_AGREEMENT:
         problems.append(
             f"date alignment CHANGED — market_summary_daily now matches "
             f"price_history at offset {best}d, not the expected "
-            f"{EXPECTED_DATE_OFFSET}d (agreement {agree_best:.0%} on {n_best} pairs). "
-            f"NeoBDM's publish timing or the workflow schedule moved; every "
-            f"date-joined label is shifted until EXPECTED_DATE_OFFSET is updated.")
+            f"previous IDX session (agreement {agree_best:.0%} on {n_best} pairs). "
+            f"Verify capture timing and the source session before changing any date-joined labels.")
         return
 
     if agree_best < MIN_AGREEMENT:
         m = ms.copy()
-        m["date"] = m["date"].map(lambda d: _shift(d, best))
+        m["date"] = m["date"].map(lambda d: _source_date(d, best))
         j = m.merge(ph, on=["date", "ticker"], suffixes=("_ms", "_ph"))
         j = j[(j["close_ms"] > 0) & (j["close_ph"] > 0)].copy()
         j["dev"] = (j["close_ph"] / j["close_ms"] - 1).abs()
@@ -436,6 +522,8 @@ def check_schema_and_coverage(conn, problems, notes, stats, lifecycle=None):
         problems.append(f"type change on {latest}: {', '.join(drift)} — the field's meaning or "
                         f"encoding changed")
 
+    check_numeric_source_contract(conn, judged, cols, latest, problems)
+
     # Constant-field collapse: a cross-section that suddenly carries one value.
     if rows >= MIN_ROWS_FOR_COLLAPSE:
         collapsed = []
@@ -538,6 +626,10 @@ def check_signal_sources(conn, problems, notes, stats, lifecycle=None):
         elif status == nsc.RETIRED_SOURCE and source not in retired_signals:
             problems.append(f"signal source {source} marked RETIRED_SOURCE on {latest} without a "
                             f"retired field in the lifecycle registry")
+        elif status == nsc.RETIRED_SOURCE:
+            notes.append(f"signal source {source} RETIRED_SOURCE on {latest}: unavailable by lifecycle, "
+                         "excluded from zero-hit interpretation")
+            _finding(stats, "RETIRED_SOURCE", f"{source} on {latest}", "info", source=source)
         elif status == nsc.EMPTY_UNVERIFIED:
             notes.append(f"signal source {source} returned nothing on {latest} and cannot tell "
                          f"'no hits' from a failed scrape")
@@ -571,6 +663,7 @@ def check_signals_measurable(conn, problems, notes, stats):
     if not gap:
         return
     share = len(gap) / len(sig)
+    stats["unmeasurable_signals"] = gap
     detail = (f"{len(gap)} of {len(sig)} signalled ticker(s) on {latest} have no "
               f"captured close ({', '.join(gap[:4])}) — they can never be scored")
     if share > MAX_UNMEASURABLE_SIGNALS:
@@ -579,40 +672,80 @@ def check_signals_measurable(conn, problems, notes, stats):
             f"limit — the panel has shrunk or the signal source drifted off-universe.")
     else:
         notes.append(f"{detail} ({share:.0%}, normal panel churn)")
+    _finding(stats, "UNMEASURABLE_SIGNALS", detail,
+             "fail" if share > MAX_UNMEASURABLE_SIGNALS else "info", tickers=gap)
 
 
-def check_value_sanity(conn, problems):
-    """Cheap impossibilities, scoped to the window so history does not re-fire."""
-    window = _recent_dates(conn, "price_history", WINDOW_DAYS)
-    if not window:
-        return
-    qs = ",".join("?" * len(window))
-    bad = conn.execute(
-        f"SELECT COUNT(*) FROM price_history WHERE date IN ({qs}) AND "
-        f"(close IS NULL OR close <= 0 OR volume < 0 OR high < low)", window).fetchone()[0]
-    if bad:
-        problems.append(f"{bad} price_history row(s) in the window are impossible "
-                        f"(null/zero close, negative volume, or high < low)")
+def check_numeric_source_contract(conn, judged, cols, latest, problems):
+    """Numeric field meanings apply even to the first observed capture."""
+    for field in sorted(NUMERIC_SOURCE_FIELDS & set(judged) & set(cols)):
+        values = conn.execute(f'SELECT "{field}", typeof("{field}") FROM market_summary_daily '
+                              f'WHERE date=? AND "{field}" IS NOT NULL', (latest,)).fetchall()
+        bad = sum(kind not in {"integer", "real"} or not math.isfinite(value)
+                  for value, kind in values)
+        if bad:
+            problems.append(f"numeric source contract: {field} has {bad} nonnumeric/nonfinite value(s) on {latest}")
+
+
+def check_value_sanity(conn, problems, notes=None, stats=None):
+    """Structural impossibilities fail independently of age, pause or quarantine."""
+    faults, unsupported = inspect_price_rows(conn)
+    problems.extend(f for f in faults if f not in problems)
+    if unsupported and notes is not None and stats is not None:
+        detail = f"historical price calendar UNKNOWN/UNSUPPORTED: {unsupported[:5]}"
+        notes.append(detail)
+        _finding(stats, "CALENDAR_UNSUPPORTED", detail)
 
 
 # ── reporting ─────────────────────────────────
 
-def check(conn):
+def check_report_inputs(conn, problems, notes, stats, as_of, universe):
+    try:
+        stats["report_admission"] = report_admission(conn, as_of, universe=universe)
+    except AdmissionRefused as exc:
+        stats["report_admission"] = exc.evidence
+        for reason in exc.evidence["rejection_reasons"]:
+            detail = "ML required input refused: " + reason
+            problems.append(detail)
+            _finding(stats, "REPORT_INPUT_REFUSED", detail, "fail")
+
+
+def check(conn, as_of=None, producer_states=None, price_baseline=None, universe=EXPECTED_UNIVERSE):
     problems, notes, stats = [], [], {}
-    check_freshness(conn, problems)
-    check_schema_and_coverage(conn, problems, notes, stats)
-    check_capture_contract(conn, problems, notes, stats)
-    check_new_contamination(conn, problems, notes, stats)
-    check_cross_source(conn, problems, notes, stats)
-    check_signals_measurable(conn, problems, notes, stats)
-    check_signal_sources(conn, problems, notes, stats)
-    check_value_sanity(conn, problems)
+    stats["as_of"] = (as_of or jakarta_today()).isoformat()
+    check_freshness(conn, problems, notes, stats, as_of, producer_states, universe)
+    checks = [
+        (check_report_inputs, "REPORT_INPUT_REFUSED", (conn, problems, notes, stats, as_of, universe)),
+        (check_schema_and_coverage, "SOURCE_CONTRACT_FAILURE", (conn, problems, notes, stats)),
+        (check_capture_contract, "SOURCE_CONTRACT_FAILURE", (conn, problems, notes, stats)),
+        (check_value_sanity, "STRUCTURAL_DEFECT", (conn, problems, notes, stats)),
+        (check_new_contamination, "PRICE_CHECK_FAILURE", (conn, problems, notes, stats, price_baseline)),
+        (check_cross_source, "CROSS_SOURCE_DISAGREEMENT", (conn, problems, notes, stats)),
+        (check_signals_measurable, "UNMEASURABLE_SIGNALS", (conn, problems, notes, stats)),
+        (check_signal_sources, "SOURCE_UNAVAILABLE", (conn, problems, notes, stats)),
+    ]
+    for fn, category, args in checks:
+        before = len(problems)
+        try:
+            fn(*args)
+        except IdxCalendarUnavailable as exc:
+            detail = f"{fn.__name__} UNVERIFIED: {exc}"
+            notes.append(detail)
+            _finding(stats, "FRESHNESS_UNVERIFIED", detail)
+        except (sqlite3.Error, pd.errors.DatabaseError, pd.errors.DataError, ValueError, TypeError, KeyError) as exc:
+            problems.append(f"STRUCTURAL_DEFECT: {fn.__name__} cannot inspect the data: {exc}")
+            category = "STRUCTURAL_DEFECT"
+        for detail in problems[before:]:
+            if not any(f["detail"] == detail for f in stats.get("findings", [])):
+                _finding(stats, category, detail, "fail")
     return problems, notes, stats
 
 
 def format_report(problems, notes, stats):
     if problems:
         head = "🔴 SIGNAL INTEGRITY FAILED"
+    elif stats.get("degraded"):
+        head = "🟠 SIGNAL INTEGRITY DEGRADED — unresolved quality or producer availability; not healthy"
     elif stats.get("capture_health") == nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED:
         head = (f"🟠 {nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED} — the latest capture broke its then-active "
                 f"contract ({', '.join(stats.get('contract_breaks') or [])}); the retirement explains it, "
@@ -630,20 +763,35 @@ def format_report(problems, notes, stats):
                      f"contract {stats.get('contract', 'no manifest')} | "
                      f"health at capture {stats.get('capture_health', 'n/a')} under "
                      f"{stats.get('contract_at_capture', 'n/a')}")
-    if "fresh_suspects" in stats:
-        lines.append(f"new contamination in last {WINDOW_DAYS}d: "
-                     f"{stats['fresh_suspects']} of {stats.get('window_rows', 0)} rows")
+    if "unresolved_suspects" in stats:
+        lines.append(f"unresolved suspects across history: {stats['unresolved_suspects']} "
+                     f"({stats.get('recent_unresolved_suspects', 0)} recent) | "
+                     f"proven new contamination: {stats.get('new_contamination', 0)} | "
+                     f"recent price rows: {stats.get('window_rows', 0)}")
     for p in problems:
         lines.append(f"❌ {p}")
     for n in notes:
         lines.append(f"⚠️ {n}")
-    if problems:
-        lines += ["", 'Tell Claude: "check_signal_integrity.py is failing with the '
-                      'above — see HANDOFF.md stage 2 for the scraper defect."']
+    if problems or stats.get("degraded"):
+        lines += ["", "Recover the named producer or verify the named price/source defect. "
+                      "A suspect price-limit move alone does not prove a ticker-selection defect."]
     return "\n".join(lines)
 
 
+def notification_text(message):
+    """Keep Telegram within its UTF-16 limit; retain full JSON/Actions evidence."""
+    if len(message.encode("utf-16-le")) <= 7800:
+        return message
+    prefix = message.encode("utf-16-le")[:6800].decode("utf-16-le", errors="ignore")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    link = (f"https://github.com/{repository}/actions/runs/{run_id}"
+            if repository and run_id else "Actions logs and --json-out evidence")
+    return prefix + "\n... notification shortened; full evidence: " + link[:250]
+
+
 def send_telegram(message):
+    message = notification_text(message)
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
@@ -655,27 +803,75 @@ def send_telegram(message):
     print("sent to Telegram" if r.ok else f"telegram error {r.status_code}: {r.text}")
 
 
-def main():
+def github_producer_states(repository, token=None):
+    """Read workflow availability; no dispatch, enable, disable or reconfigure calls."""
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.get(f"https://api.github.com/repos/{repository}/actions/workflows",
+                            headers=headers, params={"per_page": 100}, timeout=15)
+    response.raise_for_status()
+    return {w["path"].rsplit("/", 1)[-1]: w["state"] for w in response.json()["workflows"]}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--as-of", type=date.fromisoformat, default=None)
+    ap.add_argument("--price-baseline", help="prior price snapshot database, opened read-only")
+    ap.add_argument("--producer-states", help="JSON mapping workflow filenames to observed GitHub states")
+    ap.add_argument("--json-out", help="write complete machine-readable integrity evidence")
+    ap.add_argument("--telegram", action="store_true")
+    args = ap.parse_args(argv)
     _load_dotenv()
-    conn = sqlite3.connect(DB_PATH)
+    states, availability_note = {}, None
+    if args.producer_states:
+        with open(args.producer_states, encoding="utf-8") as fh:
+            states = json.load(fh)
+    elif os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_REPOSITORY"):
+        try:
+            states = github_producer_states(os.environ["GITHUB_REPOSITORY"],
+                                            os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"))
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            availability_note = "Producer state UNVERIFIED: read-only GitHub workflow lookup failed; freshness still enforced"
+    baseline = None
+    if args.price_baseline:
+        prior = open_readonly(args.price_baseline)
+        try:
+            baseline = load(prior)
+        finally:
+            prior.close()
+    conn = open_readonly(args.db)
     try:
-        problems, notes, stats = check(conn)
+        problems, notes, stats = check(conn, args.as_of, states, baseline)
     finally:
         conn.close()
+    if availability_note:
+        notes.append(availability_note)
+        _finding(stats, "PRODUCER_STATE_UNVERIFIED", availability_note)
+    if args.json_out:
+        destination = Path(args.json_out)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".tmp")
+        temporary.write_text(json.dumps({
+            "schema": "sig1-integrity-evidence.v1",
+            "exit_code": exit_code(problems, stats),
+            "problems": problems, "notes": notes, "stats": stats,
+        }, indent=2, default=str), encoding="utf-8")
+        temporary.replace(destination)
     report = format_report(problems, notes, stats)
     print(report)
     # Quiet when healthy: Telegram only hears about problems (exit 1 or 2).
-    if "--telegram" in sys.argv and exit_code(problems, stats) != 0:
+    if args.telegram and exit_code(problems, stats) != 0:
         send_telegram(report)
     sys.exit(exit_code(problems, stats))
 
 
 def exit_code(problems, stats):
-    """1 = failed; 2 = source-contract break acknowledged (explained, still not
-    healthy, so the run stays red); 0 = healthy."""
+    """1 = hard failure; 2 = degraded/acknowledged, still unhealthy; 0 = healthy."""
     if problems:
         return 1
-    if stats.get("capture_health") == nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED:
+    if stats.get("degraded") or stats.get("capture_health") == nsc.SOURCE_CONTRACT_BREAK_ACKNOWLEDGED:
         return 2
     return 0
 

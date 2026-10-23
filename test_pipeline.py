@@ -1446,6 +1446,10 @@ def test_ml_health_runs_and_counts_inventory_evidence_tests():
     launched = []
 
     def successful_suite(args, **kwargs):
+        if args[1:3] == ["-m", "pytest"]:
+            assert "test_sig1_corrective.py" in args and "test_signal_integrity.py" in args
+            launched.append("SIG1 pytest")
+            return subprocess.CompletedProcess(args, 0, "1 passed\n", "")
         name = os.path.basename(args[1])
         launched.append(name)
         assert kwargs["cwd"] == health.HERE
@@ -1488,6 +1492,10 @@ def test_ml_health_runs_and_counts_bandarmolony_trade_tests():
     launched = []
 
     def successful_suite(args, **kwargs):
+        if args[1:3] == ["-m", "pytest"]:
+            assert "test_sig1_corrective.py" in args and "test_signal_integrity.py" in args
+            launched.append("SIG1 pytest")
+            return subprocess.CompletedProcess(args, 0, "1 passed\n", "")
         name = os.path.basename(args[1])
         launched.append(name)
         assert args == [health.sys.executable, os.path.join(health.HERE, name)]

@@ -362,7 +362,7 @@ def load_clean(conn, strict=False):
 
     bad = set(zip(q["date"], q["ticker"]))
     keep = [(d, t) not in bad for d, t in zip(px["date"], px["ticker"])]
-    return px[keep].reset_index(drop=True)
+    return px.loc[pd.Series(keep, index=px.index, dtype=bool)].reset_index(drop=True)
 
 
 def _open_anchor_valid(px, g):

@@ -224,6 +224,16 @@ def check_unit_tests(problems, stats):
         if r.returncode != 0:
             tail = (r.stdout + r.stderr).strip().splitlines()[-6:]
             problems.append(f"{name} FAILED — " + " | ".join(tail))
+    # SIG1 uses pytest functions; executing the file directly collects zero tests.
+    sig1 = ("test_sig1_corrective.py", "test_signal_integrity.py")
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *sig1],
+                       capture_output=True, text=True, cwd=HERE, timeout=900)
+    summary = re.search(r"(\d+) passed", r.stdout)
+    if r.returncode != 0 or summary is None:
+        problems.append("SIG1 pytest FAILED or collected no tests: " + (r.stdout + r.stderr)[-1800:])
+    else:
+        passed += int(summary.group(1))
+    stats["sig1_test_files"] = list(sig1)
     stats["tests_passed"] = passed
 
 
