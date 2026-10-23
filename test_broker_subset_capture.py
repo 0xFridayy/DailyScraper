@@ -94,6 +94,57 @@ class Tests(unittest.TestCase):
         r=capture.capture(self.root,self.registry,self.subset,EXPECTED,stale,sleep=lambda _:None)
         self.assertEqual(r["per_ticker"]["BRMS"]["state"],"FAILED")
         self.assertEqual(r["acquisition_status"],"PARTIAL")
+
+    def test_valid_stale_history_is_preserved_and_remains_incomplete(self):
+        def stale(query):
+            t=parse_qs(query)["symbol"][0]
+            env=payload(t,base=1000 if t=="BMRI" else 2000)
+            if t=="BRMS":
+                env["data"]["date"].pop()
+                env["data"]["ohlc"].pop()
+                for field in capture.bc.cg.SERIES_FIELDS:
+                    for series in env["data"][field].values(): series.pop()
+            return Response(env)
+        r=capture.capture(self.root,self.registry,self.subset,EXPECTED,stale,sleep=lambda _:None)
+        item=r["per_ticker"]["BRMS"]
+        self.assertEqual(item["state"],"SOURCE_STALE")
+        self.assertEqual(item["last_session"],"2026-10-20")
+        self.assertFalse(item["requested_session_available"])
+        self.assertTrue(item["successful_source_answer"])
+        self.assertEqual(r["source_response_counts"]["validated_nonempty"],2)
+        self.assertFalse(r["eligible_scope_complete"])
+        self.assertTrue((self.root/item["artifacts"][0]["path"]).is_file())
+        # Simulate the old generic failure. Repair comes from the saved bytes,
+        # not the reported last date, and never makes a provider request.
+        run=next((self.root/"runs").iterdir())
+        item["state"]="FAILED"
+        item["last_session"]=EXPECTED
+        capture.publish_receipt(self.root,run,r)
+        before=list(self.queries)
+        audited=capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)
+        self.assertEqual(audited["per_ticker"]["BRMS"]["state"],"SOURCE_STALE")
+        self.assertEqual(audited["per_ticker"]["BRMS"]["last_session"],"2026-10-20")
+        self.assertEqual(audited["archive_audit"]["provider_requests"],0)
+        self.assertEqual(self.queries,before)
+        self.assertEqual(capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)["counts"],r["counts"])
+
+    def test_source_ahead_is_distinct_and_never_current(self):
+        data=payload("BMRI")["data"]
+        item=capture.observation_item(data,"BMRI",self.subset,"2026-10-20",[{}])
+        self.assertEqual(item["state"],"SOURCE_AHEAD")
+        self.assertFalse(item["requested_session_available"])
+
+    def test_archive_audit_refuses_changed_original(self):
+        r=self.run_capture()
+        (self.root/r["per_ticker"]["BMRI"]["artifacts"][0]["path"]).write_bytes(b"tampered")
+        audited=capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)
+        self.assertEqual(audited["per_ticker"]["BMRI"]["state"],"FAILED")
+        self.assertIn("hash mismatch",audited["per_ticker"]["BMRI"]["reason"])
+
+    def test_archive_audit_does_not_convert_unattempted_to_failure(self):
+        self.run_capture(max_requests=1)
+        r=capture.audit_archive(self.root,self.registry,self.subset,EXPECTED)
+        self.assertEqual(r["per_ticker"]["BRMS"]["state"],"MISSING")
     def test_cloned_ohlcv_is_refused_across_individual_ticker_calls(self):
         r=capture.capture(self.root,self.registry,self.subset,EXPECTED,
                           lambda q:Response(payload(parse_qs(q)["symbol"][0],base=1000)),

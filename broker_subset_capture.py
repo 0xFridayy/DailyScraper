@@ -165,6 +165,112 @@ def validate_stored(root,item,subset,expected,ticker=None):
         return False
     return True
 
+def observation_item(data,ticker,subset,expected,artifacts):
+    """Record usable source history without certifying the requested session."""
+    dates=data["date"]
+    if not artifacts:
+        raise ValueError("Successful capture lacks durable source bytes")
+    if not dates:
+        raise ValueError("Nonempty validated source history required")
+    last=dates[-1]
+    state="COMPLETE" if last==expected else "SOURCE_STALE" if last<expected else "SOURCE_AHEAD"
+    item=dict(state=state,last_session=last,first_session=dates[0],
+        expected_session=expected,observed_sessions=len(dates),artifacts=artifacts,
+        ohlc_sha256=digest(encoded(data["ohlc"])),subset_sha256=subset["sha256"],
+        successful_source_answer=True,requested_session_available=last==expected,
+        history_certification="SOURCE_SPAN_RECORDED_SESSION_COMPLETENESS_UNVERIFIED",
+        price_certification="RAW_OBSERVATION_NOT_FINANCIAL_ADMISSION",source_identity=ticker)
+    if state!="COMPLETE":
+        item["reason"]=("SOURCE_HISTORY_ENDS_BEFORE_REQUESTED_SESSION" if last<expected
+                        else "SOURCE_HISTORY_EXCEEDS_REQUESTED_CUTOFF")
+    return item
+
+def replay_observation(root,ticker,item,subset,expected):
+    """Reclassify only after rehashing the saved original and parsing it again."""
+    artifacts=item.get("artifacts") or []
+    if not artifacts:
+        raise ValueError("No preserved source response")
+    root=Path(root).resolve()
+    raw=None
+    for artifact in artifacts:
+        path=(root/artifact["path"]).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError("Source object escapes archive")
+        compressed=path.read_bytes()
+        if digest(compressed)!=artifact["sha256"]:
+            raise ValueError("Compressed source hash mismatch")
+        raw=gzip.decompress(compressed)
+        if digest(raw)!=artifact["source_sha256"]:
+            raise ValueError("Original source hash mismatch")
+    if artifacts[-1].get("http_status")!=200 or artifacts[-1].get("hash_basis")!="ORIGINAL_RESPONSE_BYTES":
+        raise ValueError("Original successful source response required")
+    env=json.loads(raw)
+    if (env.get("meta") or {}).get("symbol")!=ticker:
+        raise ValueError("Source ticker identity not verified")
+    try:
+        data=bc.validate_envelope(env,ticker,subset["codes"])
+    except bc.EmptyResponse:
+        return dict(state="NO_DATA",reason="SOURCE_RETURNED_EMPTY_DATE_AXIS",
+                    successful_source_answer=True,requested_session_available=False,
+                    source_identity=ticker,subset_sha256=subset["sha256"],artifacts=artifacts,
+                    price_certification="RAW_OBSERVATION_NOT_FINANCIAL_ADMISSION")
+    return observation_item(data,ticker,subset,expected,artifacts)
+
+def coverage_summary(receipt,members):
+    states=[receipt["per_ticker"][t]["state"] for t in members]
+    eligible=[t for t in members if t not in bc.NOT_A_TICKER]
+    receipt["counts"]={s:states.count(s) for s in sorted(set(states))}
+    receipt["eligible_scope_complete"]=all(receipt["per_ticker"][t]["state"]=="COMPLETE" for t in eligible)
+    receipt["acquisition_status"]="COMPLETE" if all(s=="COMPLETE" for s in states) else "PARTIAL"
+    receipt["eligibility"]=dict(registry_entries=len(members),source_eligible=len(eligible),
+        explicitly_ineligible=sorted(set(members)&bc.NOT_A_TICKER),
+        scope_evidence="broker_collect.NOT_A_TICKER")
+    receipt["source_response_counts"]={
+        "validated_nonempty":sum(receipt["per_ticker"][t]["state"] in
+            {"COMPLETE","SOURCE_STALE","SOURCE_AHEAD"} for t in eligible),
+        "empty":states.count("NO_DATA"),"current":states.count("COMPLETE"),
+        "stale":states.count("SOURCE_STALE"),"ahead":states.count("SOURCE_AHEAD")}
+
+def audit_archive(root,registry,subset,expected,checkpoint=None):
+    """Offline receipt repair. Original responses and old receipts are immutable."""
+    root=Path(root).resolve()
+    run_dir=root/"runs"/(expected+"_"+registry.sha256[:16]+"_"+subset["sha256"][:16])
+    with store_lock(root):
+        original=(run_dir/RECEIPT_NAME).read_bytes()
+        receipt=json.loads(original)
+        if (receipt.get("registry_sha256")!=registry.sha256 or receipt.get("subset")!=subset
+                or receipt.get("trade_date")!=expected
+                or set(receipt.get("per_ticker",{}))!=set(registry.tickers)):
+            raise ValueError("Archive receipt contract mismatch")
+        signatures={}
+        changed={}
+        for ticker,item in list(receipt["per_ticker"].items()):
+            if ticker in bc.NOT_A_TICKER:
+                continue
+            if item.get("state")=="MISSING" and not item.get("artifacts"):
+                continue
+            try:
+                observed=replay_observation(root,ticker,item,subset,expected)
+                signature=observed.get("ohlc_sha256")
+                if signature and signature in signatures:
+                    raise ValueError("Full OHLCV identical to "+signatures[signature])
+                if signature:
+                    signatures[signature]=ticker
+            except (ValueError,KeyError,TypeError,OSError,EOFError,bc.FetchRejected) as exc:
+                observed=dict(item,state="FAILED",reason=bc._safe_error_local(exc))
+            if observed["state"]!=item.get("state"):
+                changed[ticker]=dict(before=item.get("state"),after=observed["state"],
+                                     previous_reason=item.get("reason"))
+            receipt["per_ticker"][ticker]=observed
+        coverage_summary(receipt,registry.tickers)
+        receipt["processing_status"]="COMPLETE"
+        receipt["archive_audit"]=dict(source_receipt_sha256=digest(original),changes=changed,
+            audited_at=stamp(),provider_requests=0,original_bytes_modified=False)
+        publish_receipt(root,run_dir,receipt)
+        if checkpoint:
+            checkpoint(root,run_dir,receipt)
+        return receipt
+
 def publish_receipt(root,run_dir,receipt):
     raw=encoded(receipt)
     immutable(Path(run_dir)/"receipt_versions"/(digest(raw)+".json"),raw)
@@ -246,32 +352,14 @@ def capture(root,registry,subset,expected_session,request_get,*,max_requests=100
                 elif ticker not in result["ok"]:
                     item=dict(state="FAILED",reason=result.get("failed",{}).get(ticker,"FETCH_FAILED"))
                 else:
-                    cached=Path(bc.cache_path(str(cache_root),bc.MODE_DAILY,ticker))
-                    with gzip.open(cached,"rt",encoding="utf-8") as fh:
-                        env=json.load(fh)
-                    if str((env.get("meta") or {}).get("symbol","")).upper()!=ticker:
-                        raise ValueError("Source ticker identity not verified")
-                    data=env["data"]
-                    reason=bc.cg.explicit_coverage_reason(data,subset["codes"])
-                    if reason:
-                        raise ValueError("Requested subset coverage mismatch: "+reason)
-                    dates=data["date"]
-                    if not dates or dates[-1]!=expected:
-                        raise ValueError("Source session is stale or ahead of exact requested cutoff")
-                    ohlc_sha=digest(encoded(data["ohlc"]))
+                    item=replay_observation(root,ticker,
+                        dict(artifacts=transport.evidence.get(ticker,[])),subset,expected)
+                    ohlc_sha=item["ohlc_sha256"]
                     clones=[t for t,row in receipt["per_ticker"].items()
-                            if t!=ticker and row.get("state")=="COMPLETE"
+                            if t!=ticker and row.get("state") in {"COMPLETE","SOURCE_STALE","SOURCE_AHEAD"}
                             and row.get("ohlc_sha256")==ohlc_sha]
                     if clones:
                         raise ValueError("Full OHLCV identical to "+clones[0]+"; identity review required")
-                    artifacts=transport.evidence.get(ticker,[])
-                    if not artifacts:
-                        raise ValueError("Successful capture lacks durable source bytes")
-                    item=dict(state="COMPLETE",last_session=dates[-1],first_session=dates[0],
-                        observed_sessions=len(dates),artifacts=artifacts,ohlc_sha256=ohlc_sha,
-                        history_certification="SOURCE_SPAN_RECORDED_SESSION_COMPLETENESS_UNVERIFIED",
-                        price_certification="RAW_OBSERVATION_NOT_FINANCIAL_ADMISSION",
-                        source_identity=ticker)
             except Exception as exc:
                 item=dict(state="FAILED",reason=bc._safe_error_local(exc))
             item["subset_sha256"]=subset["sha256"]
@@ -285,17 +373,10 @@ def capture(root,registry,subset,expected_session,request_get,*,max_requests=100
             if transport.paused:
                 receipt["halt_reason"]=transport.paused
                 break
-        states=[x["state"] for x in receipt["per_ticker"].values()]
-        receipt["acquisition_status"]="COMPLETE" if all(s=="COMPLETE" for s in states) else "PARTIAL"
+        coverage_summary(receipt,members)
         receipt["processing_status"]="COMPLETE"
         receipt["request_budget"]=dict(allowed=max_requests,performed=transport.calls,
                                       retry_limit_per_ticker=bc.MAX_RETRY)
-        receipt["counts"]={s:states.count(s) for s in sorted(set(states))}
-        eligible=[t for t in members if t not in bc.NOT_A_TICKER]
-        receipt["eligibility"]=dict(registry_entries=len(members),source_eligible=len(eligible),
-            explicitly_ineligible=sorted(set(members)&bc.NOT_A_TICKER),
-            scope_evidence="broker_collect.NOT_A_TICKER")
-        receipt["eligible_scope_complete"]=all(receipt["per_ticker"][t]["state"]=="COMPLETE" for t in eligible)
         receipt["captured_at"]=stamp()
         publish_receipt(root,run_dir,receipt)
         if checkpoint:
