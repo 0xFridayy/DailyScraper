@@ -1,0 +1,16 @@
+{
+  "name": "spectra-core-10.v1",
+  "codes": [
+    "AK",
+    "AZ",
+    "BK",
+    "CC",
+    "MG",
+    "SQ",
+    "TP",
+    "XL",
+    "YP",
+    "ZP"
+  ],
+  "meaning": "Explicit observed broker subset. No client retail/institution classification."
+}
