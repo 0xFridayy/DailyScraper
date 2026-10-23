@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import daily_capture_receipt as receipt
@@ -68,9 +68,27 @@ def test_actual_yu_zp_abort_is_not_green_and_snapshot_is_unchanged(tmp_path):
     assert receipt.main(args) == 1
     # Legacy reporter still returns zero after the actual atomic capture rejected.
     fake_picks = types.SimpleNamespace(telegram_sender_from_env=lambda: None,
-        run_morning=lambda **kwargs: ('sent', 'ok'))
-    with patch.object(scraper, 'run_all_jobs', lambda: None), patch.dict(sys.modules, daily_picks=fake_picks):
+        run_morning=lambda *args, **kwargs: ('sent', 'ok'))
+    morning_db = tmp_path / 'morning.db'
+    def failed_save(page):
+        fixture_db(morning_db, start, ('YU', 'ZP'))
+        return None
+    # Exercise the real run_all_jobs orchestration through morning.main.
+    # Only external browser/network/report inputs are replaced.
+    with patch.object(scraper, 'sync_playwright', MagicMock()), \
+         patch.object(scraper, 'login', lambda page: None), \
+         patch.object(scraper, 'scrape_market_summary', lambda *args: []), \
+         patch.object(scraper, 'scrape_dashboard_presets', lambda *args: {}), \
+         patch.object(scraper, 'scrape_broker_stalker', lambda *args: {}), \
+         patch.object(scraper, 'save_daily_broker_flow', failed_save), \
+         patch.object(scraper, 'read_broker_flow_code', mock_reader(('YU', 'ZP'))), \
+         patch.object(scraper, '_offset_safe', lambda *args: False), \
+         patch.object(scraper, 'format_combined_message', lambda *args: 'daily report'), \
+         patch.dict(sys.modules, daily_picks=fake_picks):
         assert morning.main() == 0
+    assert morning_db.exists()
+    actual = receipt.build_receipt(morning_db, start.isoformat(), scraper.BROKER_FLOW_CAPTURE_CODES, 'run', '1')
+    assert not actual['complete']
 
 
 def test_healthy_capture_and_exact_run_identity(tmp_path):
