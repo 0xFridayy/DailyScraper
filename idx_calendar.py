@@ -12,6 +12,10 @@ exchange announced it closed, and a date outside COVERED_FROM..COVERED_THROUGH
 raises IdxCalendarUnavailable instead of falling back to "previous weekday"
 (IDX holidays and cuti bersama make that wrong) or to price_history.
 
+A producer that stores a session the same evening it closes may be checked
+against that session instead: its caller, which owns the clock and cutoff,
+passes it to expected_closed_session(), which accepts nothing else.
+
 Closures are copied from the official announcements in SOURCES and must be
 extended (with a new CALENDAR_VERSION) when IDX publishes the next year or
 amends a published one. price_history's observed sessions are only a secondary
@@ -153,3 +157,19 @@ def latest_idx_session_before(scrape_date):
             return d
     raise IdxCalendarUnavailable(
         f"no IDX session in the {MAX_LOOKBACK_DAYS} days before {scrape_date} per {CALENDAR_VERSION}")
+
+
+def expected_closed_session(as_of, closed_session=None):
+    """The newest session a session-dated snapshot checked on `as_of` must hold.
+
+    By default latest_idx_session_before(as_of). A caller whose producer stores a
+    session after it closes may pass `closed_session`: either that default or
+    `as_of` itself when `as_of` is a session. Anything else raises ValueError, so
+    a caller can neither hide staleness nor admit the future."""
+    default = latest_idx_session_before(as_of)
+    if closed_session is None:
+        return default
+    _check_date(closed_session)
+    if closed_session == default or (closed_session == as_of and is_idx_session(as_of)):
+        return closed_session
+    raise ValueError(f"closed session {closed_session} is neither {default} nor the session {as_of}")

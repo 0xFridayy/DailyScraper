@@ -300,6 +300,24 @@ def test_weekends_and_idx_holidays_do_not_create_missing_sessions(as_of, expecte
     assert health["freshness"] == "CURRENT" and health["expected"] == expected
 
 
+def test_a_same_day_price_session_is_due_only_when_the_caller_says_it_closed():
+    as_of = date(2026, 10, 14)
+    conn = fixture(price_date=as_of.isoformat())
+    add_preceding_prices(conn)
+    default = table_freshness(conn, "price_history", as_of, universe=SYNTHETIC_UNIVERSE)
+    assert default["expected"] == "2026-10-13" and default["ahead_of_cutoff_dates"] == ["2026-10-14"]
+    closed = table_freshness(conn, "price_history", as_of, universe=SYNTHETIC_UNIVERSE, closed_session=as_of)
+    assert closed["freshness"] == "CURRENT" and closed["expected"] == "2026-10-14"
+    assert not closed["ahead_of_cutoff_dates"]
+    # Capture-dated producers keep their own convention.
+    assert (table_freshness(conn, "broker_flow", as_of, universe=SYNTHETIC_UNIVERSE, closed_session=as_of)
+            == table_freshness(conn, "broker_flow", as_of, universe=SYNTHETIC_UNIVERSE))
+    assert require_current_prices(conn, as_of, SYNTHETIC_UNIVERSE, closed_session=as_of)["expected"] == "2026-10-14"
+    ahead = lambda problems: [p for p in problems if "AHEAD_OF_CUTOFF" in p]
+    assert ahead(check_fixture(conn, as_of)[0])
+    assert not ahead(check_fixture(conn, as_of, closed_session=as_of)[0])
+
+
 def test_paused_and_stale_are_separate_and_unknown_state_is_not_assumed_paused():
     conn = fixture(price_date="2026-10-09")
     health = table_freshness(conn, "price_history", date(2026, 10, 14),
