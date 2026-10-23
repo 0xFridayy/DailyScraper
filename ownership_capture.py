@@ -26,12 +26,14 @@ verified not to trip NeoBDM's rate limiting).
 
 Usage:
     python ownership_capture.py --dry-run --tickers BREN,PANI,TPIA
-    python ownership_capture.py                      # full TRACKED_TICKERS universe
+    python ownership_capture.py                      # full versioned registry universe
     python ownership_capture.py --limit 5             # smoke test
     python ownership_capture.py --run-id 2026-08-30   # force/resume a specific run
 """
 import argparse
 import io
+import hashlib
+from pathlib import Path
 import json
 import os
 import random
@@ -41,14 +43,18 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from neobdm_scraper import login, TRACKED_TICKERS, log  # noqa: E402
+from ownership_auth import login, legacy_tickers, log, SourcePaused  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 import ownership_ingest as ing  # noqa: E402
+from ownership_receipt import open_receipt, save_receipt, pending_batch
+from ticker_registry import load_registry
 from ownership_schema import connect  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR = os.path.join(HERE, "ownership_raw")
+ARCHIVE_ROOT = os.environ.get("OWNERSHIP_ARCHIVE_ROOT", HERE)
+RAW_DIR = os.path.join(ARCHIVE_ROOT, "ownership_raw")
+ing.HERE = ARCHIVE_ROOT
 DB_PATH = os.path.join(HERE, "neobdm_ownership.db")
 BALANCE_DASH_URL = "https://neobdm.tech/django_plotly_dash/app/bp_app/_dash-update-component"
 STOCK_DETAIL_URL = "https://neobdm.tech/stock_detail/{ticker}/"
@@ -87,6 +93,10 @@ def fetch_balance_position_full(req, csrf, ticker):
     headers = {"Content-Type": "application/json", "X-CSRFToken": csrf,
                "Referer": "https://neobdm.tech/balance_position_chart/"}
     r = req.post(BALANCE_DASH_URL, data=json.dumps(body), headers=headers, timeout=60000)
+    if r.status in (401, 403, 429):
+        raise SourcePaused("PROVIDER_HTTP_" + str(r.status))
+    if r.status != 200:
+        raise ValueError("Ownership source response unavailable")
     j = json.loads(r.text())
     fig = (((j.get("response") or {}).get("balance-position-chart") or {}).get("figure") or {})
     data = fig.get("data") or []
@@ -116,7 +126,11 @@ def inspect_xlsx(req, url):
 def capture_ticker(page, req, csrf, ticker):
     """One page load + one Dash POST. Returns the raw capture dict (no
     HTML, no credentials) ready for json.dump and for ingest_capture()."""
-    page.goto(STOCK_DETAIL_URL.format(ticker=ticker), wait_until="domcontentloaded", timeout=60000)
+    response = page.goto(STOCK_DETAIL_URL.format(ticker=ticker), wait_until="domcontentloaded", timeout=60000)
+    if response and response.status in (401, 403, 429):
+        raise SourcePaused("PROVIDER_HTTP_" + str(response.status))
+    if "login" in page.url.lower():
+        raise SourcePaused("PROVIDER_AUTH_REQUIRED")
     page.wait_for_timeout(6000)
 
     panes = {}
@@ -154,26 +168,42 @@ def capture_ticker(page, req, csrf, ticker):
     }
 
 
-def main():
+def main(argv=None, checkpoint=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tickers", default="", help="comma-separated; default is TRACKED_TICKERS")
-    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--tickers", default="", help="comma-separated registry subset; default is the full registry")
+    ap.add_argument("--limit", type=int, default=0, help="bounded pending batch; denominator stays full")
+    ap.add_argument("--legacy-tracked", action="store_true", help="explicit legacy public subset")
+    ap.add_argument("--receipt", default="")
     ap.add_argument("--run-id", default=time.strftime("%Y-%m-%d"))
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--dry-run", action="store_true",
                      help="capture + ingest, but roll back the DB transaction at the end")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     syms = ([s.strip().upper() for s in a.tickers.split(",") if s.strip()]
-            if a.tickers else list(TRACKED_TICKERS))
-    if a.limit:
-        syms = syms[:a.limit]
+            if a.tickers else (legacy_tickers() if a.legacy_tracked else list(load_registry().tickers)))
+    receipt_path = a.receipt or os.path.join(ARCHIVE_ROOT, 'ownership_receipts', a.run_id + '.json')
+    receipt = open_receipt(receipt_path, a.run_id, syms, a.dry_run)
+    for ticker, item in receipt["per_ticker"].items():
+        if ticker in ("IHSG", "ISSI"):
+            receipt["per_ticker"][ticker] = {"status": "SOURCE_UNAVAILABLE", "reason": "INDEX_SYMBOL_NOT_EQUITY"}
+        elif item["status"] == "PERSISTED":
+            artifact = item.get("artifact", {})
+            path = (Path(ARCHIVE_ROOT) / artifact.get("path", "")).resolve()
+            if (not path.is_relative_to(Path(ARCHIVE_ROOT).resolve()) or not path.is_file()
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != artifact.get("sha256")):
+                item.update(status="FAILED", reason="STORED_CAPTURE_INVALID")
+    syms = pending_batch(receipt, syms, a.limit)
+    save_receipt(receipt_path, receipt, checkpoint)
 
+    if not syms:
+        return 0
     conn = connect(a.db)
     conn.execute("BEGIN")
     log.info(f"ownership_capture: run_id={a.run_id} db={a.db} n_tickers={len(syms)} "
              f"dry_run={a.dry_run}")
 
+    receipt.pop("halt_reason", None)
     ok = fail = 0
     totals = {}
     t_start = time.time()
@@ -190,8 +220,15 @@ def main():
             capture = None
             if os.path.exists(cache_file):
                 log.info(f"[{i}/{len(syms)}] {ticker}: resume -- using cached raw capture")
-                cached = json.load(open(cache_file, encoding="utf-8"))
-                capture, captured_at = cached["capture"], cached["captured_at"]
+                try:
+                    with open(cache_file, encoding="utf-8") as handle:
+                        cached = json.load(handle)
+                    capture, captured_at = cached["capture"], cached["captured_at"]
+                    if capture.get('ticker') != ticker:
+                        raise ValueError('Cache ticker mismatch')
+                except (OSError, ValueError, KeyError, TypeError):
+                    fail += 1
+                    capture = None
             else:
                 delay = 2.0
                 for attempt in range(MAX_RETRY):
@@ -201,6 +238,11 @@ def main():
                         json.dump({"captured_at": captured_at, "capture": capture},
                                   open(cache_file, "w", encoding="utf-8"),
                                   indent=1, ensure_ascii=False, default=str)
+                        break
+                    except SourcePaused as e:
+                        receipt["halt_reason"] = str(e)
+                        capture = None
+                        fail += 1
                         break
                     except Exception as e:
                         msg = str(e)[:150]
@@ -237,11 +279,23 @@ def main():
                         conn.commit()
                         conn.execute("BEGIN")
                     ok += 1
+                    receipt['per_ticker'][ticker] = dict(
+                        status='DRY_RUN' if a.dry_run else 'PERSISTED', captured_at=captured_at,
+                        content_status='OBSERVED' if any(capture.get('panes', {}).values()) or capture.get('balance_position_traces') else 'EMPTY',
+                        artifact=dict(path=Path(cache_file).relative_to(ARCHIVE_ROOT).as_posix(),
+                                      sha256=hashlib.sha256(Path(cache_file).read_bytes()).hexdigest()),
+                        history_certification='NOT_CERTIFIED')
                 except Exception as e:
                     conn.execute("ROLLBACK TO ticker_savepoint")
                     conn.execute("RELEASE ticker_savepoint")
                     log.warning(f"[{i}/{len(syms)}] {ticker} Ingestion failed, rolled back ticker transaction: {e}")
                     fail += 1
+
+            if capture is None or receipt['per_ticker'][ticker]['status'] not in ('PERSISTED', 'DRY_RUN'):
+                receipt['per_ticker'][ticker] = {'status': 'FAILED'}
+            save_receipt(receipt_path, receipt, checkpoint)
+            if receipt.get("halt_reason"):
+                break
 
             if i % REST_EVERY == 0:
                 time.sleep(REST_FOR)
@@ -255,7 +309,9 @@ def main():
         log.info("dry-run: rolled back DB writes (raw captures on disk are kept)")
     log.info(f"DONE ok={ok} fail={fail} in {(time.time()-t_start)/60:.1f} min -- totals: {totals}")
     conn.close()
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+
