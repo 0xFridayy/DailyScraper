@@ -17,6 +17,9 @@ import sys
 from urllib import request, parse, error
 from zoneinfo import ZoneInfo
 
+from ticker_registry import load_registry
+from sentinel_evidence import check_price_evidence, check_receipt
+
 WIB = ZoneInfo("Asia/Jakarta")
 
 # filename: (role, expected_state, allowed_age_hours)
@@ -68,55 +71,8 @@ def timestamp(s: str) -> datetime:
         raise SentinelError("UNZONED_ACTION_TIMESTAMP")
     return dt
 
-def weekdays_since(last: date, current: date) -> int:
-    if current < last:
-        return -1
-    n = 0
-    while last < current:
-        last += timedelta(days=1)
-        if last.weekday() < 5:
-            n += 1
-    return n
-
-def check_price_history(db_path: Path, today: date) -> dict:
-    item = {"name": "neobdm.db/price_history", "severity": "CRITICAL",
-            "status": "UNKNOWN", "asof": None}
-    if not db_path.is_file():
-        item.update(status="MISSING_DATABASE")
-        return item
-    try:
-        db = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
-        try:
-            table = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_history'").fetchone()
-            if not table:
-                item.update(status="MISSING_TABLE")
-                return item
-            cols = {r[1] for r in db.execute("PRAGMA table_info(price_history)")}
-            if "date" not in cols:
-                item.update(status="MISSING_DATE_COLUMN")
-                return item
-            latest = db.execute("SELECT MAX(SUBSTR(date,1,10)) FROM price_history").fetchone()[0]
-        finally:
-            db.close()
-        if not latest:
-            item.update(status="EMPTY")
-            return item
-        try:
-            d = date.fromisoformat(latest)
-        except ValueError:
-            item.update(status="INVALID_SOURCE_DATE")
-            return item
-        days = weekdays_since(d, today)
-        item.update(asof=d.isoformat(), days=days, threshold_days=3)
-        if days < 0:
-            item.update(status="FUTURE_SOURCE_DATE")
-        elif days > 3:
-            item.update(status="STALE")
-        else:
-            item.update(status="RECENT", severity="OK")
-    except (OSError, sqlite3.DatabaseError):
-        item.update(status="DATABASE_CORRUPT_OR_UNREADABLE")
-    return item
+def check_price_history(db_path: Path, today: date, registry=None) -> dict:
+    return check_price_evidence(db_path, today, registry=registry)
 
 def check_workflow(get, base, name, policy, meta, now):
     role, expected, max_age = policy
@@ -170,7 +126,8 @@ def check_workflow(get, base, name, policy, meta, now):
         result.update(severity="OK", status="RECENT_SCHEDULED_SUCCESS")
     return result
 
-def audit(get, repo: str, now: datetime, db_path: Path) -> dict:
+def audit(get, repo: str, now: datetime, db_path: Path, *, registry=None,
+          receipts_dir=None, artifact_root=None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise SentinelError("INVALID_REPOSITORY")
     base = "https://api.github.com/repos/" + repo
@@ -185,18 +142,34 @@ def audit(get, repo: str, now: datetime, db_path: Path) -> dict:
         if name not in POLICY and name != "spectra-sentinel.yml" and name != "update-graph":
             rows.append(dict(name=name, expected="unclassified", state=meta.get("state"),
                              severity="WARNING", status="UNCLASSIFIED_WORKFLOW"))
-    data = check_price_history(db_path, now.astimezone(WIB).date())
+    registry = registry or load_registry()
+    today = now.astimezone(WIB).date()
+    data = check_price_history(db_path, today, registry=registry)
+    source_checks = [data]
+    if receipts_dir is not None:
+        from idx_calendar import latest_idx_session_before
+        expected = latest_idx_session_before(today)
+        for name in ("broker-subset-capture-receipt.json", "ownership-capture-receipt.json",
+                     "company-news-receipt.json", "idx-disclosures-receipt.json"):
+            source_checks.append(check_receipt(Path(receipts_dir) / name, registry,
+                                               expected, artifact_root=artifact_root))
     critical = [r["name"] + ": " + r["status"] for r in rows if r["severity"] == "CRITICAL"]
     warnings = [r["name"] + ": " + r["status"] for r in rows if r["severity"] == "WARNING"]
-    if data["severity"] == "CRITICAL":
-        critical.append(data["name"] + ": " + data["status"])
+    for item in source_checks:
+        if item["severity"] == "CRITICAL":
+            critical.append(item["name"] + ": " + item["status"])
+    # Unobservable or acquisition-blocked required streams must never imply a
+    # healthy complete fleet, even when the monitored Actions jobs are green.
+    warnings.extend(name + ": " + status for name, status in EXTERNAL.items())
     return {
-        "schema": "SPECTRA_GITHUB_SENTINEL_V1",
+        "schema": "SPECTRA_GITHUB_SENTINEL_V2",
         "repo": repo,
         "checked_at_wib": now.astimezone(WIB).isoformat(),
         "overall": "RED" if critical else "DEGRADED" if warnings else "GREEN_MONITORED_ONLY",
         "critical": critical, "warnings": warnings,
-        "workflows": rows, "source_checks": [data], "external_not_certified": EXTERNAL,
+        "workflows": rows, "source_checks": source_checks, "external_not_certified": EXTERNAL,
+        "expected_registry": registry.metadata(),
+        "full_fleet_certification": "NOT_CERTIFIED" if critical or warnings else "MONITORED_SCOPE_ONLY",
         "policy_note": ("BROKER_LEARNING intentionally disabled by project HANDOFF.md; "
                         "Github cron status != authorized full-universe source access; "
                         "Stockbit images and local Windows task are NOT covered."),
@@ -212,7 +185,7 @@ def markdown(r):
                     str(x.get("latest_run") or "—")[:19], x["severity"], x["status"])) + " |")
     out += ["", "## Dataset", ""]
     for x in r["source_checks"]:
-        out.append(f"- **{x['name']}** {x['status']}; last={x.get('asof')} (weekday-only tolerance)")
+        out.append(f"- **{x['name']}** {x['status']}; last={x.get('asof')} (official session and fixed-universe evidence)")
     out += ["", "## Known outside-GitHub / unavailable feeds"]
     out += ["- " + name + ": " + status for name, status in r["external_not_certified"].items()]
     out += ["", "## Critical findings"]
@@ -240,12 +213,18 @@ def main():
     p.add_argument("--repo", default=os.getenv("GITHUB_REPOSITORY", "0xFridayy/DailyScraper"))
     p.add_argument("--db", type=Path, default=Path("neobdm.db"))
     p.add_argument("--notify-red", action="store_true")
+    p.add_argument("--registry", type=Path, default=Path(__file__).with_name("all_tickers.json"))
+    p.add_argument("--receipts-dir", type=Path, default=Path("collector_receipts"))
+    p.add_argument("--artifact-root", type=Path)
+
     args = p.parse_args()
     now = datetime.now(timezone.utc)
     try:
-        r = audit(github_get, args.repo, now, args.db)
-    except (SentinelError, OSError):
-        r = {"schema": "SPECTRA_GITHUB_SENTINEL_V1", "repo": args.repo,
+        r = audit(github_get, args.repo, now, args.db,
+                  registry=load_registry(args.registry), receipts_dir=args.receipts_dir,
+                  artifact_root=args.artifact_root)
+    except (SentinelError, OSError, ValueError, RuntimeError):
+        r = {"schema": "SPECTRA_GITHUB_SENTINEL_V2", "repo": args.repo,
              "checked_at_wib": now.astimezone(WIB).isoformat(), "overall": "RED",
              "critical": ["SENTINEL_SELF_AUDIT_FAILED"], "warnings": [],
              "workflows": [], "source_checks": [],
@@ -256,7 +235,7 @@ def main():
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(report)
-    if args.notify_red:
+    if args.notify_red or os.getenv("SENTINEL_NOTIFY_RED") == "true":
         sent = telegram_red(r)
         print("Telegram alert sent" if sent else "Telegram alert unavailable or not required")
     print(json.dumps({"overall": r["overall"], "critical": r["critical"],
