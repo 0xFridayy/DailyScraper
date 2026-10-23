@@ -480,7 +480,8 @@ def _short_window_message(accepted, mode, sd, ed):
             f"check LOOKBACK_DAYS before spending a full run.")
 
 
-def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures, codes):
+def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures, codes,
+         start_date_override=None, end_date_override=None):
     """The fetch loop, independent of how requests are made (see collect).
 
     Each attempt is recorded in `captures` (an inventory_capture.CaptureLog):
@@ -489,7 +490,7 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures,
     clone check, the short-window probe and the cache write, which a
     persisting line announces first (inventory_capture: PERSIST_UNCONFIRMED).
     `codes` is the checked explicit request (collect)."""
-    sd, ed = start_date(now), end_date(now)
+    sd, ed = start_date_override or start_date(now), end_date_override or end_date(now)
     ok, failed, sessions, empty = [], {}, {}, {}
     accepted = []          # (ticker, sessions) of successful fetches, in order
     seen = {}              # OHLC signature -> the ticker it was served for
@@ -604,7 +605,8 @@ def _run(tickers, mode, raw_dir, sleep, now, get, relogin, safe_error, captures,
 
 
 def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
-            request_get=None, relogin=None, pipeline_run_id=None, codes=None):
+            request_get=None, relogin=None, pipeline_run_id=None, codes=None,
+            start_date_override=None, end_date_override=None):
     """Fetch, validate and cache each ticker; {"ok", "failed", "sessions", "empty"}.
 
     `codes` is the explicit request, broker_codes.json when None. More than 10
@@ -625,6 +627,12 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
     Playwright's APIResponse; relogin() is called for the one re-login. Left as
     None, collect() logs in to NeoBDM through Playwright.
     """
+    for bound in (start_date_override, end_date_override):
+        if bound is not None and (not isinstance(bound, str) or
+                datetime.strptime(bound, "%Y-%m-%d").strftime("%Y-%m-%d") != bound):
+            raise ValueError("Inventory bounds require canonical ISO dates")
+    if (start_date_override or start_date(now)) > (end_date_override or end_date(now)):
+        raise ValueError("Inventory start date follows end date")
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
     tickers = _dedupe([str(t).strip().upper() for t in tickers])
@@ -638,7 +646,8 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
                              collection_mode=ic.EXPLICIT_CODES)
     if request_get is not None:
         return _run(tickers, mode, raw_dir, sleep, now, request_get,
-                    relogin or (lambda: None), _safe_error_local, captures, codes)
+                    relogin or (lambda: None), _safe_error_local, captures, codes,
+                    start_date_override, end_date_override)
 
     # Imported here, never at module scope: neobdm_scraper raises on import
     # without all four secrets, and nothing else in this module needs a browser.
@@ -672,7 +681,7 @@ def collect(tickers, mode, raw_dir=RAW_DIR, sleep=time.sleep, now=None,
             except Exception as e:
                 raise RuntimeError(f"NeoBDM login failed: {_safe_error(e)}") from None
             return _run(tickers, mode, raw_dir, sleep, now, get, sign_in, _safe_error,
-                        captures, codes)
+                        captures, codes, start_date_override, end_date_override)
         finally:
             browser.close()
 
