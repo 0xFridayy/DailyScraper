@@ -199,6 +199,18 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(calls),1)
         self.assertEqual(r["halt_reason"],"PROVIDER_HTTP_429")
         self.assertEqual(r["counts"],{"FAILED":1,"MISSING":1})
+
+    def test_later_explicit_batch_clears_old_pause_but_retains_its_evidence(self):
+        def throttled(query):
+            response=Response(dict(success=False,message='abnormal usage'))
+            response.status=429
+            return response
+        first=capture.capture(self.root,self.registry,self.subset,EXPECTED,throttled,sleep=lambda _:None)
+        self.assertEqual(first['halt_reason'],'PROVIDER_HTTP_429')
+        later=self.run_capture()
+        self.assertNotIn('halt_reason',later)
+        self.assertEqual(later['previous_halt']['reason'],'PROVIDER_HTTP_429')
+        self.assertEqual(later['counts'],{'COMPLETE':2})
     def test_index_exclusions_are_explicit_even_under_one_request_budget(self):
         registry=registry_from_tickers(["BMRI","IHSG","ISSI"],source="synthetic")
         r=capture.capture(self.root,registry,self.subset,EXPECTED,self.get,
