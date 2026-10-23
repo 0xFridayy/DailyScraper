@@ -100,8 +100,9 @@ jobs:
       - name: Install Playwright Chromium (+ system deps)
         run: python -m playwright install --with-deps chromium
 
-      - name: Capture ownership data (full tracked universe)
-        run: python ownership_capture.py --run-id "$(date -u +%Y-%m-%d)"
+      # Keep the historical public subset explicit; full registry archives run privately.
+      - name: Capture ownership data (legacy tracked subset)
+        run: python ownership_capture.py --legacy-tracked --run-id "$(date -u +%Y-%m-%d)"
 
       # Debug screenshots taken strictly BEFORE authentication succeeds (see
       # neobdm_scraper.py login(): login_page.png is captured immediately after
@@ -154,3 +155,4 @@ jobs:
           git diff --staged --quiet || git commit -m "Update neobdm_ownership.db + raw fragments ($(date -u +%Y-%m-%d))"
           git pull --rebase
           git push
+
