@@ -1,0 +1,23 @@
+name: Broker response contract tests
+on:
+  pull_request:
+    paths:
+      - neobdm_scraper.py
+      - test_broker_flow_response_retry.py
+      - test_neobdm_source_contract.py
+      - .github/workflows/broker-response-contract-tests.yml
+permissions:
+  contents: read
+jobs:
+  response-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install offline parser test dependencies without browser binaries
+        run: python -m pip install pytest pandas numpy requests pyarrow playwright schedule pytz
+      - name: Verify bounded recovery and refusal contracts without network requests
+        run: python -m pytest -q test_broker_flow_response_retry.py
