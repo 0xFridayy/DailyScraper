@@ -1515,6 +1515,11 @@ def init_db():
 BROKER_FLOW_METHOD = "dash_callback_v1"
 BROKER_FLOW_DURATION = "Today"
 FLOW_OK, FLOW_SOURCE_FAILURE = "OK", "SOURCE_FAILURE"
+FLOW_RESPONSE_RETRY_DELAY_SECONDS = 30
+
+
+class BrokerFlowResponseUnavailable(RuntimeError):
+    """An exact HTTP-200 submit supplied a malformed side container."""
 SNAPSHOT_PERSISTED, SNAPSHOT_REJECTED, SNAPSHOT_SUPERSEDED = "PERSISTED", "REJECTED", "SUPERSEDED"
 FLOW_LABEL_NAMESPACE = "dash_bootstrap_components"
 FLOW_LABEL_SIDE = {"akum": "Buy", "dist": "Sell"}
@@ -1719,6 +1724,13 @@ def read_broker_flow_code(page, code, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
                            f"for the exact [{code!r}] request")
     try:
         body = _api_json(response)
+        # A provider pause is not a transient schema failure and must never be
+        # retried as one, including when the alert arrives with HTTP 200.
+        message = _json.dumps(body).lower()
+        if any(marker in message for marker in (
+                'abnormal usage', 'too many requests', 'rate limit',
+                'temporarily blocked', 'access denied', 'please log in', 'please login')):
+            raise RuntimeError('broker source paused or authentication required; response refused')
         sides = {side: _stalker_rows_from_response(_side_response_data(body, side), side)
                  for side in ("akum", "dist")}
         sessions = {side: _side_session_date(body, side) for side in sides}
@@ -1731,6 +1743,8 @@ def read_broker_flow_code(page, code, timeout_ms=STALKER_CALLBACK_TIMEOUT_MS):
         if both:
             raise ValueError(f"{len(both)} ticker(s) are in both the akum and the dist table")
     except ValueError as e:
+        if '.children is not a list' in str(e):
+            raise BrokerFlowResponseUnavailable(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
         raise RuntimeError(f"{SUBMIT_TRIGGER} Dash callback response {e}") from e
     return {"session_date": sessions["akum"], "akum": sides["akum"], "dist": sides["dist"]}
 
@@ -1764,12 +1778,23 @@ def capture_broker_flow(page, tickers, codes=None):
     started = datetime.now(pytz.timezone(TIMEZONE))
     expected, calendar_problem = expected_source_session(started.date())
     scans, rows = [], []
+    response_retry_remaining = 1  # One extra submit for the entire daily sweep.
     for code in codes:
         scan = {"broker_code": code, "status": FLOW_SOURCE_FAILURE, "session_date": None,
                 "akum_rows_returned": None, "dist_rows_returned": None, "tracked_rows": None,
                 "started_utc": nsc.utc_now(), "completed_utc": None, "detail": ""}
         try:
-            got = read_broker_flow_code(page, code)
+            try:
+                got = read_broker_flow_code(page, code)
+            except BrokerFlowResponseUnavailable as error:
+                if not response_retry_remaining:
+                    raise
+                response_retry_remaining -= 1
+                scan['response_retry'] = dict(attempts=2, first_failure=_safe_error(error, 300))
+                log.warning('broker_flow %s malformed response; one fresh read after %ss',
+                            code, FLOW_RESPONSE_RETRY_DELAY_SECONDS)
+                page.wait_for_timeout(FLOW_RESPONSE_RETRY_DELAY_SECONDS * 1000)
+                got = read_broker_flow_code(page, code)
             code_rows = [{"ticker": r["symbol"], "broker_code": code,
                           **{f: _flow_number(r[f]) for f in STALKER_ROW_FIELDS[1:]}}
                          for side in ("akum", "dist") for r in got[side] if r["symbol"] in tickers]
