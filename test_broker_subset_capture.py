@@ -75,7 +75,8 @@ class Tests(unittest.TestCase):
         second=self.run_capture(max_requests=1)
         self.assertEqual(second["counts"],{"COMPLETE":2})
         self.assertEqual(len(self.queries),2)
-        self.assertGreaterEqual(len(list(self.root.glob("runs/*/receipt_versions/*.json"))),3)
+        self.assertEqual(list(self.root.glob("runs/*/receipt_versions")),[])
+        self.assertTrue(list(self.root.glob("runs/*/"+capture.RECEIPT_NAME)))
 
     def test_mid_run_checkpoint_counts_match_durable_ticker_outcomes(self):
         seen=[]
