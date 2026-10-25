@@ -293,25 +293,18 @@ def test_gitignore_keeps_caches_html_and_history_out():
     print("  ok test_gitignore_keeps_caches_html_and_history_out")
 
 
-def test_weekly_history_release_is_a_draft():
-    # Amendment A2: the history export is paid data and the repo is public.
-    # Only a DRAFT release keeps its assets collaborator-only, the upload
-    # stays behind the owner's opt-in variable, and a release that is not a
-    # draft stops the upload rather than receiving the files.
+def test_weekly_history_cannot_publish_vendor_data_from_public_workflows():
+    # The private pipeline replaces public draft releases and data commits.
     wf = os.path.join(HERE, ".github", "workflows")
-    with open(os.path.join(wf, "broker-learning-weekly.yml"), encoding="utf-8") as f:
-        text = f.read()
-    code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())   # not the comments
-    assert "gh release create broker-history --draft" in code
-    assert code.count("gh release create") == 1
-    assert "gh release upload broker-history broker_history/*.parquet --clobber" in code
-    assert "if: vars.BROKER_HISTORY_UPLOAD == 'true'" in code
-    assert "GH_TOKEN: ${{ github.token }}" in code
-    assert code.index("--json isDraft") < code.index("gh release upload"), \
-        "the draft check must run before any upload"
-    with open(os.path.join(wf, "broker-learning-daily.yml"), encoding="utf-8") as f:
-        assert "gh release" not in f.read(), "only the weekly job exports history"
-    print("  ok test_weekly_history_release_is_a_draft")
+    for name in ("broker-learning-weekly.yml", "broker-learning-daily.yml"):
+        with open(os.path.join(wf, name), encoding="utf-8") as source:
+            code = "\n".join(line.split("#", 1)[0] for line in source)
+        assert "gh release" not in code
+        assert "upload-artifact" not in code
+        assert "secrets." not in code
+        assert "contents: write" not in code
+        assert "SPECTRA-evidence" in code and "exit 1" in code
+    print("  ok test_weekly_history_cannot_publish_vendor_data_from_public_workflows")
 
 
 def test_load_watchlist_drops_bad_codes_dedupes_and_keeps_order():
@@ -1046,3 +1039,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

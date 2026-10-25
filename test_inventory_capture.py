@@ -716,19 +716,15 @@ def test_harvest_records_every_attempt_beside_an_unchanged_cache():
     print("  ok test_harvest_records_every_attempt_beside_an_unchanged_cache")
 
 
-def test_arb_veto_harvest_entry_point_still_runs_and_never_claims_full_coverage():
-    """Regression: the weekly ARB veto's first step is `python
-    harvest_inventory.py`, no arguments, the configured 101 codes. The
-    explicit-code guard of this branch must not kill it (the veto model reads
-    price features only), and a silently truncated answer must still never pass
-    for full coverage: it is cached as before, recorded as coverage NOT
-    verified, and refused by every guarded full-universe reader."""
+def test_retired_arb_veto_keeps_the_offline_harvest_coverage_guard():
+    """Public acquisition is retired; the local legacy reader still refuses
+    silently truncated broker coverage when explicitly exercised offline."""
     workflow = os.path.join(HERE, ".github", "workflows", "arb-veto.yml")
-    with open(workflow, encoding="utf-8") as fh:
-        steps = [line.strip() for line in fh]
-    assert "run: python harvest_inventory.py" in steps          # the exact entry point, no args
-    assert steps.index("run: python harvest_inventory.py") < steps.index(
-        "run: python build_inventory_db.py") < steps.index("run: python arb_veto.py")
+    with open(workflow, encoding="utf-8") as source:
+        code = source.read()
+    assert "run: python harvest_inventory.py" not in code
+    assert "secrets." not in code and "contents: write" not in code
+    assert "SPECTRA-evidence" in code and "exit 1" in code
 
     complete = payload(base=1000.0, brokers=tuple(CODES))                  # all 101 came back
     truncated = payload(base=2000.0, brokers=tuple(CODES[:10]))            # the server's first 10
@@ -759,7 +755,7 @@ def test_arb_veto_harvest_entry_point_still_runs_and_never_claims_full_coverage(
         assert "10 of the 101" in str(e), e
     else:
         raise AssertionError("a 10-of-101 harvest cache passed for full coverage")
-    print("  ok test_arb_veto_harvest_entry_point_still_runs_and_never_claims_full_coverage")
+    print("  ok test_retired_arb_veto_keeps_the_offline_harvest_coverage_guard")
 
 
 def test_harvest_records_the_short_window_abort_before_raising():
@@ -2051,3 +2047,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
