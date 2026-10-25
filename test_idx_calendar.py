@@ -22,11 +22,20 @@ def days(start, end):
 
 def test_coverage_is_whole_years_each_with_closures_and_sources():
     years = list(range(cal.COVERED_FROM.year, cal.COVERED_THROUGH.year + 1))
-    assert (cal.COVERED_FROM, cal.COVERED_THROUGH) == (date(2026, 1, 1), date(2027, 12, 31))
+    assert (cal.COVERED_FROM, cal.COVERED_THROUGH) == (date(2025, 1, 1), date(2027, 12, 31))
     assert sorted(cal.IDX_CLOSED_WEEKDAYS) == sorted(cal.SOURCES) == years
 
 
-@pytest.mark.parametrize("year", [2026, 2027])
+def test_2025_equity_amendment_includes_august_but_keeps_december_31_closed():
+    assert not cal.is_idx_session(date(2025, 8, 18))
+    assert not cal.is_idx_session(date(2025, 12, 31))
+    assert cal.latest_idx_session_before(date(2025, 8, 19)) == date(2025, 8, 15)
+    assert cal.latest_idx_session_before(date(2026, 1, 2)) == date(2025, 12, 30)
+    assert cal.SOURCES[2025]["sessions"] == 236
+    assert cal.SOURCES[2025]["ksei"]["announcement"] == "PENG-0004/DIR/KSEI/0825"
+
+
+@pytest.mark.parametrize("year", [2025, 2026, 2027])
 def test_closures_are_weekdays_of_their_year_and_match_the_announced_session_count(year):
     closed = [date.fromisoformat(d) for d in cal.IDX_CLOSED_WEEKDAYS[year]]
     assert all(d.year == year and d.weekday() < 5 for d in closed)
@@ -49,7 +58,7 @@ def test_sources_name_the_verified_announcements():
     assert [h["announcement"] for h in s26["ksei_history"]] == ["PENG-0005/DIR/KSEI/1025"]
     assert (s27["idx"]["announcement"], s27["idx"]["date"]) == ("Peng-00169/BEI.POP/09-2026", "2026-09-16")
     assert (s27["ksei"]["announcement"], s27["ksei"]["date"]) == ("PENG-0004/DIR/KSEI/0926", "2026-09-24")
-    assert all(s["verified_at"] == cal.VERIFIED_AT == "2026-09-30" for s in cal.SOURCES.values())
+    assert all(s["verified_at"] == cal.VERIFIED_AT == "2026-09-30" for y, s in cal.SOURCES.items() if y in (2026, 2027))
     assert "Peng-00171/BEI.POP/09-2026" not in repr(cal.SOURCES)       # no unproven 2027 update
 
 
@@ -62,9 +71,9 @@ def test_is_idx_session(d, session):
     assert cal.is_idx_session(d) is session
 
 
-@pytest.mark.parametrize("d", [date(2025, 12, 31), date(2028, 1, 1), date(2027, 12, 31) + timedelta(days=400)])
+@pytest.mark.parametrize("d", [date(2024, 12, 31), date(2028, 1, 1), date(2027, 12, 31) + timedelta(days=400)])
 def test_is_idx_session_refuses_uncovered_dates(d):
-    with pytest.raises(cal.IdxCalendarUnavailable, match="is outside IDX calendar idx-2026-2027.v1"):
+    with pytest.raises(cal.IdxCalendarUnavailable, match="is outside IDX calendar idx-2025-2027.v2"):
         cal.is_idx_session(d)
 
 
@@ -101,7 +110,7 @@ def test_latest_session_is_strictly_before_and_skips_only_non_sessions():
 
 
 @pytest.mark.parametrize("scrape_date, missing", [
-    (date(2026, 1, 1), "2025-12-31"), (date(2026, 1, 2), "2025-12-31"),   # before COVERED_FROM
+    (date(2025, 1, 1), "2024-12-31"), (date(2025, 1, 2), "2024-12-31"),   # before COVERED_FROM
     (date(2028, 1, 2), "2028-01-01"), (date(2028, 1, 4), "2028-01-03"),   # after COVERED_THROUGH
 ])
 def test_latest_session_fails_closed_outside_coverage(scrape_date, missing):
@@ -162,3 +171,4 @@ def test_price_history_sessions_agree_with_the_calendar_secondary_check():
     last = date.fromisoformat(max(observed))
     sessions = {d.isoformat() for d in days(cal.COVERED_FROM, last) if cal.is_idx_session(d)}
     assert observed == sessions
+

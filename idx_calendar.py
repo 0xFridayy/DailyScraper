@@ -24,8 +24,8 @@ consistency check (test_idx_calendar.py), never the authority.
 
 from datetime import date, datetime, timedelta
 
-CALENDAR_VERSION = "idx-2026-2027.v1"
-COVERED_FROM = date(2026, 1, 1)
+CALENDAR_VERSION = "idx-2025-2027.v2"
+COVERED_FROM = date(2025, 1, 1)
 COVERED_THROUGH = date(2027, 12, 31)
 VERIFIED_AT = "2026-09-30"
 
@@ -37,6 +37,33 @@ MAX_LOOKBACK_DAYS = 14
 # Weekday exchange closures (libur bursa), exactly as announced. Weekends are
 # never sessions and are not listed.
 IDX_CLOSED_WEEKDAYS = {
+    2025: frozenset({
+        "2025-01-01",
+        "2025-01-27",
+        "2025-01-28",
+        "2025-01-29",
+        "2025-03-28",
+        "2025-03-31",
+        "2025-04-01",
+        "2025-04-02",
+        "2025-04-03",
+        "2025-04-04",
+        "2025-04-07",
+        "2025-04-18",
+        "2025-05-01",
+        "2025-05-12",
+        "2025-05-13",
+        "2025-05-29",
+        "2025-05-30",
+        "2025-06-06",
+        "2025-06-09",
+        "2025-06-27",
+        "2025-08-18",
+        "2025-09-05",
+        "2025-12-25",
+        "2025-12-26",
+        "2025-12-31",
+    }),
     2026: frozenset({
         "2026-01-01",   # Tahun Baru 2026 Masehi
         "2026-01-16",   # Isra Mikraj Nabi Muhammad SAW
@@ -90,6 +117,21 @@ IDX_CLOSED_WEEKDAYS = {
 # (idx.co.id is bot-protected, so the KSEI text is the copy that was read).
 # `sessions` is the announced number of trading days, a cross-check on the list.
 SOURCES = {
+    2025: {
+        "idx": {"announcement": "Peng-00213/BEI.POP/10-2024", "date": "2024-10-16",
+                "title": "Kalender Libur Bursa Tahun 2025",
+                "url": "https://www.idx.id/StaticData/NewsAndAnnouncement/ANNOUNCEMENTSTOCK/Exchange/Peng-00213-No.%20Peng-00213BEI.POP10-2024.pdf",
+                "sha256": "84cfc174e5eab9257e9f93ce36bb41c76e67a3d8cb99cc9b4a80c76c26638b43"},
+        "idx_amendment": {"announcement": "Peng-00149/BEI.POP/08-2025", "date": "2025-08-08",
+                          "title": "Perubahan Kalender Libur Bursa Tahun 2025",
+                          "authority_basis": "Restated explicitly in KSEI PENG-0004/DIR/KSEI/0825"},
+        "ksei": {"announcement": "PENG-0004/DIR/KSEI/0825", "date": "2025-08-08",
+                 "title": "Pengumuman Perubahan Hari Libur dan Cuti Bersama PT KSEI Tahun 2025",
+                 "url": "https://web.ksei.co.id/files/Pengumuman_Perubahan_Hari_Libur_dan_Cuti_Bersama_PT_KSEI_Tahun_2025.pdf",
+                 "sha256": "c29c466e48ed8eb968876e51b99076a23c91d79e6f9cc8f7c646986ff9b50f21"},
+        "ksei_history": [], "sessions": 236, "verified_at": "2026-10-24",
+        "session_count_basis": "237 originally announced equity sessions minus the added 18 August closure; 31 December remains closed for equities",
+    },
     2026: {
         "idx": {"announcement": "Peng-00171/BEI.POP/09-2025", "date": "2025-09-23",
                 "title": "Kalender Libur Bursa Tahun 2026",
@@ -173,3 +215,4 @@ def expected_closed_session(as_of, closed_session=None):
     if closed_session == default or (closed_session == as_of and is_idx_session(as_of)):
         return closed_session
     raise ValueError(f"closed session {closed_session} is neither {default} nor the session {as_of}")
+
