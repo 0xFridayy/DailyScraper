@@ -1,130 +1,15 @@
 name: NeoBDM Daily Scrape
-
+# Vendor source bytes and derived private data belong in SPECTRA-evidence.
+# Existing historical public Git objects are not rewritten by this retirement.
 on:
-  schedule:
-    # 22:00 UTC == 05:00 Asia/Jakarta (UTC+7, no DST) == 06:00 Asia/Kuala_Lumpur.
-    # Note: GitHub may start scheduled runs late, by hours rather than minutes
-    # (the old 23:00 UTC slot started 07:38-09:28 WIB, 2026-09-19..10-03). A run
-    # that starts after the 09:00 WIB IDX open stores nothing date-keyed
-    # (neobdm_scraper._offset_safe), so the morning picks go stale; the earlier
-    # slot leaves more room before the open.
-    - cron: "0 22 * * *"
-  workflow_dispatch:  # lets you trigger a run manually from the Actions tab
-
+  workflow_dispatch:
 permissions:
-  contents: write
-
-# Never let two runs that push the same database overlap. Shared with
-# arb-veto.yml (both push daily_picks.db), and still keeps a manual run off the
-# scheduled one (both push neobdm.db). Groups are repository-wide, so only the
-# shared name makes one workflow wait for the other. At most one run waits: a
-# third one queued meanwhile cancels the waiting one.
-concurrency:
-  group: picks-db
-  cancel-in-progress: false
-
+  contents: read
 jobs:
-  scrape:
+  migrated:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    env:
-      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
-      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
-      # The branch tip, not the triggering commit: a run that waited on the
-      # concurrency group was triggered before the other run pushed, and its
-      # daily_picks.db commit could never rebase onto that push (binary file).
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.ref }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Point to the private source pipeline without accessing a provider
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright Chromium (+ system deps)
-        run: python -m playwright install --with-deps chromium
-
-      # morning.py runs the unchanged scrape (neobdm_scraper.run_all_jobs),
-      # then sends ONE message with picks + follow-ups instead of the raw list.
-      # To roll back, change this line back to: python neobdm_scraper.py --now
-      - name: Record exact capture run boundary
-        run: echo "DAILY_CAPTURE_NOT_BEFORE=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" >> "$GITHUB_ENV"
-
-      - name: Run scraper + morning picks (one-shot)
-        run: python morning.py
-
-      - name: Write sanitized daily capture receipt
-        if: always()
-        run: >-
-          python daily_capture_receipt.py
-          --not-before "$DAILY_CAPTURE_NOT_BEFORE"
-          --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}"
-
-      - name: Upload sanitized daily capture receipt
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: daily-capture-receipt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/daily-capture-receipt.json
-          if-no-files-found: error
-          retention-days: 30
-
-      # market_summary/dashboard scrapes have been silently failing
-      # (selector timeouts, likely a NeoBDM site update) without failing the
-      # job overall - upload the page snapshots neobdm_scraper.py saves so
-      # they can actually be inspected afterward instead of just a log line.
-      # if: always() so this still runs even if the scraper step errors out.
-      - name: Upload page snapshots for debugging
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: page-snapshots-${{ github.run_id }}
-          path: |
-            *.png
-            *.html
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Commit updated neobdm.db, raw fragments and daily picks
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Only these two paths -- never `git add .` / `git add -A`.
-          # market_summary_raw_fragments/ holds the immutable screener responses the
-          # capture manifest (ms_capture_manifest) points at: content-addressed and
-          # write-once (neobdm_source_contract.store_raw_bytes), so an unchanged
-          # response re-adds nothing and no step here can stage a deletion. The
-          # guard keeps a run that stored no response from failing under `set -e`.
-          git add neobdm.db
-          if [ -d market_summary_raw_fragments ]; then
-            git add market_summary_raw_fragments/
-          fi
-          # daily_picks.db: picks, learned weights and sent-message log (morning.py).
-          if [ -f daily_picks.db ]; then
-            git add daily_picks.db
-          fi
-          git diff --staged --quiet || git commit -m "Update neobdm.db ($(date -u +%Y-%m-%d))"
-          for i in 1 2 3; do
-            if git pull --rebase && git push; then exit 0; fi
-            git rebase --abort 2>/dev/null || true
-            sleep 15
-          done
-          echo "::error::push failed 3 times - today's data is NOT saved"
+          echo "::error::This public data writer is retired. Use 0xFridayy/SPECTRA-evidence private-daily.yml."
           exit 1
-
-
-      # Keep successful source persistence/report behavior, then fail partial runs.
-      - name: Require complete current-run daily capture
-        if: always()
-        run: >-
-          python daily_capture_receipt.py --check
-          --not-before "$DAILY_CAPTURE_NOT_BEFORE"
-          --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}"

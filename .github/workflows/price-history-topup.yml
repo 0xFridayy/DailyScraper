@@ -1,118 +1,15 @@
 name: NeoBDM price_history Top-up
-
-# neobdm_scraper.py's daily job only ever wrote broker_flow going forward -
-# price_history was only ever populated once, by backfill_inventory.py's
-# one-time historical backfill (see that script's docstring). Nothing kept
-# it current after that, so it silently stopped moving once the backfill
-# ceiling was reached. backfill_inventory.py is already safe to rerun
-# repeatedly: it writes price_history unconditionally with INSERT OR REPLACE
-# (idempotent), and skips broker_flow rows past BACKFILL_END so it never
-# overwrites the live-scraped broker_flow data from the other workflow. This
-# just reruns that same already-validated script on its own schedule,
-# offset well clear of the main daily-scrape.yml run so both workflows never
-# race to commit/push neobdm.db at the same time.
-
+# Vendor source bytes and derived private data belong in SPECTRA-evidence.
+# Existing historical public Git objects are not rewritten by this retirement.
 on:
-  schedule:
-    # 00:30 UTC daily - ~90 min after daily-scrape.yml's 23:00 UTC run
-    # (which has its own 35-min timeout), so that commit always lands first.
-    - cron: "30 0 * * *"
   workflow_dispatch:
-    inputs:
-      tickers:
-        description: >-
-          Space-separated tickers to scrape, e.g. "BBHI BNBR BREN". Leave empty
-          for all tracked tickers. A 3-ticker run finishes in ~2 minutes, so a
-          hypothesis can be tested straight after a push instead of waiting for
-          the next nightly run — which is what made runs #15 and #16 cost a day
-          each to learn one fact.
-        required: false
-        default: ""
-
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  topup:
+  migrated:
     runs-on: ubuntu-latest
-    # backfill_inventory.py now issues ONE authenticated JSON GET per ticker
-    # (the /inventory/ Plotly page and its per-ticker re-click race are gone), so
-    # a full ~50-ticker run is a couple of minutes. The generous ceiling stays
-    # only as headroom for a slow login or transient API stalls — being killed
-    # mid-run is a worse outcome than a slow green.
-    timeout-minutes: 20
-    env:
-      # Without this, Python block-buffers stdout when it is not a TTY and a
-      # killed run loses ALL progress output. Run #16 hit the timeout and its log
-      # showed nothing at all between login and cancellation.
-      PYTHONUNBUFFERED: "1"
-      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
-      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Point to the private source pipeline without accessing a provider
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install Playwright Chromium (+ system deps)
-        run: python -m playwright install --with-deps chromium
-
-      # HANDOFF.md stage 2: gate the commit on the scrape not having made things
-      # worse. An absolute threshold would be useless here - the historical
-      # backlog is large and shrinking - so this compares before against after
-      # and only fails on a REGRESSION. Because the commit step below does not
-      # run when this fails, contaminated rows never reach master.
-      #
-      # The gate counts cross_ticker_dup ONLY, not all three detectors. That is
-      # the sole detector whose growth means the scraper regressed (one ticker's
-      # OHLCV stored under another's name); two different real stocks cannot share
-      # byte-identical OHLCV, so a correct scrape never raises it. Gating on the
-      # total instead froze price_history: limit_violation / series_break also
-      # fire on legitimate IDX moves (a +25% ARA day, a corporate action) and on
-      # the centered rolling median shifting at each series' fresh end, so every
-      # correct nightly scrape added ~1 and the gate blocked the commit forever.
-      # See price_audit.cmd_count and HANDOFF.md Appendix O.
-      - name: Record contamination baseline
-        run: echo "CONTAM_BEFORE=$(python price_audit.py count cross_ticker_dup)" >> "$GITHUB_ENV"
-
-      - name: Top up price_history
-        run: python backfill_inventory.py ${{ inputs.tickers }}
-
-      # backfill_inventory.py dumps the raw JSON of its FIRST failed response
-      # (topup-failure.json). With the API there is no page to screenshot — the
-      # response body IS the diagnostic. Without this upload an API break leaves
-      # only stdout, and diagnosing it costs another day.
-      - name: Upload failure snapshot for debugging
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: topup-failure-${{ github.run_id }}
-          path: topup-failure.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Fail if the scrape introduced new cross-ticker contamination
-        run: |
-          AFTER=$(python price_audit.py count cross_ticker_dup)
-          echo "cross-ticker contaminated rows: $CONTAM_BEFORE -> $AFTER"
-          if [ "$AFTER" -gt "$CONTAM_BEFORE" ]; then
-            echo "::error::scrape added $((AFTER - CONTAM_BEFORE)) cross-ticker contaminated rows - not committing"
-            exit 1
-          fi
-
-      - name: Commit updated neobdm.db
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add neobdm.db
-          git diff --staged --quiet || git commit -m "Top up price_history ($(date -u +%Y-%m-%d))"
-          git pull --rebase
-          git push
+          echo "::error::This public data writer is retired. Use 0xFridayy/SPECTRA-evidence private-price-integrity.yml."
+          exit 1
