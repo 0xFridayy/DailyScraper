@@ -1,0 +1,22 @@
+name: Public vendor storage boundary
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - test_vendor_storage_boundary.py
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/**'
+      - test_vendor_storage_boundary.py
+permissions:
+  contents: read
+jobs:
+  vendor-storage-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: python -m unittest -v test_vendor_storage_boundary.py

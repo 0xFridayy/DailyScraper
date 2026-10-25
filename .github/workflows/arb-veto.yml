@@ -1,93 +1,15 @@
 name: Weekly ARB Veto
-
-# Refreshes the limit-down veto list daily_picks.py reads before choosing
-# machine picks. Weekly, not daily: the model's label is "an ARB close
-# anywhere in T+1..T+5", so a list stays meaningful for about a trading week,
-# and one inventory harvest a week keeps well clear of the abnormal-usage
-# throttle neobdm_scraper.py documents (~1,000 calls per harvest).
-# The schedule was off between 2026-09-24 and this commit. A harvest pinned to
-# a start date a year older than the API's rolling window came back with a
-# month of data per ticker and an empty panel, so a weekly run would have spent
-# ~1,000 calls on a guaranteed failure. harvest_inventory.start_date() now
-# tracks that window, and the 2026-09-24 manual run trained on 108,846 rows and
-# wrote a five-name list -- so this is on again, on evidence rather than hope.
+# Vendor source bytes and derived private data belong in SPECTRA-evidence.
+# Existing historical public Git objects are not rewritten by this retirement.
 on:
-  schedule:
-    # 21:00 UTC Sunday == 05:00 Monday Asia/Kuala_Lumpur, before the 23:00 UTC
-    # daily scrape that consumes the list.
-    - cron: "0 21 * * 0"
   workflow_dispatch:
-
 permissions:
-  contents: write
-
-# daily-scrape also pushes daily_picks.db; never let the two overlap. The group
-# must match daily-scrape.yml's: groups are repository-wide, and only a shared
-# name makes one workflow wait for the other.
-concurrency:
-  group: picks-db
-  cancel-in-progress: false
-
+  contents: read
 jobs:
-  veto:
+  migrated:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # the harvest alone ran 48 min over 1,037 tickers
-    env:
-      NEOBDM_USERNAME: ${{ secrets.NEOBDM_USERNAME }}
-      NEOBDM_PASSWORD: ${{ secrets.NEOBDM_PASSWORD }}
-      # Nothing here sends a message, but harvest_inventory.py imports
-      # neobdm_scraper, which calls _require_env() for all four secrets at
-      # module scope -- so importing it without these raises before the
-      # harvest starts. The other three steps need no secrets at all.
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
-      # The branch tip, not the triggering commit: a run that waited on the
-      # concurrency group was triggered before the other run pushed, and its
-      # daily_picks.db commit could never rebase onto that push (binary file).
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.ref }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Point to the private source pipeline without accessing a provider
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install scikit-learn pyarrow
-
-      - name: Install Playwright Chromium (+ system deps)
-        run: python -m playwright install --with-deps chromium
-
-      - name: Harvest the inventory API
-        run: python harvest_inventory.py
-
-      - name: Build parquet from the cache
-        run: python build_inventory_db.py
-
-      - name: Features and labels
-        run: python inventory_features.py
-
-      - name: Score the ARB veto list
-        run: python arb_veto.py
-
-      - name: Commit the veto list
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # daily_picks.db only. The parquet files and inventory_raw/ cache are
-          # build artefacts -- large, regenerable, and deliberately not tracked.
-          if [ -f daily_picks.db ]; then
-            git add daily_picks.db
-          fi
-          git diff --staged --quiet || git commit -m "Refresh ARB veto list ($(date -u +%Y-%m-%d))"
-          for i in 1 2 3; do
-            if git pull --rebase && git push; then exit 0; fi
-            git rebase --abort 2>/dev/null || true
-            sleep 15
-          done
-          echo "::error::push failed 3 times - this week's veto list is NOT saved"
+          echo "::error::This public data writer is retired. Use 0xFridayy/SPECTRA-evidence private-daily.yml."
           exit 1
