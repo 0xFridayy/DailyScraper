@@ -147,8 +147,8 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(series(doc)[-1]["cumulative_observable_lots"], 20)
 
     def test_unsupported_calendar_preserves_raw_without_invented_continuity(self):
-        axis = ie.idx_session_axis("2025-10-01", "2025-10-03")
-        doc = build([row("2025-10-01"), row("2025-10-03")], axis, windows=(2,))
+        axis = ie.idx_session_axis("2024-10-01", "2024-10-03")
+        doc = build([row("2024-10-01"), row("2024-10-03")], axis, windows=(2,))
         self.assertEqual(doc["axis"]["status"], "UNSUPPORTED")
         self.assertEqual(doc["axis"]["sessions"], [])
         self.assertEqual([r["segment_cumulative_net_lots"] for r in series(doc)], [10, 10])
@@ -1768,3 +1768,4 @@ class SourceAcceptanceHardeningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

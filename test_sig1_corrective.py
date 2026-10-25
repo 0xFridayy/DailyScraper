@@ -91,10 +91,10 @@ def test_medium1_historical_non_session_rejected(day):
 
 def test_unsupported_historical_calendar_is_unknown_and_unhealthy():
     conn = current_fixture()
-    add_price(conn, "2025-10-13", "ZZZZ", close=300, volume=3000)
+    add_price(conn, "2024-10-14", "ZZZZ", close=300, volume=3000)
     problems, _, stats = csi.check(conn, AS_OF, universe=SYNTHETIC_UNIVERSE)
     assert "CALENDAR_UNSUPPORTED" in categories(stats)
-    assert not any("2025-10-13" in p and "non-session" in p for p in problems)
+    assert not any("2024-10-14" in p and "non-session" in p for p in problems)
     assert csi.exit_code(problems, stats) != 0
     admitted = health.require_current_prices(conn, AS_OF, SYNTHETIC_UNIVERSE)
     assert admitted["historical_calendar_status"] == "UNKNOWN/UNSUPPORTED"
@@ -363,7 +363,7 @@ def test_reporting_snapshot_refuses_an_uncheckpointed_wal_image(tmp_path, monkey
 # Final review regressions use the versioned full registry membership.
 def test_n1_historical_calendar_does_not_hide_current_coverage():
     conn = production_scope_fixture()
-    add_price(conn, "2025-01-02", "BBHI")
+    add_price(conn, "2024-01-02", "BBHI")
     conn.execute("DELETE FROM price_history WHERE date>'2026-10-09'")
     item = health.table_freshness(conn, "price_history", AS_OF, {"price-history-topup.yml": "disabled_manually"})
     assert item["freshness"] == "SOURCE_STALE"
@@ -383,10 +383,10 @@ def test_n1_historical_calendar_does_not_hide_current_coverage():
 
 def test_n1_current_admission_separates_historical_certification():
     conn = production_scope_fixture()
-    add_price(conn, "2025-01-02", "BBHI")
+    add_price(conn, "2024-01-02", "BBHI")
     item = health.require_current_prices(conn, AS_OF)
     assert item["freshness"] == "CURRENT"
-    assert item["unsupported_dates"] == ["2025-01-02"]
+    assert item["unsupported_dates"] == ["2024-01-02"]
     assert item["historical_calendar_status"] == "UNKNOWN/UNSUPPORTED"
     assert item["source_certification"] == "UNVERIFIED" and item["spectra_ingestion"] == "BLOCKED"
     assert item["universe_sha256"] == load_registry().sha256
@@ -395,7 +395,7 @@ def test_n1_current_admission_separates_historical_certification():
 def test_n1_unsupported_ticker_lag_is_unknown_without_hiding_other_tickers():
     conn = production_scope_fixture()
     conn.execute("DELETE FROM price_history WHERE ticker='BBHI'")
-    add_price(conn, "2025-01-02", "BBHI")
+    add_price(conn, "2024-01-02", "BBHI")
     item = health.table_freshness(conn, "price_history", AS_OF)
     assert item["session_lag_by_ticker"]["BBHI"] is None
     assert item["session_lag_by_ticker"]["BNBR"] == 0
@@ -661,3 +661,4 @@ def test_cli_full_registry_json_out_preserves_refusal(tmp_path, monkeypatch):
     assert stopped.value.code == evidence["exit_code"] == 1
     missing = evidence["stats"]["freshness"]["price_history"]["missing_coverage"]["2026-10-13"]
     assert len(missing) == len(EXPECTED_UNIVERSE.tickers)
+
